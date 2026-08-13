@@ -12,22 +12,19 @@
 
 set -euo pipefail
 
-# Style helpers
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Resolve script location and enter project root before sourcing _lib.sh.
+# NAM_LIB_NO_CD=1 disables the automatic cd inside _lib.sh so we retain full
+# control over the working directory (required by this script's PGO/BOLT paths).
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$PROJECT_DIR" || { echo "[FATAL] Cannot cd to project root: $PROJECT_DIR" >&2; exit 1; }
+NAM_LIB_NO_CD=1 source "$SCRIPT_DIR/_lib.sh"
 
 echo -e "${BLUE}${BOLD}========================================================================${NC}"
 echo -e "${BLUE}${BOLD}   nam-audio-pipe Unified Release Build & Optimization Pipeline         ${NC}"
 echo -e "${BLUE}${BOLD}========================================================================${NC}"
 
-# Ensure execution from the subproject root directory
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
+# (SCRIPT_DIR and PROJECT_DIR are already set and cd performed above.)
 
 # State tracking for signal safety and cleanup
 ORIG_PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "2")
@@ -73,10 +70,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 export CARGO_TARGET_DIR="$PGO_BUILD_TARGET_DIR"
-
-# Disable symbol stripping during release compilation so BOLT can reorder symbols
-export CARGO_PROFILE_DIST_STRIP="false"
-export CARGO_PROFILE_BENCH_STRIP="false"
 
 # Extract rustflags from .cargo/config.toml using tomllib (or regex fallback)
 CONFIG_RUSTFLAGS=$(python3 -c '
@@ -182,25 +175,24 @@ fi
 if [ "$ORIG_PARANOID" -gt 1 ]; then
     echo -e "  kernel.perf_event_paranoid is $ORIG_PARANOID. Attempting to set to 1..."
     if command -v sudo &>/dev/null; then
-        if sudo -n sysctl -w kernel.perf_event_paranoid=1 &>/dev/null; then
-            sudo sysctl -w kernel.perf_event_paranoid=1
+        # Try passwordless sudo first; if it succeeds the value is already applied.
+        if sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
             PARANOID_MODIFIED=true
-            echo -e "  ${GREEN}✓${NC} paranoid level set to 1."
-        else
-            echo -e "${YELLOW}Warning: Passwordless sudo not available. Trying interactive sudo...${NC}"
-            if [ -t 0 ]; then
-                if sudo sysctl -w kernel.perf_event_paranoid=1; then
-                    PARANOID_MODIFIED=true
-                    echo -e "  ${GREEN}✓${NC} paranoid level set to 1."
-                else
-                    echo -e "${YELLOW}Warning: Failed to set paranoid level to 1. BOLT profiling might be skipped.${NC}"
-                fi
+            echo -e "  ${GREEN}✓${NC} paranoid level set to 1 (passwordless sudo)."
+        elif [ -t 0 ]; then
+            # Interactive terminal: prompt for password once.
+            echo -e "${YELLOW}Warning: Passwordless sudo not available. Prompting for password...${NC}"
+            if sudo sysctl -q -w kernel.perf_event_paranoid=1; then
+                PARANOID_MODIFIED=true
+                echo -e "  ${GREEN}✓${NC} paranoid level set to 1."
             else
-                echo -e "${YELLOW}Warning: Non-interactive shell, cannot prompt for sudo password. BOLT profiling might be skipped.${NC}"
+                warn "Failed to set paranoid level to 1. BOLT profiling might be skipped."
             fi
+        else
+            warn "Non-interactive shell and no passwordless sudo. BOLT profiling might be skipped."
         fi
     else
-        echo -e "${YELLOW}Warning: 'sudo' command not found. BOLT profiling might be skipped.${NC}"
+        warn "'sudo' command not found. BOLT profiling might be skipped."
     fi
 fi
 
@@ -257,14 +249,16 @@ if [ -f "$MERGED_PROFILE" ]; then
     export RUSTFLAGS="$CONFIG_RUSTFLAGS $ORIG_RUSTFLAGS -Cprofile-use=$MERGED_PROFILE"
 else
     export RUSTFLAGS="$CONFIG_RUSTFLAGS $ORIG_RUSTFLAGS"
-    echo -e "  ${YELLOW}No PGO profile available — compiling without PGO.${NC}"
+    warn "No PGO profile available — compiling without PGO."
 fi
 echo -e "  Using RUSTFLAGS: ${BOLD}$RUSTFLAGS${NC}"
 
 echo -e "  Building standalone executable..."
-# -Clink-arg=-Wl,-q emits relocation sections into the unstripped binary,
-# which is required by LLVM BOLT for post-link function and basic-block reordering.
-RUSTFLAGS="$RUSTFLAGS -Clink-arg=-Wl,-q" cargo build --profile dist
+# -C strip=none overrides the [profile.dist] strip=true setting so that the
+# binary retains symbol tables — LLVM BOLT requires these for function and
+# basic-block reordering. Stripping is applied manually in Phase 5 after BOLT.
+# -Clink-arg=-Wl,-q emits relocation sections required by BOLT.
+RUSTFLAGS="$RUSTFLAGS -C strip=none -Clink-arg=-Wl,-q" cargo build --profile dist
 
 PGO_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe"
 if [ ! -f "$PGO_BIN" ]; then
@@ -410,7 +404,13 @@ with wave.open('$TEST_WAV', 'w') as w:
         if [ -f "$BOLT_DIR/perf.data" ] && [ -s "$BOLT_DIR/perf.data" ]; then
             PERF2BOLT_FLAGS=()
             if [ "$USE_LBR" = "false" ]; then
-                PERF2BOLT_FLAGS+=("--basic-events")
+                # --basic-events was renamed across LLVM versions. Probe the flag
+                # before use so the build degrades gracefully on older toolchains.
+                if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
+                    PERF2BOLT_FLAGS+=("--basic-events")
+                else
+                    warn "perf2bolt --basic-events not supported by this toolchain; omitting flag."
+                fi
             fi
 
             if "$PERF2BOLT" "${PERF2BOLT_FLAGS[@]}" -p "$BOLT_DIR/perf.data" "$PGO_BIN" -o "$BOLT_DIR/perf.fdata" --ignore-build-id > "$BOLT_DIR/perf2bolt.log" 2>&1; then
@@ -495,6 +495,16 @@ else
     echo -e "  Installed executable (PGO): $BIN_TARGET"
 fi
 chmod +x "$BIN_TARGET"
+
+# Validate the installed binary is functional before declaring success.
+echo -e "  Validating installed binary integrity (--diagnose)..."
+if "$BIN_TARGET" --diagnose > /dev/null 2>&1; then
+    echo -e "  ${GREEN}✓${NC} Binary integrity verified (--diagnose exited 0)."
+else
+    echo -e "${RED}${BOLD}Error: Installed binary failed --diagnose check. The artifact may be corrupt.${NC}"
+    echo -e "${YELLOW}  Check $BIN_TARGET manually and re-run the build pipeline.${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}${BOLD}==============================================================${NC}"
 echo -e "${GREEN}${BOLD}   Pipeline completed! Artifact ready for distribution.        ${NC}"
