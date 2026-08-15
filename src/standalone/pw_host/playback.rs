@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 /// Configures the playback stream and its RT listener.
 ///
 /// The `process()` closure reads from `DspBridge` (filled by the capture stream)
-/// e entrega ao hardware via `playback_dsp_cycle`.
+/// and delivers to hardware via `playback_dsp_cycle`.
 pub fn setup_playback_stream<'c>(
     core: &'c pw::core::Core,
     bridge_ptr: BridgeRef,

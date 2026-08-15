@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 [package]
 name = "nam-audio-pipe"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/fabiohl/NAM-Audio-Pipe"
@@ -27,7 +27,7 @@ required-features = ["testing"]
 
 [dependencies]
 # S7.T1: pinned to the local motor 0.5.0 (path) — crates.io 0.4.0 is NOT mixed in.
-NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs", version = "0.5.0" }
+NeuralAmpModeler-rs = "0.5.0"
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"

@@ -291,7 +291,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     assert_eq!(wav_sample_count(&wav_path), 2);
 }
 
-/// S7.T3 / R-13 — full `--record` lifecycle, end-to-end:
+/// R-13 — full `--record` lifecycle, end-to-end:
 ///
 /// 1. spawns `run_pipewire_host` with a REAL recording producer and the real
 ///    disk I/O thread (`disk_writer_loop`), inside a clean temp CWD;

@@ -22,7 +22,7 @@ use std::time::Duration;
 
 mod common;
 
-/// R-17 (S7.T4): the script (`utils/tests-quick.sh` Phase 3) only executes
+/// R-17: the script (`utils/tests-quick.sh` Phase 3) only executes
 /// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
 /// test therefore means the daemon vanished mid-run or the script↔test
 /// probes diverged — a silent `return` would let the script print
