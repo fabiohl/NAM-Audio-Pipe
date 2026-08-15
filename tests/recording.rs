@@ -10,34 +10,20 @@ use nam_audio_pipe::recording::buffer::{
     AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, RING_CAPACITY, RingPayload,
     create_audio_ring_buffer,
 };
-use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
+use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
+use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
+use neural_amp_modeler_rs::common::spsc::{self, GcOverflowBuffer, RtStatusFlags, SHUTDOWN};
+use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+use rtrb::RingBuffer;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+mod common;
 
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-fn io_uring_available() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(v) = std::fs::read_to_string("/proc/sys/kernel/io_uring_disabled")
-            && v.trim() == "2"
-        {
-            return false;
-        }
-        let params: [u8; 128] = unsafe { std::mem::zeroed() };
-        let ret = unsafe { libc::syscall(libc::SYS_io_uring_setup, 2, params.as_ptr()) };
-        if ret >= 0 {
-            unsafe { libc::close(ret as _) };
-            return true;
-        }
-        false
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
 
 fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("nam-recording-test-{}", std::process::id()));
@@ -98,12 +84,9 @@ impl Drop for CwdGuard {
 }
 
 #[test]
+#[ignore = "requires io_uring support"]
 fn disk_writer_loop_creates_valid_wav() {
     let _lock = TEST_MUTEX.lock().unwrap();
-    if !io_uring_available() {
-        eprintln!("SKIP: io_uring unavailable");
-        return;
-    }
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
@@ -178,12 +161,9 @@ fn disk_writer_loop_creates_valid_wav() {
 }
 
 #[test]
+#[ignore = "requires io_uring support"]
 fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
     let _lock = TEST_MUTEX.lock().unwrap();
-    if !io_uring_available() {
-        eprintln!("SKIP: io_uring unavailable");
-        return;
-    }
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
@@ -237,12 +217,9 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
 }
 
 #[test]
+#[ignore = "requires io_uring support"]
 fn disk_writer_loop_discards_audio_before_metadata() {
     let _lock = TEST_MUTEX.lock().unwrap();
-    if !io_uring_available() {
-        eprintln!("SKIP: io_uring unavailable");
-        return;
-    }
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
@@ -312,4 +289,159 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     let wav_path = found.expect("no WAV file created");
     // Only 4 floats: 2 samples × 2 channels
     assert_eq!(wav_sample_count(&wav_path), 2);
+}
+
+/// S7.T3 / R-13 — full `--record` lifecycle, end-to-end:
+///
+/// 1. spawns `run_pipewire_host` with a REAL recording producer and the real
+///    disk I/O thread (`disk_writer_loop`), inside a clean temp CWD;
+/// 2. waits for ≥1 processed audio quantum (`last_n_samples > 0` — the RT
+///    callback pushes `Metadata` + `Audio` into the recording ring);
+/// 3. signals stop (`SHUTDOWN`) → host runs `thread_loop.stop()` →
+///    `push_stream_stop` (retry 200 ms) → bounded join (5 s);
+/// 4. asserts the finalized WAV `data` chunk size equals the PCM bytes
+///    actually written to the file (coherent header, never `data=0` after a
+///    clean stop).
+///
+/// The 5 s join detach in `run_pipewire_host` is a LAST RESORT: if the I/O
+/// thread stalls beyond it, the header may be left with `data=0`. That case
+/// FAILS this test — a clean stop must never produce a silent/incomplete WAV.
+///
+/// Requires a running PipeWire daemon AND io_uring. If the daemon is absent
+/// the test prints an honest `SKIP:` (Phase 4 of `utils/tests-quick.sh`
+/// recognizes it and never emits `RECORDING_IO_URING=RAN` for a skip).
+#[test]
+#[ignore = "E2E recording: requires running PipeWire daemon + io_uring; auto-detected by utils/tests-quick.sh Phase 4"]
+fn record_e2e_pipewire_wav_header_matches_bytes() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let _sd = ShutdownGuard::new();
+    let dir = temp_dir();
+    let _cwd = CwdGuard::enter(&dir);
+    let _guard = DirGuard(dir.clone());
+
+    if !common::probe_pipewire_daemon() {
+        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
+        return;
+    }
+
+    pipewire::init();
+
+    let (_param_prod, param_cons) = RingBuffer::new(4);
+    let (gc_prod, gc_cons) = RingBuffer::new(4);
+    let (res_prod, res_cons) = RingBuffer::new(2);
+    let (cs_prod, cs_cons) = RingBuffer::new(2);
+    let (sl_prod, sl_cons) = RingBuffer::new(2);
+    let (os_prod, os_cons) = RingBuffer::new(2);
+
+    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
+    let rt_status = Arc::new(RtStatusFlags::default());
+
+    let (recording_producer, recording_consumer) =
+        create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let io_handle = std::thread::Builder::new()
+        .name("nam-e2e-recording-io".into())
+        .spawn(move || {
+            tokio_uring::start(async {
+                nam_audio_pipe::recording::disk_writer_loop(recording_consumer)
+                    .await
+                    .expect("disk_writer_loop should succeed");
+            });
+        })
+        .expect("failed to spawn recording I/O thread");
+
+    let rt_clone = rt_status.clone();
+    let gc_overflow_clone = gc_overflow.clone();
+    let sys = SystemSnapshot::capture();
+
+    let pw_thread = thread::spawn(move || {
+        pw_host::run_pipewire_host(
+            param_cons,
+            gc_prod,
+            gc_overflow_clone,
+            res_cons,
+            res_prod,
+            cs_cons,
+            cs_prod,
+            rt_clone,
+            PipewireHostConfig {
+                buffer_size: 0,
+                sys,
+                ir_raw_samples: None,
+                full_wavenet_model: None,
+                slimmable_producer: sl_prod,
+                os_producer: os_prod,
+                oversample: OversampleFactor::Off,
+            },
+            gc_cons,
+            sl_cons,
+            os_cons,
+            Some(recording_producer),
+            Some(io_handle),
+        )
+    });
+
+    // Wait (bounded) for the RT callback to process ≥1 quantum. That proves
+    // the capture stream ran AND the recording ring received Metadata+Audio.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last_n_samples = 0u32;
+    while std::time::Instant::now() < deadline {
+        last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
+        if last_n_samples > 0 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
+
+    let host_result = pw_thread
+        .join()
+        .expect("the PipeWire host thread suffered a fatal panic");
+    if let Err(e) = host_result {
+        panic!("run_pipewire_host failed while the PipeWire daemon is up: {e:#}");
+    }
+
+    assert!(
+        last_n_samples > 0,
+        "no audio quantum was processed (last_n_samples == 0) — recording ring never received data"
+    );
+
+    // Locate the WAV written by disk_writer_loop in the temp CWD.
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(&dir).expect("failed to read temp dir") {
+        let e = entry.expect("dir entry error");
+        let p = e.path();
+        if p.extension().is_some_and(|ext| ext == "wav") {
+            found = Some(p);
+            break;
+        }
+    }
+    let wav_path = found.expect("no WAV file created by the E2E recording session");
+
+    // The `data` chunk size field (header) must equal the PCM bytes actually
+    // present in the file — the R-13 coherence invariant. A clean stop must
+    // never leave `data=0` (incomplete header from the detached-join path).
+    let file_bytes = std::fs::read(&wav_path).expect("failed to read recorded WAV");
+    let data_pos = file_bytes
+        .windows(4)
+        .rposition(|w| w == b"data")
+        .expect("'data' chunk not found in recorded WAV");
+    let data_size = u32::from_le_bytes(file_bytes[data_pos + 4..data_pos + 8].try_into().unwrap());
+    let payload_bytes = file_bytes.len() as u64 - (data_pos as u64 + 8);
+
+    let sample_count = wav_sample_count(&wav_path);
+    let expected_payload = sample_count as u64 * 2 * 4; // stereo × 32-bit float
+    assert_eq!(
+        data_size as u64, payload_bytes,
+        "R-13: WAV 'data' header size ({data_size}) != PCM bytes actually written ({payload_bytes})"
+    );
+    assert_eq!(
+        expected_payload, payload_bytes,
+        "R-13: hound duration disagrees with actual file payload ({} vs {payload_bytes})",
+        expected_payload
+    );
+    assert!(
+        data_size > 0,
+        "R-13: WAV 'data' size is 0 after a clean stop — header rewrite never completed"
+    );
 }

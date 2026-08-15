@@ -44,15 +44,22 @@ pub(super) fn handle_resampler_rebuild(
                 );
 
                 if resampler_producer.push(Box::new(new_rs)).is_err() {
+                    // Fail-closed: the replacement was built but could not reach
+                    // the RT callback. Keep NEEDS_RESAMPLER_REBUILD set so the
+                    // next main-loop iteration retries the delivery. Clearing
+                    // NEEDS here (or setting REBUILD_FAILED) would either strand
+                    // RESAMP_SWAP_PENDING (permanent mute) or unmute with the
+                    // stale resampler (wrong rate).
                     NamDiagnostic::new(NamErrorCode::ResamplerChannelFull, sys)
-                        .message("Resampler channel full. Rebuild discarded.")
+                        .message("Resampler channel full. Rebuild will be retried.")
                         .hint(
                             "The audio engine is overloaded. \
-                             If the problem persists, restart NAM-Audio-Pipe.",
+                             The resampler swap is retried automatically until delivery succeeds.",
                         )
                         .param("target_host_rate", target_host_rate)
                         .param("target_nam_rate", target_nam_rate)
                         .emit_warning();
+                    return;
                 }
             }
             Err(e) => {
@@ -130,14 +137,18 @@ pub(super) fn handle_cabsim_rebuild(
                         adapter.engine().fft_size(),
                     );
                     if cabsim_producer.push(Some(adapter)).is_err() {
+                        // Fail-closed: keep NEEDS_CABSIM_REBUILD so the next
+                        // main-loop iteration retries. Clearing NEEDS here
+                        // would lock the RT on the stale partition size.
                         NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                            .message("Cab-sim rebuild channel full. Rebuild discarded.")
+                            .message("Cab-sim rebuild channel full. Rebuild will be retried.")
                             .hint(
                                 "The audio engine is overloaded. \
-                                 If the problem persists, restart NAM-Audio-Pipe.",
+                                 The cab-sim swap is retried automatically until delivery succeeds.",
                             )
                             .param("partition_size", partition_size)
                             .emit_warning();
+                        return;
                     }
                 }
                 Err(e) => {
@@ -168,7 +179,11 @@ pub(super) fn handle_slimmable_rebuild(
             Ok(mut slimmed) => {
                 slimmed.prewarm();
                 let model_l = Box::new(StaticModel::WavenetDyn(Box::new(slimmed)));
-                let _ = slimmable_producer.push(Some(model_l));
+                if slimmable_producer.push(Some(model_l)).is_err() {
+                    // Fail-closed: keep NEEDS so the next cycle retries
+                    // instead of locking quality on the previous channel count.
+                    return;
+                }
             }
             Err(_) => {
                 rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
@@ -179,7 +194,9 @@ pub(super) fn handle_slimmable_rebuild(
             Ok(mut slimmed) => {
                 slimmed.prewarm();
                 let model_r = Box::new(StaticModel::WavenetDyn(Box::new(slimmed)));
-                let _ = slimmable_producer.push(Some(model_r));
+                if slimmable_producer.push(Some(model_r)).is_err() {
+                    return;
+                }
             }
             Err(_) => {
                 rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
@@ -233,5 +250,106 @@ pub(super) fn handle_oversample_rebuild(
                 .param("detail", e)
                 .emit();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
+        Box::new(NamResampler::new(pw, nam, 64).unwrap())
+    }
+
+    fn request_rebuild(flags: &RtStatusFlags, host: u32, nam: u32) {
+        flags.requested_host_rate.store(host, Ordering::Relaxed);
+        flags.requested_nam_rate.store(nam, Ordering::Relaxed);
+        flags.set_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
+        flags.set_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING);
+    }
+
+    #[test]
+    fn resampler_push_full_keeps_needs_for_retry() {
+        let flags = RtStatusFlags::new();
+        request_rebuild(&flags, 44100, 48000);
+        let sys = SystemSnapshot::capture();
+
+        // Saturate the resampler channel (capacity 1) so the delivery fails.
+        let (mut prod, mut cons) = rtrb::RingBuffer::new(1);
+        prod.push(make_rs(48000, 48000)).unwrap();
+
+        handle_resampler_rebuild(&flags, &sys, &mut prod);
+
+        // Fail-closed: NEEDS stays set (retry scheduled) and REBUILD_FAILED is
+        // NOT set — the RT must remain muted awaiting the in-flight replacement.
+        assert!(flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD));
+        assert!(!flags.check_flag(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED));
+        assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+
+        // Free the channel and retry: delivery now succeeds.
+        let _ = cons.pop().unwrap();
+        handle_resampler_rebuild(&flags, &sys, &mut prod);
+
+        assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD));
+        assert!(!flags.check_flag(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED));
+        // PENDING is cleared only when the RT drains the new resampler.
+        assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+
+        let new_rs = cons.pop().unwrap();
+        assert_eq!(new_rs.host_rate(), 44100);
+        assert_eq!(new_rs.nam_rate(), 48000);
+    }
+
+    fn request_cabsim_rebuild(flags: &RtStatusFlags, partition: u32) {
+        flags
+            .requested_cabsim_partition_size
+            .store(partition, Ordering::Relaxed);
+        flags.set_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
+    }
+
+    #[test]
+    fn cabsim_push_full_keeps_needs_for_retry() {
+        let flags = RtStatusFlags::new();
+        request_cabsim_rebuild(&flags, 64);
+        let sys = SystemSnapshot::capture();
+        let ir = [1.0f32, 0.0, 0.0, 0.0];
+
+        let (mut prod, mut cons) = rtrb::RingBuffer::new(1);
+        let placeholder = ConvEngine::new(&ir, 64)
+            .ok()
+            .and_then(|engine| CabSimAdapter::new(Box::new(engine)).ok())
+            .expect("placeholder cabsim adapter");
+        prod.push(Some(placeholder)).unwrap();
+
+        handle_cabsim_rebuild(&flags, Some(&ir), &sys, &mut prod);
+
+        assert!(
+            flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD),
+            "Full must keep NEEDS_CABSIM_REBUILD for retry"
+        );
+
+        let _ = cons.pop().unwrap();
+        handle_cabsim_rebuild(&flags, Some(&ir), &sys, &mut prod);
+
+        assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
+        assert!(cons.pop().is_ok());
+    }
+
+    #[test]
+    fn resampler_push_success_clears_needs() {
+        let flags = RtStatusFlags::new();
+        request_rebuild(&flags, 44100, 48000);
+        let sys = SystemSnapshot::capture();
+
+        let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+
+        handle_resampler_rebuild(&flags, &sys, &mut prod);
+
+        assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD));
+        assert!(!flags.check_flag(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED));
+        assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+
+        let new_rs = cons.pop().unwrap();
+        assert_eq!(new_rs.host_rate(), 44100);
     }
 }

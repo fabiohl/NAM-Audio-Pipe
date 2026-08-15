@@ -315,7 +315,7 @@ fn main() {
         let mut os_engine_r_4x =
             OversampleEngine::new(OversampleFactor::X4, MAX_RESAMP_BUF).unwrap();
 
-        let mut os_buf: [f32; MAX_RESAMP_BUF * 4] = [0.0f32; MAX_RESAMP_BUF * 4];
+        let mut os_buf: [f32; MAX_RESAMP_BUF * 6] = [0.0f32; MAX_RESAMP_BUF * 6];
         let mut samples_l = vec![0.0f32; block_size];
         let mut samples_r = vec![0.0f32; block_size];
 
@@ -359,7 +359,9 @@ fn main() {
 
             let (os_in_l_slice, rest) = os_buf.split_at_mut(MAX_RESAMP_BUF);
             let (os_in_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-            let (os_model_l_slice, os_model_r_slice) = rest.split_at_mut(MAX_RESAMP_BUF);
+            let (os_model_l_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
+            let (os_model_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
+            let (xfd_scratch_l_slice, xfd_scratch_r_slice) = rest.split_at_mut(MAX_RESAMP_BUF);
 
             let bufs = DspBuffers {
                 resamp_mid_l: &mut resamp_mid_l,
@@ -372,6 +374,8 @@ fn main() {
                 os_in_r: os_in_r_slice,
                 os_model_l: os_model_l_slice,
                 os_model_r: os_model_r_slice,
+                crossfade_scratch_l: xfd_scratch_l_slice,
+                crossfade_scratch_r: xfd_scratch_r_slice,
             };
 
             capture_dsp_pipeline(

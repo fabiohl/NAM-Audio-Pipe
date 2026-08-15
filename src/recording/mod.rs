@@ -3,6 +3,7 @@
 
 pub mod buffer;
 pub mod disk;
+pub mod probe;
 pub mod wav_header;
 
 pub use buffer::{
@@ -10,4 +11,5 @@ pub use buffer::{
     create_audio_ring_buffer,
 };
 pub use disk::disk_writer_loop;
+pub use probe::{IoUringSupport, probe_io_uring};
 pub use wav_header::{build_wav_header, resolve_available_filename};

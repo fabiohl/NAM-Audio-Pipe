@@ -7,8 +7,8 @@
 //! SPSC channel setup, gain parameter injection, and graceful shutdown.
 //!
 //! Requires a running PipeWire daemon (session or system). Without it, the test
-//! is skipped by the `#[ignore]` attribute; `utils/tests-long.sh` auto-detects
-//! the daemon via `pw-cli info`.
+//! is skipped by the `#[ignore]` attribute; `utils/tests-quick.sh` Phase 3
+//! auto-detects the daemon via `pw-cli info`.
 
 use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
@@ -20,14 +20,21 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-fn probe_pipewire_daemon() -> bool {
-    std::process::Command::new("pw-cli")
-        .args(["info", "0"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+mod common;
+
+/// R-17 (S7.T4): the script (`utils/tests-quick.sh` Phase 3) only executes
+/// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
+/// test therefore means the daemon vanished mid-run or the script↔test
+/// probes diverged — a silent `return` would let the script print
+/// `LIVE_PW=RAN` with zero DSP executed. Fail closed instead: panic.
+fn assert_daemon_probe_consistent() {
+    if !common::probe_pipewire_daemon() {
+        panic!(
+            "R-17: pw-cli info 0 failed inside the test after the script probe \
+             passed — daemon vanished or probes diverged. Refusing to emit \
+             LIVE_PW=RAN without real DSP execution."
+        );
+    }
 }
 
 /// Tests the basic initialization and communication of the PipeWire pipeline.
@@ -38,12 +45,11 @@ fn probe_pipewire_daemon() -> bool {
 /// 3. Sending gain parameters via the control channel.
 /// 4. Shutdown signaled via atomic flag.
 #[test]
-#[ignore = "requires a running PipeWire daemon (session or system); auto-detected by utils/tests-long.sh"]
+#[ignore = "requires a running PipeWire daemon (session or system); auto-detected by utils/tests-quick.sh Phase 3"]
 fn test_pipewire_integration() {
-    if !probe_pipewire_daemon() {
-        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
-        return;
-    }
+    // R-17: fail-closed divergence check — never a silent skip here (the
+    // script probe already gated on the daemon).
+    assert_daemon_probe_consistent();
 
     pipewire::init();
     println!("PipeWire initialized successfully.");
@@ -85,6 +91,7 @@ fn test_pipewire_integration() {
             sl_cons,
             os_cons,
             None,
+            None,
         )
     });
 
@@ -92,21 +99,40 @@ fn test_pipewire_integration() {
     let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::InputGain(2.5));
     let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::OutputGain(-1.0));
 
-    thread::sleep(Duration::from_millis(150));
-    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
-
-    match pw_thread.join() {
-        Ok(result) => {
-            if let Err(e) = result {
-                eprintln!(
-                    "PipeWire host exited with expected error (possible daemon absence): {e}"
-                );
-            } else {
-                println!("Pipeline host ran and shut down gracefully.");
-            }
+    // Wait (bounded) for the RT callback to observe at least one audio quantum.
+    // `last_n_samples > 0` proves the capture stream actually processed a buffer
+    // — the daemon probe alone is not evidence of DSP execution.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut last_n_samples = 0u32;
+    while std::time::Instant::now() < deadline {
+        last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
+        if last_n_samples > 0 {
+            break;
         }
-        Err(_) => panic!("The PipeWire thread suffered a fatal panic!"),
+        thread::sleep(Duration::from_millis(20));
     }
 
-    println!("Integration test completed.")
+    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
+
+    let host_result = match pw_thread.join() {
+        Ok(result) => result,
+        Err(_) => panic!("The PipeWire thread suffered a fatal panic!"),
+    };
+
+    // Fail-closed: the daemon probe confirmed PipeWire is up, so an `Err` from
+    // the host is a defect — never a benign "possible daemon absence".
+    if let Err(e) = host_result {
+        panic!("run_pipewire_host failed while the PipeWire daemon is up: {e:#}");
+    }
+
+    assert!(
+        last_n_samples > 0,
+        "no audio quantum was processed (last_n_samples == 0); \
+         LIVE_PW must reflect real DSP execution, not merely daemon presence"
+    );
+
+    println!(
+        "Integration test completed: host ran, {} samples processed in the last quantum.",
+        last_n_samples
+    )
 }

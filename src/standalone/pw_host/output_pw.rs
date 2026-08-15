@@ -4,11 +4,13 @@
 //! PipeWire output DSP pipeline and host configuration (standalone).
 
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
-use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
+use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 use neural_amp_modeler_rs::dsp::pipeline::DspBridgeReader;
 use pipewire as pw;
 use std::sync::atomic::Ordering;
+
+use super::rt_callback::check_ffi_contract;
 
 /// Holds essential PipeWire instances (`StreamBox` and `Listener`).
 ///
@@ -45,6 +47,32 @@ pub struct PipewireHostConfig {
     pub oversample: OversampleFactor,
 }
 
+/// Playback FFI contract validation for both output channels.
+///
+/// Returns `Some((n_bytes, n_samples))` when both raw buffers are present,
+/// aligned to `align_of::<f32>()`, and large enough to hold `n_samples`
+/// within their `maxsize`; `None` otherwise. A `None` verdict must skip the
+/// quantum and set `RT_STATUS_HOST_CONTRACT_VIOLATION` — never clamp or cast.
+#[inline(always)]
+fn check_playback_contract(
+    raw_l: Option<&[u8]>,
+    raw_r: Option<&[u8]>,
+    max_l: usize,
+    max_r: usize,
+    n_samples: usize,
+) -> Option<(usize, usize)> {
+    let n_bytes = n_samples * std::mem::size_of::<f32>();
+    if n_samples == 0 || n_bytes > max_l || n_bytes > max_r {
+        return None;
+    }
+    let (bl, sl) = check_ffi_contract(raw_l?, 0, n_bytes)?;
+    let (br, sr) = check_ffi_contract(raw_r?, 0, n_bytes)?;
+    if bl != n_bytes || sl != n_samples || br != n_bytes || sr != n_samples {
+        return None;
+    }
+    Some((n_bytes, n_samples))
+}
+
 /// Playback DSP Pipeline (Bridge → Hardware).
 #[inline(always)]
 pub fn playback_dsp_cycle(
@@ -77,22 +105,28 @@ pub fn playback_dsp_cycle(
         let data_l = &mut datas_left[0];
         let data_r = &mut datas_right[0];
 
-        let max_l = data_l.as_raw().maxsize as usize / std::mem::size_of::<f32>();
-        let max_r = data_r.as_raw().maxsize as usize / std::mem::size_of::<f32>();
-        let n_out = n_samples.min(max_l).min(max_r);
-        if n_out == 0 {
+        let max_l = data_l.as_raw().maxsize as usize;
+        let max_r = data_r.as_raw().maxsize as usize;
+
+        let raw_l = data_l.data();
+        let raw_r = data_r.data();
+
+        let Some((_n_bytes, n_out)) =
+            check_playback_contract(raw_l.as_deref(), raw_r.as_deref(), max_l, max_r, n_samples)
+        else {
+            rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
             return;
-        }
+        };
 
         // Copies the processed sound directly to your sound card outputs.
-        if let Some(raw_l) = data_l.data() {
+        if let Some(raw_l) = raw_l {
             let out_l =
                 unsafe { std::slice::from_raw_parts_mut(raw_l.as_mut_ptr().cast::<f32>(), n_out) };
             unsafe {
                 core::ptr::copy_nonoverlapping(buf_l.as_ptr(), out_l.as_mut_ptr(), n_out);
             }
         }
-        if let Some(raw_r) = data_r.data() {
+        if let Some(raw_r) = raw_r {
             let out_r =
                 unsafe { std::slice::from_raw_parts_mut(raw_r.as_mut_ptr().cast::<f32>(), n_out) };
             unsafe {
@@ -150,5 +184,48 @@ pub unsafe fn build_spa_format_pod<'a>(
 
         // Returns the contract ready to be signed and used by the system.
         Ok(&*(pod_ptr as *const pw::spa::pod::Pod))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn playback_contract_accepts_aligned_buffers_within_maxsize() {
+        let buf = [0u8; 64];
+        let raw = &buf[..];
+        assert!(check_playback_contract(Some(raw), Some(raw), 64, 64, 16).is_some());
+        assert!(check_playback_contract(Some(raw), Some(raw), 64, 64, 4).is_some());
+    }
+
+    #[test]
+    fn playback_contract_rejects_claimed_larger_than_maxsize() {
+        let buf = [0u8; 16];
+        let raw = &buf[..];
+        // 8 samples need 32 bytes, but maxsize is only 16 -> rejected.
+        assert!(check_playback_contract(Some(raw), Some(raw), 16, 16, 8).is_none());
+        // Asymmetric maxsize: right channel too small -> rejected.
+        assert!(check_playback_contract(Some(raw), Some(raw), 16, 8, 4).is_none());
+    }
+
+    #[test]
+    fn playback_contract_rejects_missing_or_unaligned_buffer() {
+        let buf = [0u8; 64];
+        let raw = &buf[..];
+        // Missing raw buffer -> rejected.
+        assert!(check_playback_contract(None, Some(raw), 64, 64, 4).is_none());
+        assert!(check_playback_contract(Some(raw), None, 64, 64, 4).is_none());
+
+        // Misaligned base pointer -> rejected.
+        let storage = [0u8; 4 + 64];
+        let base = storage.as_ptr() as usize;
+        let align = std::mem::align_of::<f32>();
+        let mut delta = 1usize;
+        while (base + delta).is_multiple_of(align) {
+            delta += 1;
+        }
+        let misaligned = &storage[delta..];
+        assert!(check_playback_contract(Some(misaligned), Some(raw), 64, 64, 4).is_none());
     }
 }

@@ -75,3 +75,56 @@ if [ "${NAM_LIB_NO_CD:-0}" != "1" ]; then
         exit 1
     }
 fi
+
+# ---------------------------------------------------------------------------
+# Quick-runner gate infrastructure (typed receipt + fail-closed assertion)
+# ---------------------------------------------------------------------------
+
+# emit <receipt-line>
+#   Appends one structured line to the typed quick-run receipt
+#   (target/logs/quick-receipt.txt), mirroring it on stdout. Single-line
+#   appends are atomic under O_APPEND.
+emit() {
+    mkdir -p target/logs
+    printf '%s\n' "$1" | tee -a target/logs/quick-receipt.txt
+}
+
+# assert_ran_tests <log_file> [min_count]
+#   Verifies that a test log proves real execution: sums the "X passed" and
+#   "X measured" counters of every libtest summary line (plus a benchmark
+#   fallback) and fails the gate when the total falls below min_count.
+#   Fail-closed against typo'd targets, empty filters and 100% skip selection.
+assert_ran_tests() {
+    local log_file="$1"
+    local min_count="${2:-1}"
+
+    local total_passed=0
+
+    local passed
+    if passed=$(grep -oP 'test result: ok\.\s+\K\d+(?=\s+passed)' "$log_file" 2>/dev/null); then
+        for p in $passed; do
+            total_passed=$((total_passed + p))
+        done
+    fi
+
+    local measured
+    if measured=$(grep -oP '\K\d+(?=\s+measured)' "$log_file" 2>/dev/null); then
+        for m in $measured; do
+            total_passed=$((total_passed + m))
+        done
+    fi
+
+    if [ "$total_passed" -eq 0 ]; then
+        local bench_count
+        bench_count=$(grep -cP '^\S.*time:\s+\[' "$log_file" 2>/dev/null || true)
+        bench_count="${bench_count:-0}"
+        total_passed=$bench_count
+    fi
+
+    if [ "$total_passed" -lt "$min_count" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: phase executed 0 tests/benchmarks (empty selection or filter mismatch).${NC}"
+        return 1
+    fi
+    echo -e "  Gate: ${total_passed} test(s)/benchmark(s) executed ≥ ${min_count}  ✓"
+    return 0
+}

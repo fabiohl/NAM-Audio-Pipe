@@ -188,11 +188,13 @@ fn main() -> anyhow::Result<()> {
     rt_setup::configure_process_wide();
 
     // Create the recording ring buffer and spawn the disk I/O thread (opt-in via --record)
-    let recording_producer = if args.record {
+    let (recording_producer, recording_io_handle) = if args.record {
         let (producer, consumer) = recording::create_audio_ring_buffer::<{ buffer::MAX_BLOCK_SIZE }>(
             buffer::RING_CAPACITY,
         );
-        std::thread::Builder::new()
+        // The JoinHandle is retained and awaited (bounded) during shutdown so the
+        // WAV header is finalized before PipeWire is deinitialized.
+        let io_handle = std::thread::Builder::new()
             .name("nam-recording-io".into())
             .spawn(move || {
                 tokio_uring::start(async {
@@ -202,9 +204,9 @@ fn main() -> anyhow::Result<()> {
                 });
             })
             .expect("Failed to spawn recording I/O thread");
-        Some(producer)
+        (Some(producer), Some(io_handle))
     } else {
-        None
+        (None, None)
     };
 
     // Run the PipeWire host (blocking)
@@ -230,6 +232,7 @@ fn main() -> anyhow::Result<()> {
         slimmable_consumer,
         os_consumer,
         recording_producer,
+        recording_io_handle,
     );
 
     log::info!("{} Encerrando NAM-Audio-Pipe...", "🔌".yellow());

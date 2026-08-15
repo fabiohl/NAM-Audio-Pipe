@@ -19,6 +19,13 @@ pub const RING_CAPACITY: usize = 1024;
 /// Reported to the user at shutdown to indicate potential audio data loss.
 pub static OVERRUN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Serializes unit tests that mutate the process-wide [`OVERRUN_COUNT`] global.
+/// Test-only; compiled out of production builds. Guards against races between
+/// the overrun-accounting tests and the `overrun_counter_starts_at_zero` test
+/// (both live in the same `--lib` test binary).
+#[cfg(test)]
+pub(crate) static OVERRUN_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Cache-line-aligned audio block to prevent cache line bouncing (False Sharing)
 /// between the DSP and I/O threads. Standard CPU cache lines are 64 bytes,
 /// but the 128-byte alignment (`align(128)`) prevents the hardware spatial prefetcher
@@ -202,6 +209,7 @@ mod tests {
 
     #[test]
     fn overrun_counter_starts_at_zero() {
+        let _guard = OVERRUN_COUNT_LOCK.lock().unwrap();
         assert_eq!(OVERRUN_COUNT.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 

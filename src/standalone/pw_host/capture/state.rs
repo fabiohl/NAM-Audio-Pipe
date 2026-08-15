@@ -11,7 +11,6 @@
 use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
-use neural_amp_modeler_rs::common::spsc::GcItem;
 use neural_amp_modeler_rs::dsp::adaptive::AdaptiveCompute;
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimAdapter;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
@@ -45,6 +44,10 @@ pub struct CaptureState {
     pub os_in_r: Box<[f32; MAX_OS_BUF]>,
     pub os_model_l: Box<[f32; MAX_OS_BUF]>,
     pub os_model_r: Box<[f32; MAX_OS_BUF]>,
+    /// WaveNet crossfade scratch buffers (motor 0.5.0 `DspBuffers`): second
+    /// pass output used when processing is chunked (active resampler).
+    pub xfd_scratch_l: Box<[f32; MAX_RESAMP_BUF]>,
+    pub xfd_scratch_r: Box<[f32; MAX_RESAMP_BUF]>,
     pub user_input_gain_mult: f32,
     pub user_output_gain_mult: f32,
     pub model_input_mult_adj: f32,
@@ -59,9 +62,9 @@ pub struct CaptureState {
     pub threshold_open_sq: f32,
     pub threshold_close_sq: f32,
     pub shared_target_rate: Arc<AtomicU32>,
-    pub parking_lot: [Option<GcItem>; 16],
     pub frame_count: u32,
     pub recording_meta_sent: bool,
+    pub recording_meta_rate: u32,
     pub recording_block: AlignedBlock<MAX_BLOCK_SIZE>,
     pub thread_configured: bool,
     pub ir_raw_samples: Option<Vec<f32>>,
@@ -127,6 +130,8 @@ impl CaptureState {
             os_in_r: Box::new([0.0f32; MAX_OS_BUF]),
             os_model_l: Box::new([0.0f32; MAX_OS_BUF]),
             os_model_r: Box::new([0.0f32; MAX_OS_BUF]),
+            xfd_scratch_l: Box::new([0.0f32; MAX_RESAMP_BUF]),
+            xfd_scratch_r: Box::new([0.0f32; MAX_RESAMP_BUF]),
             user_input_gain_mult: 1.0,
             user_output_gain_mult: 1.0,
             model_input_mult_adj: 1.0,
@@ -141,9 +146,9 @@ impl CaptureState {
             threshold_open_sq: open_lin * open_lin,
             threshold_close_sq: close_lin * close_lin,
             shared_target_rate: Arc::new(AtomicU32::new(0)),
-            parking_lot: Default::default(),
             frame_count: 0,
             recording_meta_sent: false,
+            recording_meta_rate: 0,
             recording_block: AlignedBlock::new(),
             thread_configured: false,
             ir_raw_samples: None,

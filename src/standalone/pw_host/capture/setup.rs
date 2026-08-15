@@ -87,6 +87,7 @@ pub fn setup_capture_stream<'c>(
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     oversample: OversampleFactor,
     recording_producer_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    parking_lot_ptr: *mut [Option<GcItem>; 16],
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let capture_props = create_capture_properties(buffer_size);
 
@@ -120,12 +121,20 @@ pub fn setup_capture_stream<'c>(
             // is the only writer, and after thread_loop.stop() the shutdown
             // path takes sequential ownership. No concurrent access occurs.
             let recording_producer = unsafe { &mut *recording_producer_ptr };
+            // SAFETY: parking_lot_ptr points to a stack-local slot in
+            // run_pipewire_host that outlives this closure (same contract as
+            // recording_producer_ptr). While the loop runs, the RT callback
+            // is the sole writer; after thread_loop.stop() the main thread
+            // takes single-owner handoff and drains the 16 slots off-RT
+            // (R-04). The periodic drain in run_pipewire_host NEVER touches
+            // this slot — that would race with the RT flush below.
+            let parking_lot = unsafe { &mut *parking_lot_ptr };
             if !state.thread_configured {
                 rt_setup::configure_realtime_thread(target_cpu, rt_status_for_process.clone());
                 state.thread_configured = true;
             }
 
-            for slot in state.parking_lot.iter_mut() {
+            for slot in parking_lot.iter_mut() {
                 let Some(old) = slot.take() else { continue };
                 if let Err(rtrb::PushError::Full(old_back)) = gc_producer.push(old) {
                     *slot = Some(old_back);
@@ -137,7 +146,7 @@ pub fn setup_capture_stream<'c>(
                 &mut resampler_consumer,
                 &mut state.resampler,
                 &mut gc_producer,
-                &mut state.parking_lot,
+                parking_lot,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -146,7 +155,7 @@ pub fn setup_capture_stream<'c>(
                 &mut cabsim_consumer,
                 &mut state.active_cabsim,
                 &mut gc_producer,
-                &mut state.parking_lot,
+                parking_lot,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -159,7 +168,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.active_model_l,
                 &mut state.active_model_r,
                 &mut gc_producer,
-                &mut state.parking_lot,
+                parking_lot,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
                 &mut state.user_input_gain_mult,
@@ -178,7 +187,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.active_model_l,
                 &mut state.active_model_r,
                 &mut gc_producer,
-                &mut state.parking_lot,
+                parking_lot,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -188,7 +197,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.os_l,
                 &mut state.os_r,
                 &mut gc_producer,
-                &mut state.parking_lot,
+                parking_lot,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -261,12 +270,15 @@ pub fn setup_capture_stream<'c>(
                     os_in_r: &mut *state.os_in_r,
                     os_model_l: &mut *state.os_model_l,
                     os_model_r: &mut *state.os_model_r,
+                    crossfade_scratch_l: &mut *state.xfd_scratch_l,
+                    crossfade_scratch_r: &mut *state.xfd_scratch_r,
                 },
                 current_host_rate,
                 &mut state.frame_count,
                 &rt_status_for_process,
                 recording_producer,
                 &mut state.recording_meta_sent,
+                &mut state.recording_meta_rate,
                 &mut state.recording_block,
             );
 

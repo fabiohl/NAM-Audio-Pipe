@@ -60,6 +60,7 @@ pub fn run_pipewire_host(
     slimmable_consumer: Consumer<Option<Box<StaticModel>>>,
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     recording_producer: Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_io_handle: Option<std::thread::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let PipewireHostConfig {
         buffer_size,
@@ -95,6 +96,15 @@ pub fn run_pipewire_host(
     let rec_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>> =
         &raw mut recording_producer_slot;
 
+    // R-04: the RT parking lot (16 slots) lives HERE — a stack-local slot in
+    // the main thread, accessed by the RT callback through a raw pointer
+    // (same contract as `rec_ptr`: the slot outlives the closure). While the
+    // loop runs, the RT callback is the sole writer. After `thread_loop.stop()`
+    // the main thread becomes single owner and the final drain releases the
+    // 16 slots off-RT via `drain_gc_channels` — never on the audio thread.
+    let mut rt_parking_lot: [Option<GcItem>; 16] = Default::default();
+    let parking_lot_ptr: *mut [Option<GcItem>; 16] = &raw mut rt_parking_lot;
+
     // =========================================================
     // 3. CORE OPTIMIZATION (CPU Affinity)
     // =========================================================
@@ -126,6 +136,7 @@ pub fn run_pipewire_host(
             os_consumer,
             oversample,
             rec_ptr,
+            parking_lot_ptr,
         )?;
         capture_stream = cs;
         capture_listener = cl;
@@ -190,9 +201,16 @@ pub fn run_pipewire_host(
                 &*(bridge_ptr.as_ptr())
             });
 
+        // R-04: while the loop runs, the parking lot is RT-owned (the callback
+        // flushes it back to this SPSC every cycle), so this periodic drain
+        // must NOT touch `rt_parking_lot` — concurrent `take()`s would race.
+        // An empty main-side lot drains SPSC + overflow only; the 16 slots are
+        // released by the final drain after `thread_loop.stop()` (handoff).
+        let mut rt_owned_lot: [Option<GcItem>; 16] = Default::default();
         let drained = neural_amp_modeler_rs::common::spsc::drain_gc_channels(
             &mut gc_consumer,
             &gc_overflow,
+            &mut rt_owned_lot,
             &rt_status,
         );
         rt_status
@@ -205,11 +223,171 @@ pub fn run_pipewire_host(
     // =========================================================
     // 7. GRACEFUL SHUTDOWN
     // =========================================================
-    if let Some(ref mut producer) = recording_producer_slot {
-        let _ = producer.push(RingPayload::StreamStop);
-    }
-
+    // Ordering invariant (R-13): stop the audio loop FIRST so the RT callback
+    // releases its `&mut` access to the recording producer (single-writer
+    // SPSC contract). Only after `thread_loop.stop()` returns — which waits for
+    // the loop thread to finish its current iteration — is the main thread the
+    // sole writer of the recording channel.
     thread_loop.stop();
 
+    // R-04: single-owner handoff — the loop thread has stopped, so the RT
+    // callback will never touch `rt_parking_lot` again. One canonical
+    // `drain_gc_channels` now releases SPSC + overflow + the 16 parked slots
+    // on the main thread, before any RT state is dropped.
+    let final_drained = neural_amp_modeler_rs::common::spsc::drain_gc_channels(
+        &mut gc_consumer,
+        &gc_overflow,
+        &mut rt_parking_lot,
+        &rt_status,
+    );
+    rt_status
+        .drains
+        .fetch_add(final_drained as u32, Ordering::Relaxed);
+    if final_drained > 0 {
+        log::debug!(
+            "nam-audio-pipe: final GC drain released {final_drained} item(s) off-RT (R-04)"
+        );
+    }
+
+    // The main thread now exclusively owns the recording producer: signal the
+    // I/O thread to close and finalize the current WAV file. Retry briefly
+    // so a full ring does not drop StreamStop (header rewrite would then
+    // depend only on the SHUTDOWN race against the join timeout).
+    if let Some(ref mut producer) = recording_producer_slot {
+        push_stream_stop(producer, STREAM_STOP_RETRY_TIMEOUT);
+    }
+
+    // Wait (bounded) for the I/O thread to rewrite the WAV header with the
+    // final `data` byte count before the producer is dropped here and before
+    // the caller deinitializes PipeWire.
+    if let Some(handle) = recording_io_handle {
+        join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT);
+    }
+
     Ok(())
+}
+
+/// Upper bound for waiting on the `nam-recording-io` thread during shutdown.
+const RECORDING_IO_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Bound for retrying `StreamStop` after the audio loop has already stopped.
+const STREAM_STOP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Pushes `StreamStop` with a short retry. The audio callback is already
+/// stopped, so the I/O thread is the only remaining consumer and should
+/// drain capacity quickly. On timeout the token is dropped and finalization
+/// falls back to the `SHUTDOWN` flag.
+fn push_stream_stop(
+    producer: &mut rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>,
+    timeout: std::time::Duration,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if producer.push(RingPayload::StreamStop).is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "StreamStop could not be delivered within {timeout:?}; \
+                 I/O will finalize on SHUTDOWN if it is still running."
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Bounded join for the `nam-recording-io` thread.
+///
+/// `disk_writer_loop` rewrites the WAV header with the final `data` byte count
+/// and issues an `fsync` before returning. The main thread must wait for that
+/// completion so the recorded file is valid before `pipewire::deinit()` and
+/// process exit. The wait is bounded by `timeout`: if the thread does not
+/// finish in time, the handle is detached (`SHUTDOWN` is already set, so the
+/// thread still exits on its own) and a warning is logged.
+fn join_recording_io(handle: std::thread::JoinHandle<()>, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "nam-recording-io did not finish within {timeout:?}; \
+                 detaching — the WAV header may be incomplete."
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // `is_finished() == true` guarantees `join()` returns immediately.
+    let _ = handle.join();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_recording_io_returns_promptly_when_thread_finishes() {
+        let handle = std::thread::spawn(|| {});
+        let start = std::time::Instant::now();
+        join_recording_io(handle, std::time::Duration::from_secs(5));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn join_recording_io_detaches_after_timeout() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+        let start = std::time::Instant::now();
+        join_recording_io(handle, std::time::Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "join returned before the timeout ({elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(450),
+            "join blocked past the bounded timeout ({elapsed:?})"
+        );
+    }
+
+    fn dummy_meta() -> RingPayload<MAX_BLOCK_SIZE> {
+        RingPayload::Metadata(crate::recording::buffer::AudioMetadata {
+            sample_rate: 48000.0,
+            bit_depth: 32,
+            channels: 2,
+        })
+    }
+
+    #[test]
+    fn push_stream_stop_succeeds_when_capacity_frees() {
+        let (mut prod, mut cons) = rtrb::RingBuffer::new(1);
+        prod.push(dummy_meta()).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = cons.pop();
+        });
+
+        push_stream_stop(&mut prod, std::time::Duration::from_millis(200));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn push_stream_stop_times_out_when_ring_stays_full() {
+        let (mut prod, _cons) = rtrb::RingBuffer::new(1);
+        prod.push(dummy_meta()).unwrap();
+
+        let start = std::time::Instant::now();
+        push_stream_stop(&mut prod, std::time::Duration::from_millis(30));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "retry returned before the timeout ({elapsed:?})"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "retry blocked past the bounded timeout ({elapsed:?})"
+        );
+    }
 }
