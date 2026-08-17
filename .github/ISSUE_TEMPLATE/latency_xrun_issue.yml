@@ -1,0 +1,83 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+name: Latency, Xrun, or Real-Time Scheduling Issue
+description: Report buffer underruns (xruns), CPU spikes, SCHED_FIFO scheduling failures, or latency issues in NAM-Audio-Pipe.
+title: "[LATENCY]: "
+labels: ["performance", "latency", "pipewire", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to report audio glitches, high latency, buffer overruns/underruns (xruns), or real-time priority issues with PipeWire.
+
+  - type: dropdown
+    id: issue_type
+    attributes:
+      label: Latency / RT Category
+      description: What specific latency issue are you experiencing?
+      options:
+        - "Audio Dropouts / Xruns at Low Buffers (<= 64 samples)"
+        - "SCHED_FIFO / RT Priority Grant Failure"
+        - "CPU Spikes during Processing"
+        - "Memory Locking / HugeTLB / Page Fault Latency"
+        - "io_uring Background Thread Contention"
+        - "Audio Interface Drift / Timing Jitter"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: system_details
+    attributes:
+      label: System & Kernel Configuration
+      description: Detailed system tuning parameters (governor, kernel preempt, rlimits).
+      placeholder: |
+        - Linux Kernel: 6.8.0-lowlatency (or PREEMPT_RT)
+        - CPU Governor: performance
+        - Real-Time Limits (`ulimit -r` / `rtprio`): 95
+        - Memlock Limits (`ulimit -l`): unlimited
+        - PipeWire Version: 1.0.7
+    validations:
+      required: true
+
+  - type: textarea
+    id: audio_parameters
+    attributes:
+      label: Buffer & Audio Stream Settings
+      description: Sample rate, quantum, and observed xrun counts.
+      placeholder: |
+        - Sample Rate: 48000 Hz
+        - Quantum / Buffer: 64 samples (1.33 ms)
+        - Observed Xruns: 12 xruns in 60 seconds
+        - CPU Load Reported by Telemetry: e.g. 18% DSP load
+    validations:
+      required: true
+
+  - type: textarea
+    id: pipewire_graph
+    attributes:
+      label: PipeWire Graph / Routing Info
+      description: How is NAM-Audio-Pipe connected in the audio graph (e.g. via Helvum/qpwgraph or default sink)?
+      placeholder: "ALSA Capture -> NAM-Audio-Pipe (In) -> NAM-Audio-Pipe (Out) -> ALSA Playback"
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Telemetry / Debug Logs
+      description: Paste any telemetry stats or `pw-top` / `RUST_LOG=debug` output.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Confirmation
+      options:
+        - label: I verified that the system CPU frequency governor is set to `performance`.
+          required: true
+        - label: I tested with different buffer sizes (e.g. 64 vs 128 samples).
+          required: true

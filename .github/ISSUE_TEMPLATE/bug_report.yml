@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+name: Bug Report (PipeWire Host)
+description: Report a bug, crash, audio dropout, or streaming issue in NAM-Audio-Pipe.
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting an issue with **NAM-Audio-Pipe** (Standalone PipeWire Host)!
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Subsystem
+      description: Select which component of the host is affected.
+      options:
+        - "PipeWire Stream / Node Connection"
+        - "Real-Time Audio Processing Loop"
+        - "Command-Line Interface (CLI) & Arguments"
+        - "Model & CabSim IR Loading / Hot-Swap"
+        - "Terminal UI / Telemetry & Meters"
+        - "io_uring Worker / Asynchronous I/O"
+        - "Real-Time Priority (SCHED_FIFO / rlimits / RTKit)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: system_environment
+    attributes:
+      label: Linux Environment & Audio Stack
+      description: Provide details about your Linux distribution, kernel, PipeWire version, and CPU.
+      placeholder: |
+        - NAM-Audio-Pipe version / commit: 0.4.0 (or commit hash)
+        - Linux Distribution: Ubuntu 24.04 / Arch Linux / Fedora 40
+        - Kernel Version: `uname -r` (e.g. 6.8.0-lowlatency / 6.10-arch1)
+        - PipeWire Version: `pipewire --version` (e.g. 1.0.7)
+        - WirePlumber Version: `wireplumber --version` (e.g. 0.5.2)
+        - CPU Model: AMD Ryzen 7 5800X / Intel Core i7-12700K
+    validations:
+      required: true
+
+  - type: textarea
+    id: audio_configuration
+    attributes:
+      label: Audio Hardware & Buffer Settings
+      description: Specify audio interface, sample rate, and PipeWire quantum.
+      placeholder: |
+        - Audio Interface: Focusrite Scarlett 2i2 / MOTU M2 (USB)
+        - Sample Rate: 48000 Hz (or 44100 / 96000 Hz)
+        - Buffer Size / Quantum: 64 samples (or 32 / 128 / 256 samples)
+        - Command Executed: `nam-audio-pipe --model amp.nam --ir cab.wav -b 64 -r 48000`
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description & Observed Behavior
+      description: Describe what happened, error messages, and how it diverged from expected behavior.
+      placeholder: "Describe the bug clearly (e.g., node fails to connect to default audio sink, audio crackling at 64 samples, panic during model hot-swap)..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction_steps
+    attributes:
+      label: Steps to Reproduce
+      description: Exact commands and steps to reproduce.
+      placeholder: |
+        1. Start PipeWire session
+        2. Run `nam-audio-pipe --model amp.nam --ir cab.wav`
+        3. Connect audio ports via Helvum/qpwgraph
+        4. Observe behavior / error
+    validations:
+      required: true
+
+  - type: textarea
+    id: model_ir_attachment
+    attributes:
+      label: Model / IR File Attachment (Optional)
+      description: |
+        If the issue is triggered by a specific `.nam`, `.namb`, or IR `.wav` file, attach it directly by dragging and dropping it into this box, or provide a download URL.
+      placeholder: "Drag and drop .nam / .namb / .wav / .zip file here, or paste download link..."
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal Logs & PipeWire Trace
+      description: Paste terminal output with `RUST_LOG=debug` or `PIPEWIRE_DEBUG=3`.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I verified that PipeWire is running and functional on the system.
+          required: true
+        - label: I tested with the latest release / `main` branch of NAM-Audio-Pipe.
+          required: true
+        - label: I verified whether user permissions allow real-time scheduling (e.g. `limits.conf` / `rtkit`).
+          required: true

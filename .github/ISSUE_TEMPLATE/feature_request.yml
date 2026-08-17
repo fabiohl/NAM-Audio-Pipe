@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+name: Feature Request (PipeWire Host)
+description: Suggest a new CLI option, telemetry feature, or routing capability for NAM-Audio-Pipe.
+title: "[FEATURE]: "
+labels: ["enhancement", "proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for proposing an enhancement to **NAM-Audio-Pipe**!
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature Area
+      description: What area of the standalone host does this improve?
+      options:
+        - "CLI Flags & Configuration Files"
+        - "PipeWire Routing & Port Management"
+        - "MIDI Control & Preset Switching"
+        - "Terminal UI / Telemetry & Meters"
+        - "Embedded / Headless System Integration (systemd, headless rig)"
+        - "DSP / Model Hot-Swapping"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem_statement
+    attributes:
+      label: Motivation / Use Case
+      description: What problem or live-performance use case does this solve?
+      placeholder: "A clear description of why this capability is useful for standalone PipeWire users..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed_solution
+    attributes:
+      label: Proposed Solution & Technical Design
+      description: Describe the proposed CLI interface, configuration format, or runtime behavior.
+      placeholder: "Explain the proposed flag syntax, config structure, or terminal workflow..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Any alternative solutions or workarounds you have considered.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Confirmation
+      options:
+        - label: I checked existing issues and feature requests to avoid duplicates.
+          required: true
+        - label: The proposed feature preserves the low-latency, zero-allocation real-time audio guarantees.
+          required: true
