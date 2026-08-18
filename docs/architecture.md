@@ -97,7 +97,7 @@ The shared memory bridge (`src/standalone/pw_host/bridge.rs`) facilitates lock-f
 ### 2.1 Double Buffering & Cache Isolation
 
 - **Zero-Copy Double Buffering:** `DspBridge` contains two independent `BridgeBuffer` slots (`MAX_BRIDGE_BUF = 8192` samples). The capture stream writes to `buffers[1 - active_idx]` and flips `active_read_idx` using `Ordering::Release`. The playback stream loads `active_read_idx` using `Ordering::Acquire` and reads without mutex locking.
-- **Cache-Line Isolation (`#[repr(align(128))]`):** Aligned to 128 bytes to isolate cache lines and prevent CPU cache-line bouncing (False Sharing) between capture write cycles and playback read cycles.
+- **Cache-Line Isolation (`#[repr(align(128))]`) & Page Alignment:** The struct is internally aligned to 128 bytes to isolate cache lines and prevent CPU cache-line bouncing (False Sharing). It is allocated via a page-aligned layout (4096 bytes) to satisfy Linux kernel requirements for virtual memory operations.
 - **Kernel Memory Advisories:**
   - `madvise(MADV_DONTFORK)` — Prevents Copy-on-Write memory duplication overhead if helper child processes are spawned.
   - `madvise(MADV_DONTDUMP)` — Excludes large DSP scratch memory from core dump files to preserve system disk space during debugging.
