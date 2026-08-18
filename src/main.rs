@@ -188,25 +188,29 @@ fn main() -> anyhow::Result<()> {
     rt_setup::configure_process_wide();
 
     // Create the recording ring buffer and spawn the disk I/O thread (opt-in via --record)
-    let (recording_producer, recording_io_handle) = if args.record {
+    let (recording_producer, recording_data_available, recording_io_handle) = if args.record {
         let (producer, consumer) = recording::create_audio_ring_buffer::<{ buffer::MAX_BLOCK_SIZE }>(
             buffer::RING_CAPACITY,
         );
+        let data_available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_for_thread = std::sync::Arc::clone(&data_available);
         // The JoinHandle is retained and awaited (bounded) during shutdown so the
         // WAV header is finalized before PipeWire is deinitialized.
         let io_handle = std::thread::Builder::new()
             .name("nam-recording-io".into())
             .spawn(move || {
                 tokio_uring::start(async {
-                    if let Err(e) = recording::disk_writer_loop(consumer).await {
+                    if let Err(e) =
+                        recording::disk_writer_loop(consumer, Some(flag_for_thread)).await
+                    {
                         log::error!("Disk writer error: {e}");
                     }
                 });
             })
             .expect("Failed to spawn recording I/O thread");
-        (Some(producer), Some(io_handle))
+        (Some(producer), Some(data_available), Some(io_handle))
     } else {
-        (None, None)
+        (None, None, None)
     };
 
     // Run the PipeWire host (blocking)
@@ -232,6 +236,7 @@ fn main() -> anyhow::Result<()> {
         slimmable_consumer,
         os_consumer,
         recording_producer,
+        recording_data_available,
         recording_io_handle,
     );
 

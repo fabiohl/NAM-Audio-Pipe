@@ -98,7 +98,7 @@ fn disk_writer_loop_creates_valid_wav() {
         .name("nam-test-recording-io".into())
         .spawn(move || {
             tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer)
+                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
                     .await
                     .expect("disk_writer_loop should succeed");
             });
@@ -175,7 +175,7 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
         .name("nam-test-recording-io".into())
         .spawn(move || {
             tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer)
+                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
                     .await
                     .expect("disk_writer_loop should succeed");
             });
@@ -231,7 +231,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
         .name("nam-test-recording-io".into())
         .spawn(move || {
             tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer)
+                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
                     .await
                     .expect("disk_writer_loop should succeed");
             });
@@ -342,7 +342,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
         .name("nam-e2e-recording-io".into())
         .spawn(move || {
             tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(recording_consumer)
+                nam_audio_pipe::recording::disk_writer_loop(recording_consumer, None)
                     .await
                     .expect("disk_writer_loop should succeed");
             });
@@ -376,6 +376,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
             sl_cons,
             os_cons,
             Some(recording_producer),
+            None,
             Some(io_handle),
         )
     });

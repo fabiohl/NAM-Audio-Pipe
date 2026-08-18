@@ -88,11 +88,19 @@ fn recording_metadata_confirmed_only_on_push_success() {
     let mut prod_opt = Some(prod);
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
+    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(
+        &mut prod_opt,
+        48000,
+        &mut meta_sent,
+        &mut meta_rate,
+        Some(&flag),
+    );
 
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
+    assert!(flag.load(Ordering::Relaxed));
     match cons.pop().unwrap() {
         RingPayload::Metadata(m) => assert_eq!(m.sample_rate, 48000.0),
         _ => panic!("expected Metadata"),
@@ -113,14 +121,14 @@ fn recording_metadata_not_confirmed_when_channel_full() {
         .push(RingPayload::Audio(AlignedBlock::new()))
         .unwrap();
 
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(!meta_sent, "metadata must not be confirmed when push fails");
     assert_eq!(meta_rate, 0);
 
     // Free the channel and retry: the flag is confirmed.
     let _ = cons.pop().unwrap();
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
@@ -137,17 +145,17 @@ fn recording_metadata_reset_on_host_rate_change() {
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
 
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate, None);
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
     let _ = cons.pop().unwrap();
 
     // Same rate again: no duplicate header.
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate, None);
     assert!(cons.pop().is_err());
 
     // Host rate change: a new header is emitted for the new rate.
-    send_recording_metadata(&mut prod_opt, 44100, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 44100, &mut meta_sent, &mut meta_rate, None);
     assert!(meta_sent);
     assert_eq!(meta_rate, 44100);
     match cons.pop().unwrap() {
@@ -162,7 +170,7 @@ fn recording_metadata_absent_producer_never_confirmed() {
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
 
-    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate);
+    send_recording_metadata(&mut prod_opt, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(!meta_sent);
     assert_eq!(meta_rate, 0);
@@ -186,6 +194,7 @@ fn recording_audio_oversized_block_dropped_and_counted() {
         &resamp_l,
         &resamp_r,
         &mut block,
+        None,
     );
 
     assert!(cons.pop().is_err(), "oversized block must not be pushed");
@@ -205,9 +214,18 @@ fn recording_audio_normal_block_pushed() {
         resamp_r[i] = -(i as f32);
     }
     let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_audio(&mut prod_opt, 4, &resamp_l, &resamp_r, &mut block);
+    send_recording_audio(
+        &mut prod_opt,
+        4,
+        &resamp_l,
+        &resamp_r,
+        &mut block,
+        Some(&flag),
+    );
 
+    assert!(flag.load(Ordering::Relaxed));
     match cons.pop().unwrap() {
         RingPayload::Audio(b) => {
             assert_eq!(b.valid_len, 8);
@@ -236,9 +254,18 @@ fn recording_audio_full_channel_counted_as_overrun() {
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
     let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_audio(&mut prod_opt, 4, &resamp_l, &resamp_r, &mut block);
+    send_recording_audio(
+        &mut prod_opt,
+        4,
+        &resamp_l,
+        &resamp_r,
+        &mut block,
+        Some(&flag),
+    );
 
+    assert!(!flag.load(Ordering::Relaxed));
     assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
 
     OVERRUN_COUNT.store(0, Ordering::Relaxed);

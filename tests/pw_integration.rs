@@ -92,6 +92,7 @@ fn test_pipewire_integration() {
             os_cons,
             None,
             None,
+            None,
         )
     });
 

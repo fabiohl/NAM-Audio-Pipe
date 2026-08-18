@@ -21,7 +21,7 @@ use pipewire as pw;
 use pw::properties::properties;
 use rtrb::Consumer;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Assembles PipeWire property attributes for the capture Virtual Sink node.
 pub fn create_capture_properties(buffer_size: u32) -> pw::properties::PropertiesBox {
@@ -88,6 +88,8 @@ pub fn setup_capture_stream<'c>(
     oversample: OversampleFactor,
     recording_producer_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
     parking_lot_ptr: *mut [Option<GcItem>; 16],
+    parking_lot_dirty_ptr: *const AtomicBool,
+    recording_data_available: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let capture_props = create_capture_properties(buffer_size);
 
@@ -121,24 +123,39 @@ pub fn setup_capture_stream<'c>(
             // is the only writer, and after thread_loop.stop() the shutdown
             // path takes sequential ownership. No concurrent access occurs.
             let recording_producer = unsafe { &mut *recording_producer_ptr };
-            // SAFETY: parking_lot_ptr points to a stack-local slot in
-            // run_pipewire_host that outlives this closure (same contract as
+            let recording_data_available_ref = recording_data_available.as_deref();
+            // SAFETY: parking_lot_ptr and parking_lot_dirty_ptr point to stack-local slots in
+            // run_pipewire_host that outlive this closure (same contract as
             // recording_producer_ptr). While the loop runs, the RT callback
             // is the sole writer; after thread_loop.stop() the main thread
             // takes single-owner handoff and drains the 16 slots off-RT
             // (R-04). The periodic drain in run_pipewire_host NEVER touches
             // this slot — that would race with the RT flush below.
             let parking_lot = unsafe { &mut *parking_lot_ptr };
+            let parking_lot_dirty = unsafe { &*parking_lot_dirty_ptr };
+            // Cold-path RT setup: must run on the actual DSP data thread (this callback),
+            // NOT in `state_changed_handler` (which executes on the separate PipeWire ThreadLoop thread).
+            // This ensures DAZ/FTZ (MXCSR), SCHED_FIFO, thread name, and CPU affinity apply directly
+            // to the active audio processing thread (H-06 / Sprint C-01).
             if !state.thread_configured {
                 rt_setup::configure_realtime_thread(target_cpu, rt_status_for_process.clone());
                 state.thread_configured = true;
             }
 
-            for slot in parking_lot.iter_mut() {
-                let Some(old) = slot.take() else { continue };
-                if let Err(rtrb::PushError::Full(old_back)) = gc_producer.push(old) {
-                    *slot = Some(old_back);
-                    break;
+            // Fast-path: skip the 16-slot scan if no GC item was ever parked since last drain.
+            // parking_lot_dirty is set Release by gc_cascade callers when parking/disposing an item.
+            if parking_lot_dirty.load(Ordering::Acquire) {
+                let mut any_remaining = false;
+                for slot in parking_lot.iter_mut() {
+                    let Some(old) = slot.take() else { continue };
+                    if let Err(rtrb::PushError::Full(old_back)) = gc_producer.push(old) {
+                        *slot = Some(old_back);
+                        any_remaining = true;
+                        break;
+                    }
+                }
+                if !any_remaining {
+                    parking_lot_dirty.store(false, Ordering::Release);
                 }
             }
 
@@ -147,6 +164,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.resampler,
                 &mut gc_producer,
                 parking_lot,
+                parking_lot_dirty,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -156,6 +174,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.active_cabsim,
                 &mut gc_producer,
                 parking_lot,
+                parking_lot_dirty,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -169,6 +188,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.active_model_r,
                 &mut gc_producer,
                 parking_lot,
+                parking_lot_dirty,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
                 &mut state.user_input_gain_mult,
@@ -188,6 +208,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.active_model_r,
                 &mut gc_producer,
                 parking_lot,
+                parking_lot_dirty,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -198,6 +219,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.os_r,
                 &mut gc_producer,
                 parking_lot,
+                parking_lot_dirty,
                 &gc_overflow_for_process,
                 &rt_status_for_process,
             );
@@ -280,6 +302,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.recording_meta_sent,
                 &mut state.recording_meta_rate,
                 &mut state.recording_block,
+                recording_data_available_ref,
             );
 
             // Sample PipeWire clock for drift diagnostics (every 64 frames)

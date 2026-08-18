@@ -26,8 +26,7 @@ path = "src/bin/pgo_workload.rs"
 required-features = ["testing"]
 
 [dependencies]
-# S7.T1: pinned to the local motor 0.5.0 (path) — crates.io 0.4.0 is NOT mixed in.
-NeuralAmpModeler-rs = "0.5.0"
+NeuralAmpModeler-rs = "0.6.0"
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"

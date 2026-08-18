@@ -14,7 +14,7 @@ use neural_amp_modeler_rs::models::StaticModel;
 
 use rtrb::Consumer;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 5.1.2. COMMAND RECEPTION (SPSC Channel)
 /// Processes commands from the command-line interface or control system (volume, model, noise gate).
@@ -32,6 +32,7 @@ pub fn receive_commands(
     active_model_r: &mut Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
     rt_status_for_process: &Arc<RtStatusFlags>,
     user_input_gain_mult: &mut f32,
@@ -83,6 +84,7 @@ pub fn receive_commands(
 
                 for m_opt in &mut old_models {
                     if let Some(m) = m_opt.take() {
+                        parking_lot_dirty.store(true, Ordering::Release);
                         gc_cascade(
                             Some(GcItem::Model(m)),
                             gc_producer,
@@ -144,12 +146,17 @@ pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatu
 /// Drains slimmable-rebuilt models delivered by the main thread via SPSC.
 /// Handles both L and R channels for dual-mono/stereo configurations.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+)]
 pub fn drain_slimmable_models(
     slimmable_rx: &mut Option<Consumer<Option<Box<StaticModel>>>>,
     active_model_l: &mut Option<Box<StaticModel>>,
     active_model_r: &mut Option<Box<StaticModel>>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
     gc_overflow: &GcOverflowBuffer,
     rt_status: &RtStatusFlags,
 ) {
@@ -159,6 +166,7 @@ pub fn drain_slimmable_models(
     while let Ok(Some(new_model)) = rx.pop() {
         let old = active_model_l.replace(new_model);
         if let Some(old) = old {
+            parking_lot_dirty.store(true, Ordering::Release);
             gc_cascade(
                 Some(GcItem::Model(old)),
                 gc_producer,
@@ -172,6 +180,7 @@ pub fn drain_slimmable_models(
         {
             let old_r = active_model_r.replace(new_model_r);
             if let Some(old_r) = old_r {
+                parking_lot_dirty.store(true, Ordering::Release);
                 gc_cascade(
                     Some(GcItem::Model(old_r)),
                     gc_producer,
@@ -187,12 +196,17 @@ pub fn drain_slimmable_models(
 /// Drains oversampling engines delivered by the main thread via SPSC.
 /// Swaps both L and R engines and sends the obsolete ones to the GC cascade.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+)]
 pub fn drain_os_engines(
     os_rx: &mut Option<Consumer<Box<OsEnginePair>>>,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
     gc_overflow: &GcOverflowBuffer,
     rt_status: &RtStatusFlags,
 ) {
@@ -202,6 +216,7 @@ pub fn drain_os_engines(
     while let Ok(pair) = rx.pop() {
         let old_l = std::mem::replace(os_l, pair.l);
         let old_r = std::mem::replace(os_r, pair.r);
+        parking_lot_dirty.store(true, Ordering::Release);
         gc_cascade(
             Some(GcItem::Oversample(old_l)),
             gc_producer,
@@ -216,5 +231,73 @@ pub fn drain_os_engines(
             gc_overflow,
             rt_status,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+
+    #[test]
+    fn drain_slimmable_empty_no_change() {
+        let mut rx = None;
+        let mut model_l = None;
+        let mut model_r = None;
+        let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
+        let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
+        let gc_overflow = GcOverflowBuffer::default();
+        let flags = RtStatusFlags::new();
+
+        drain_slimmable_models(
+            &mut rx,
+            &mut model_l,
+            &mut model_r,
+            &mut gc_p,
+            &mut parking_lot,
+            &parking_lot_dirty,
+            &gc_overflow,
+            &flags,
+        );
+
+        assert!(!parking_lot_dirty.load(Ordering::Acquire));
+        assert!(gc_c.pop().is_err());
+    }
+
+    #[test]
+    fn drain_os_engines_swaps_and_sets_dirty() {
+        let (mut prod, cons) = rtrb::RingBuffer::new(4);
+        let mut rx = Some(cons);
+        let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
+        let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
+        let gc_overflow = GcOverflowBuffer::default();
+        let flags = RtStatusFlags::new();
+
+        let pair = Box::new(OsEnginePair {
+            l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+            r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+        });
+        prod.push(pair).unwrap();
+
+        drain_os_engines(
+            &mut rx,
+            &mut os_l,
+            &mut os_r,
+            &mut gc_p,
+            &mut parking_lot,
+            &parking_lot_dirty,
+            &gc_overflow,
+            &flags,
+        );
+
+        assert!(parking_lot_dirty.load(Ordering::Acquire));
+        let old1 = gc_c.pop().unwrap();
+        let old2 = gc_c.pop().unwrap();
+        assert!(matches!(old1, GcItem::Oversample(_)));
+        assert!(matches!(old2, GcItem::Oversample(_)));
     }
 }

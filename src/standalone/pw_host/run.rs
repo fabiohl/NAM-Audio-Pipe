@@ -16,7 +16,7 @@ use neural_amp_modeler_rs::models::StaticModel;
 
 use rtrb::Consumer;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::PipewireHostConfig;
 use super::bridge;
@@ -60,6 +60,7 @@ pub fn run_pipewire_host(
     slimmable_consumer: Consumer<Option<Box<StaticModel>>>,
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     recording_producer: Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_data_available: Option<Arc<AtomicBool>>,
     recording_io_handle: Option<std::thread::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let PipewireHostConfig {
@@ -102,8 +103,15 @@ pub fn run_pipewire_host(
     // loop runs, the RT callback is the sole writer. After `thread_loop.stop()`
     // the main thread becomes single owner and the final drain releases the
     // 16 slots off-RT via `drain_gc_channels` — never on the audio thread.
+    //
+    // H-01 (B-01): `rt_parking_lot_dirty` avoids scanning all 16 slots in steady
+    // state when no swaps occurred. It is set (Release) whenever an item cascades
+    // to GC, and reset (Release) when the RT drain finishes emptying all slots.
     let mut rt_parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_ptr: *mut [Option<GcItem>; 16] = &raw mut rt_parking_lot;
+    let rt_parking_lot_dirty = std::sync::atomic::AtomicBool::new(false);
+    let parking_lot_dirty_ptr: *const std::sync::atomic::AtomicBool =
+        &raw const rt_parking_lot_dirty;
 
     // =========================================================
     // 3. CORE OPTIMIZATION (CPU Affinity)
@@ -137,6 +145,8 @@ pub fn run_pipewire_host(
             oversample,
             rec_ptr,
             parking_lot_ptr,
+            parking_lot_dirty_ptr,
+            recording_data_available,
         )?;
         capture_stream = cs;
         capture_listener = cl;
@@ -173,6 +183,7 @@ pub fn run_pipewire_host(
     // =========================================================
     let mut was_silent = false;
     let mut was_fading = false;
+    let mut poll_state = rt_setup::PollState::default();
     while !SHUTDOWN.load(Ordering::Acquire) {
         // pairs with Release store in main.rs:104
         let active = rt_status.active_rate.load(Ordering::Relaxed);
@@ -196,10 +207,14 @@ pub fn run_pipewire_host(
         );
         handlers::handle_oversample_rebuild(&rt_status, &sys, &mut os_producer);
 
-        (was_silent, was_fading) =
-            rt_setup::poll_rt_status(&rt_status, &sys, was_silent, was_fading, unsafe {
-                &*(bridge_ptr.as_ptr())
-            });
+        (was_silent, was_fading) = rt_setup::poll_rt_status(
+            &rt_status,
+            &sys,
+            was_silent,
+            was_fading,
+            unsafe { &*(bridge_ptr.as_ptr()) },
+            &mut poll_state,
+        );
 
         // R-04: while the loop runs, the parking lot is RT-owned (the callback
         // flushes it back to this SPSC every cycle), so this periodic drain

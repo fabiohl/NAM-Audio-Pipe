@@ -73,7 +73,10 @@ impl AsyncWavWriter {
             metadata,
             data_bytes_written: 0,
             current_offset: header_len,
-            io_buf: Vec::new(),
+            // Pre-sized to MAX_BLOCK_SIZE * 4 bytes (f32 -> little-endian bytes).
+            // Guarantees reserve() in write_block() is always a no-op, even across
+            // PipeWire quantum renegotiations that may deliver larger blocks.
+            io_buf: Vec::with_capacity(MAX_BLOCK_SIZE * 4),
         })
     }
 
@@ -141,7 +144,10 @@ impl AsyncWavWriter {
 /// Consumes the lock-free ring buffer and writes WAV files fully asynchronously via `io_uring`.
 /// Supports graceful shutdown: when `SHUTDOWN` is activated, all remaining data is drained,
 /// and the WAV file is properly finalized (via `fsync`) before returning.
-pub async fn disk_writer_loop(mut consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>>) -> Result<()> {
+pub async fn disk_writer_loop(
+    mut consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>>,
+    recording_data_available: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<()> {
     let mut wav_writer: Option<AsyncWavWriter> = None;
     let mut part_counter: u32 = 0;
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -210,7 +216,8 @@ pub async fn disk_writer_loop(mut consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>
                     }
                 }
             }
-        } else if SHUTDOWN.load(Ordering::SeqCst) {
+        } else if SHUTDOWN.load(Ordering::Acquire) {
+            // Pairs with Release store in main.rs (spsc::SHUTDOWN.store(true, Ordering::Release))
             // Drain remaining items that arrived between the last pop and shutdown detection.
             while let Ok(payload) = consumer.pop() {
                 if let RingPayload::Audio(block) = payload
@@ -246,9 +253,15 @@ pub async fn disk_writer_loop(mut consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>
 
             break;
         } else {
-            // Ring buffer empty and no shutdown — back off to avoid 100% CPU usage.
-            tokio::task::yield_now().await;
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            // Check hint flag before sleeping to reduce unnecessary poll latency.
+            // The flag is set Relaxed by the RT producer; we reset it here before sleeping
+            // to avoid missing a notification that arrives during the sleep window.
+            if let Some(ref flag) = recording_data_available {
+                flag.store(false, Ordering::Relaxed);
+            }
+            // Brief sleep to avoid busy-spinning while allowing timely SHUTDOWN detection.
+            // Wakeup latency of 10ms is acceptable for a disk writer (not latency-sensitive).
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 

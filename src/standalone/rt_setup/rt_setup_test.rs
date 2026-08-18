@@ -30,9 +30,13 @@ fn test_select_optimal_cpu_returns_something() {
 
 #[test]
 fn test_parse_interrupts_basic() {
-    let allowed = get_allowed_cpus();
-    let irqs = parse_interrupts_per_cpu(allowed.len() + 1);
-    assert_eq!(irqs.len(), allowed.len() + 1);
+    let irqs = parse_interrupts_per_cpu();
+    if std::path::Path::new("/proc/interrupts").exists() {
+        assert!(
+            !irqs.is_empty(),
+            "The map of parsed interrupts per CPU should not be empty on Linux."
+        );
+    }
 }
 
 #[test]

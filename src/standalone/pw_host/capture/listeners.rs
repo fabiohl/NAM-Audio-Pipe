@@ -10,6 +10,11 @@ use crate::standalone::colors::Colorize;
 use pipewire as pw;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// Handles PipeWire stream state changes.
+///
+/// Note (Sprint C-01 / H-06): This handler executes on the PipeWire `ThreadLoop` thread,
+/// NOT on the RT data processing thread that runs `process()`. Real-time thread setup
+/// (DAZ/FTZ MXCSR, SCHED_FIFO, CPU affinity) must remain in the cold-path of `process()`.
 pub fn state_changed_handler(
     _stream: &pw::stream::Stream,
     _user_data: &mut (),

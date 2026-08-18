@@ -8,7 +8,7 @@ use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, RtStatusFlag
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 
 use rtrb::Consumer;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 5.1.1. Resampler Draining (Zero-Alloc Swap)
 /// Replaces resamplers without using memory allocation in the critical path.
@@ -18,6 +18,7 @@ pub fn drain_resamplers(
     resampler: &mut Box<NamResampler>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
     rt_status_for_process: &RtStatusFlags,
 ) {
@@ -34,6 +35,7 @@ pub fn drain_resamplers(
         rt_status_for_process
             .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
 
+        parking_lot_dirty.store(true, Ordering::Release);
         gc_cascade(
             Some(GcItem::Resampler(old_rs)),
             gc_producer,
@@ -48,7 +50,7 @@ pub fn drain_resamplers(
 mod tests {
     use super::*;
     use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
         Box::new(NamResampler::new(pw, nam, 64).unwrap())
@@ -60,6 +62,7 @@ mod tests {
         let mut active = make_rs(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
         let gc_overflow = GcOverflowBuffer::default();
         let flags = RtStatusFlags::new();
 
@@ -68,12 +71,14 @@ mod tests {
             &mut active,
             &mut gc_p,
             &mut parking_lot,
+            &parking_lot_dirty,
             &gc_overflow,
             &flags,
         );
 
         assert_eq!(active.host_rate(), 48000);
         assert_eq!(active.nam_rate(), 48000);
+        assert!(!parking_lot_dirty.load(Ordering::Acquire));
         assert!(gc_c.pop().is_err());
     }
 
@@ -83,6 +88,7 @@ mod tests {
         let mut active = make_rs(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
         let gc_overflow = GcOverflowBuffer::default();
         let flags = RtStatusFlags::new();
 
@@ -93,6 +99,7 @@ mod tests {
             &mut active,
             &mut gc_p,
             &mut parking_lot,
+            &parking_lot_dirty,
             &gc_overflow,
             &flags,
         );
@@ -102,6 +109,7 @@ mod tests {
         assert_eq!(flags.active_rate.load(Ordering::Relaxed), 44100);
         assert_eq!(flags.active_rate_changed.load(Ordering::Relaxed), 44100);
         assert!(!flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
+        assert!(parking_lot_dirty.load(Ordering::Acquire));
 
         let old = gc_c.pop().unwrap();
         assert!(matches!(old, GcItem::Resampler(_)));
@@ -113,6 +121,7 @@ mod tests {
         let mut active = make_rs(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
         let gc_overflow = GcOverflowBuffer::default();
         let flags = RtStatusFlags::new();
 
@@ -124,12 +133,14 @@ mod tests {
             &mut active,
             &mut gc_p,
             &mut parking_lot,
+            &parking_lot_dirty,
             &gc_overflow,
             &flags,
         );
 
         assert_eq!(active.host_rate(), 96000);
         assert_eq!(flags.active_rate.load(Ordering::Relaxed), 96000);
+        assert!(parking_lot_dirty.load(Ordering::Acquire));
 
         let _first = gc_c.pop().unwrap();
         let _second = gc_c.pop().unwrap();
@@ -142,6 +153,7 @@ mod tests {
         let mut active = make_rs(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
         let gc_overflow = GcOverflowBuffer::default();
         let flags = RtStatusFlags::new();
 
@@ -152,6 +164,7 @@ mod tests {
             &mut active,
             &mut gc_p,
             &mut parking_lot,
+            &parking_lot_dirty,
             &gc_overflow,
             &flags,
         );

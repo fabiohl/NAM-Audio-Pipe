@@ -60,12 +60,12 @@ pub fn select_optimal_cpu() -> Option<usize> {
         .collect();
 
     // Totals the interrupts handled per core to detect "noisy neighbors".
-    let irq_totals = parse_interrupts_per_cpu(cpus.len());
+    let irq_totals = parse_interrupts_per_cpu();
 
     capacities
         .iter()
         .map(|&(cpu, cap)| {
-            let irqs = irq_totals.get(cpu).copied().unwrap_or(u64::MAX);
+            let irqs = irq_totals.get(&cpu).copied().unwrap_or(u64::MAX);
             (cpu, cap, irqs)
         })
         .max_by(|a, b| {
@@ -102,15 +102,16 @@ pub fn get_allowed_cpus() -> Vec<usize> {
     allowed
 }
 
-/// Parses /proc/interrupts to extract the interrupt load per core.
+/// Parses /proc/interrupts to extract the interrupt load per physical core.
 ///
-/// This function parses the kernel's tabular format, where each column
-/// (after the first) represents a counter for a specific core.
-pub fn parse_interrupts_per_cpu(num_cpus: usize) -> Vec<u64> {
+/// Returns a map from physical CPU index (extracted from the header) to the total
+/// number of numeric interrupts serviced by that CPU.
+pub fn parse_interrupts_per_cpu() -> std::collections::HashMap<usize, u64> {
+    use std::collections::HashMap;
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let mut totals = vec![0u64; num_cpus];
+    let mut totals: HashMap<usize, u64> = HashMap::new();
 
     // Streaming Refactoring: Avoids monolithic string allocation for /proc/interrupts.
     // Essential for systems with high CPU counts where the file can be large.
@@ -118,10 +119,27 @@ pub fn parse_interrupts_per_cpu(num_cpus: usize) -> Vec<u64> {
         Ok(f) => f,
         Err(_) => return totals,
     };
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
-    // Skips the header (CPU0 CPU1 ...)
-    for line_result in reader.lines().skip(1) {
+    // 1. Parse header to extract physical CPU IDs (e.g. CPU0, CPU1, CPU4)
+    let mut header = String::new();
+    if reader.read_line(&mut header).is_err() {
+        return totals;
+    }
+    let cpu_ids: Vec<usize> = header
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix("CPU")?.parse::<usize>().ok())
+        .collect();
+
+    if cpu_ids.is_empty() {
+        return totals;
+    }
+    for &id in &cpu_ids {
+        totals.insert(id, 0);
+    }
+
+    // 2. Accumulate IRQ counts keyed by physical CPU ID
+    for line_result in reader.lines() {
         let line = match line_result {
             Ok(l) => l,
             Err(_) => break,
@@ -148,12 +166,9 @@ pub fn parse_interrupts_per_cpu(num_cpus: usize) -> Vec<u64> {
         };
 
         // Accumulates counters for each core present in the line.
-        for (cpu_idx, token) in after_colon.split_whitespace().enumerate() {
-            if cpu_idx >= num_cpus {
-                break;
-            }
+        for (&cpu_id, token) in cpu_ids.iter().zip(after_colon.split_whitespace()) {
             if let Ok(count) = token.parse::<u64>() {
-                totals[cpu_idx] += count;
+                *totals.entry(cpu_id).or_insert(0) += count;
             } else {
                 // Stops at the first non-numeric token (usually the driver/device name).
                 break;

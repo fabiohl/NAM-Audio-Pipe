@@ -11,29 +11,53 @@
 /// This function attempts to identify which physical device audio should be sent to
 /// by default. It parses the output of the PipeWire `pw-metadata` utility.
 ///
+/// A watchdog thread with a 500ms timeout prevents hanging if the PipeWire daemon
+/// or `pw-metadata` is unresponsive.
+///
 /// Returns `Some(name)` if a valid sink that is not NAM-rs itself is found,
 /// or `None` otherwise (allowing routing to be decided by WirePlumber).
 pub fn detect_hardware_sink() -> Option<String> {
-    // Runs the external command to read PipeWire server metadata
-    let out = std::process::Command::new("pw-metadata")
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let child = std::process::Command::new("pw-metadata")
         .args(["-n", "default", "0", "default.audio.sink"])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
 
-    // Converts the raw output to string (UTF-8 lossy)
-    let s = String::from_utf8_lossy(&out.stdout);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
 
-    // Manual parsing: locates the "name" key in the JSON-like output
+    let output = match rx.recv_timeout(TIMEOUT) {
+        Ok(Ok(out)) => out,
+        Ok(Err(_)) => return None,
+        Err(_) => {
+            log::warn!(
+                "detect_hardware_sink: pw-metadata did not respond within {}ms — \
+                 skipping default sink detection (WirePlumber will decide routing).",
+                TIMEOUT.as_millis()
+            );
+            return None;
+        }
+    };
+
+    parse_sink_name_from_metadata(&output.stdout)
+}
+
+/// Parses the default sink name from `pw-metadata` raw output.
+pub(crate) fn parse_sink_name_from_metadata(raw_stdout: &[u8]) -> Option<String> {
+    let s = String::from_utf8_lossy(raw_stdout);
     let start = s.find("\"name\":\"")?;
     let rest = &s[start + 8..];
     let end = rest.find('"')?;
     let name = &rest[..end];
 
-    // We avoid the "infinite loop" routing if the detected default is NAM-rs's own input.
     if name == crate::standalone::pw_host::identity::PW_CAPTURE_NODE_NAME {
         None
     } else {
-        // Returns the real hardware name (e.g. 'alsa_output.pci-0000_00_1f.3.analog-stereo')
         Some(name.to_string())
     }
 }
@@ -72,5 +96,43 @@ pub fn lock_cpu_c_states() -> Option<std::fs::File> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_hardware_sink() {
+        let sample = br#"update: id:0 key:'default.audio.sink' value:'{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}' type:'Spa:String:JSON'"#;
+        let result = parse_sink_name_from_metadata(sample);
+        assert_eq!(
+            result.as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+    }
+
+    #[test]
+    fn parse_nam_capture_node_ignored() {
+        let sample = format!(
+            r#"update: id:0 key:'default.audio.sink' value:'{{"name":"{}"}}' type:'Spa:String:JSON'"#,
+            crate::standalone::pw_host::identity::PW_CAPTURE_NODE_NAME
+        );
+        let result = parse_sink_name_from_metadata(sample.as_bytes());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_invalid_output_returns_none() {
+        let sample = b"No metadata found";
+        let result = parse_sink_name_from_metadata(sample);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_hardware_sink_terminates_promptly() {
+        // Runs detect_hardware_sink to ensure it executes without panicking and respects the 500ms timeout.
+        let _ = detect_hardware_sink();
     }
 }

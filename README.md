@@ -239,7 +239,7 @@ The following technical documents are maintained in the source repository:
 
 ### AI Transparency Note
 
-The system architecture, real-time safety guarantees, DSP pipeline design, and optimization engineering are the intellectual work of the maintainer (**Fábio Henrique de Lima Silva**). Implementation was accelerated through pair programming (*Vibe Coding*) using artificial intelligence models (Gemini, Claude, DeepSeek) within Google Antigravity IDE.
+The system architecture, real-time safety guarantees, DSP pipeline design, and optimization engineering are intellectual work (and love) of the maintainer (**Fábio Lima**). Implementation was accelerated through pair programming (*Vibe Coding*) using artificial intelligence models (Gemini, Claude, Grok, DeepSeek and others) within Google Antigravity IDE. IA is just a tool that make wonder in wise hands.
 
 ### License
 

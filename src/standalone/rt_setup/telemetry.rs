@@ -9,8 +9,16 @@
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Mutable state for `poll_rt_status`, replacing function-scoped statics
+/// to make the function testable and re-entrant.
+#[derive(Debug, Clone, Default)]
+pub struct PollState {
+    pub hugepage_synced: bool,
+    pub telemetry_throttle: u32,
+}
 
 /// Reads atomic RT status flags and emits monitoring logs to the user.
 ///
@@ -25,6 +33,7 @@ pub fn poll_rt_status(
     was_silent: bool,
     was_fading: bool,
     bridge: &neural_amp_modeler_rs::dsp::pipeline::DspBridge,
+    state: &mut PollState,
 ) -> (bool, bool) {
     let current_bits = rt_status.status_bits.load(Ordering::Relaxed);
     rt_status
@@ -106,13 +115,9 @@ pub fn poll_rt_status(
 
     // 3.5 HUGE PAGE STATUS:
     // Sync from mirror buffer global and log once.
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static HUGEPAGE_SYNCED: AtomicBool = AtomicBool::new(false);
-        if !HUGEPAGE_SYNCED.load(Ordering::Relaxed) {
-            neural_amp_modeler_rs::dsp::mirror_buf::sync_huge_page_flag(rt_status);
-            HUGEPAGE_SYNCED.store(true, Ordering::Relaxed);
-        }
+    if !state.hugepage_synced {
+        neural_amp_modeler_rs::dsp::mirror_buf::sync_huge_page_flag(rt_status);
+        state.hugepage_synced = true;
     }
     if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HUGEPAGE_OK) {
         log::info!(
@@ -255,12 +260,8 @@ pub fn poll_rt_status(
     let nanos = rt_status.dsp_cycle_time.load(Ordering::Relaxed);
     if nanos > 0 {
         let duration = Duration::from_nanos(nanos);
-        static TELEMETRY_THROTTLE: AtomicU32 = AtomicU32::new(0);
-        if TELEMETRY_THROTTLE
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_rem(100)
-            == 0
-        {
+        state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
+        if state.telemetry_throttle.wrapping_rem(100) == 0 {
             let p50 = rt_status.latency_hist.get_percentile(0.50) / 1000;
             let p99 = rt_status.latency_hist.get_percentile(0.99) / 1000;
             let exact = rt_status.latency_hist.take_exact_max() / 1000;
@@ -375,3 +376,7 @@ pub fn poll_rt_status(
 
     (current_silent, current_fading)
 }
+
+#[cfg(test)]
+#[path = "telemetry_test.rs"]
+mod telemetry_test;

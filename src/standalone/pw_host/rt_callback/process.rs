@@ -13,7 +13,7 @@ use neural_amp_modeler_rs::dsp::pipeline::{DspBuffers, DspPipelineContext, captu
 
 use pipewire as pw;
 use rtrb::Producer;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime FFI contract validation for a single PipeWire buffer channel.
 ///
@@ -48,12 +48,12 @@ fn send_recording_metadata(
     current_host_rate: u32,
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
+    recording_data_available: Option<&AtomicBool>,
 ) {
     if *recording_meta_sent && *recording_meta_rate == current_host_rate {
         return;
     }
-    *recording_meta_sent = false;
-    if let Some(producer) = recording_producer {
+    if let Some(producer) = recording_producer.as_mut() {
         let meta = AudioMetadata {
             sample_rate: current_host_rate as f32,
             bit_depth: 32,
@@ -62,6 +62,9 @@ fn send_recording_metadata(
         if producer.push(RingPayload::Metadata(meta)).is_ok() {
             *recording_meta_sent = true;
             *recording_meta_rate = current_host_rate;
+            if let Some(flag) = recording_data_available {
+                flag.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -80,11 +83,12 @@ fn send_recording_audio(
     resamp_out_l: &[f32],
     resamp_out_r: &[f32],
     recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
+    recording_data_available: Option<&AtomicBool>,
 ) {
     if n_pw == 0 {
         return;
     }
-    let Some(producer) = recording_producer else {
+    let Some(producer) = recording_producer.as_mut() else {
         return;
     };
     let interleaved_len = n_pw * 2;
@@ -93,18 +97,24 @@ fn send_recording_audio(
         return;
     }
     let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
-    for i in 0..n_pw {
-        block.data[i * 2] = resamp_out_l[i];
-        block.data[i * 2 + 1] = resamp_out_r[i];
+    let dst = &mut block.data[..interleaved_len];
+    for (i, (&l, &r)) in resamp_out_l[..n_pw]
+        .iter()
+        .zip(&resamp_out_r[..n_pw])
+        .enumerate()
+    {
+        dst[i * 2] = l;
+        dst[i * 2 + 1] = r;
     }
     block.valid_len = interleaved_len;
     if producer.push(RingPayload::Audio(block)).is_err() {
         OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+    } else if let Some(flag) = recording_data_available {
+        flag.store(true, Ordering::Relaxed);
     }
 }
 
-/// 5.1.4. REAL-TIME DSP LOGIC
-/// Acquires the raw system buffer and delegates the heavy lifting to the Audio Factory (pipeline).
+/// Executes the DSP pipeline on the dequeued PipeWire audio buffer.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -121,6 +131,7 @@ pub fn process_dsp_buffer(
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
     recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
+    recording_data_available: Option<&AtomicBool>,
 ) {
     let mut _buf = match stream.dequeue_buffer() {
         Some(b) => b,
@@ -163,13 +174,13 @@ pub fn process_dsp_buffer(
                 if n_samples > 0 {
                     let samples_l = unsafe {
                         std::slice::from_raw_parts_mut(
-                            raw_l.as_mut_ptr().add(offset_l).cast::<f32>(),
+                            raw_l.as_ptr().add(offset_l) as *mut f32,
                             n_samples,
                         )
                     };
                     let samples_r = unsafe {
                         std::slice::from_raw_parts_mut(
-                            raw_r.as_mut_ptr().add(offset_r).cast::<f32>(),
+                            raw_r.as_ptr().add(offset_r) as *mut f32,
                             n_samples,
                         )
                     };
@@ -179,6 +190,7 @@ pub fn process_dsp_buffer(
                         current_host_rate,
                         recording_meta_sent,
                         recording_meta_rate,
+                        recording_data_available,
                     );
 
                     let should_measure = (*frame_count & 0xF) == 0;
@@ -225,6 +237,7 @@ pub fn process_dsp_buffer(
                             &buffers.resamp_out_l[..],
                             &buffers.resamp_out_r[..],
                             recording_block,
+                            recording_data_available,
                         );
                     }
 
