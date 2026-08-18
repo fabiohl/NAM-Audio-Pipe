@@ -97,7 +97,7 @@ The shared memory bridge (`src/standalone/pw_host/bridge.rs`) facilitates lock-f
 ### 2.1 Double Buffering & Cache Isolation
 
 - **Zero-Copy Double Buffering:** `DspBridge` contains two independent `BridgeBuffer` slots (`MAX_BRIDGE_BUF = 8192` samples). The capture stream writes to `buffers[1 - active_idx]` and flips `active_read_idx` using `Ordering::Release`. The playback stream loads `active_read_idx` using `Ordering::Acquire` and reads without mutex locking.
-- **Cache-Line Isolation (`#[repr(align(128))]`) & Page Alignment:** The struct is internally aligned to 128 bytes to isolate cache lines and prevent CPU cache-line bouncing (False Sharing). It is allocated via a page-aligned layout (4096 bytes) to satisfy Linux kernel requirements for virtual memory operations.
+- **Cache-Line Isolation (`#[repr(align(128))]`) & Page Alignment:** The struct is internally aligned to 128 bytes to isolate cache lines and prevent CPU cache-line bouncing (False Sharing). To satisfy Linux kernel virtual memory alignment requirements for system advisories, it is allocated dynamically via the global allocator with a page-aligned (4096-byte) layout (`Layout::from_size_align(size, 4096.max(align_of::<DspBridge>()))` padded to align) and wrapped in a safe `BridgeRef` pointer abstraction (`src/standalone/pw_host/bridge.rs`).
 - **Kernel Memory Advisories:**
   - `madvise(MADV_DONTFORK)` — Prevents Copy-on-Write memory duplication overhead if helper child processes are spawned.
   - `madvise(MADV_DONTDUMP)` — Excludes large DSP scratch memory from core dump files to preserve system disk space during debugging.
@@ -115,7 +115,7 @@ NAM-Audio-Pipe enforces strict thread segregation across three distinct executio
 │  - PipeWire Initialization & Shutdown                                       │
 │  - Off-RT Resampler / CabSim Rebuild                                        │
 │  - Housekeeping & SPSC GC Drain (drain_gc_channels)                          │
-│  - Telemetry Polling (poll_rt_status @ 10 Hz)                               │
+│  - Telemetry Polling (poll_rt_status @ 10 Hz with PollState)                 │
 └──────┬──────────────────────────────┬───────────────────────────────┬───────┘
        │                              │                               │
        │ SPSC Command Channels        │ Atomic Telemetry              │ SPSC Audio Ring
@@ -123,8 +123,8 @@ NAM-Audio-Pipe enforces strict thread segregation across three distinct executio
 ┌─────────────────────────────┐┌──────────────────────────────┐┌──────────────┐
 │  Audio Thread (RT Callback) ││       RtStatusFlags          ││ Recording I/O│
 │  - PipeWire thread_loop     ││  - Sample Rate & Latency     ││  - tokio-uring│
-│  - Strict RT Safety Contract││  - CPU Cycles per Quantum    ││  - Disk Write│
-│  - Neural Inference & DSP   ││  - Gate State & Overloads    ││  - WAV Split │
+│  - Strict RT Safety Contract││  - CPU Cycles per Quantum    ││  - Async Disk│
+│  - Neural Inference & DSP   ││  - Gate State & Overloads    ││  - Idle Sleep│
 └─────────────────────────────┘└──────────────────────────────┘└──────────────┘
 ```
 
@@ -146,13 +146,15 @@ To guarantee glitch-free audio processing at quantum sizes down to 64 samples (1
 ### 4.1 CPU Core Affinity (`affinity.rs`)
 
 - Automatically queries system CPU topology (`/sys/devices/system/cpu/`) via `select_optimal_cpu()`.
+- Parses `/proc/interrupts` with a streaming reader (`parse_interrupts_per_cpu()`) that extracts numeric interrupt counts mapped directly to physical CPU IDs parsed from header tokens (`CPU0`, `CPU1`, ...), returning a `HashMap<usize, u64>` without allocating monolithic string representations.
 - Binds the PipeWire real-time loop thread to an isolated non-boot CPU core, avoiding IRQ interruptions and scheduler migrations.
 - Issues IRQ balancing advisories (`sys.emit_irq_advisory(target_cpu)`) to alert maintainers if system hardware interrupts share the audio core.
 
-### 4.2 Power Management QoS Latency Pinning (`pm_qos.rs`)
+### 4.2 Power Management QoS Latency Pinning & Hardware Sink Detection (`pm_qos.rs`)
 
 - Opens Linux power management interface `/dev/cpu_dma_latency` and writes `0` (target 0 µs C-state latency).
 - Prevents CPU cores from entering deep sleep states (C-states: C1, C6, C8), eliminating CPU wake-up latency penalties when processing intermittent audio blocks.
+- **Hardware Sink Auto-Detection (`detect_hardware_sink`):** Queries `pw-metadata` to discover the default audio output sink, using a 500 ms watchdog timeout (`rx.recv_timeout`) to guard against hung daemon queries, and parsing the sink JSON (`parse_sink_name_from_metadata`) while filtering out `NAM-Audio-Pipe-input` to avoid feedback routing.
 
 ### 4.3 Memory Paging Lock (`thread.rs`)
 
@@ -206,7 +208,7 @@ RT Thread (Replaced Asset)
 ```
 
 1. **Tier 1 (SPSC GC Queue):** Pushed to `gc_tx` (32 slots). Main thread drains and deallocates items during its 100 ms control loop via `drain_gc_channels`.
-2. **Tier 2 (RT Parking Lot):** Fixed array `[Option<GcItem>; 16]` allocated in main thread stack and accessed via raw pointer by the RT callback. Parked items are retried each audio block; during shutdown, `thread_loop.stop()` halts the audio thread and hands `rt_parking_lot` by mutable reference to the final main-thread drain.
+2. **Tier 2 (RT Parking Lot):** Fixed array `[Option<GcItem>; 16]` allocated in main thread stack and accessed via raw pointer by the RT callback. An atomic dirty tracking flag (`rt_parking_lot_dirty: AtomicBool`) is updated with `Ordering::Release` whenever an asset cascades to GC and cleared once all 16 slots are drained. This avoids iterating over the 16 slots during steady-state audio callbacks when no resource swaps have occurred. During shutdown, `thread_loop.stop()` halts the audio thread and hands `rt_parking_lot` by mutable reference to the final main-thread drain.
 3. **Tier 3 (Atomic Ring Buffer):** `GcOverflowBuffer` prevents unbounded allocation leaks under severe overload while ensuring the RT audio deadline is never breached.
 
 ---
@@ -276,13 +278,15 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 │  Audio Thread (RT)                                                          │
 │    - Checks gate state (n_pw > 0)                                           │
 │    - Pushes RingPayload::Audio(AlignedBlock) into SPSC RingBuffer           │
+│    - Signals recording_data_available notification flag                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Recording Worker Thread ("nam-recording-io")                               │
 │    - tokio-uring async event loop (Linux io_uring)                          │
 │    - Consumes RingPayload (Metadata, Audio, StreamStop)                     │
 │    - Reuses internal I/O buffer (io_buf) to eliminate heap allocations      │
+│    - Enters 10ms idle sleep when channel is drained to eliminate busy spin  │
 │    - Automatically splits files at 4 GiB RIFF size limit (_partN.wav)       │
-│    - Graceful shutdown: push_stream_stop (200ms retry) + bounded join (5s) │
+│    - Graceful shutdown: push_stream_stop (200ms retry) + bounded join (5s)  │
 │    - Rewrites WAV header with exact data byte count & issues fsync          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```

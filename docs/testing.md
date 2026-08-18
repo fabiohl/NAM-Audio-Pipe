@@ -27,8 +27,12 @@ The test suite is partitioned into unit tests co-located with module sources and
 ### 2.1 Unit Tests (Module-Level)
 
 - **CLI Parsing ([`src/standalone/cli_test.rs`](../src/standalone/cli_test.rs)):** Validates command-line flag combinations, model and cabinet path parsing, gain limits (`-20.0` to `+20.0` dB), oversampling enum mappings, and diagnostic flags (`--diagnose`, `--diagnose-full`).
-- **Real-Time System Setup ([`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs)):** Validates CPU affinity selection heuristics (`select_optimal_cpu`), PM QoS `/dev/cpu_dma_latency` interaction, and TSC clock calibration routines.
-- **Process Callback & Gain Staging ([`src/standalone/pw_host/rt_callback/process_test.rs`](../src/standalone/pw_host/rt_callback/process_test.rs)):** Tests the RT audio processing callback, channel extraction, gain multiplier smoothing, noise gate envelope evaluation, and silence trimming.
+- **Real-Time System Setup & Hardware Sink Detection ([`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)):** Validates CPU affinity selection heuristics (`select_optimal_cpu`), interrupt load parsing from `/proc/interrupts` streaming per physical CPU (`parse_interrupts_per_cpu`), PM QoS `/dev/cpu_dma_latency` interaction, and default hardware sink detection via `pw-metadata` with a 500 ms watchdog timeout and self-capture node filtering.
+- **Telemetry & Status Polling ([`src/standalone/rt_setup/telemetry_test.rs`](../src/standalone/rt_setup/telemetry_test.rs)):** Validates `PollState` struct lifecycle, hugepage flag synchronization, telemetry throttling, silent and fading transition states, and diagnostic RT status flag clearing during periodic monitoring (`poll_rt_status`).
+- **Shared Memory Bridge Allocation ([`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)):** Validates page-aligned (4096-byte) memory layout allocation, `madvise` memory flags, and initial atomic generation counters in `allocate_dsp_bridge`.
+- **PipeWire Capture Stream Setup ([`src/standalone/pw_host/capture/setup_test.rs`](../src/standalone/pw_host/capture/setup_test.rs)):** Tests capture property dictionary creation, latency string formatting (`node.latency`), and SPA Pod audio format generation.
+- **Process Callback & Gain Staging ([`src/standalone/pw_host/rt_callback/process_test.rs`](../src/standalone/pw_host/rt_callback/process_test.rs)):** Tests the RT audio processing callback, channel extraction, gain multiplier smoothing, noise gate envelope evaluation, recording queue dispatch, and silence trimming.
+- **SPSC Resource Swaps & Command Handling ([`src/standalone/pw_host/rt_callback/commands.rs`](../src/standalone/pw_host/rt_callback/commands.rs), [`src/standalone/pw_host/rt_callback/cabsim_swap.rs`](../src/standalone/pw_host/rt_callback/cabsim_swap.rs), [`src/standalone/pw_host/rt_callback/resampler_swap.rs`](../src/standalone/pw_host/rt_callback/resampler_swap.rs)):** Validates zero-alloc dynamic swaps for neural models, cabinet IR convolution engines (`drain_cabsims`), sample rate converters (`drain_resamplers`), and oversampling engines (`drain_os_engines`), asserting correct GC cascades and RT parking lot dirty flag updates.
 - **Off-RT Rebuild Handlers ([`src/standalone/pw_host/handlers_test.rs`](../src/standalone/pw_host/handlers_test.rs)):** Validates dynamic resampler reconstruction, cabinet IR convolution updates, slimmable container swaps, and oversampling filter rebuilds triggered by sample rate changes.
 - **Host Execution & Shutdown ([`src/standalone/pw_host/run_test.rs`](../src/standalone/pw_host/run_test.rs)):** Validates bounded retry on `push_stream_stop` and bounded thread join for `nam-recording-io` during host teardown.
 
@@ -65,11 +69,11 @@ A 4-phase agile test runner executing under low CPU/IO priority (`nice -n 19`, `
 │                       utils/tests-quick.sh Execution Flow                   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 1: Structural (Debug)                                                │
-│    - cargo test --features testing --lib --bin nam-audio-pipe                │
+│    - cargo test --features testing --lib --bin nam-audio-pipe               │
 │                 --test recording --test e2e_cli                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 2: Release Verification (Release, S6-T04 / RES-04)                   │
-│    - cargo test --features testing --test recording --test e2e_cli --release │
+│    - cargo test --features testing --test recording --test e2e_cli --release│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 3: PipeWire Live Integration (Release, Daemon Probe)                 │
 │    - Probes pw-cli info 0 -> Runs tests/pw_integration.rs (asserts DSP run) │
