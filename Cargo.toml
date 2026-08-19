@@ -30,13 +30,16 @@ NeuralAmpModeler-rs = "0.6.0"
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
-rtrb = "0.3.4"
+rtrb = "0.4.0"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 tokio-uring = "0.5"
 anyhow = "1.0.104"
 libc = "0.2.189"
 log = "0.4.33"
 env_logger = { version = "0.11.11", default-features = false }
+
+[patch.crates-io]
+NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }
 
 [features]
 default = []

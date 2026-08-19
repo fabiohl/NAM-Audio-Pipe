@@ -7,8 +7,9 @@
 # and post-link BOLT binary reordering.
 #
 # Deliverables:
-#   - ~/.local/bin/nam-audio-pipe  (PGO + BOLT optimized standalone binary)
-#   - target/dsp_hotpath.asm       (Disassembly hotspot report)
+#   - ~/.local/bin/nam-audio-pipe                     (PGO + BOLT optimized standalone binary)
+#   - target/dsp_hotpath.asm                          (Disassembly hotspot report)
+#   - ~/nam-audio-pipe-v<ver>-linux-x86_64-v3.tar.zst (Release distribution tarball)
 
 set -euo pipefail
 
@@ -112,10 +113,10 @@ BIN_TARGET="$BIN_INSTALL_DIR/nam-audio-pipe"
 # -----------------------------------------------------------------------------
 # PHASE 1: Environment & Dependency Verification
 # -----------------------------------------------------------------------------
-echo -e "\n${BLUE}${BOLD}[Phase 1/5] Verifying dependencies and environment...${NC}"
+echo -e "\n${BLUE}${BOLD}[Phase 1/6] Verifying dependencies and environment...${NC}"
 
 # Verify core dependencies
-for cmd in rustc cargo python3; do
+for cmd in rustc cargo python3 tar zstd; do
     if ! command -v "$cmd" &>/dev/null; then
         echo -e "${RED}Error: '$cmd' is not installed or available in PATH.${NC}"
         exit 1
@@ -214,7 +215,7 @@ fi
 # -----------------------------------------------------------------------------
 # PHASE 2: Profile-Guided Optimization (PGO) - Offline DSP Workload
 # -----------------------------------------------------------------------------
-echo -e "\n${BLUE}${BOLD}[Phase 2/5] Generating PGO profiles via offline DSP workload...${NC}"
+echo -e "\n${BLUE}${BOLD}[Phase 2/6] Generating PGO profiles via offline DSP workload...${NC}"
 
 export RUSTFLAGS="$CONFIG_RUSTFLAGS $ORIG_RUSTFLAGS -Cprofile-generate=$PROFRAW_DIR"
 export LLVM_PROFILE_FILE="$PROFRAW_DIR/default_%m_%p.profraw"
@@ -243,7 +244,7 @@ rm -rf "$PROFRAW_DIR"
 # -----------------------------------------------------------------------------
 # PHASE 3: Compile PGO-Optimized Standalone Binary
 # -----------------------------------------------------------------------------
-echo -e "\n${BLUE}${BOLD}[Phase 3/5] Compiling PGO-optimized binary...${NC}"
+echo -e "\n${BLUE}${BOLD}[Phase 3/6] Compiling PGO-optimized binary...${NC}"
 
 if [ -f "$MERGED_PROFILE" ]; then
     export RUSTFLAGS="$CONFIG_RUSTFLAGS $ORIG_RUSTFLAGS -Cprofile-use=$MERGED_PROFILE"
@@ -273,7 +274,7 @@ echo -e "  ${GREEN}✓${NC} PGO compilation completed successfully."
 BOLT_APPLIED=false
 
 if [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = true ]; then
-    echo -e "\n${BLUE}${BOLD}[Phase 4/5] Applying BOLT post-link optimization...${NC}"
+    echo -e "\n${BLUE}${BOLD}[Phase 4/6] Applying BOLT post-link optimization...${NC}"
 
     PW_RUNNING=false
     if command -v pw-cli &>/dev/null && (pw-cli info 0 &>/dev/null || pgrep -x pipewire &>/dev/null); then
@@ -445,13 +446,13 @@ with wave.open('$TEST_WAV', 'w') as w:
         echo -e "${YELLOW}  Warning: PipeWire is not running or no model files found. Skipping BOLT.${NC}"
     fi
 else
-    echo -e "\n${YELLOW}[Phase 4/5] Skipping BOLT (llvm-bolt or perf not available/configured).${NC}"
+    echo -e "\n${YELLOW}[Phase 4/6] Skipping BOLT (llvm-bolt or perf not available/configured).${NC}"
 fi
 
 # -----------------------------------------------------------------------------
 # PHASE 4.5: Assembly Hotspot Disassembly Report
 # -----------------------------------------------------------------------------
-echo -e "\n${BLUE}${BOLD}[Phase 4.5/5] Generating AI-ready assembly hotspot report...${NC}"
+echo -e "\n${BLUE}${BOLD}[Phase 4.5/6] Generating AI-ready assembly hotspot report...${NC}"
 
 ASM_TARGET="$PROJECT_DIR/target/dsp_hotpath.asm"
 
@@ -480,7 +481,7 @@ fi
 # -----------------------------------------------------------------------------
 # PHASE 5: Deliverables Installation & Verification
 # -----------------------------------------------------------------------------
-echo -e "\n${BLUE}${BOLD}[Phase 5/5] Installing and validating artifact...${NC}"
+echo -e "\n${BLUE}${BOLD}[Phase 5/6] Installing and validating artifact...${NC}"
 
 mkdir -p "$BIN_INSTALL_DIR"
 
@@ -506,11 +507,46 @@ else
     exit 1
 fi
 
-echo -e "${GREEN}${BOLD}==============================================================${NC}"
-echo -e "${GREEN}${BOLD}   Pipeline completed! Artifact ready for distribution.        ${NC}"
-echo -e "${GREEN}${BOLD}==============================================================${NC}"
-ls -lath "$BIN_TARGET"
+# -----------------------------------------------------------------------------
+# PHASE 6: Release Packaging (.tar.zst)
+# -----------------------------------------------------------------------------
+echo -e "\n${BLUE}${BOLD}[Phase 6/6] Generating distribution tarball...${NC}"
+
+VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c "import sys, json; print(json.load(sys.stdin)['packages'][0]['version'])")
+ARCHIVE_NAME="nam-audio-pipe-v${VERSION}-linux-x86_64-v3"
+# mktemp creates a unique temporary directory — do not destroy it immediately;
+# simply create the archive subdirectory inside it.
+PKG_DIR="$(mktemp -d -t nam-audio-pipe-pkg.XXXXXX)"
+mkdir -p "$PKG_DIR/$ARCHIVE_NAME"
+
+cp "$BIN_TARGET" "$PKG_DIR/$ARCHIVE_NAME/nam-audio-pipe"
+cp README.md LICENSE.txt "$PKG_DIR/$ARCHIVE_NAME/" 2>/dev/null || true
+
+# Generate 1-click install script for end-users
+cat << 'EOF' > "$PKG_DIR/$ARCHIVE_NAME/install.sh"
+#!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+set -e
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+cp nam-audio-pipe "$BIN_DIR/"
+chmod +x "$BIN_DIR/nam-audio-pipe"
+echo "✅ Installed nam-audio-pipe to $BIN_DIR/nam-audio-pipe"
+EOF
+chmod +x "$PKG_DIR/$ARCHIVE_NAME/install.sh"
+
+TARBALL="$HOME/${ARCHIVE_NAME}.tar.zst"
+tar -C "$PKG_DIR" -I "zstd -6 -T0" -cf "$TARBALL" "$ARCHIVE_NAME"
+rm -rf "$PKG_DIR"
+
+echo -e "  ${GREEN}✓${NC} Distribution package generated at: ${BOLD}$TARBALL${NC}"
+
+echo -e "${GREEN}${BOLD}================================================================${NC}"
+echo -e "${GREEN}${BOLD}   Pipeline completed! Standalone binary ready for distribution.${NC}"
+echo -e "${GREEN}${BOLD}================================================================${NC}"
+ls -lath "$BIN_TARGET" "$TARBALL"
 if [ -f "$PROJECT_DIR/target/dsp_hotpath.asm" ]; then
     echo -e "\n${YELLOW}${BOLD}💡 AI-Ready Assembly Hotspots generated at:${NC} ${BOLD}target/dsp_hotpath.asm${NC}"
 fi
-echo -e "${GREEN}${BOLD}==============================================================${NC}"
+echo -e "${GREEN}${BOLD}================================================================${NC}"
