@@ -324,7 +324,122 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 
 ---
 
-## 9. References
+## 9. Flatpak Packaging & Sandbox Architecture
+
+NAM-Audio-Pipe supports standalone distribution as an isolated, high-performance Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//25.08`:
+
+### 9.1 Sandbox Topology & Low-Latency Audio IPC
+
+Executing real-time DSP applications inside an unprivileged Linux container sandbox requires deterministic, low-latency communication channels with the host kernel and PipeWire daemon:
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Flatpak Application Sandbox                       │
+│                        (io.github.fabiohl.NAMAudioPipe)                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Binary: /app/bin/nam-audio-pipe                                            │
+│  DSP Loop: Hard RT Determinism, SPSC Queues, DspBridge Double Buffering     │
+│  Model Loader: Reads from ~/ via --filesystem=home:ro                       │
+└──────┬──────────────────────────────┬───────────────────────────────┬───────┘
+       │                              │                               │
+       │ xdg-run/pipewire-0 Socket    │ POSIX memfd_create (--share=ipc)│ PM QoS (/dev/cpu_dma_latency)
+       ▼                              ▼                               ▼
+┌─────────────────────────────┐┌──────────────────────────────┐┌───────────────┐
+│    PipeWire Host Daemon     ││  Zero-Copy Audio Buffers     ││ Linux Kernel  │
+│  - Driver loop scheduling   ││  - Direct shared memory pages││ - 0 µs C-state│
+│  - Node graph auto-routing  ││  - Zero context switch alloc ││ - DMA latency │
+└─────────────────────────────┘└──────────────────────────────┘└───────────────┘
+```
+
+#### Detailed Sandbox Grants & Rationale
+
+- **PipeWire Unix Domain Socket (`--filesystem=xdg-run/pipewire-0`):** Provides a direct Unix socket connection to the user's host PipeWire session daemon. Bypasses emulation layers, enabling native quantum scheduling down to 64 samples (1.33 ms).
+- **POSIX Shared Memory & IPC (`--share=ipc`):** Grants access to `memfd_create` and POSIX shared memory primitives. Required by PipeWire SPA (Simple Plugin API) buffers to achieve zero-copy audio stream transfer between the sandbox process and the host daemon.
+- **Audio & DMA Device Access (`--device=all`):** Grants access to `/dev/snd/*` devices and the Linux Power Management QoS interface `/dev/cpu_dma_latency`, allowing the real-time thread tuning layer (`rt_setup`) to pin CPU DMA latency to 0 µs and prevent C-state wake-up stutter.
+- **Read-Only Model Storage (`--filesystem=home:ro`):** Allows resolving and loading `.nam`/`.namb` neural amp models and `.wav` impulse responses from anywhere in the user's `$HOME` directory without write exposure.
+- **Display & Fallback Sockets (`--socket=wayland`, `--socket=fallback-x11`, `--socket=pulseaudio`):** Ensures interoperability with desktop environments and fallback sound servers.
+
+### 9.2 Desktop Integration & AppStream Metadata
+
+The packaging directory (`packaging/flatpak/`) provides standard XDG desktop integration assets:
+
+- **Desktop Entry (`io.github.fabiohl.NAMAudioPipe.desktop`):** Registers `NAM-Audio-Pipe` in application menus under the `Audio;AudioVideo;` categories with terminal execution support (`Terminal=true`).
+- **AppStream Metainfo (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`):** Provides catalog metadata for graphical package managers (GNOME Software, KDE Discover), documenting capabilities, URLs, release tags, and developer identity (`io.github.fabiohl`).
+- **Hicolor Icon Hierarchy (`icons/hicolor/`):** Full icon suite including scalable vector (`scalable/apps/io.github.fabiohl.NAMAudioPipe.svg`) and high-resolution rasterized assets (`64x64`, `128x128`, `256x256`, `512x512` PNGs generated via `render-icons.py`).
+
+### 9.3 Flatpak Manifest Specification (`io.github.fabiohl.NAMAudioPipe.yml`)
+
+The Flatpak manifest defines the standalone application package targeting `org.freedesktop.Platform//25.08`:
+
+```yaml
+id: io.github.fabiohl.NAMAudioPipe
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk//25.08
+command: nam-audio-pipe
+
+finish-args:
+  - --socket=pipewire
+  - --share=ipc
+  - --device=all
+  - --filesystem=home:ro
+  - --socket=fallback-x11
+  - --socket=wayland
+
+modules:
+  - name: nam-audio-pipe
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 nam-audio-pipe ${FLATPAK_DEST}/bin/nam-audio-pipe
+      - install -Dm644 io.github.fabiohl.NAMAudioPipe.desktop ${FLATPAK_DEST}/share/applications/io.github.fabiohl.NAMAudioPipe.desktop
+      - install -Dm644 io.github.fabiohl.NAMAudioPipe.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.fabiohl.NAMAudioPipe.metainfo.xml
+      - install -Dm644 icons/hicolor/scalable/apps/io.github.fabiohl.NAMAudioPipe.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.fabiohl.NAMAudioPipe.svg
+      - install -Dm644 icons/hicolor/64x64/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/64x64/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/128x128/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/256x256/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png
+```
+
+### 9.4 Integrated Release Pipeline (`build-release.sh`)
+
+Flatpak packaging is embedded directly into Phase 7 of `utils/build-release.sh`:
+
+1. **Environment Initialization:** Runs `flatpak build-init` configuring `org.freedesktop.Sdk//25.08` (falling back to `org.freedesktop.Platform` if SDK is uninstalled).
+2. **Artifact Installation:** Installs optimized binary, desktop entry, AppStream XML, hicolor icon hierarchy, and GPL-3.0 license.
+3. **Sandbox Finalization:** Applies `flatpak build-finish` with sandbox grants (`--socket=pipewire`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--socket=wayland`, `--socket=fallback-x11`).
+4. **OSTree Repository Export:** Runs `flatpak build-export --update-appstream` to create a local OSTree repository.
+5. **Bundle Export:** Runs `flatpak build-bundle` outputting `~/nam-audio-pipe-v<VERSION>-linux-x86_64-v3.flatpak`.
+6. **Automated User Installation:** If `--install` is supplied, registers and installs the package locally (`flatpak install --user --reinstall -y`).
+
+### 9.5 Developer Build & Sandbox Inspection Commands
+
+```bash
+# 1. Automated build of optimized binary and Flatpak bundle:
+./utils/build-release.sh --install
+
+# 2. Standalone compilation using flatpak-builder:
+cargo build --release
+flatpak-builder --user --install --force-clean \
+  --state-dir=target/flatpak-builder \
+  target/flatpak-build \
+  packaging/flatpak/io.github.fabiohl.NAMAudioPipe.yml
+
+# 3. Run containerized diagnostics:
+flatpak run io.github.fabiohl.NAMAudioPipe --diagnose
+
+# 4. Run containerized live DSP stream with custom model and buffer size:
+flatpak run io.github.fabiohl.NAMAudioPipe \
+  --model ~/models/amp.nam \
+  --cab ~/irs/cab.wav \
+  --buffer-size 64
+
+# 5. Remove Flatpak application:
+flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
+```
+
+---
+
+## 10. References
 
 - [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) — Core neural amplifier DSP inference engine.
 - [PipeWire Documentation](https://docs.pipewire.org/) — PipeWire low-latency multimedia routing daemon.

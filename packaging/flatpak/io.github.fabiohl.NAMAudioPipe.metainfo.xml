@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+-->
+<component type="desktop-application">
+  <id>io.github.fabiohl.NAMAudioPipe.desktop</id>
+  <name>NAM Audio Pipe</name>
+  <summary>Low-latency PipeWire standalone host for Neural Amp Modeler</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.fabiohl">
+    <name>Fábio Henrique de Lima Silva</name>
+  </developer>
+  <description>
+    <p>
+      NAM-Audio-Pipe is an ultra-low latency, real-time standalone PipeWire host application
+      for Neural Amp Modeler (NAM) simulation on Linux, engineered in pure Rust with strict real-time safety.
+    </p>
+    <p>Key features include:</p>
+    <ul>
+      <li>Direct native PipeWire integration (libpipewire-0.3) at low quantum buffer sizes (down to 64 samples).</li>
+      <li>Inherited NeuralAmpModeler-rs DSP engine supporting WaveNet (A1/A2 standard and lite) and LSTM topologies.</li>
+      <li>Strict real-time safety: zero heap allocations, zero mutex locks, and zero blocking calls on the audio loop.</li>
+      <li>Integrated CabSim Impulse Response (IR) loader and zero-latency partitioned convolution.</li>
+      <li>Concurrent asynchronous 32-bit float WAV recording powered by Linux io_uring with 4 GiB auto-split and noise gate trim.</li>
+      <li>Half-band polyphase anti-aliasing oversampling (2× and 4×) and adaptive compute auto-slimming.</li>
+      <li>Hardware-accelerated SIMD AVX2/FMA baseline vectorization.</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.fabiohl.NAMAudioPipe.desktop</launchable>
+  <url type="homepage">https://github.com/fabiohl/NAM-Audio-Pipe</url>
+  <url type="bugtracker">https://github.com/fabiohl/NAM-Audio-Pipe/issues</url>
+  <url type="vcs-browser">https://github.com/fabiohl/NAM-Audio-Pipe</url>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+  </categories>
+  <keywords>
+    <keyword>audio</keyword>
+    <keyword>pipewire</keyword>
+    <keyword>nam</keyword>
+    <keyword>guitar</keyword>
+    <keyword>amplifier</keyword>
+    <keyword>cabsim</keyword>
+    <keyword>neural-network</keyword>
+    <keyword>wavenet</keyword>
+    <keyword>lstm</keyword>
+    <keyword>dsp</keyword>
+  </keywords>
+  <content_rating type="oars-1.1" />
+  <provides>
+    <binary>nam-audio-pipe</binary>
+  </provides>
+  <releases>
+    <release version="0.5.0" date="2026-08-19">
+      <description>
+        <p>NAM-Audio-Pipe 0.5.0 release with Flatpak metadata and PipeWire integration.</p>
+        <ul>
+          <li>Native low-latency PipeWire client support.</li>
+          <li>WaveNet and LSTM neural model inference with SIMD AVX2 acceleration.</li>
+          <li>Integrated CabSim IR convolver and io_uring WAV recorder.</li>
+          <li>Polyphase oversampling and adaptive compute.</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+</component>

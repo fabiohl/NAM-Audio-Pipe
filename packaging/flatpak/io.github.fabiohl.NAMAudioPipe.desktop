@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+[Desktop Entry]
+Type=Application
+Name=NAM Audio Pipe
+GenericName=Neural Amp Modeler PipeWire Host
+Comment=Low-latency PipeWire standalone host for Neural Amp Modeler (NAM)
+Exec=nam-audio-pipe
+Icon=io.github.fabiohl.NAMAudioPipe
+Terminal=true
+Categories=AudioVideo;Audio;ConsoleOnly;
+Keywords=audio;dsp;nam;guitar;amp;pipewire;
+StartupNotify=false

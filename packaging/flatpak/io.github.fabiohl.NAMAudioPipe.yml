@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+id: io.github.fabiohl.NAMAudioPipe
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk//25.08
+command: nam-audio-pipe
+
+finish-args:
+  - --socket=pipewire
+  - --share=ipc
+  - --device=all
+  - --filesystem=home:ro
+  - --socket=fallback-x11
+  - --socket=wayland
+
+modules:
+  - name: nam-audio-pipe
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 nam-audio-pipe ${FLATPAK_DEST}/bin/nam-audio-pipe
+      - install -Dm644 io.github.fabiohl.NAMAudioPipe.desktop ${FLATPAK_DEST}/share/applications/io.github.fabiohl.NAMAudioPipe.desktop
+      - install -Dm644 io.github.fabiohl.NAMAudioPipe.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.fabiohl.NAMAudioPipe.metainfo.xml
+      - install -Dm644 icons/hicolor/scalable/apps/io.github.fabiohl.NAMAudioPipe.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.fabiohl.NAMAudioPipe.svg
+      - install -Dm644 icons/hicolor/64x64/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/64x64/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/128x128/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/128x128/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/256x256/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.fabiohl.NAMAudioPipe.png
+      - install -Dm644 icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png
+    sources:
+      - type: file
+        path: nam-audio-pipe
+      - type: file
+        path: io.github.fabiohl.NAMAudioPipe.desktop
+      - type: file
+        path: io.github.fabiohl.NAMAudioPipe.metainfo.xml
+      - type: dir
+        path: icons

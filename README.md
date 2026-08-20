@@ -97,13 +97,97 @@ For maximum performance in live setups, `NAM-Audio-Pipe` includes a 5-phase opti
 
 #### What `build-release.sh` does under the hood
 
-1. **Phase 1 — Environment Verification:** Validates toolchain prerequisites (`rustc`, `cargo`, `python3`, `llvm-profdata`, `llvm-bolt`, and `perf`) and verifies target CPU flags from `.cargo/config.toml`.
+1. **Phase 1 — Environment Verification:** Validates toolchain prerequisites (`rustc`, `cargo`, `python3`, `tar`, `zstd`, `flatpak`, `llvm-profdata`, `llvm-bolt`, and `perf`) and verifies target CPU flags from `.cargo/config.toml`.
 2. **Phase 2 — PGO Trace Generation:** Compiles the `pgo_workload` binary with `-Cprofile-generate`, executing synthetic neural DSP workloads to collect realistic hardware branch and execution profile files (`.profraw`), merging them into `merged.profdata`.
 3. **Phase 3 — PGO-Optimized Compilation:** Recompiles `nam-audio-pipe` using `-Cprofile-use=merged.profdata` and relocation symbols (`-Clink-arg=-Wl,-q`), allowing LLVM to optimize hot loops, inline critical neural activation functions, and unroll vector SIMD loops based on real execution data.
 4. **Phase 4 — LLVM BOLT Machine Code Reordering:** Uses Linux `perf` to record CPU cycle samples during live execution, parses performance counters via `perf2bolt`, and reorders machine code binary instructions via `llvm-bolt` to minimize Instruction Cache (I-Cache) misses and TLB pressure.
 5. **Phase 4.5 — Assembly Hotspot Disassembly Report:** Generates an AI-ready assembly hotspot report at `target/dsp_hotpath.asm` for low-level inspection.
 6. **Phase 5 — Automated Deployment:** Strips and installs the finalized, hyper-optimized binary directly into `~/.local/bin/nam-audio-pipe`.
 7. **Phase 6 — Release Packaging (.tar.zst):** Generates a release distribution archive at `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.tar.zst` containing the optimized binary, documentation, license, and a 1-click installation script.
+8. **Phase 7 — Release Packaging (.flatpak):** Builds and exports the standalone Flatpak application bundle (`~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.flatpak`) configured with low-latency PipeWire, PulseAudio, IPC, and desktop metadata.
+
+#### CLI Options
+
+| Option          | Description                                                                                                     |
+|:--------------- |:--------------------------------------------------------------------------------------------------------------- |
+| `--install`     | Automatically installs the Flatpak application locally (`flatpak install --user`) in addition to `~/.local/bin/`|
+| `--no-flatpak`  | Skips Phase 7 (Flatpak bundle creation).                                                                        |
+| `--no-tarball`  | Skips Phase 6 (.tar.zst archive creation).                                                                      |
+| `--no-pgo`      | Skips Phase 2/3 (Profile-Guided Optimization) and compiles directly with the `dist` release profile.            |
+| `--no-bolt`     | Skips Phase 4 (LLVM BOLT post-link optimization).                                                               |
+| `-h, --help`    | Displays command-line help screen and exits.                                                                    |
+
+---
+
+### 3. Flatpak Standalone Application Distribution (`.flatpak`)
+
+In addition to traditional native binary deployment (`~/.local/bin/nam-audio-pipe`), `NAM-Audio-Pipe` is distributed as a standalone **Flatpak Application** (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform` runtime (`25.08`).
+
+The Flatpak bundle provides an isolated, reproducible runtime while retaining direct access to host PipeWire low-latency audio graphs, real-time power management QoS, and user model libraries.
+
+#### End-User Installation
+
+Install the `.flatpak` bundle directly into your local user Flatpak repository:
+
+```bash
+flatpak install --user --reinstall ~/nam-audio-pipe-v0.5.0-linux-x86_64-v3.flatpak
+```
+
+#### Running via Flatpak
+
+Execute `NAM-Audio-Pipe` inside the Flatpak sandbox using `flatpak run`:
+
+```bash
+# 1. Run environment diagnostic bundle
+flatpak run io.github.fabiohl.NAMAudioPipe --diagnose
+
+# 2. Run amp simulation with model and cabinet IR located in your home directory
+flatpak run io.github.fabiohl.NAMAudioPipe \
+  --model ~/models/BossWN-standard.nam \
+  --cab ~/irs/Marshall1960A.wav \
+  --buffer-size 64 \
+  --activation fast
+```
+
+#### Sandbox Permissions & Low-Latency Audio IPC
+
+The Flatpak package is pre-configured with carefully scoped permissions required for ultra-low latency audio processing:
+
+* `--filesystem=xdg-run/pipewire-0` — Direct client connection to the host PipeWire daemon Unix socket.
+* `--share=ipc` — POSIX shared memory and `memfd_create` support, allowing zero-copy audio buffer transport between the sandbox and PipeWire daemon.
+* `--device=all` — Grants access to `/dev/snd` and `/dev/cpu_dma_latency` for Linux PM QoS 0 µs C-state latency pinning.
+* `--filesystem=home:ro` — Read-only access to user home directory for resolving `.nam`/`.namb` neural models and `.wav` IR files.
+* `--socket=wayland` and `--socket=fallback-x11` — Windowing system integration.
+* `--socket=pulseaudio` — Fallback audio server connectivity.
+
+#### Developer Workflow (Building & Testing Flatpak Locally)
+
+1. **Automated Pipeline Build & Install:**
+
+   ```bash
+   ./utils/build-release.sh --install
+   ```
+
+2. **Standalone Manifest Compilation via `flatpak-builder`:**
+
+   ```bash
+   # Build the release binary first
+   cargo build --release
+
+   # Compile and install the application manifest locally
+   flatpak-builder --user --install --force-clean \
+     --state-dir=target/flatpak-builder \
+     target/flatpak-build \
+     packaging/flatpak/io.github.fabiohl.NAMAudioPipe.yml
+   ```
+
+#### Uninstallation
+
+To remove the Flatpak application:
+
+```bash
+flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
+```
 
 ---
 

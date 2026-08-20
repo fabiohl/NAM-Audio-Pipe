@@ -93,15 +93,16 @@ A 4-phase agile test runner executing under low CPU/IO priority (`nice -n 19`, `
 
 ## 4. Compiler Optimization Pipeline ([`utils/build-release.sh`](../utils/build-release.sh))
 
-A multi-stage optimization pipeline combining Profile-Guided Optimization (PGO) and LLVM BOLT:
+A multi-stage optimization and packaging pipeline combining Profile-Guided Optimization (PGO), LLVM BOLT, and Flatpak distribution:
 
-1. **Phase 1 (Environment Verification):** Validates required tools (`rustc`, `cargo`, `python3`, `llvm-profdata`, `llvm-bolt`, `perf`) and verifies `x86-64-v3` compiler flags.
+1. **Phase 1 (Environment Verification):** Validates required tools (`rustc`, `cargo`, `python3`, `tar`, `zstd`, `flatpak`, `llvm-profdata`, `llvm-bolt`, `perf`) and verifies `x86-64-v3` compiler flags.
 2. **Phase 2 (PGO Workload Profiling):** Builds `src/bin/pgo_workload.rs` with `-Cprofile-generate`, executes synthetic neural DSP workloads, and merges execution counters into `merged.profdata`.
 3. **Phase 3 (PGO Compilation):** Recompiles `nam-audio-pipe` using `-Cprofile-use=merged.profdata` and relocation symbols (`-Clink-arg=-Wl,-q`).
 4. **Phase 4 (LLVM BOLT Layout Optimization):** Uses Linux `perf` to capture CPU branch and instruction samples, then executes `llvm-bolt` to optimize instruction cache layout and minimize TLB misses.
 5. **Phase 4.5 (Assembly Hotspot Report):** Disassembles critical DSP loops into `target/dsp_hotpath.asm` for microarchitectural analysis.
 6. **Phase 5 (Deployment):** Strips and installs the hyper-optimized binary to `~/.local/bin/nam-audio-pipe`.
 7. **Phase 6 (Release Packaging):** Packages the release tarball `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.tar.zst` with installer script and documentation.
+8. **Phase 7 (Flatpak Application Packaging):** Builds the standalone Flatpak bundle `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.flatpak` with low-latency PipeWire, PulseAudio, IPC permissions, and desktop metadata. Support `--install` flag for automated user installation.
 
 ---
 
