@@ -5,11 +5,11 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 # NAM-Audio-Pipe
 
-![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg) ![Rust](https://img.shields.io/badge/Rust-orange.svg) ![PipeWire](https://img.shields.io/badge/PipeWire-%E2%89%A5%200.3-brightgreen.svg) ![Latency](https://img.shields.io/badge/Latency-Sub--ms-red.svg) ![RT-Safe](https://img.shields.io/badge/RT--Safe-Zero--Alloc-brightgreen.svg) ![SIMD](https://img.shields.io/badge/SIMD-AVX2%20%7C%20AVX--512-blueviolet.svg) ![Recording](https://img.shields.io/badge/Recording-WAV%2032bit%20Float-yellow.svg)
+![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg) ![Rust](https://img.shields.io/badge/Rust-orange.svg) ![PipeWire](https://img.shields.io/badge/PipeWire-%E2%89%A5%200.3-brightgreen.svg) ![Latency](https://img.shields.io/badge/Latency-Sub--ms-red.svg) ![RT-Safe](https://img.shields.io/badge/RT--Safe-Zero--Alloc-brightgreen.svg) ![SIMD](https://img.shields.io/badge/SIMD-AVX2%20x86--64--v3-blueviolet.svg) ![Recording](https://img.shields.io/badge/Recording-WAV%2032bit%20Float-yellow.svg)
 
 **NAM-Audio-Pipe** is an ultra-low latency, real-time standalone PipeWire host application for [Neural Amp Modeler (NAM)](https://www.neuralampmodeler.com/) simulation on Linux.
 
-It directly embeds [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) as its core neural DSP engine, inheriting all of its real-time guarantees: **zero heap allocations**, **zero locks**, **zero blocking system calls** on the audio thread, `x86-64-v3` (AVX2/FMA) baseline SIMD vectorization, AVX-512 multiversioning, and exact numerical parity against canonical C++ NAMCore and double-precision f64 reference oracles.
+It directly embeds [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) as its core neural DSP engine, inheriting all of its real-time guarantees: **zero heap allocations**, **zero locks**, **zero blocking system calls** on the audio thread, `x86-64-v3` (AVX2/FMA) production SIMD, and exact numerical parity against canonical C++ NAMCore and double-precision f64 reference oracles.
 
 Designed for live performance, automated studio routing, and headless Linux audio setups, NAM-Audio-Pipe processes audio directly over PipeWire graphs and provides built-in lock-free 32-bit float WAV stream recording.
 
@@ -39,7 +39,7 @@ Designed for live performance, automated studio routing, and headless Linux audi
 | **RT Determinism**             | Strict Zero Heap Drop, Zero Locks, Zero Hot-Path Logging                 | Guaranteed audio stability without buffer underruns (xruns)        |
 | **Kernel Latency Tuning**      | Zero DMA latency (`/dev/cpu_dma_latency` 0 µs), `mlockall`, THP disable  | Eliminates CPU C-state wake-up lag and virtual memory page faults  |
 | **CPU & IRQ Isolation**        | Dynamic `/proc/interrupts` load profiling + `pthread_setaffinity_np`     | Pins audio loop to the least-interrupted core (noisy neighbor safe)|
-| **SIMD Hardware Acceleration** | Mandatory `x86-64-v3` (AVX2/FMA) baseline + AVX-512 multiversioning      | Ultra-low CPU usage (< 3% of 1.33 ms quantum deadline)             |
+| **SIMD Hardware Acceleration** | Engine `x86-64-v3` (AVX2/FMA) production backend                         | Ultra-low CPU usage (< 3% of 1.33 ms quantum on the AVX2 path)     |
 | **Binary Optimization**        | Profile-Guided Optimization (PGO) + LLVM BOLT basic block reordering     | Drastically minimizes I-Cache and iTLB misses in DSP loops         |
 | **Cabinet IR Convolution**     | Partitioned FFT & Direct FIR convolution engine (.wav IRs)               | Seamless, zero-latency speaker cabinet simulation                  |
 | **WAV Recording**              | High-performance `tokio-uring` ringbuffer + 4 GiB auto-split (`--record`)| Records 32-bit float stereo WAV files in real-time with gate trim  |

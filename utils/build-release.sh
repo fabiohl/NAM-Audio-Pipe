@@ -727,11 +727,17 @@ else
     echo -e "\n${YELLOW}[Phase 7/7] Skipping Flatpak packaging (--no-flatpak).${NC}"
 fi
 
-echo -e "\n${GREEN}${BOLD}========================================================================${NC}"
+echo -e "\n${GREEN}${BOLD}================================================================================${NC}"
 echo -e "${GREEN}${BOLD}   Pipeline completed! Artifacts ready for distribution:                ${NC}"
-echo -e "${GREEN}${BOLD}========================================================================${NC}"
-ls -lath "$BIN_TARGET" $([ "$BUILD_TARBALL" = true ] && echo "$TARBALL") $([ "$BUILD_FLATPAK" = true ] && echo "$FLATPAK_BUNDLE")
-if [ -f "$PROJECT_DIR/target/dsp_hotpath.asm" ]; then
-    echo -e "\n${YELLOW}${BOLD}💡 AI-Ready Assembly Hotspots generated at:${NC} ${BOLD}target/dsp_hotpath.asm${NC}"
+echo -e "  ${BOLD}Artifacts saved:${NC}"
+echo -e "    - Binary Executable: ${CYAN}$BIN_TARGET${NC}"
+if [ "$BUILD_TARBALL" = true ]; then
+    echo -e "    - Tarball:           ${CYAN}$TARBALL${NC}"
 fi
-echo -e "${GREEN}${BOLD}========================================================================${NC}"
+if [ "$BUILD_FLATPAK" = true ]; then
+    echo -e "    - Flatpak Bundle:    ${CYAN}$FLATPAK_BUNDLE${NC}"
+fi
+if [ -f "$PROJECT_DIR/target/dsp_hotpath.asm" ]; then
+    echo -e "    - Assembly ASM:      ${CYAN}$PROJECT_DIR/target/dsp_hotpath.asm${NC}"
+fi
+echo -e "${GREEN}${BOLD}================================================================================${NC}\n"

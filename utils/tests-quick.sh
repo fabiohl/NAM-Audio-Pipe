@@ -179,8 +179,14 @@ if [ ${#GAPS[@]} -gt 0 ]; then
         emit "GAP: $g"
         echo -e "${YELLOW}${BOLD}WARN GAP: $g${NC}"
     done
-    echo -e "${YELLOW}${BOLD}OVERALL: PASSED_WITH_GAPS${NC}"
-    emit "OVERALL: PASSED_WITH_GAPS"
+    echo -e "\n${YELLOW}${BOLD}================================================================================${NC}"
+    echo -e "  ${BOLD}Artifacts saved:${NC}"
+    echo -e "    - Receipt:     ${CYAN}target/logs/quick-receipt.txt${NC}"
+    echo -e "    - Phase 1 log: ${CYAN}target/logs/quick-phase1.log${NC}"
+    echo -e "    - Phase 2 log: ${CYAN}target/logs/quick-phase2.log${NC}"
+    echo -e "    - Phase 3 log: ${CYAN}target/logs/quick-phase3.log${NC}"
+    echo -e "    - Phase 4 log: ${CYAN}target/logs/quick-phase4.log${NC}"
+    echo -e "${YELLOW}${BOLD}================================================================================${NC}\n"
     if [ "${NAM_QUICK_STRICT:-0}" = "1" ]; then
         echo -e "${RED}${BOLD}OVERALL: FAIL reason=strict_gaps${NC}"
         emit "OVERALL: FAIL reason=strict_gaps"
@@ -188,7 +194,14 @@ if [ ${#GAPS[@]} -gt 0 ]; then
     fi
     exit 0
 fi
-echo -e "${GREEN}${BOLD}=========================================${NC}"
-echo -e "${GREEN}${BOLD} All tests completed successfully!       ${NC}"
-echo -e "${GREEN}${BOLD}=========================================${NC}"
+
+echo -e "\n${GREEN}${BOLD}================================================================================${NC}"
+echo -e "${GREEN}${BOLD} All tests completed successfully! (NAM-Audio-Pipe)       ${NC}"
+echo -e "  ${BOLD}Artifacts saved:${NC}"
+echo -e "    - Receipt:     ${CYAN}target/logs/quick-receipt.txt${NC}"
+echo -e "    - Phase 1 log: ${CYAN}target/logs/quick-phase1.log${NC}"
+echo -e "    - Phase 2 log: ${CYAN}target/logs/quick-phase2.log${NC}"
+echo -e "    - Phase 3 log: ${CYAN}target/logs/quick-phase3.log${NC}"
+echo -e "    - Phase 4 log: ${CYAN}target/logs/quick-phase4.log${NC}"
+echo -e "${GREEN}${BOLD}================================================================================${NC}\n"
 emit "OVERALL: PASSED"
