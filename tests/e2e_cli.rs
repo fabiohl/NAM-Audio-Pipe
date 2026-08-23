@@ -47,7 +47,8 @@ fn diagnose_flag_exits_zero_and_prints_diagnostics() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("NAM-rs Diagnostic")
+        stdout.contains("NeuralAmpModeler-rs Diagnostic")
+            || stdout.contains("NAM-rs Diagnostic")
             || stdout.contains("System Information")
             || stdout.contains("Runtime State"),
         "--diagnose should print diagnostic sections, got: {}",
@@ -69,7 +70,8 @@ fn diagnose_full_exits_zero() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("NAM-rs Diagnostic")
+        stdout.contains("NeuralAmpModeler-rs Diagnostic")
+            || stdout.contains("NAM-rs Diagnostic")
             || stdout.contains("System Information")
             || stdout.contains("Runtime State"),
         "--diagnose-full should print diagnostic sections"

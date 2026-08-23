@@ -45,6 +45,7 @@ pub fn drain_cabsims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn empty_consumer_no_change_and_clean_lot() {
@@ -100,6 +101,6 @@ mod tests {
         assert!(active.is_none());
         assert!(parking_lot_dirty.load(Ordering::Acquire));
         let old = gc_c.pop().unwrap();
-        assert!(matches!(old, GcItem::CabConvAdapter(_)));
+        assert_matches!(old, GcItem::CabConvAdapter(_));
     }
 }

@@ -55,9 +55,14 @@ Designed for live performance, automated studio routing, and headless Linux audi
 | Dependency                | Minimum Version                              | Package / Command     |
 |:------------------------- |:-------------------------------------------- |:--------------------- |
 | **Linux Kernel**          | ≥ 5.10 (≥ 5.1 for io_uring)                  | `uname -r`            |
-| **Rust Toolchain**        | ≥ 1.85                                       | `rustc --version`     |
+| **Rust Toolchain**        | ≥ 1.98.0 (edition 2024)                      | `rustc --version`     |
 | **PipeWire Daemon**       | ≥ 0.3                                        | `pipewire --version`  |
 | **Development Libraries** | `libpipewire-0.3-dev`, `pkg-config`, `cmake` | See apt command below |
+
+> **MSRV policy:** `rust-version = "1.98.0"` in `Cargo.toml` is the **public MSRV promise**.
+> Development happens on `stable` (pinned by `rust-toolchain.toml`). The MSRV promise is
+> verified as an **isolated local check** — never mixed with the dev toolchain:
+> `cargo +1.98.0 check --locked` from the repository root.
 
 ### Installation of System Dependencies (Debian / Ubuntu / Pop!_OS)
 

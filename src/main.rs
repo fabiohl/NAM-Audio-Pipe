@@ -25,7 +25,7 @@ use neural_amp_modeler_rs::{common::spsc, common::spsc::ParamPayload};
 use std::ffi::CStr;
 use std::sync::atomic::Ordering;
 
-/// Entry point for NAM-rs.
+/// Entry point for NAM-Audio-Pipe.
 fn main() -> anyhow::Result<()> {
     // Install panic hook to capture crash diagnostics
     neural_amp_modeler_rs::common::panic_hook::install_panic_hook("standalone");
@@ -77,7 +77,7 @@ fn main() -> anyhow::Result<()> {
     rt_setup::calibrate_tsc();
 
     // 3. KNOW THE COMPUTER: Captures a "snapshot" of your processor's capabilities.
-    // This helps NAM-rs choose the fastest way to process the audio math.
+    // This helps NAM-Audio-Pipe choose the fastest way to process the audio math.
     let sys = SystemSnapshot::capture();
     log::info!(
         "🎸 {}",

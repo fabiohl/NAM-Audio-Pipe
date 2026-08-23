@@ -238,6 +238,7 @@ pub fn drain_os_engines(
 mod tests {
     use super::*;
     use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+    use std::assert_matches;
 
     #[test]
     fn drain_slimmable_empty_no_change() {
@@ -297,7 +298,7 @@ mod tests {
         assert!(parking_lot_dirty.load(Ordering::Acquire));
         let old1 = gc_c.pop().unwrap();
         let old2 = gc_c.pop().unwrap();
-        assert!(matches!(old1, GcItem::Oversample(_)));
-        assert!(matches!(old2, GcItem::Oversample(_)));
+        assert_matches!(old1, GcItem::Oversample(_));
+        assert_matches!(old2, GcItem::Oversample(_));
     }
 }

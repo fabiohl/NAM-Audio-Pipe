@@ -460,7 +460,7 @@ with wave.open('$TEST_WAV', 'w') as w:
                 fi
 
                 if [ -f "$TEST_WAV" ] && command -v pw-play &>/dev/null; then
-                    pw-play --target="NAM-rs-input" "$TEST_WAV" &
+                    pw-play --target="NAM-Audio-Pipe-input" "$TEST_WAV" &
                     PLAY_PID=$!
                     perf record "${PERF_ARGS[@]}" -- sleep 2 &>/dev/null || true
                     kill "$PLAY_PID" 2>/dev/null || true

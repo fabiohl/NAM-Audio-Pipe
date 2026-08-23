@@ -6,6 +6,7 @@
 //! in the L1/L2 caches, plus shared atomic flags for cross-thread coordination.
 
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU64;
 
 /// Maximum number of interleaved f32 samples per audio block, defined at compile time.
@@ -32,12 +33,20 @@ pub(crate) static OVERRUN_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 /// from pulling intensely mutated variables from the I/O thread's adjacency
 /// into the DSP thread's cache perimeter.
 ///
-/// `valid_len` tracks how many samples in `data` contain real audio — the remainder
-/// is zero-padding and must not be written to the WAV file.
+/// Samples are stored **planar** (channel L contiguous, then channel R contiguous)
+/// so the PipeWire→block copy is a plain `write_copy_of_slice` memcpy per channel —
+/// the RT hot path never touches uninitialized memory and never issues a full-array
+/// `assume_init()`. `valid_len` tracks how many samples in `data` contain real audio
+/// (`2 * frames` after a stereo fill); the remainder is uninitialized and must never
+/// be read. The disk consumer converts only `[0..valid_len]` to bytes, interleaving
+/// L/R on the fly (off-RT).
 #[repr(align(128))]
+#[derive(Debug)]
 pub struct AlignedBlock<const SIZE: usize> {
-    /// Interleaved f32 audio samples (channel L, channel R, L, R, ...).
-    pub data: [f32; SIZE],
+    /// Planar f32 audio samples: `data[0..n]` = channel L, `data[n..2n]` = channel R.
+    /// Stored as `MaybeUninit` so the RT path can fill without zero-initializing
+    /// the whole 16 KiB array (see `new_uninit`).
+    data: [MaybeUninit<f32>; SIZE],
     /// Number of valid f32 samples in `data[0..valid_len]`.
     pub valid_len: usize,
 }
@@ -46,19 +55,16 @@ impl<const SIZE: usize> AlignedBlock<SIZE> {
     /// Creates a new zeroed block without heap allocation.
     pub const fn new() -> Self {
         Self {
-            data: [0.0; SIZE],
+            data: [MaybeUninit::new(0.0); SIZE],
             valid_len: 0,
         }
     }
 
     /// Creates a block WITHOUT zero-initializing the data array.
     ///
-    /// # Safety
-    ///
-    /// All 32-bit patterns are valid IEEE 754 `f32` values, so the
-    /// uninitialized memory is not UB for this element type. The
-    /// consumer MUST only read `data[0..valid_len]` — garbage past
-    /// that boundary MUST be considered undefined.
+    /// All `MaybeUninit` slots start uninitialized. The consumer MUST only read
+    /// `[0..valid_len]` after a successful [`Self::fill_planar`] — garbage past
+    /// that boundary is not valid `f32` data.
     ///
     /// # Performance
     ///
@@ -66,18 +72,42 @@ impl<const SIZE: usize> AlignedBlock<SIZE> {
     /// `--record` active (~12 MB/s saved at 750 callbacks/s).
     /// On a 5-second capture at 48 kHz / 128-sample quanta
     /// (~1875 callbacks), this saves ~30 MiB of redundant writes.
-    #[expect(
-        clippy::uninit_assumed_init,
-        reason = "f32 has no invalid bit patterns — any 32 bits represent a valid (possibly NaN) float. The consumer only reads data[0..valid_len]."
-    )]
     #[inline]
     pub fn new_uninit() -> Self {
-        unsafe {
-            Self {
-                data: std::mem::MaybeUninit::uninit().assume_init(),
-                valid_len: 0,
-            }
+        Self {
+            data: [MaybeUninit::uninit(); SIZE],
+            valid_len: 0,
         }
+    }
+
+    /// Copies `left` and `right` (up to `SIZE / 2` frames each) into the planar
+    /// block via `MaybeUninit::write_copy_of_slice`, returning the new valid
+    /// length (`2 * frames`). Only the copied region is initialized; the rest of
+    /// the array is left untouched.
+    #[inline]
+    pub fn fill_planar(&mut self, left: &[f32], right: &[f32]) -> usize {
+        let n = left.len().min(right.len()).min(SIZE / 2);
+        let (l_slot, r_slot) = self.data.split_at_mut(n);
+        let l = l_slot[..n].write_copy_of_slice(&left[..n]);
+        let r = r_slot[..n].write_copy_of_slice(&right[..n]);
+        self.valid_len = l.len() + r.len();
+        self.valid_len
+    }
+
+    /// Returns the valid `[0..valid_len]` region as a `&[f32]`.
+    ///
+    /// # Safety
+    ///
+    /// Only the first `valid_len` elements are ever initialized (by `fill_planar`
+    /// or by [`Self::new`]'s zero-fill) before `valid_len` is updated, so the
+    /// slice projection is always fully initialized.
+    #[inline]
+    pub fn as_slice(&self) -> &[f32] {
+        // SAFETY: `valid_len` is only ever set after the corresponding
+        // `[0..valid_len]` elements have been initialized (fill_planar writes
+        // them, new/new_uninit start with valid_len == 0). Reading beyond that
+        // region is not possible through this API.
+        unsafe { self.data[..self.valid_len].assume_init_ref() }
     }
 }
 
@@ -104,6 +134,7 @@ pub struct AudioMetadata {
 /// Aligned to 128 bytes to ensure each slot occupies distinct cache lines,
 /// preventing false sharing between the producer (DSP) and consumer (I/O) cores.
 #[repr(align(128))]
+#[derive(Debug)]
 pub enum RingPayload<const SIZE: usize> {
     /// Audio block containing interleaved f32 samples ready for writing.
     Audio(AlignedBlock<SIZE>),
@@ -127,6 +158,7 @@ pub fn create_audio_ring_buffer<const BLOCK_SIZE: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn ring_buffer_push_pop_round_trip() {
@@ -137,25 +169,21 @@ mod tests {
             channels: 2,
         };
         assert!(p.push(RingPayload::Metadata(meta)).is_ok());
-        assert!(matches!(c.pop().unwrap(), RingPayload::Metadata(m) if m == meta));
+        assert_matches!(c.pop().unwrap(), RingPayload::Metadata(m) if m == meta);
     }
 
     #[test]
     fn ring_buffer_audio_round_trip() {
         let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
         let mut block = AlignedBlock::new();
-        block.valid_len = 128;
-        for i in 0..64 {
-            block.data[i * 2] = i as f32;
-            block.data[i * 2 + 1] = -(i as f32);
-        }
-        let expected = block.data;
+        block.fill_planar(&[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]);
         let expected_len = block.valid_len;
+        let expected = block.as_slice().to_vec();
         assert!(p.push(RingPayload::Audio(block)).is_ok());
         match c.pop().unwrap() {
             RingPayload::Audio(b) => {
                 assert_eq!(b.valid_len, expected_len);
-                assert_eq!(&b.data[..expected_len], &expected[..expected_len]);
+                assert_eq!(b.as_slice(), &expected[..]);
             }
             other => panic!(
                 "expected Audio payload, got {:?}",
@@ -168,7 +196,7 @@ mod tests {
     fn ring_buffer_stream_stop_round_trip() {
         let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
         assert!(p.push(RingPayload::StreamStop).is_ok());
-        assert!(matches!(c.pop().unwrap(), RingPayload::StreamStop));
+        assert_matches!(c.pop().unwrap(), RingPayload::StreamStop);
     }
 
     #[test]
@@ -181,17 +209,13 @@ mod tests {
         };
         p.push(RingPayload::Metadata(meta)).unwrap();
         let mut block = AlignedBlock::new();
-        block.valid_len = 4;
-        block.data[0] = 1.0;
-        block.data[1] = 2.0;
-        block.data[2] = 3.0;
-        block.data[3] = 4.0;
+        block.fill_planar(&[1.0, 2.0], &[3.0, 4.0]);
         p.push(RingPayload::Audio(block)).unwrap();
         p.push(RingPayload::StreamStop).unwrap();
 
-        assert!(matches!(c.pop().unwrap(), RingPayload::Metadata(_)));
-        assert!(matches!(c.pop().unwrap(), RingPayload::Audio(_)));
-        assert!(matches!(c.pop().unwrap(), RingPayload::StreamStop));
+        assert_matches!(c.pop().unwrap(), RingPayload::Metadata(_));
+        assert_matches!(c.pop().unwrap(), RingPayload::Audio(_));
+        assert_matches!(c.pop().unwrap(), RingPayload::StreamStop);
     }
 
     #[test]
@@ -202,9 +226,10 @@ mod tests {
 
     #[test]
     fn aligned_block_default_is_zero_init() {
-        let block = AlignedBlock::<MAX_BLOCK_SIZE>::default();
+        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::default();
         assert_eq!(block.valid_len, 0);
-        assert!(block.data.iter().all(|&x| x == 0.0));
+        block.valid_len = MAX_BLOCK_SIZE;
+        assert!(block.as_slice().iter().all(|&x| x == 0.0));
     }
 
     #[test]

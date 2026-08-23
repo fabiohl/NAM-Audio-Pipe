@@ -115,15 +115,16 @@ fn disk_writer_loop_creates_valid_wav() {
         .expect("metadata push should succeed");
 
     const BLOCK_SAMPLES: usize = 480;
-    let interleaved_len = BLOCK_SAMPLES * 2;
     for block_idx in 0..10u32 {
         let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+        let mut left = [0.0f32; BLOCK_SAMPLES];
+        let mut right = [0.0f32; BLOCK_SAMPLES];
         for i in 0..BLOCK_SAMPLES {
             let v = (block_idx * BLOCK_SAMPLES as u32 + i as u32) as f32 * 0.001;
-            block.data[i * 2] = v;
-            block.data[i * 2 + 1] = -v;
+            left[i] = v;
+            right[i] = -v;
         }
-        block.valid_len = interleaved_len;
+        block.fill_planar(&left, &right);
         producer
             .push(RingPayload::Audio(block))
             .expect("audio push should succeed");
@@ -240,11 +241,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
 
     // Push Audio BEFORE Metadata — should be discarded silently
     let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    for i in 0..64 {
-        block.data[i * 2] = 1.0;
-        block.data[i * 2 + 1] = -1.0;
-    }
-    block.valid_len = 128;
+    block.fill_planar(&[1.0f32; 64], &[-1.0f32; 64]);
     producer
         .push(RingPayload::Audio(block))
         .expect("audio push should succeed");
@@ -259,11 +256,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
         .expect("metadata push should succeed");
 
     let mut block2 = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    block2.valid_len = 4;
-    block2.data[0] = 0.5;
-    block2.data[1] = -0.5;
-    block2.data[2] = 0.6;
-    block2.data[3] = -0.6;
+    block2.fill_planar(&[0.5, 0.6], &[-0.5, -0.6]);
     producer
         .push(RingPayload::Audio(block2))
         .expect("audio push should succeed");
@@ -424,7 +417,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     // never leave `data=0` (incomplete header from the detached-join path).
     let file_bytes = std::fs::read(&wav_path).expect("failed to read recorded WAV");
     let data_pos = file_bytes
-        .windows(4)
+        .array_windows::<4>()
         .rposition(|w| w == b"data")
         .expect("'data' chunk not found in recorded WAV");
     let data_size = u32::from_le_bytes(file_bytes[data_pos + 4..data_pos + 8].try_into().unwrap());

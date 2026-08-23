@@ -4,7 +4,7 @@
 //! Telemetry and RT status monitoring for the audio engine.
 //!
 //! Translates atomic signals from the DSP thread into diagnostic logs for
-//! the main loop, acting as the "dashboard" of NAM-rs.
+//! the main loop, acting as the "dashboard" of NAM-Audio-Pipe.
 
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
@@ -22,7 +22,7 @@ pub struct PollState {
 
 /// Reads atomic RT status flags and emits monitoring logs to the user.
 ///
-/// This function acts as the "dashboard" of NAM-rs. It is called periodically
+/// This function acts as the "dashboard" of NAM-Audio-Pipe. It is called periodically
 /// to translate the technical signals coming from the audio thread (which is silent and ultra-fast)
 /// into understandable messages, performance warnings, and latency telemetry.
 ///

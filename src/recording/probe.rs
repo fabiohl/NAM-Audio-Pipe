@@ -53,17 +53,18 @@ pub fn probe_io_uring() -> IoUringSupport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn probe_returns_a_well_formed_verdict() {
         // The probe must never panic and must return exactly one of the three
         // variants; which one depends on the host kernel/security policy.
         let verdict = probe_io_uring();
-        assert!(matches!(
+        assert_matches!(
             verdict,
             IoUringSupport::Available
                 | IoUringSupport::KernelUnsupported
                 | IoUringSupport::ProbeFailed
-        ));
+        );
     }
 }

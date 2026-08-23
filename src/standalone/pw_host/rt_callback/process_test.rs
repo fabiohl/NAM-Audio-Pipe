@@ -229,10 +229,8 @@ fn recording_audio_normal_block_pushed() {
     match cons.pop().unwrap() {
         RingPayload::Audio(b) => {
             assert_eq!(b.valid_len, 8);
-            assert_eq!(b.data[0], 0.0);
-            assert_eq!(b.data[1], -0.0);
-            assert_eq!(b.data[2], 1.0);
-            assert_eq!(b.data[3], -1.0);
+            // Planar layout: L = [0, 1, 2, 3], R = [-0, -1, -2, -3].
+            assert_eq!(b.as_slice(), &[0.0, 1.0, 2.0, 3.0, -0.0, -1.0, -2.0, -3.0]);
         }
         _ => panic!("expected Audio"),
     }

@@ -50,6 +50,7 @@ pub fn drain_resamplers(
 mod tests {
     use super::*;
     use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING;
+    use std::assert_matches;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
@@ -112,7 +113,7 @@ mod tests {
         assert!(parking_lot_dirty.load(Ordering::Acquire));
 
         let old = gc_c.pop().unwrap();
-        assert!(matches!(old, GcItem::Resampler(_)));
+        assert_matches!(old, GcItem::Resampler(_));
     }
 
     #[test]

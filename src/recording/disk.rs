@@ -88,15 +88,21 @@ impl AsyncWavWriter {
             return Ok(());
         }
 
-        // Prepare the reusable I/O buffer with the block bytes (Little Endian per WAV spec)
+        // Prepare the reusable I/O buffer with the block bytes (Little Endian per WAV spec).
+        // The block is planar (L samples then R samples); the RIFF/WAV spec requires
+        // interleaved (L, R, L, R, ...) frame order, so interleave here on the disk
+        // (off-RT) thread.
         let bytes_len = valid_samples * 4;
         self.io_buf.clear();
         self.io_buf.reserve(bytes_len);
 
-        // Safe iterative byte conversion. `tokio_uring` requires buffer ownership;
-        // `f32::to_le_bytes()` ensures safety and platform independence.
-        for &sample in &block.data[..valid_samples] {
-            self.io_buf.extend_from_slice(&sample.to_le_bytes());
+        let frames = valid_samples / 2;
+        let (left, right) = block.as_slice().split_at(frames);
+        for (l, r) in left.iter().zip(right) {
+            // Safe iterative byte conversion. `tokio_uring` requires buffer ownership;
+            // `f32::to_le_bytes()` ensures safety and platform independence.
+            self.io_buf.extend_from_slice(&l.to_le_bytes());
+            self.io_buf.extend_from_slice(&r.to_le_bytes());
         }
 
         // tokio_uring takes ownership of the buffer for the async write.

@@ -5,7 +5,7 @@ use super::*;
 
 #[test]
 fn test_parse_args_diagnose() {
-    let args = vec!["nam-rs", "--diagnose"];
+    let args = vec!["nam-audio-pipe", "--diagnose"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert!(cli_args.diagnose);
@@ -14,7 +14,7 @@ fn test_parse_args_diagnose() {
 
 #[test]
 fn test_parse_args_diagnose_full() {
-    let args = vec!["nam-rs", "--diagnose-full"];
+    let args = vec!["nam-audio-pipe", "--diagnose-full"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert!(!cli_args.diagnose);
@@ -24,7 +24,7 @@ fn test_parse_args_diagnose_full() {
 #[test]
 fn test_parse_args_model_and_gains() {
     let args = vec![
-        "nam-rs",
+        "nam-audio-pipe",
         "-m",
         "my_model.nam",
         "-i",
@@ -46,7 +46,7 @@ fn test_parse_args_model_and_gains() {
 
 #[test]
 fn test_parse_args_activation_standard() {
-    let args = vec!["nam-rs", "--activation", "standard"];
+    let args = vec!["nam-audio-pipe", "--activation", "standard"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.activation, Some(ActivationPrecision::Standard));
@@ -54,7 +54,7 @@ fn test_parse_args_activation_standard() {
 
 #[test]
 fn test_parse_args_activation_fast() {
-    let args = vec!["nam-rs", "--activation", "fast"];
+    let args = vec!["nam-audio-pipe", "--activation", "fast"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.activation, Some(ActivationPrecision::Fast));
@@ -62,7 +62,7 @@ fn test_parse_args_activation_fast() {
 
 #[test]
 fn test_parse_args_activation_std_alias() {
-    let args = vec!["nam-rs", "--activation", "std"];
+    let args = vec!["nam-audio-pipe", "--activation", "std"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.activation, Some(ActivationPrecision::Standard));
@@ -84,7 +84,7 @@ fn test_parse_args_activation_default() {
     // a harmless real flag (`--buffer-size 256`, the documented default)
     // keeps `has_args = true` and exercises the same "activation not passed"
     // path without tripping that exit.
-    let args: Vec<&str> = vec!["nam-rs", "--buffer-size", "256"];
+    let args: Vec<&str> = vec!["nam-audio-pipe", "--buffer-size", "256"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.activation, None);

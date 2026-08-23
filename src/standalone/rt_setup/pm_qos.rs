@@ -14,7 +14,7 @@
 /// A watchdog thread with a 500ms timeout prevents hanging if the PipeWire daemon
 /// or `pw-metadata` is unresponsive.
 ///
-/// Returns `Some(name)` if a valid sink that is not NAM-rs itself is found,
+/// Returns `Some(name)` if a valid sink that is not NAM-Audio-Pipe itself is found,
 /// or `None` otherwise (allowing routing to be decided by WirePlumber).
 pub fn detect_hardware_sink() -> Option<String> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);

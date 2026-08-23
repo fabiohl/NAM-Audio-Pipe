@@ -26,11 +26,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) fn check_ffi_contract(raw: &[u8], offset: usize, size: usize) -> Option<(usize, usize)> {
     let align = std::mem::align_of::<f32>();
     if !(raw.as_ptr() as usize).is_multiple_of(align) || !offset.is_multiple_of(align) {
+        core::hint::cold_path();
         return None;
     }
     let n_bytes = size.min(raw.len().saturating_sub(offset));
     let n_samples = n_bytes / std::mem::size_of::<f32>();
     if offset + n_bytes > raw.len() || n_samples * std::mem::size_of::<f32>() != n_bytes {
+        core::hint::cold_path();
         return None;
     }
     Some((n_bytes, n_samples))
@@ -93,21 +95,14 @@ fn send_recording_audio(
     };
     let interleaved_len = n_pw * 2;
     if interleaved_len > MAX_BLOCK_SIZE {
+        core::hint::cold_path();
         OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
-    let dst = &mut block.data[..interleaved_len];
-    for (i, (&l, &r)) in resamp_out_l[..n_pw]
-        .iter()
-        .zip(&resamp_out_r[..n_pw])
-        .enumerate()
-    {
-        dst[i * 2] = l;
-        dst[i * 2 + 1] = r;
-    }
-    block.valid_len = interleaved_len;
+    block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
     if producer.push(RingPayload::Audio(block)).is_err() {
+        core::hint::cold_path();
         OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
     } else if let Some(flag) = recording_data_available {
         flag.store(true, Ordering::Relaxed);

@@ -8,6 +8,7 @@
 //! - `resolve_available_filename`: Resolves timestamp-based capture filenames and collision increments.
 
 use anyhow::{Context, Result};
+use core::fmt::NumBuffer;
 use std::path::{Path, PathBuf};
 
 use crate::recording::buffer::AudioMetadata;
@@ -41,7 +42,12 @@ pub fn resolve_available_filename(base_dir: &Path, part: u32) -> PathBuf {
     let base_name = if part <= 1 {
         format!("capture_{}.wav", timestamp)
     } else {
-        format!("capture_{}_part{}.wav", timestamp, part)
+        let mut part_buf = NumBuffer::new();
+        format!(
+            "capture_{}_part{}.wav",
+            timestamp,
+            part.format_into(&mut part_buf)
+        )
     };
 
     let candidate = base_dir.join(&base_name);
@@ -50,7 +56,12 @@ pub fn resolve_available_filename(base_dir: &Path, part: u32) -> PathBuf {
     }
 
     for suffix in 1u32.. {
-        let alt = base_dir.join(format!("capture_{}-{}.wav", timestamp, suffix));
+        let mut suffix_buf = NumBuffer::new();
+        let alt = base_dir.join(format!(
+            "capture_{}-{}.wav",
+            timestamp,
+            suffix.format_into(&mut suffix_buf)
+        ));
         if !alt.exists() {
             return alt;
         }
@@ -91,7 +102,7 @@ pub fn build_wav_header(meta: &AudioMetadata, data_bytes: u32) -> Result<Vec<u8>
     // Patch the "data" chunk size — explicit search via `rposition` for robustness,
     // avoiding the assumption that the last 4 bytes of the header are necessarily the size field.
     let data_pos = header
-        .windows(4)
+        .array_windows::<4>()
         .rposition(|w| w == b"data")
         .context("'data' chunk not found in the hound-generated WAV header")?;
     if data_pos + 8 > header.len() {
@@ -103,7 +114,7 @@ pub fn build_wav_header(meta: &AudioMetadata, data_bytes: u32) -> Result<Vec<u8>
     // Validates chunk size before patching for robustness against `hound` changes.
     if meta.bit_depth == 32 {
         let samples_per_channel = data_bytes / (meta.channels as u32 * (meta.bit_depth as u32 / 8));
-        if let Some(fact_pos) = header.windows(4).position(|w| w == b"fact")
+        if let Some(fact_pos) = header.array_windows::<4>().position(|w| w == b"fact")
             && fact_pos + 12 <= header.len()
         {
             let chunk_size = u32::from_le_bytes(
@@ -153,7 +164,10 @@ mod tests {
         assert_eq!(file_size, header.len() as u32 - 8 + data_bytes);
 
         // Verify data chunk size patch
-        let data_pos = header.windows(4).rposition(|w| w == b"data").unwrap();
+        let data_pos = header
+            .array_windows::<4>()
+            .rposition(|w| w == b"data")
+            .unwrap();
         let chunk_data_bytes =
             u32::from_le_bytes(header[data_pos + 4..data_pos + 8].try_into().unwrap());
         assert_eq!(chunk_data_bytes, data_bytes);

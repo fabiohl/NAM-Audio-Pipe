@@ -129,7 +129,7 @@ pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags
     let thread_id = unsafe { libc::pthread_self() };
 
     unsafe {
-        let name = b"nam_rs_dsp\0";
+        let name = b"nam_pipe_dsp\0";
         libc::pthread_setname_np(thread_id, name.as_ptr() as *const libc::c_char);
     }
 
