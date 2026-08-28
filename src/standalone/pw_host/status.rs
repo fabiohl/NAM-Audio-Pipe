@@ -114,6 +114,8 @@ impl BackendStatusSnapshot {
 #[derive(Debug, Default)]
 pub struct SharedBackendStatus {
     failed: AtomicBool,
+    capture_active: AtomicBool,
+    playback_active: AtomicBool,
     state: Mutex<BackendState>,
     failure_detail: Mutex<Option<BackendFailureDetail>>,
 }
@@ -173,13 +175,35 @@ impl SharedBackendStatus {
         }
     }
 
+    /// Updates active state for a stream (`capture` or `playback`).
+    pub fn set_stream_active(&self, stream: &'static str, active: bool) {
+        if stream == "capture" {
+            self.capture_active.store(active, Ordering::Release);
+        } else if stream == "playback" {
+            self.playback_active.store(active, Ordering::Release);
+        }
+        let cap = self.capture_active.load(Ordering::Acquire);
+        let pb = self.playback_active.load(Ordering::Acquire);
+        let mut guard = self.lock_state();
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
+        if cap && pb {
+            if matches!(
+                *guard,
+                BackendState::Starting | BackendState::Reconnecting { .. }
+            ) {
+                *guard = BackendState::Running;
+            }
+        } else if matches!(*guard, BackendState::Running) {
+            *guard = BackendState::Starting;
+        }
+    }
+
     /// Transitions to [`BackendState::Running`].
     ///
     /// A no-op once the backend failed — `Failed` is sticky so the control loop
-    /// always observes the terminal condition. The sticky check and the state
-    /// store happen under the same state-lock acquisition, so a concurrent
-    /// [`Self::mark_failed`] can never be erased by an in-flight
-    /// `mark_running` (T6.5 model-check invariant).
+    /// always observes the terminal condition.
     pub fn mark_running(&self) {
         let mut guard = self.lock_state();
         if self.failed.load(Ordering::Acquire) {
@@ -202,16 +226,6 @@ impl SharedBackendStatus {
 
     /// Transitions to [`BackendState::Failed`] for `stream` and records the
     /// sticky failure detail (F-RB-010 / T4.4).
-    ///
-    /// The whole transaction — state store, failure detail and the `Release`
-    /// store of the atomic flag — happens under one state-lock acquisition.
-    /// This gives two guarantees under concurrent writers:
-    ///
-    /// * any `Acquire` poll that observes the flag also observes the fully
-    ///   published `Failed` state and failure detail;
-    /// * no concurrent [`Self::mark_running`]/[`Self::mark_degraded`] can
-    ///   interleave between the state store and the flag store and erase the
-    ///   failure (the check-then-act race closed by T6.5).
     pub fn mark_failed(&self, stream: &'static str, reason: impl Into<String>) {
         let reason = reason.into();
         let mut guard = self.lock_state();
@@ -226,27 +240,16 @@ impl SharedBackendStatus {
     /// Marks the backend [`BackendState::Terminated`] after teardown finished.
     pub fn mark_terminated(&self) {
         *self.lock_state() = BackendState::Terminated;
+        self.capture_active.store(false, Ordering::Release);
+        self.playback_active.store(false, Ordering::Release);
     }
 
     /// Enters the bounded reconnect cycle (F-RB-010 / T4.5).
-    ///
-    /// Clears the sticky failure (flag + detail) and publishes the observable
-    /// [`BackendState::Reconnecting`] transition. Only the main control loop
-    /// calls this, and only *after* `thread_loop.stop()` returned — the dying
-    /// instance's state handlers can no longer fire, so no stale event can
-    /// re-assert the failure while the fresh instance is being built.
-    ///
-    /// The whole transaction happens under one state-lock acquisition. The
-    /// clear-before-publish ordering matters: clearing the `Acquire`-read
-    /// failure flag first means a poll that sees `Reconnecting` never sees a
-    /// stale `Failed`, and the fresh instance's `mark_running` on successful
-    /// reconnection is not a no-op. Holding the lock across all three stores
-    /// also makes the clear and the [`BackendState::Reconnecting`] publication
-    /// atomic with respect to a concurrent [`Self::mark_failed`] (T6.5
-    /// model-check invariant).
     pub fn begin_reconnect(&self, attempt: u32, total_attempts: u32, next_backoff: Duration) {
         let mut guard = self.lock_state();
         self.failed.store(false, Ordering::Release);
+        self.capture_active.store(false, Ordering::Release);
+        self.playback_active.store(false, Ordering::Release);
         *self.lock_failure_detail() = None;
         *guard = BackendState::Reconnecting {
             attempt,
@@ -269,17 +272,6 @@ impl SharedBackendStatus {
 }
 
 /// Maps a PipeWire stream-state transition to the backend state machine.
-///
-/// Installed on both the capture (`capture/listeners.rs`) and playback
-/// (`playback.rs`) streams:
-///
-/// * `StreamState::Error(err)` → [`BackendState::Failed`] (fatal);
-/// * `StreamState::Unconnected` after a previously connected (`Paused` /
-///   `Streaming`) state → [`BackendState::Failed`] (daemon restart/crash);
-/// * transition into `StreamState::Streaming` → [`BackendState::Running`]
-///   (recovery from a node switch or from [`BackendState::Degraded`]).
-///
-/// Executes on the PipeWire `ThreadLoop` thread (cold path, never RT).
 pub fn observe_stream_state(
     stream: &'static str,
     old: pw::stream::StreamState,
@@ -292,6 +284,7 @@ pub fn observe_stream_state(
                 "{} Critical PipeWire {stream} stream failure: {err}",
                 "💥".red(),
             );
+            backend.set_stream_active(stream, false);
             backend.mark_failed(stream, err);
         }
         pw::stream::StreamState::Unconnected if was_connected(&old) => {
@@ -300,16 +293,20 @@ pub fn observe_stream_state(
                  (daemon restart or crash) — bounded reconnect or fail-fast teardown follows.",
                 "🔌".red(),
             );
+            backend.set_stream_active(stream, false);
             backend.mark_failed(stream, "stream disconnected from the audio backend");
         }
-        pw::stream::StreamState::Paused if old == pw::stream::StreamState::Streaming => {
-            log::info!(
-                "{} Audio disconnected or node switch ({stream} stream).",
-                "⏸️".yellow(),
-            );
+        pw::stream::StreamState::Paused => {
+            backend.set_stream_active(stream, false);
+            if old == pw::stream::StreamState::Streaming {
+                log::info!(
+                    "{} Audio disconnected or node switch ({stream} stream).",
+                    "⏸️".yellow(),
+                );
+            }
         }
         pw::stream::StreamState::Streaming => {
-            backend.mark_running();
+            backend.set_stream_active(stream, true);
             if old == pw::stream::StreamState::Paused {
                 log::info!(
                     "{} Audio captured ({stream} connection established).",

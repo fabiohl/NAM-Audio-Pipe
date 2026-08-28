@@ -120,7 +120,8 @@ fn main() -> anyhow::Result<()> {
     // 6. LOAD THE MODEL: If a model path was provided, open the .nam file,
     // parse architecture & metadata, and push it to the audio thread.
     let model_setup = setup::load_initial_model(model_path.as_deref(), &sys, &mut producer);
-    let full_wavenet_model = model_setup.full_wavenet_model;
+    let full_wavenet_model_l = model_setup.full_wavenet_model_l;
+    let full_wavenet_model_r = model_setup.full_wavenet_model_r;
     let has_model_r = model_setup.has_model_r;
     let model_architecture = model_setup.architecture;
 
@@ -276,7 +277,8 @@ fn main() -> anyhow::Result<()> {
             sys,
             ir_raw_samples,
             ir_source_rate,
-            full_wavenet_model,
+            full_wavenet_model_l,
+            full_wavenet_model_r,
             has_model_r,
             slimmable_producer,
             os_producer,

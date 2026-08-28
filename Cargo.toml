@@ -63,7 +63,7 @@ heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
 proptest = "1.11.0"
 # ER-5 / T5.6 distribution QA harness: strict XML well-formedness parsing for
 # the AppStream metainfo audit (tests/distribution_qa.rs).
-quick-xml = "0.41"
+quick-xml = "0.42"
 # ER-5 / T5.6 distribution QA harness: JSON parsing + SHA-256 verification of
 # the release provenance receipt (tests/distribution_qa.rs).
 serde_json = "1"

@@ -36,6 +36,7 @@ use common::{DirGuard, temp_dir};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -61,7 +62,7 @@ const LONG_PHASE_NAMES: [&str; 5] = [
     "Phase 2: RT-Safety heap-audit (zero-alloc)",
     "Phase 3: RT Deadline gate (nanosecond budget)",
     "Phase 4: RT Jitter gate (inter-callback dispersion)",
-    "Phase 5: Concurrency model checking & resilience",
+    "Phase 5: Concurrency interleaving stress & state resilience",
 ];
 
 fn repo_root() -> PathBuf {
@@ -118,7 +119,7 @@ fn parse_release_entries(xml: &str) -> Result<Vec<(String, String)>, Vec<String>
     loop {
         match reader.read_event() {
             Ok(Event::Eof) => break,
-            Ok(Event::Start(e)) if e.name().as_ref() == b"release" => {
+            Ok(Event::Start(e)) if e.name().as_ref() == "release" => {
                 let mut version = String::new();
                 let mut date = String::new();
                 for attr in e.attributes() {
@@ -130,13 +131,13 @@ fn parse_release_entries(xml: &str) -> Result<Vec<(String, String)>, Vec<String>
                         }
                     };
                     match attr.key.as_ref() {
-                        b"version" => {
+                        "version" => {
                             version = attr
                                 .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                 .map(|c| c.into_owned())
                                 .unwrap_or_default();
                         }
-                        b"date" => {
+                        "date" => {
                             date = attr
                                 .normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                 .map(|c| c.into_owned())
@@ -430,7 +431,49 @@ TEST_RESULT[record_e2e]=SKIP:daemon_unavailable
 
 // ---------------------------------------------------------------------------
 // (c) Provenance integrity (F-RB-014 / T5.5)
-// ---------------------------------------------------------------------------
+fn get_git_head(dir: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to execute git rev-parse HEAD in {}: {e}",
+                dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD in {} exited with status {:?}",
+            dir.display(),
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn get_git_tree(dir: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD^{tree}"])
+        .output()
+        .map_err(|e| {
+            format!(
+                "failed to execute git rev-parse HEAD^{{tree}} in {}: {e}",
+                dir.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD^{{tree}} in {} exited with status {:?}",
+            dir.display(),
+            output.status.code()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 fn sha256_hex(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -443,10 +486,77 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
         .collect())
 }
 
-/// Fail-closed validator for the release provenance receipt: every artifact
-/// referenced in `artifacts` must exist on disk and its computed SHA-256 and
-/// size must match the recorded values exactly. Relative paths are resolved
-/// against the crate root (the receipt may be moved with the repo).
+fn verify_single_artifact(
+    name: &str,
+    art: &serde_json::Value,
+    root: &Path,
+    seen_paths: &mut HashMap<PathBuf, (String, u64)>,
+) -> Result<(), String> {
+    let art_obj = art
+        .as_object()
+        .ok_or_else(|| format!("artifact '{name}': expected an object"))?;
+    let rec_path = art_obj
+        .get("path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("artifact '{name}': missing 'path'"))?;
+    let abs = PathBuf::from(rec_path);
+    let abs = if abs.is_absolute() {
+        abs
+    } else {
+        root.join(abs)
+    };
+
+    if !abs.is_file() {
+        return Err(format!(
+            "'{name}': referenced file does not exist on disk: {}",
+            abs.display()
+        ));
+    }
+
+    let recorded_sha = art_obj
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("artifact '{name}': missing 'sha256' field"))?;
+
+    let actual_sha = sha256_hex(&abs)?;
+    if !actual_sha.eq_ignore_ascii_case(recorded_sha) {
+        return Err(format!(
+            "'{name}': SHA-256 mismatch (recorded {recorded_sha}, computed {actual_sha})"
+        ));
+    }
+
+    let recorded_size = art_obj
+        .get("size_bytes")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| format!("artifact '{name}': missing 'size_bytes' field"))?;
+
+    let actual_size = std::fs::metadata(&abs)
+        .map_err(|e| format!("stat {}: {e}", abs.display()))?
+        .len();
+    if actual_size != recorded_size {
+        return Err(format!(
+            "'{name}': size mismatch (recorded {recorded_size}, actual {actual_size})"
+        ));
+    }
+
+    if let Some((prev_sha, prev_size)) = seen_paths.get(&abs) {
+        if !prev_sha.eq_ignore_ascii_case(recorded_sha) || *prev_size != recorded_size {
+            return Err(format!(
+                "'{name}': duplicate path collision with divergent content: {}",
+                abs.display()
+            ));
+        }
+    } else {
+        seen_paths.insert(abs, (recorded_sha.to_string(), recorded_size));
+    }
+
+    Ok(())
+}
+
+/// Fail-closed validator for the release provenance receipt: every artifact,
+/// receipt, log, source commit, git tree SHA, lockfile hash, coupled dependency
+/// commit, and ceremony chain status must exist, match on-disk hashes/content,
+/// and be semantically consistent (T8.2).
 fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read provenance receipt {}: {e}", path.display()))?;
@@ -466,6 +576,81 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         ));
     }
 
+    let root = repo_root();
+
+    // 1. Validate project commit and tree SHA
+    let project = doc
+        .get("project")
+        .and_then(|v| v.as_object())
+        .ok_or("'project' object missing from receipt")?;
+    let rec_commit = project
+        .get("commit")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'project.commit'")?;
+    let actual_commit = get_git_head(&root)?;
+    if rec_commit != actual_commit {
+        return Err(format!(
+            "project.commit mismatch: recorded {rec_commit:?}, current HEAD is {actual_commit:?}"
+        ));
+    }
+
+    let rec_tree = project
+        .get("git_tree_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'project.git_tree_sha256'")?;
+    let actual_tree = get_git_tree(&root)?;
+    if rec_tree != actual_tree {
+        return Err(format!(
+            "git_tree_sha256 mismatch: recorded {rec_tree:?}, current tree is {actual_tree:?}"
+        ));
+    }
+
+    // 2. Validate dependencies (Cargo.lock hash and coupled NeuralAmpModeler-rs commit)
+    let deps = doc
+        .get("dependencies")
+        .and_then(|v| v.as_object())
+        .ok_or("'dependencies' object missing from receipt")?;
+    let rec_lock_sha = deps
+        .get("cargo_lock_sha256")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'dependencies.cargo_lock_sha256'")?;
+    let lock_path = root.join("Cargo.lock");
+    let actual_lock_sha = sha256_hex(&lock_path)?;
+    if !rec_lock_sha.eq_ignore_ascii_case(&actual_lock_sha) {
+        return Err(format!(
+            "cargo_lock_sha256 mismatch: recorded {rec_lock_sha:?}, actual Cargo.lock is {actual_lock_sha:?}"
+        ));
+    }
+
+    let rec_nam_commit = deps
+        .get("neural_amp_modeler_rs_commit")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'dependencies.neural_amp_modeler_rs_commit'")?;
+    let nam_dir = root.join("../NeuralAmpModeler-rs");
+    let expected_nam_commit = if nam_dir.join(".git").exists() {
+        get_git_head(&nam_dir)?
+    } else {
+        "not-a-git-repo".to_string()
+    };
+    if rec_nam_commit != expected_nam_commit {
+        return Err(format!(
+            "neural_amp_modeler_rs_commit mismatch: recorded {rec_nam_commit:?}, actual is {expected_nam_commit:?}"
+        ));
+    }
+
+    // 3. Validate ceremony_chain (Mandatory schema component, T8.2)
+    let chain = doc
+        .get("ceremony_chain")
+        .and_then(|v| v.as_object())
+        .ok_or("'ceremony_chain' object missing from receipt (old schema rejected)")?;
+    let status = chain
+        .get("certification_status")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'certification_status' in ceremony_chain")?;
+    if status != "certified_release" && status != "uncertified" {
+        return Err(format!("invalid certification_status: {status:?}"));
+    }
+
     let artifacts = doc
         .get("artifacts")
         .and_then(|v| v.as_object())
@@ -474,72 +659,143 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         return Err("'artifacts' object is empty — a release receipt with no certified artifacts cannot be trusted".into());
     }
 
-    let root = repo_root();
-    let mut problems = Vec::new();
+    let mut seen_paths = HashMap::new();
+    let mut total_audited = 0usize;
+
     for (name, art) in artifacts {
-        let art = art
-            .as_object()
-            .ok_or_else(|| format!("artifact '{name}': expected an object"))?;
-        let rec_path = art
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("artifact '{name}': missing 'path'"))?;
-        let abs = PathBuf::from(rec_path);
-        let abs = if abs.is_absolute() {
-            abs
+        verify_single_artifact(name, art, &root, &mut seen_paths)?;
+        total_audited += 1;
+    }
+
+    // Validate receipts and phase logs in ceremony_chain
+    if status == "certified_release" {
+        for req_receipt in [
+            "quick_receipt",
+            "long_receipt",
+            "pgo_receipt",
+            "release_receipt",
+        ] {
+            let art = chain
+                .get(req_receipt)
+                .and_then(|v| v.as_object())
+                .ok_or_else(|| {
+                    format!(
+                        "certified_release requires mandatory '{req_receipt}' in ceremony_chain"
+                    )
+                })?;
+            verify_single_artifact(
+                req_receipt,
+                &serde_json::Value::Object(art.clone()),
+                &root,
+                &mut seen_paths,
+            )?;
+            total_audited += 1;
+        }
+
+        let phase_logs = chain
+            .get("phase_logs")
+            .and_then(|v| v.as_object())
+            .ok_or("certified_release requires 'phase_logs' object in ceremony_chain")?;
+        if phase_logs.is_empty() {
+            return Err(
+                "certified_release requires non-empty 'phase_logs' in ceremony_chain".into(),
+            );
+        }
+        for (log_name, art) in phase_logs {
+            verify_single_artifact(
+                &format!("phase_log:{log_name}"),
+                art,
+                &root,
+                &mut seen_paths,
+            )?;
+            total_audited += 1;
+        }
+
+        // Validate semantic content of quick_receipt & long_receipt
+        let quick_art_obj = chain.get("quick_receipt").unwrap().as_object().unwrap();
+        let quick_path_str = quick_art_obj.get("path").unwrap().as_str().unwrap();
+        let quick_abs = if Path::new(quick_path_str).is_absolute() {
+            PathBuf::from(quick_path_str)
         } else {
-            root.join(abs)
+            root.join(quick_path_str)
         };
-
-        if !abs.is_file() {
-            problems.push(format!(
-                "'{name}': referenced file does not exist on disk: {}",
-                abs.display()
-            ));
-            continue;
+        let quick_text = std::fs::read_to_string(&quick_abs)
+            .map_err(|e| format!("read quick_receipt {}: {e}", quick_abs.display()))?;
+        if !quick_text.contains("STRICT: 1") || !quick_text.contains("OVERALL: PASSED") {
+            return Err(
+                "certified_release requires quick_receipt with STRICT: 1 and OVERALL: PASSED"
+                    .into(),
+            );
         }
 
-        match art.get("sha256").and_then(|v| v.as_str()) {
-            Some(recorded) => {
-                let actual = sha256_hex(&abs)?;
-                if !actual.eq_ignore_ascii_case(recorded) {
-                    problems.push(format!(
-                        "'{name}': SHA-256 mismatch (recorded {recorded}, computed {actual})"
-                    ));
-                }
-            }
-            None => problems.push(format!("'artifact {name}': missing 'sha256' field")),
+        let long_art_obj = chain.get("long_receipt").unwrap().as_object().unwrap();
+        let long_path_str = long_art_obj.get("path").unwrap().as_str().unwrap();
+        let long_abs = if Path::new(long_path_str).is_absolute() {
+            PathBuf::from(long_path_str)
+        } else {
+            root.join(long_path_str)
+        };
+        let long_text = std::fs::read_to_string(&long_abs)
+            .map_err(|e| format!("read long_receipt {}: {e}", long_abs.display()))?;
+        if !long_text.contains("STRICT: 1")
+            || !long_text.contains("MODE: full")
+            || !long_text.contains("OVERALL: PASSED")
+        {
+            return Err("certified_release requires long_receipt with STRICT: 1, MODE: full, and OVERALL: PASSED".into());
         }
-
-        match art.get("size_bytes").and_then(|v| v.as_u64()) {
-            Some(recorded) => {
-                let actual = std::fs::metadata(&abs)
-                    .map_err(|e| format!("stat {}: {e}", abs.display()))?
-                    .len();
-                if actual != recorded {
-                    problems.push(format!(
-                        "'{name}': size mismatch (recorded {recorded}, actual {actual})"
-                    ));
-                }
+    } else {
+        // Optional receipt verification when uncertified
+        for key in [
+            "quick_receipt",
+            "long_receipt",
+            "pgo_receipt",
+            "release_receipt",
+        ] {
+            if let Some(art) = chain.get(key).filter(|v| !v.is_null()) {
+                verify_single_artifact(key, art, &root, &mut seen_paths)?;
+                total_audited += 1;
             }
-            None => problems.push(format!("'artifact {name}': missing 'size_bytes' field")),
+        }
+        if let Some(phase_logs) = chain.get("phase_logs").and_then(|v| v.as_object()) {
+            for (log_name, art) in phase_logs {
+                verify_single_artifact(
+                    &format!("phase_log:{log_name}"),
+                    art,
+                    &root,
+                    &mut seen_paths,
+                )?;
+                total_audited += 1;
+            }
         }
     }
 
-    if !problems.is_empty() {
-        return Err(format!(
-            "provenance integrity violations ({}): {}",
-            problems.len(),
-            problems.join("; ")
-        ));
-    }
-    Ok(artifacts.len())
+    Ok(total_audited)
 }
 
-/// Writes a minimal synthetic provenance receipt referencing `files` (as
-/// `name -> path`) with the current on-disk hashes — used to exercise the
-/// validator's positive/negative paths without depending on a release build.
+fn write_synthetic_receipt_with_doc(receipt_path: &Path, doc: serde_json::Value) {
+    std::fs::write(
+        receipt_path,
+        serde_json::to_vec_pretty(&doc).expect("serialize receipt"),
+    )
+    .expect("write synthetic receipt");
+}
+
+/// Writes a full synthetic provenance receipt referencing `files` (as `name -> path`)
+/// with valid worktree commit, tree hash, lockfile SHA-256 and ceremony chain (T8.2).
 fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
+    let root = repo_root();
+    let commit = get_git_head(&root)
+        .unwrap_or_else(|_| "0000000000000000000000000000000000000000".to_string());
+    let tree_sha = get_git_tree(&root)
+        .unwrap_or_else(|_| "0000000000000000000000000000000000000000".to_string());
+    let lock_sha = sha256_hex(&root.join("Cargo.lock")).unwrap_or_default();
+    let nam_dir = root.join("../NeuralAmpModeler-rs");
+    let nam_commit = if nam_dir.join(".git").exists() {
+        get_git_head(&nam_dir).unwrap_or_else(|_| "not-a-git-repo".to_string())
+    } else {
+        "not-a-git-repo".to_string()
+    };
+
     let mut artifacts = serde_json::Map::new();
     for (name, path) in files {
         let mut art = serde_json::Map::new();
@@ -552,17 +808,42 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
         art.insert("size_bytes".into(), size.into());
         artifacts.insert((*name).into(), art.into());
     }
+
     let doc = serde_json::json!({
         "schema_version": 1,
         "tool": "distribution_qa.rs",
         "kind": "release-provenance",
-        "artifacts": artifacts,
+        "project": {
+            "name": "nam-audio-pipe",
+            "version": env!("CARGO_PKG_VERSION"),
+            "commit": commit,
+            "git_tree_sha256": tree_sha,
+            "timestamp_utc": "2026-08-28T00:00:00Z"
+        },
+        "toolchain": {
+            "rustc": "rustc 1.88.0",
+            "cargo": "cargo 1.88.0"
+        },
+        "build": {
+            "profile": "dist",
+            "rustflags": "-C target-cpu=x86-64-v3",
+            "optimizations": {
+                "status": "PGO+BOLT",
+                "cpu_baseline": "x86-64-v3",
+                "pgo": true,
+                "bolt": true
+            }
+        },
+        "dependencies": {
+            "cargo_lock_sha256": lock_sha,
+            "neural_amp_modeler_rs_commit": nam_commit
+        },
+        "ceremony_chain": {
+            "certification_status": "uncertified"
+        },
+        "artifacts": artifacts
     });
-    std::fs::write(
-        receipt_path,
-        serde_json::to_vec_pretty(&doc).expect("serialize receipt"),
-    )
-    .expect("write synthetic receipt");
+    write_synthetic_receipt_with_doc(receipt_path, doc);
 }
 
 /// (c) Positive: a receipt whose recorded hashes match the referenced files
@@ -579,6 +860,96 @@ fn provenance_validator_accepts_matching_receipt() {
     let audited = validate_provenance_receipt(&receipt)
         .unwrap_or_else(|e| panic!("matching receipt must validate: {e}"));
     assert_eq!(audited, 1);
+}
+
+/// (c) Negative: old schema missing `ceremony_chain` must be rejected (T8.2).
+#[test]
+fn provenance_validator_rejects_old_schema_without_ceremony_chain() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc.as_object_mut().unwrap().remove("ceremony_chain");
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("ceremony_chain") && err.contains("old schema rejected"),
+        "receipt without ceremony_chain must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: mismatched `project.commit` must be rejected (T8.2).
+#[test]
+fn provenance_validator_rejects_mismatched_commit() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["project"]["commit"] = "1111111111111111111111111111111111111111".into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("project.commit mismatch"),
+        "mismatched project.commit must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: mismatched `dependencies.cargo_lock_sha256` must be rejected (T8.2).
+#[test]
+fn provenance_validator_rejects_mismatched_lock_hash() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["dependencies"]["cargo_lock_sha256"] =
+        "2222222222222222222222222222222222222222222222222222222222222222".into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("cargo_lock_sha256 mismatch"),
+        "mismatched Cargo.lock hash must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: mismatched `dependencies.neural_amp_modeler_rs_commit` must be rejected (T8.2).
+#[test]
+fn provenance_validator_rejects_mismatched_nam_commit() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["dependencies"]["neural_amp_modeler_rs_commit"] =
+        "3333333333333333333333333333333333333333".into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("neural_amp_modeler_rs_commit mismatch"),
+        "mismatched neural_amp_modeler_rs_commit must be rejected, got: {err}"
+    );
 }
 
 /// (c) Negative: a receipt referencing a file that does not exist on disk
@@ -616,6 +987,66 @@ fn provenance_validator_rejects_tampered_hash() {
     assert!(
         err.contains("SHA-256 mismatch"),
         "hash divergence must be reported, got: {err}"
+    );
+}
+
+/// (c) Negative: `certification_status == "certified_release"` without quick `STRICT: 1` or
+/// long `STRICT: 1` + `MODE: full` + `OVERALL: PASSED` must be rejected (T8.2).
+#[test]
+fn provenance_validator_rejects_certified_release_without_strict_quick_or_long_receipt() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+
+    let quick_file = dir.join("quick-receipt.txt");
+    std::fs::write(
+        &quick_file,
+        "SUITE: tests-quick\nSTRICT: 0\nOVERALL: PASSED\n",
+    )
+    .unwrap();
+    let long_file = dir.join("long-receipt.txt");
+    std::fs::write(
+        &long_file,
+        "SUITE: tests-long\nSTRICT: 1\nMODE: full\nPHASE1: PASS log=p1.log\nPHASE2: PASS log=p2.log\nPHASE3: PASS log=p3.log\nPHASE4: PASS log=p4.log\nPHASE5: PASS log=p5.log\nOVERALL: PASSED\n",
+    )
+    .unwrap();
+    let pgo_file = dir.join("pgo-receipt.json");
+    std::fs::write(&pgo_file, "{}").unwrap();
+    let release_file = dir.join("release-receipt.json");
+    std::fs::write(&release_file, "{}").unwrap();
+    let log_file = dir.join("phase1.log");
+    std::fs::write(&log_file, "log content").unwrap();
+
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    let make_art = |p: &Path| {
+        serde_json::json!({
+            "path": p.display().to_string(),
+            "sha256": sha256_hex(p).unwrap(),
+            "size_bytes": std::fs::metadata(p).unwrap().len()
+        })
+    };
+
+    doc["ceremony_chain"] = serde_json::json!({
+        "certification_status": "certified_release",
+        "quick_receipt": make_art(&quick_file),
+        "long_receipt": make_art(&long_file),
+        "pgo_receipt": make_art(&pgo_file),
+        "release_receipt": make_art(&release_file),
+        "phase_logs": {
+            "phase1.log": make_art(&log_file)
+        }
+    });
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("quick_receipt with STRICT: 1 and OVERALL: PASSED"),
+        "non-strict quick receipt must be rejected in certified_release, got: {err}"
     );
 }
 
@@ -795,6 +1226,35 @@ fn long_suite_script_is_executable_and_fully_specified() {
     assert!(
         text.contains("--simulate") && text.contains("SIMULATE=1"),
         "{} must parse --simulate/--dry-run (the safe non-executing structural surface)",
+        path.display()
+    );
+}
+
+/// (e) Structural audit: `utils/build-release.sh` must enforce a real, strict long-suite
+/// receipt (`SUITE: tests-long`, `STRICT: 1`, `MODE: full`, `OVERALL: PASSED`) during `--release-ceremony`
+/// and strictly reject `SIMULATED`, `STRICT: 0`, `COMPLETED_WITH_GAPS`, `FAILED` or missing receipts (T8.1).
+#[test]
+fn build_release_script_requires_real_strict_long_receipt() {
+    let path = repo_root().join("utils/build-release.sh");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+
+    assert!(
+        text.contains("SUITE: tests-long")
+            && text.contains("STRICT: 1")
+            && text.contains("MODE: full")
+            && text.contains("OVERALL: PASSED"),
+        "{} must check for SUITE: tests-long, STRICT: 1, MODE: full, OVERALL: PASSED in long-receipt.txt",
+        path.display()
+    );
+    assert!(
+        !text.contains("tests-long.sh\" --simulate"),
+        "{} must NOT generate long receipt via --simulate in release ceremony",
+        path.display()
+    );
+    assert!(
+        text.contains("strictly rejected") || text.contains("tests-long.sh --strict-pre-release"),
+        "{} must instruct operator to execute tests-long.sh --strict-pre-release when receipt is absent/invalid",
         path.display()
     );
 }
@@ -1047,6 +1507,95 @@ impl LongReceipt {
             )),
         }
     }
+
+    /// Verifies if the receipt meets strict release certification requirements (T8.1):
+    /// `SUITE: tests-long`, `STRICT: 1`, `MODE: full`, `OVERALL: PASSED`.
+    fn verify_release_certification(&self) -> Result<(), String> {
+        self.audit()?;
+        if self.suite != "tests-long" {
+            return Err(format!("expected SUITE: tests-long, got {:?}", self.suite));
+        }
+        if !self.strict {
+            return Err("release certification requires STRICT: 1 (got STRICT: 0)".into());
+        }
+        if self.mode != "full" {
+            return Err(format!(
+                "release certification requires MODE: full (got {:?})",
+                self.mode
+            ));
+        }
+        if self.overall != "PASSED" {
+            return Err(format!(
+                "release certification requires OVERALL: PASSED (got {:?})",
+                self.overall
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// (e) Negative: `LongReceipt::verify_release_certification` must reject simulated receipts
+/// (`MODE: simulate`, `OVERALL: SIMULATED`) when evaluating release certification (T8.1).
+#[test]
+fn long_receipt_certification_rejects_simulated_receipt() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 0
+MODE: simulate
+PHASE1: SIMULATED log=target/logs/phase1-soak.log
+PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
+PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
+PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
+PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
+OVERALL: SIMULATED
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    let err = receipt.verify_release_certification().unwrap_err();
+    assert!(
+        err.contains("STRICT: 1") || err.contains("MODE: full") || err.contains("OVERALL: PASSED"),
+        "simulated receipt must be rejected for release certification, got: {err}"
+    );
+}
+
+/// (e) Negative: `LongReceipt::verify_release_certification` must reject `STRICT: 0` receipts
+/// even if all phases passed (T8.1).
+#[test]
+fn long_receipt_certification_rejects_non_strict_receipt() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 0
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    let err = receipt.verify_release_certification().unwrap_err();
+    assert!(
+        err.contains("STRICT: 1"),
+        "STRICT: 0 receipt must be rejected for release certification, got: {err}"
+    );
+}
+
+/// (e) Positive: `LongReceipt::verify_release_certification` accepts real strict passed receipt (T8.1).
+#[test]
+fn long_receipt_certification_accepts_real_strict_passed_receipt() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    receipt.verify_release_certification().unwrap();
 }
 
 /// (e) Positive: the `--simulate` receipt format (the sanctioned CI structural

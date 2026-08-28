@@ -12,7 +12,7 @@ use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, SlimModelPair,
+    CabSimSwapPayload, GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, SlimModelPair,
 };
 use neural_amp_modeler_rs::dsp::adaptive::AdaptiveCompute;
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
@@ -45,7 +45,7 @@ pub struct RtHostChannels {
     /// Dedicated channel receiving pre-built resamplers from the main thread.
     pub resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
     /// Dedicated channel receiving pre-built cab-sim pairs from the main thread.
-    pub cabsim_consumer: Consumer<Option<Box<CabSimPair>>>,
+    pub cabsim_consumer: Consumer<Box<CabSimSwapPayload>>,
 }
 
 /// Max oversampled buffer size: MAX_RESAMP_BUF × 4 (for X4 oversampling).
@@ -112,7 +112,7 @@ pub struct CaptureState {
     /// if its request generation advanced while parked. Slots are only touched
     /// by the RT callback; they never allocate.
     pub deferred_resampler: Option<Box<ResamplerSwapPayload>>,
-    pub deferred_cabsim: Option<Option<Box<CabSimPair>>>,
+    pub deferred_cabsim: Option<Box<CabSimSwapPayload>>,
     pub deferred_model: Option<ParamPayload>,
     pub deferred_slimmable: Option<Box<SlimModelPair>>,
     pub deferred_os: Option<Box<OsEnginePair>>,

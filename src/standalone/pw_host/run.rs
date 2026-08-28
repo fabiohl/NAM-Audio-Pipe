@@ -80,9 +80,9 @@ pub fn run_pipewire_host(
     gc_overflow: Arc<GcOverflowBuffer>,
     resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
     mut resampler_producer: rtrb::Producer<Box<ResamplerSwapPayload>>,
-    cabsim_consumer: Consumer<Option<Box<neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>>>,
+    cabsim_consumer: Consumer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
     mut cabsim_producer: rtrb::Producer<
-        Option<Box<neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>>,
+        Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>,
     >,
     rt_status: Arc<RtStatusFlags>,
     config: PipewireHostConfig,
@@ -97,7 +97,8 @@ pub fn run_pipewire_host(
         sys,
         ir_raw_samples,
         ir_source_rate,
-        full_wavenet_model,
+        full_wavenet_model_l,
+        full_wavenet_model_r,
         has_model_r,
         mut slimmable_producer,
         mut os_producer,
@@ -146,7 +147,8 @@ pub fn run_pipewire_host(
     // `sync_rate` (rt_callback/rate_sync.rs).
     let rate_for_param = rt_state.shared_target_rate.clone();
 
-    let full_wavenet_model = full_wavenet_model;
+    let full_wavenet_model_l = full_wavenet_model_l;
+    let full_wavenet_model_r = full_wavenet_model_r;
 
     // Place the recording producer (owned by the worker guard — RAII custody,
     // F-RB-009 / T3.5) on a stack slot so the RT closure can access it via a
@@ -264,8 +266,7 @@ pub fn run_pipewire_host(
             }
         };
 
-        let (capture_stream, capture_listener, playback_stream, playback_listener);
-        {
+        let setup_res: anyhow::Result<_> = (|| {
             let _lock = thread_loop.lock();
 
             let latency_str = format!("{}/48000", buffer_size);
@@ -286,8 +287,6 @@ pub fn run_pipewire_host(
                 recording_failed.clone(),
                 backend_for_capture.clone(),
             )?;
-            capture_stream = cs;
-            capture_listener = cl;
 
             let (ps, pl) = playback::setup_playback_stream(
                 &core,
@@ -297,9 +296,45 @@ pub fn run_pipewire_host(
                 rt_status.clone(),
                 backend_for_playback.clone(),
             )?;
-            playback_stream = ps;
-            playback_listener = pl;
-        }
+
+            Ok((cs, cl, ps, pl))
+        })();
+
+        let (capture_stream, capture_listener, playback_stream, playback_listener) = match setup_res
+        {
+            Ok(res) => res,
+            Err(e) => {
+                if reconnect.attempts_made() == 0 {
+                    return Err(e);
+                }
+                match reconnect.begin_attempt() {
+                    Some(backoff) => {
+                        log::warn!(
+                            "{} Stream setup failed during reconnect attempt {}/{} \
+                             ({e}); retrying in {:?}.",
+                            "🔁".yellow(),
+                            reconnect.attempts_made(),
+                            reconnect.policy().max_attempts,
+                            backoff,
+                        );
+                        backend_status.begin_reconnect(
+                            reconnect.attempts_made(),
+                            reconnect.policy().max_attempts,
+                            backoff,
+                        );
+                        if sleep_interruptible(backoff) {
+                            break 'host;
+                        }
+                        continue 'host;
+                    }
+                    None => {
+                        backend_failure =
+                            Some(("stream_setup", format!("stream setup failed: {e}")));
+                        break 'host;
+                    }
+                }
+            }
+        };
 
         let _app_state = AppState {
             capture_stream,
@@ -356,7 +391,8 @@ pub fn run_pipewire_host(
             );
             handlers::handle_slimmable_rebuild(
                 &rt_status,
-                full_wavenet_model.as_deref(),
+                full_wavenet_model_l.as_deref(),
+                full_wavenet_model_r.as_deref(),
                 has_model_r,
                 &sys,
                 &mut slimmable_producer,
@@ -400,6 +436,10 @@ pub fn run_pipewire_host(
         // the loop thread to finish its current iteration — is the main thread the
         // sole writer of the recording channel.
         thread_loop.stop();
+
+        // Invalidates/advances the DSP bridge to zero so a reconnected instance
+        // begins strictly in silence (T7.3 / G-RB-001).
+        unsafe { &*bridge_ptr.as_ptr() }.reset_to_silence();
 
         // R-04: single-owner handoff — the loop thread has stopped, so the RT
         // callback will never touch `rt_parking_lot` again. One canonical

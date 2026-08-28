@@ -428,11 +428,11 @@ run_rt_jitter_phase() {
     return 0
 }
 
-# --- Phase 5: Concurrency model checking & resilience ---
+# --- Phase 5: Concurrency interleaving stress & state resilience ---
 # 16-thread stress over swap requests, stream-state transitions, simulated
 # reconnect cycles and cooperative SHUTDOWN (T6.5) — zero deadlocks, no
 # inconsistent sample-rate reads, no leaked failure state. Emits typed markers
-# TEST_RESULT[model_check]=PASS/GAP:...
+# TEST_RESULT[concurrency_stress]=PASS/GAP:...
 run_concurrency_phase() {
     if [ ! -f tests/rt_metrics.rs ]; then
         echo "  → tests/rt_metrics.rs missing — planned by T6.5"
@@ -440,7 +440,7 @@ run_concurrency_phase() {
         return 2
     fi
     local rc=0
-    echo "  → rt_metrics concurrent state model checking (16 threads)"
+    echo "  → rt_metrics concurrent state interleaving stress (16 threads)"
     cargo test --features testing --release --no-fail-fast \
         --test rt_metrics -- concurrent --ignored --nocapture --test-threads=1 || rc=1
     # Same fail-closed precedence as the deadline gate: a real cargo failure
@@ -448,12 +448,12 @@ run_concurrency_phase() {
     if [ "$rc" -ne 0 ]; then
         return 1
     fi
-    if grep -qE "TEST_RESULT\[model_check\]=GAP|TEST_RESULT\[concurrent\]=GAP" "target/logs/phase5-concurrency.log"; then
-        record_gap "phase5:$(grep -oP 'TEST_RESULT\[(model_check|concurrent)\]=GAP:[^ ]+' target/logs/phase5-concurrency.log | head -n1)"
+    if grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent)\]=GAP" "target/logs/phase5-concurrency.log"; then
+        record_gap "phase5:$(grep -oP 'TEST_RESULT\[(concurrency_stress|model_check|concurrent)\]=GAP:[^ ]+' target/logs/phase5-concurrency.log | head -n1)"
         return 2
     fi
-    if ! grep -qE "TEST_RESULT\[model_check\]=PASS|TEST_RESULT\[concurrent\]=PASS" "target/logs/phase5-concurrency.log"; then
-        record_gap "phase5:no_typed_model_check_result"
+    if ! grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent)\]=PASS" "target/logs/phase5-concurrency.log"; then
+        record_gap "phase5:no_typed_concurrency_stress_result"
         return 2
     fi
     return 0
@@ -476,7 +476,7 @@ finish_phase "PHASE3" "phase3-rt-deadline.log" "$PHASE_RC"
 run_phase "Phase 4: RT Jitter gate (inter-callback dispersion)" "run_rt_jitter_phase" "phase4-rt-jitter.log" || true
 finish_phase "PHASE4" "phase4-rt-jitter.log" "$PHASE_RC"
 
-run_phase "Phase 5: Concurrency model checking & resilience" "run_concurrency_phase" "phase5-concurrency.log" || true
+run_phase "Phase 5: Concurrency interleaving stress & state resilience" "run_concurrency_phase" "phase5-concurrency.log" || true
 finish_phase "PHASE5" "phase5-concurrency.log" "$PHASE_RC"
 
 # ── Summary & verdict ──────────────────────────────────────────────────────

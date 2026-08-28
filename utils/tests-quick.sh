@@ -293,6 +293,8 @@ if [ ${#GAPS[@]} -gt 0 ]; then
         emit "OVERALL: FAIL reason=strict_gaps"
         exit 1
     fi
+    emit "OVERALL: COMPLETED_WITH_GAPS"
+    echo -e "${YELLOW}${BOLD}OVERALL: COMPLETED_WITH_GAPS${NC}"
     exit 0
 fi
 

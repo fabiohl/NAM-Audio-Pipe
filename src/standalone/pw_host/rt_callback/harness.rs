@@ -44,7 +44,7 @@ use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
     BridgeBuffer, BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspBuffers,
-    DspPipelineContext, MAX_BRIDGE_BUF, MAX_RESAMP_BUF, capture_dsp_pipeline,
+    DspPipelineContext, MAX_RESAMP_BUF, capture_dsp_pipeline,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::math::dsp::gain_lut::{GainLUT, get_gain_lut};
@@ -69,8 +69,8 @@ pub struct RtSwapHarness {
     gc_overflow: Arc<GcOverflowBuffer>,
     resampler_producer: Producer<Box<ResamplerSwapPayload>>,
     resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
-    cabsim_producer: Producer<Option<Box<CabSimPair>>>,
-    cabsim_consumer: Consumer<Option<Box<CabSimPair>>>,
+    cabsim_producer: Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
+    cabsim_consumer: Consumer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
     slimmable_producer: Producer<Box<SlimModelPair>>,
     os_producer: Producer<Box<OsEnginePair>>,
     parking_lot: [Option<GcItem>; 16],
@@ -100,18 +100,7 @@ impl RtSwapHarness {
         state.os_rx = Some(spsc.os_consumer);
 
         let bridge = Box::new(DspBridge {
-            buffers: [
-                BridgeBuffer {
-                    buf_l: [0.0; MAX_BRIDGE_BUF],
-                    buf_r: [0.0; MAX_BRIDGE_BUF],
-                    n_samples: 0,
-                },
-                BridgeBuffer {
-                    buf_l: [0.0; MAX_BRIDGE_BUF],
-                    buf_r: [0.0; MAX_BRIDGE_BUF],
-                    n_samples: 0,
-                },
-            ],
+            buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
             active_read_idx: Default::default(),
             generation: Default::default(),
             consumed_gen: Default::default(),
@@ -192,9 +181,20 @@ impl RtSwapHarness {
         }));
     }
 
-    /// Pushes a cab-sim pair; `None` clears/bypasses the cab-sim (F-RB-007).
+    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None` clears/bypasses the cab-sim (F-RB-007).
     pub fn push_cabsim(&mut self, pair: Option<Box<CabSimPair>>) {
-        let _ = self.cabsim_producer.push(pair);
+        let generation = self
+            .rt_status
+            .requested_cabsim_generation
+            .load(Ordering::Acquire);
+        self.push_cabsim_with_gen(generation, pair);
+    }
+
+    /// Pushes a cab-sim pair with explicit generation timestamp.
+    pub fn push_cabsim_with_gen(&mut self, generation: u64, pair: Option<Box<CabSimPair>>) {
+        let _ = self.cabsim_producer.push(Box::new(
+            neural_amp_modeler_rs::common::spsc::CabSimSwapPayload { generation, pair },
+        ));
     }
 
     /// Pushes an oversampling engine pair for an atomic L/R OS swap.
@@ -367,18 +367,20 @@ impl RtSwapHarness {
         // 6. Fail-open rollback guard (F-RB-004).
         if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
         {
-            if rt_status
-                .check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED)
-            {
-                let current_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
+            let failed_gen = rt_status
+                .resampler_failed_generation
+                .load(Ordering::Acquire);
+            let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
+
+            if failed_gen != 0 && failed_gen == requested_gen {
                 rt_status
                     .applied_rate_generation
-                    .store(current_gen, Ordering::Release);
+                    .store(requested_gen, Ordering::Release);
                 rt_status
                     .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
-                rt_status.clear_flag(
-                    neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED,
-                );
+                rt_status
+                    .resampler_failed_generation
+                    .store(0, Ordering::Release);
             } else {
                 return 0;
             }
@@ -400,6 +402,12 @@ impl RtSwapHarness {
         let writer = DspBridgeWriter::from_ref(bridge_ref)
             .expect("harness bridge pointer is non-null by construction");
 
+        let conv_pair = self
+            .state
+            .active_cabsim
+            .as_deref_mut()
+            .filter(|pair| pair.sample_rate == rate);
+
         let ctx = DspPipelineContext {
             resampler: &mut self.state.resampler,
             os_l: &mut self.state.os_l,
@@ -418,7 +426,7 @@ impl RtSwapHarness {
             adaptive: &mut self.state.adaptive_compute,
             bridge_writer: Some(writer),
             conv: None,
-            conv_pair: self.state.active_cabsim.as_deref_mut(),
+            conv_pair,
         };
         let bufs = DspBuffers {
             resamp_mid_l: &mut *self.state.resamp_mid_l,

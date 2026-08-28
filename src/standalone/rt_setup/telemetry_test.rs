@@ -9,23 +9,12 @@ use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_SLIMMABLE_RESET_FAILED, RT_STATUS_SLIMMABLE_SLICE_FAILED, RT_STATUS_THP_ACTIVE,
     RtStatusFlags,
 };
-use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, DspBridge, MAX_BRIDGE_BUF};
+use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, DspBridge};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 fn create_test_bridge() -> DspBridge {
     DspBridge {
-        buffers: [
-            BridgeBuffer {
-                buf_l: [0.0; MAX_BRIDGE_BUF],
-                buf_r: [0.0; MAX_BRIDGE_BUF],
-                n_samples: 0,
-            },
-            BridgeBuffer {
-                buf_l: [0.0; MAX_BRIDGE_BUF],
-                buf_r: [0.0; MAX_BRIDGE_BUF],
-                n_samples: 0,
-            },
-        ],
+        buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
         active_read_idx: AtomicUsize::new(0),
         generation: AtomicU64::new(0),
         consumed_gen: AtomicU64::new(0),

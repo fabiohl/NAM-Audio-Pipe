@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
-use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
+use crate::standalone::pw_host::output_pw;
+use neural_amp_modeler_rs::common::spsc::{RtStatusFlags, SHUTDOWN};
 use pipewire::stream::StreamState;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -208,6 +209,12 @@ fn observe_initial_unconnected_transition_is_not_fatal() {
 fn observe_streaming_transition_marks_running() {
     let backend = SharedBackendStatus::new();
     observe_stream_state(
+        "playback",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    observe_stream_state(
         "capture",
         StreamState::Paused,
         StreamState::Streaming,
@@ -228,7 +235,7 @@ fn observe_pause_transition_is_transient() {
         &backend,
     );
     assert!(!backend.is_failed());
-    assert_eq!(backend.state(), BackendState::Running);
+    assert_eq!(backend.state(), BackendState::Starting);
 }
 
 #[test]
@@ -334,4 +341,74 @@ fn concurrent_transitions_never_leak_incoherent_snapshots() {
         backend.snapshot().invariants_hold(),
         "final status snapshot is incoherent"
     );
+}
+
+#[test]
+fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
+    let rt = RtStatusFlags::default();
+    rt.capture_format_ok.store(0, Ordering::Relaxed);
+    rt.playback_format_ok.store(0, Ordering::Relaxed);
+    let backend = SharedBackendStatus::new();
+
+    // Case 1: Capture valid format, playback not-yet-ok
+    output_pw::mark_format_contract_ok(&rt, "capture");
+    backend.set_stream_active("capture", true);
+
+    // Audio MUST remain muted until all 4 conditions (capture_format_ok, playback_format_ok, capture_active, playback_active) are met
+    assert!(!rt.is_audio_unmuted());
+    assert_ne!(backend.state(), BackendState::Running);
+
+    // Case 2: Playback valid format, capture not-yet-ok
+    let rt2 = RtStatusFlags::default();
+    rt2.capture_format_ok.store(0, Ordering::Relaxed);
+    rt2.playback_format_ok.store(0, Ordering::Relaxed);
+    let backend2 = SharedBackendStatus::new();
+    output_pw::mark_format_contract_ok(&rt2, "playback");
+    backend2.set_stream_active("playback", true);
+
+    assert!(!rt2.is_audio_unmuted());
+    assert_ne!(backend2.state(), BackendState::Running);
+
+    // Case 3: Both format contracts ok AND both streams active -> is_audio_unmuted becomes true and state becomes Running
+    output_pw::mark_format_contract_ok(&rt, "playback");
+    backend.set_stream_active("playback", true);
+
+    assert!(rt.is_audio_unmuted());
+    assert_eq!(backend.state(), BackendState::Running);
+}
+
+#[test]
+fn invalid_stream_format_rejection_prevents_unmute() {
+    let rt = RtStatusFlags::default();
+    let backend = SharedBackendStatus::new();
+
+    // Valid capture format & active stream
+    output_pw::mark_format_contract_ok(&rt, "capture");
+    backend.set_stream_active("capture", true);
+
+    // Rejected/invalid playback format
+    output_pw::reject_negotiated_format_violation(
+        &rt,
+        "playback",
+        output_pw::ContractViolation::NotStereo(1),
+    );
+    backend.set_stream_active("playback", true);
+
+    // Audio must stay muted if playback format is invalid
+    assert!(!rt.is_audio_unmuted());
+
+    // Inverse: valid playback format & active stream, rejected capture format
+    let rt2 = RtStatusFlags::default();
+    let backend2 = SharedBackendStatus::new();
+
+    output_pw::mark_format_contract_ok(&rt2, "playback");
+    backend2.set_stream_active("playback", true);
+    output_pw::reject_negotiated_format_violation(
+        &rt2,
+        "capture",
+        output_pw::ContractViolation::NotStereo(1),
+    );
+    backend2.set_stream_active("capture", true);
+
+    assert!(!rt2.is_audio_unmuted());
 }

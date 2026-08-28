@@ -524,6 +524,10 @@ impl FfiHarnessBuf {
         unsafe { std::slice::from_raw_parts(self.samples.as_ptr() as *const u8, self.maxsize()) }
     }
 
+    fn as_samples(&self) -> &[f32] {
+        &self.samples
+    }
+
     fn fill_pattern(&mut self, byte: u8) {
         let bytes: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(self.samples.as_mut_ptr() as *mut u8, self.maxsize())
@@ -943,8 +947,9 @@ fn ffi_harness_rejects_quantum_exceeding_max_bridge_buf() {
     );
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
     assert!(
-        l.all_zero() && r.all_zero(),
-        "oversized quantum must silence both channels fail-closed"
+        l.as_samples()[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
+            && r.as_samples()[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+        "oversized quantum must silence both channels fail-closed up to max bridge bound"
     );
 }
 
@@ -1028,4 +1033,73 @@ fn ffi_harness_recovers_after_oversized_quantum() {
         ),
         Some((512, 128))
     );
+}
+
+#[test]
+fn recording_metadata_rate_change_full_ring_blocks_audio_until_consumed() {
+    let (prod, mut cons) = create_audio_ring_buffer(crate::recording::buffer::RING_CAPACITY);
+    let mut recording_producer = Some(prod);
+    let mut meta_sent = false;
+    let mut meta_rate = 44100u32;
+
+    // Send metadata for initial rate (44100)
+    send_recording_metadata(
+        &mut recording_producer,
+        44100,
+        &mut meta_sent,
+        &mut meta_rate,
+        None,
+        None,
+    );
+    assert!(meta_sent);
+    assert_eq!(meta_rate, 44100);
+    assert_eq!(cons.slots(), 1);
+
+    // Fill the ring buffer up to capacity
+    while cons.slots() < crate::recording::buffer::RING_CAPACITY {
+        let block = crate::recording::buffer::AlignedBlock::new_uninit();
+        if recording_producer
+            .as_mut()
+            .unwrap()
+            .push(crate::recording::buffer::RingPayload::Audio(block))
+            .is_err()
+        {
+            break;
+        }
+    }
+    assert_eq!(cons.slots(), crate::recording::buffer::RING_CAPACITY);
+
+    // Trigger rate change to 48000 while ring is full
+    send_recording_metadata(
+        &mut recording_producer,
+        48000,
+        &mut meta_sent,
+        &mut meta_rate,
+        None,
+        None,
+    );
+
+    // Ring is full -> Metadata(48000) push failed -> meta_sent MUST be false
+    assert!(
+        !meta_sent,
+        "Metadata push failure on rate change must invalidate meta_sent so audio is blocked"
+    );
+
+    // Free 1 slot in ring buffer
+    let _ = cons.pop();
+
+    // Retry sending metadata for new rate 48000 -> now it succeeds
+    send_recording_metadata(
+        &mut recording_producer,
+        48000,
+        &mut meta_sent,
+        &mut meta_rate,
+        None,
+        None,
+    );
+    assert!(
+        meta_sent,
+        "Metadata push on freed ring slot must succeed and set meta_sent to true"
+    );
+    assert_eq!(meta_rate, 48000);
 }

@@ -91,6 +91,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --release-ceremony)
             RELEASE_CEREMONY=true
+            STRICT_RELEASE=true
             shift
             ;;
         -h|--help)
@@ -299,8 +300,25 @@ BIN_TARGET="$BIN_INSTALL_DIR/nam-audio-pipe"
 # Official release ceremony: provenance can only bind artifacts to a clean,
 # identifiable commit. Enforced before any build or receipt is produced.
 if [ "$RELEASE_CEREMONY" = true ]; then
-    echo -e "\n${BLUE}${BOLD}Verifying release ceremony prerequisites (pristine worktree)...${NC}"
+    echo -e "\n${BLUE}${BOLD}Verifying release ceremony prerequisites (pristine worktree, quick & long receipts)...${NC}"
     verify_clean_worktree
+
+    echo -e "  → Executing quick QA suite in strict mode (NAM_QUICK_STRICT=1)..."
+    NAM_QUICK_STRICT=1 "$SCRIPT_DIR/tests-quick.sh"
+
+    LONG_RECEIPT_PATH="$PROJECT_DIR/target/logs/long-receipt.txt"
+    if [ -f "$LONG_RECEIPT_PATH" ]; then
+        echo -e "  → Verifying existing long suite receipt..."
+        if ! grep -qF "SUITE: tests-long" "$LONG_RECEIPT_PATH" || \
+           ! grep -qF "STRICT: 1" "$LONG_RECEIPT_PATH" || \
+           ! grep -qF "MODE: full" "$LONG_RECEIPT_PATH" || \
+           ! grep -qF "OVERALL: PASSED" "$LONG_RECEIPT_PATH"; then
+            die "Release ceremony requires a real, strict long suite receipt on disk (SUITE: tests-long, STRICT: 1, MODE: full, OVERALL: PASSED).\nReceipt at target/logs/long-receipt.txt failed verification (SIMULATED, STRICT: 0, COMPLETED_WITH_GAPS, FAILED or simulate mode are strictly rejected)."
+        fi
+        echo -e "  ${GREEN}✓${NC} Real strict long suite receipt verified (STRICT: 1, MODE: full, OVERALL: PASSED)."
+    else
+        die "Release ceremony requires a real, strict long suite receipt on disk (target/logs/long-receipt.txt is missing).\nPlease ask the human operator to execute:\n  ./utils/tests-long.sh --strict-pre-release\n(AI agents MUST NEVER execute the long suite directly)."
+    fi
 fi
 
 # -----------------------------------------------------------------------------
@@ -1135,11 +1153,13 @@ PY
 #   not a release); elsewhere it degrades to a typed warning.
 write_provenance_receipt() {
     mkdir -p "$PROJECT_DIR/target/logs"
-    local ts commit rustc_ver cargo_ver base_rustflags cpu_baseline \
+    local ts commit tree_sha rustc_ver cargo_ver base_rustflags cpu_baseline \
         lock_path nam_rs_dir nam_commit bin_bid bin_path tar_path \
-        flatpak_path appstream_path
+        flatpak_path appstream_path ceremony_status quick_receipt long_receipt \
+        pgo_receipt release_receipt
     ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-    commit="$(git rev-parse HEAD)"
+    commit="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
+    tree_sha="$(git rev-parse HEAD^{tree} 2>/dev/null || echo "unknown")"
     rustc_ver="$(rustc --version)"
     cargo_ver="$(cargo --version)"
     base_rustflags="${RELEASE_RUSTFLAGS:-$CONFIG_RUSTFLAGS $ORIG_RUSTFLAGS}"
@@ -1163,10 +1183,21 @@ write_provenance_receipt() {
     appstream_path="$PROJECT_DIR/packaging/flatpak/io.github.fabiohl.NAMAudioPipe.metainfo.xml"
     [ -f "$appstream_path" ] || appstream_path=""
 
-    if python3 - "$ts" "$commit" "$VERSION" "$rustc_ver" "$cargo_ver" \
+    ceremony_status="uncertified"
+    if [ "$RELEASE_CEREMONY" = true ] && [ "$STRICT_RELEASE" = true ]; then
+        ceremony_status="certified_release"
+    fi
+
+    quick_receipt="$PROJECT_DIR/target/logs/quick-receipt.txt"
+    long_receipt="$PROJECT_DIR/target/logs/long-receipt.txt"
+    pgo_receipt="$PROJECT_DIR/target/logs/pgo-workload-receipt.json"
+    release_receipt="$PROJECT_DIR/target/logs/release-receipt.json"
+
+    if python3 - "$ts" "$commit" "$tree_sha" "$VERSION" "$rustc_ver" "$cargo_ver" \
         "$base_rustflags" "$BOLT_STATUS" "$cpu_baseline" "$lock_path" \
         "$nam_commit" "$bin_bid" "$bin_path" "$tar_path" "$flatpak_path" \
-        "$appstream_path" > "$PROVENANCE_RECEIPT" <<'PY'
+        "$appstream_path" "$ceremony_status" "$quick_receipt" "$long_receipt" \
+        "$pgo_receipt" "$release_receipt" > "$PROVENANCE_RECEIPT" <<'PY'
 import hashlib
 import json
 import os
@@ -1181,11 +1212,12 @@ def sha256(path):
     return h.hexdigest()
 
 
-(ts, commit, version, rustc_ver, cargo_ver, rustflags, opt_status,
+(ts, commit, tree_sha, version, rustc_ver, cargo_ver, rustflags, opt_status,
  cpu_baseline, lock_path, nam_commit, bin_bid, bin_path, tar_path,
- flatpak_path, appstream_path) = sys.argv[1:16]
+ flatpak_path, appstream_path, ceremony_status, quick_receipt, long_receipt,
+ pgo_receipt, release_receipt) = sys.argv[1:22]
 
-lock_sha = sha256(lock_path)
+lock_sha = sha256(lock_path) if os.path.isfile(lock_path) else None
 
 
 def artifact(path):
@@ -1212,6 +1244,46 @@ for name, path in (
     if art is not None:
         artifacts[name] = art
 
+phase_logs = {}
+target_logs = os.path.join(os.path.dirname(lock_path), "target", "logs")
+if os.path.isdir(target_logs):
+    for fname in sorted(os.listdir(target_logs)):
+        if fname.endswith(".log"):
+            lpath = os.path.join(target_logs, fname)
+            art = artifact(lpath)
+            if art:
+                phase_logs[fname] = art
+
+quick_art = artifact(quick_receipt)
+long_art = artifact(long_receipt)
+pgo_art = artifact(pgo_receipt)
+release_art = artifact(release_receipt)
+
+if ceremony_status == "certified_release":
+    missing = []
+    if not commit or commit == "unknown":
+        missing.append("project.commit")
+    if not tree_sha or tree_sha == "unknown":
+        missing.append("git_tree_sha256")
+    if not lock_sha:
+        missing.append("Cargo.lock sha256")
+    if not nam_commit or nam_commit == "not-a-git-repo":
+        missing.append("neural_amp_modeler_rs_commit")
+    if not quick_art:
+        missing.append("quick_receipt")
+    if not long_art:
+        missing.append("long_receipt")
+    if not pgo_art:
+        missing.append("pgo_receipt")
+    if not release_art:
+        missing.append("release_receipt")
+    if not phase_logs:
+        missing.append("phase_logs")
+    if missing:
+        raise RuntimeError(
+            f"Release ceremony requires a complete provenance chain. Missing: {', '.join(missing)}"
+        )
+
 doc = {
     "schema_version": 1,
     "tool": "build-release.sh",
@@ -1220,6 +1292,7 @@ doc = {
         "name": "nam-audio-pipe",
         "version": version,
         "commit": commit,
+        "git_tree_sha256": tree_sha,
         "timestamp_utc": ts,
     },
     "toolchain": {"rustc": rustc_ver, "cargo": cargo_ver},
@@ -1236,6 +1309,14 @@ doc = {
     "dependencies": {
         "cargo_lock_sha256": lock_sha,
         "neural_amp_modeler_rs_commit": nam_commit,
+    },
+    "ceremony_chain": {
+        "certification_status": ceremony_status,
+        "quick_receipt": quick_art,
+        "long_receipt": long_art,
+        "pgo_receipt": pgo_art,
+        "release_receipt": release_art,
+        "phase_logs": phase_logs,
     },
     "artifacts": artifacts,
 }
@@ -1643,16 +1724,21 @@ if [ "$BUILD_FLATPAK" = true ]; then
     fi
     echo -e "  ${GREEN}✓${NC} Flatpak bundle integrity verified (import + manifest inspection)."
 
+    echo -e "  Running in-sandbox Flatpak smoke test..."
+    FLATPAK_BIN_SHA=$(sha256sum "$FLATPAK_BUILD_DIR/files/bin/nam-audio-pipe" | awk '{print $1}')
+    INSTALLED_SHA=$(sha256sum "$BIN_TARGET" | awk '{print $1}')
+    if [ "$FLATPAK_BIN_SHA" != "$INSTALLED_SHA" ]; then
+        die "Flatpak smoke test failed: packaged binary SHA-256 ($FLATPAK_BIN_SHA) differs from provenanced binary ($INSTALLED_SHA)."
+    fi
+    if ! flatpak build-run --command=nam-audio-pipe "$FLATPAK_BUILD_DIR" --diagnose >/dev/null 2>&1; then
+        die "In-sandbox Flatpak smoke test failed (flatpak build-run --diagnose returned non-zero)."
+    fi
+    echo -e "  ${GREEN}✓${NC} In-sandbox Flatpak smoke test passed (binary SHA matched provenanced ELF, --diagnose succeeded)."
+
     if [ "$DO_INSTALL_FLATPAK" = true ]; then
         echo -e "  Installing Flatpak application locally for current user..."
         flatpak install --user --reinstall -y "$FLATPAK_BUNDLE"
         echo -e "  ${GREEN}✓${NC} Flatpak application installed successfully."
-
-        echo -e "  Running in-sandbox smoke test: flatpak run --command=nam-audio-pipe --diagnose..."
-        if ! flatpak run --command=nam-audio-pipe io.github.fabiohl.NAMAudioPipe --diagnose; then
-            die "In-sandbox smoke test failed (flatpak run --diagnose returned non-zero)."
-        fi
-        echo -e "  ${GREEN}✓${NC} In-sandbox smoke test passed."
     fi
 
     rm -rf "$FLATPAK_SMOKE_REPO"

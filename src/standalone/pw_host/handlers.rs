@@ -9,7 +9,7 @@
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
 use neural_amp_modeler_rs::common::spsc::{
-    self, ResamplerSwapPayload, RtStatusFlags, SlimModelPair,
+    self, CabSimSwapPayload, ResamplerSwapPayload, RtStatusFlags, SlimModelPair,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
 use neural_amp_modeler_rs::dsp::cabsim::conv::ConvEngine;
@@ -45,7 +45,9 @@ pub(super) fn handle_resampler_rebuild(
     if target_host_rate != 0 && target_nam_rate != 0 {
         match NamResampler::new(target_host_rate, target_nam_rate, 2048) {
             Ok(new_rs) => {
-                rt_status.clear_flag_relaxed(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED);
+                rt_status
+                    .resampler_failed_generation
+                    .store(0, Ordering::Release);
 
                 log::info!(
                     "{} Sample rate updated: PW={} Hz, NAM={} Hz (bypass={})",
@@ -94,7 +96,9 @@ pub(super) fn handle_resampler_rebuild(
                     .param("detail", e)
                     .emit();
 
-                rt_status.set_flag(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED);
+                rt_status
+                    .resampler_failed_generation
+                    .store(generation, Ordering::Release);
                 rearm_rebuild_if_superseded(rt_status, generation);
             }
         }
@@ -165,7 +169,7 @@ pub(super) fn handle_cabsim_rebuild(
     ir_raw_samples: Option<&[f32]>,
     ir_source_rate: u32,
     sys: &SystemSnapshot,
-    cabsim_producer: &mut rtrb::Producer<Option<Box<CabSimPair>>>,
+    cabsim_producer: &mut rtrb::Producer<Box<CabSimSwapPayload>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD) {
         return;
@@ -214,7 +218,11 @@ pub(super) fn handle_cabsim_rebuild(
             );
             // Box::new runs exclusively on this (non-RT) main thread: the RT
             // swap then moves the same allocation into the GC (F-RB-007).
-            if cabsim_producer.push(Some(Box::new(pair))).is_err() {
+            let payload = Box::new(CabSimSwapPayload {
+                generation,
+                pair: Some(Box::new(pair)),
+            });
+            if cabsim_producer.push(payload).is_err() {
                 // Fail-closed: keep NEEDS_CABSIM_REBUILD so the next
                 // main-loop iteration retries. Clearing NEEDS here
                 // would lock the RT on the stale partition/rate.
@@ -238,7 +246,11 @@ pub(super) fn handle_cabsim_rebuild(
                 target_host_rate,
                 partition_size,
             );
-            if cabsim_producer.push(None).is_err() {
+            let payload = Box::new(CabSimSwapPayload {
+                generation,
+                pair: None,
+            });
+            if cabsim_producer.push(payload).is_err() {
                 NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
                     .message("Cab-sim bypass channel full. Rebuild will be retried.")
                     .hint(
@@ -325,7 +337,8 @@ fn rearm_cabsim_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
 /// main-loop iteration.
 pub(super) fn handle_slimmable_rebuild(
     rt_status: &RtStatusFlags,
-    full_wavenet_model: Option<&StaticModel>,
+    full_wavenet_model_l: Option<&StaticModel>,
+    full_wavenet_model_r: Option<&StaticModel>,
     has_model_r: bool,
     sys: &SystemSnapshot,
     slimmable_producer: &mut rtrb::Producer<Box<SlimModelPair>>,
@@ -337,10 +350,10 @@ pub(super) fn handle_slimmable_rebuild(
     if target_ch < 4 {
         return;
     }
-    let Some(m) = full_wavenet_model else {
+    let Some(m_l) = full_wavenet_model_l else {
         return;
     };
-    let StaticModel::WavenetDyn(w) = m else {
+    let StaticModel::WavenetDyn(w_l) = m_l else {
         return;
     };
 
@@ -348,8 +361,8 @@ pub(super) fn handle_slimmable_rebuild(
         .requested_slimmable_generation
         .load(Ordering::Acquire);
 
-    // Build L channel model (same weights, same target_ch).
-    let model_l = match slice_wavenet_model(w.as_ref(), target_ch) {
+    // Build L channel model from full_wavenet_model_l.
+    let model_l = match slice_wavenet_model(w_l.as_ref(), target_ch) {
         Ok(mut slimmed) => {
             slimmed.prewarm();
             Box::new(StaticModel::WavenetDyn(Box::new(slimmed)))
@@ -360,10 +373,17 @@ pub(super) fn handle_slimmable_rebuild(
         }
     };
 
-    // Build R channel model only for stereo configurations (F-RB-005: the pair
-    // must not introduce a generation mismatch in the R channel).
+    // Build R channel model from full_wavenet_model_r for stereo configurations.
     let model_r = if has_model_r {
-        match slice_wavenet_model(w.as_ref(), target_ch) {
+        let Some(m_r) = full_wavenet_model_r else {
+            rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
+            return;
+        };
+        let StaticModel::WavenetDyn(w_r) = m_r else {
+            rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
+            return;
+        };
+        match slice_wavenet_model(w_r.as_ref(), target_ch) {
             Ok(mut slimmed) => {
                 slimmed.prewarm();
                 Some(Box::new(StaticModel::WavenetDyn(Box::new(slimmed))))

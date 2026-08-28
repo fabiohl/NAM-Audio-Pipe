@@ -76,7 +76,14 @@ fn slimmable_pair_built_and_pushed_atomically() {
 
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(2);
 
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), true, &sys, &mut prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut prod,
+    );
 
     assert!(
         !flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
@@ -106,7 +113,7 @@ fn slimmable_mono_pair_has_no_r() {
 
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(2);
 
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), false, &sys, &mut prod);
+    handle_slimmable_rebuild(&flags, Some(full.as_ref()), None, false, &sys, &mut prod);
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
     let pair = cons.pop().expect("one pair must be delivered");
@@ -128,7 +135,14 @@ fn slimmable_push_full_keeps_needs_for_retry() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(1);
     prod.push(fake_pair(0, 8)).unwrap();
 
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), true, &sys, &mut prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut prod,
+    );
 
     assert!(
         flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
@@ -138,7 +152,14 @@ fn slimmable_push_full_keeps_needs_for_retry() {
 
     // Free the channel and retry: the whole pair is now delivered.
     let _ = cons.pop().unwrap();
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), true, &sys, &mut prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
     let pair = cons.pop().expect("retry must deliver the pair");
     assert_eq!(pair.channels, 4);
@@ -197,7 +218,14 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
 
     // RT requests A (gen 1, ch 4); main builds and pushes pair A.
     request_slimmable_rebuild(&flags, 4);
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), true, &sys, &mut sl_prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut sl_prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 
     // RT renegotiates to B (gen 2, ch 4) while A is still in the channel.
@@ -224,7 +252,14 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     assert_eq!(model_r.as_ref().unwrap().channels(), 7);
 
     // Main delivers B for generation 2 and clears the request.
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), true, &sys, &mut sl_prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut sl_prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 
     // RT drain: B matches the current generation → applied atomically.
@@ -349,9 +384,12 @@ fn cabsim_push_full_keeps_needs_for_retry() {
     let sys = SystemSnapshot::capture();
     let ir = [1.0f32, 0.0, 0.0, 0.0];
 
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(1);
-    prod.push(Some(Box::new(test_pair(&ir, 64, 48000))))
-        .unwrap();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(1);
+    prod.push(Box::new(CabSimSwapPayload {
+        generation: 0,
+        pair: Some(Box::new(test_pair(&ir, 64, 48000))),
+    }))
+    .unwrap();
 
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
 
@@ -386,7 +424,7 @@ fn cabsim_rebuild_resamples_to_requested_host_rate() {
     for target_rate in [44100u32, 48000, 96000] {
         let flags = RtStatusFlags::new();
         request_cabsim_rebuild(&flags, 64, target_rate);
-        let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+        let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
         handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
 
@@ -394,10 +432,12 @@ fn cabsim_rebuild_resamples_to_requested_host_rate() {
             !flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD),
             "successful delivery must clear the request ({target_rate} Hz)"
         );
-        let pair = cons
+        let payload = cons
             .pop()
             .unwrap_or_else(|_| panic!("pair must be delivered ({target_rate} Hz)"));
-        let pair = pair.expect("successful rebuild delivers a pair, not bypass");
+        let pair = payload
+            .pair
+            .expect("successful rebuild delivers a pair, not bypass");
         assert_eq!(
             pair.sample_rate, target_rate,
             "pair must be stamped with the applied host rate"
@@ -427,12 +467,12 @@ fn cabsim_rebuild_same_rate_no_resample() {
     let sys = SystemSnapshot::capture();
     let ir: Vec<f32> = (0..256).map(|i| (-i as f32 / 64.0).exp()).collect();
     request_cabsim_rebuild(&flags, 64, 48000);
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
-    let pair = cons.pop().unwrap().expect("pair delivered");
+    let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(pair.sample_rate, 48000);
     assert_eq!(pair.l.num_partitions(), 4, "256 samples / 64 partition");
 }
@@ -448,10 +488,10 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     // Above the ceiling: 16384 -> clamped to MAX_RESAMP_BUF.
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 16384, 48000);
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
-    let pair = cons.pop().unwrap().expect("pair delivered");
+    let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(
         pair.partition_size(),
         MAX_RESAMP_BUF,
@@ -462,10 +502,10 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     // Below the floor: 1 -> clamped to the 16-sample minimum.
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 1, 48000);
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
-    let pair = cons.pop().unwrap().expect("pair delivered");
+    let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(
         pair.partition_size(),
         16,
@@ -475,10 +515,10 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     // In-domain requests pass through untouched.
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 64, 48000);
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
-    let pair = cons.pop().unwrap().expect("pair delivered");
+    let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(pair.partition_size(), 64);
 }
 
@@ -490,14 +530,14 @@ fn cabsim_rebuild_failure_pushes_none_bypass() {
     let sys = SystemSnapshot::capture();
     let empty: Vec<f32> = Vec::new();
     request_cabsim_rebuild(&flags, 64, 96000);
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(2);
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
     // Empty raw samples make the IR resample fail deterministically.
     handle_cabsim_rebuild(&flags, Some(&empty), 48000, &sys, &mut prod);
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     assert!(
-        cons.pop().unwrap().is_none(),
+        cons.pop().unwrap().pair.is_none(),
         "rebuild failure must deliver None (safe bypass)"
     );
 }

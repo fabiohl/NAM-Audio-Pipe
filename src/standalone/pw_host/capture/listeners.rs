@@ -68,9 +68,8 @@ pub fn param_changed_handler(
             rt_status
                 .capture_negotiated_rate
                 .store(rate, Ordering::Release);
-            mark_format_contract_ok(rt_status);
+            mark_format_contract_ok(rt_status, "capture");
             check_negotiated_rate_mismatch(rt_status);
-            backend.mark_running();
         }
         Err(violation) => {
             let violation_msg = violation.to_string();

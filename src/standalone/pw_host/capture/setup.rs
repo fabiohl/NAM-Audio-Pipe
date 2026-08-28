@@ -53,6 +53,10 @@ pub fn build_capture_format_pod(
     let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
     audio_info.set_channels(2);
+    let mut pos = [0u32; 64];
+    pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+    pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    audio_info.set_position(pos);
 
     // SAFETY: `SpaPodStorage` guarantees the 8-byte alignment required by the
     // libspa pod builder, and the returned pod borrows `storage`, which outlives
@@ -282,33 +286,40 @@ pub fn setup_capture_stream<'c>(
             if rt_status_for_process
                 .check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
             {
-                if rt_status_for_process.check_flag(
-                    neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED,
-                ) {
-                    // Fail-open rollback (F-RB-004): the rebuild failed, so the
-                    // callback resumes with the previous resampler in safe
-                    // bypass/mute mode. Record the current request generation as
+                let failed_gen = rt_status_for_process
+                    .resampler_failed_generation
+                    .load(Ordering::Acquire);
+                let requested_gen = rt_status_for_process
+                    .requested_rate_generation
+                    .load(Ordering::Acquire);
+
+                if failed_gen != 0 && failed_gen == requested_gen {
+                    // Fail-open rollback (F-RB-004): the rebuild failed for requested_gen,
+                    // so the callback resumes with the previous resampler in safe
+                    // bypass/mute mode. Record the requested generation as
                     // resolved so the invariant
                     // `applied_rate_generation == requested_rate_generation`
                     // holds on unmute — the old resampler is the accepted
                     // fallback for this request, never a stale replacement.
-                    let current_gen = rt_status_for_process
-                        .requested_rate_generation
-                        .load(Ordering::Acquire);
                     rt_status_for_process
                         .applied_rate_generation
-                        .store(current_gen, Ordering::Release);
+                        .store(requested_gen, Ordering::Release);
                     rt_status_for_process.clear_flag(
                         neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING,
                     );
-                    rt_status_for_process.clear_flag(
-                        neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED,
-                    );
+                    rt_status_for_process
+                        .resampler_failed_generation
+                        .store(0, Ordering::Release);
                 } else {
                     let _ = stream.dequeue_buffer();
                     return;
                 }
             }
+
+            let conv_pair = state
+                .active_cabsim
+                .as_deref_mut()
+                .filter(|pair| pair.sample_rate == current_host_rate);
 
             rt_callback::process_dsp_buffer(
                 stream,
@@ -330,7 +341,7 @@ pub fn setup_capture_stream<'c>(
                     adaptive: &mut state.adaptive_compute,
                     bridge_writer: DspBridgeWriter::from_ref(bridge_ptr),
                     conv: None,
-                    conv_pair: state.active_cabsim.as_deref_mut(),
+                    conv_pair,
                 },
                 DspBuffers {
                     resamp_mid_l: &mut *state.resamp_mid_l,

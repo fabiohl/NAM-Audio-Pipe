@@ -107,32 +107,43 @@ pub(crate) fn check_spa_buffer_pair(
 /// which is exactly the region `Data::data()` exposes as writable.
 #[inline(always)]
 pub(crate) fn silence_spa_channels(ptr_l: usize, max_l: usize, ptr_r: usize, max_r: usize) {
-    if ptr_l != 0 && max_l > 0 {
-        // SAFETY: `maxsize` is the host-declared writable span of the SPA data
-        // region (the same span `Data::data()` re-exposes as `&mut [u8]`).
-        unsafe { std::ptr::write_bytes(ptr_l as *mut u8, 0, max_l) };
+    let align = std::mem::align_of::<f32>();
+    let stride = std::mem::size_of::<f32>();
+    let max_safe_bytes = MAX_BRIDGE_BUF * stride;
+
+    if ptr_l != 0 && ptr_l.is_multiple_of(align) && max_l > 0 && max_l.is_multiple_of(stride) {
+        let safe_l = max_l.min(max_safe_bytes);
+        // SAFETY: `ptr_l` is aligned to f32, `safe_l` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
+        unsafe { std::ptr::write_bytes(ptr_l as *mut u8, 0, safe_l) };
     }
-    if ptr_r != 0 && max_r > 0 {
-        // SAFETY: ditto for the right channel.
-        unsafe { std::ptr::write_bytes(ptr_r as *mut u8, 0, max_r) };
+    if ptr_r != 0 && ptr_r.is_multiple_of(align) && max_r > 0 && max_r.is_multiple_of(stride) {
+        let safe_r = max_r.min(max_safe_bytes);
+        // SAFETY: `ptr_r` is aligned to f32, `safe_r` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
+        unsafe { std::ptr::write_bytes(ptr_r as *mut u8, 0, safe_r) };
     }
 }
 
 /// Reads `(offset, size)` from an SPA chunk descriptor, or `None` when the
-/// chunk pointer is null (malformed descriptor).
+/// chunk pointer is null or misaligned, stride is not sizeof(f32), or corrupted flag set.
 ///
 /// The capture path uses the host-declared chunk metadata to learn how many
 /// valid audio bytes the host published this quantum. Reading the two scalar
 /// fields as integers never forms a reference to the audio bytes themselves.
 #[inline(always)]
 pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> Option<(usize, usize)> {
-    if chunk.is_null() {
+    if chunk.is_null()
+        || !(chunk as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
+    {
         core::hint::cold_path();
         return None;
     }
-    // SAFETY: `chunk` was validated non-null; the struct is owned by the SPA
+    // SAFETY: `chunk` was validated non-null and correctly aligned; the struct is owned by the SPA
     // buffer and stable for the duration of the callback.
     let c = unsafe { &*chunk };
+    if c.stride != std::mem::size_of::<f32>() as i32 || (c.flags & 1) != 0 {
+        core::hint::cold_path();
+        return None;
+    }
     Some((c.offset as usize, c.size as usize))
 }
 
@@ -195,12 +206,11 @@ fn validate_spa_channel_pair(
 /// Consolidated fail-closed FFI/SPA descriptor handling shared by the RT
 /// callbacks (capture and playback) and by the malformed-FFI harness tests.
 ///
-/// `chunk_l`/`chunk_r` must be non-null (the callbacks need the chunk structs
-/// either to read capture metadata or to write playback metadata afterwards);
+/// `chunk_l`/`chunk_r` must be non-null and correctly aligned;
 /// `offset_l`/`size_l` are the resolved valid-data window — capture reads them
 /// from the host chunk via [`read_chunk_meta`], playback passes `(0, n_bytes)`.
 ///
-/// On any violation — null data pointer, null chunk, misaligned base or offset,
+/// On any violation — null data pointer, null/misaligned chunk, misaligned base or offset,
 /// non-cardinal size, out-of-bounds region, asymmetric frame counts or
 /// overlapping intervals — it raises `RT_STATUS_HOST_CONTRACT_VIOLATION` on
 /// `rt_status`, silences both SPA data regions and returns `None`. Only after a
@@ -223,7 +233,12 @@ pub(crate) fn handle_spa_pair_fail_closed(
     size_r: usize,
     rt_status: &RtStatusFlags,
 ) -> Option<(usize, usize)> {
-    if chunk_l.is_null() || chunk_r.is_null() {
+    let chunk_align = std::mem::align_of::<pw::spa::sys::spa_chunk>();
+    if chunk_l.is_null()
+        || chunk_r.is_null()
+        || !(chunk_l as usize).is_multiple_of(chunk_align)
+        || !(chunk_r as usize).is_multiple_of(chunk_align)
+    {
         core::hint::cold_path();
         report_ffi_contract_violation(rt_status, ptr_l, max_l, ptr_r, max_r);
         return None;
@@ -260,7 +275,10 @@ fn send_recording_metadata(
     if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
         return;
     }
-    if *recording_meta_sent && *recording_meta_rate == current_host_rate {
+    if *recording_meta_rate != current_host_rate {
+        *recording_meta_sent = false;
+    }
+    if *recording_meta_sent {
         return;
     }
     if let Some(producer) = recording_producer.as_mut() {

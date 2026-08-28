@@ -12,18 +12,7 @@ fn test_dsp_bridge_concurrent_access() {
     // behavior where the object lives for the entire duration of the PipeWire host.
     // This allows safely converting the reference into raw pointers (*const/*mut).
     let bridge: &'static DspBridge = Box::leak(Box::new(DspBridge {
-        buffers: [
-            BridgeBuffer {
-                buf_l: [0.0; MAX_BRIDGE_BUF],
-                buf_r: [0.0; MAX_BRIDGE_BUF],
-                n_samples: 0,
-            },
-            BridgeBuffer {
-                buf_l: [0.0; MAX_BRIDGE_BUF],
-                buf_r: [0.0; MAX_BRIDGE_BUF],
-                n_samples: 0,
-            },
-        ],
+        buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
         active_read_idx: std::sync::atomic::AtomicUsize::new(0),
         generation: std::sync::atomic::AtomicU64::new(0),
         consumed_gen: std::sync::atomic::AtomicU64::new(0),

@@ -6,7 +6,7 @@
 
 use std::alloc::{Layout, alloc, handle_alloc_error};
 
-use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, BridgeRef, DspBridge, MAX_BRIDGE_BUF};
+use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, BridgeRef, DspBridge};
 
 /// Allocates `DspBridge` with double-buffering using page-aligned memory.
 ///
@@ -41,18 +41,7 @@ pub fn allocate_dsp_bridge() -> BridgeRef {
         std::ptr::write(
             raw_ptr,
             DspBridge {
-                buffers: [
-                    BridgeBuffer {
-                        buf_l: [0.0f32; MAX_BRIDGE_BUF],
-                        buf_r: [0.0f32; MAX_BRIDGE_BUF],
-                        n_samples: 0,
-                    },
-                    BridgeBuffer {
-                        buf_l: [0.0f32; MAX_BRIDGE_BUF],
-                        buf_r: [0.0f32; MAX_BRIDGE_BUF],
-                        n_samples: 0,
-                    },
-                ],
+                buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
                 active_read_idx: std::sync::atomic::AtomicUsize::new(0),
                 generation: std::sync::atomic::AtomicU64::new(0),
                 consumed_gen: std::sync::atomic::AtomicU64::new(0),

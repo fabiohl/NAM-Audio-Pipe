@@ -49,8 +49,8 @@ use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
 use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeBuffer, DspBridge, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_BRIDGE_BUF,
-    MAX_RESAMP_BUF, capture_dsp_pipeline,
+    BridgeBuffer, DspBridge, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_RESAMP_BUF,
+    capture_dsp_pipeline,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::loader::dispatcher::build_model;
@@ -660,18 +660,7 @@ fn main() {
         let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Off);
 
         let mut bridge = Box::new(DspBridge {
-            buffers: [
-                BridgeBuffer {
-                    buf_l: [0.0; MAX_BRIDGE_BUF],
-                    buf_r: [0.0; MAX_BRIDGE_BUF],
-                    n_samples: 0,
-                },
-                BridgeBuffer {
-                    buf_l: [0.0; MAX_BRIDGE_BUF],
-                    buf_r: [0.0; MAX_BRIDGE_BUF],
-                    n_samples: 0,
-                },
-            ],
+            buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
             active_read_idx: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             consumed_gen: AtomicU64::new(0),

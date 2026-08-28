@@ -6,7 +6,7 @@
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
-use neural_amp_modeler_rs::dsp::pipeline::DspBridgeReader;
+use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
@@ -41,8 +41,10 @@ pub struct PipewireHostConfig {
     /// resample the preserved original IR for the applied host output rate
     /// (F-RB-006 rate calibration).
     pub ir_source_rate: u32,
-    /// Full WaveNet model stored for main-thread slimmable rebuild.
-    pub full_wavenet_model: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
+    /// Full WaveNet model (L channel) stored for main-thread slimmable rebuild.
+    pub full_wavenet_model_l: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
+    /// Full WaveNet model (R channel) stored for main-thread slimmable rebuild.
+    pub full_wavenet_model_r: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
     /// Whether the loaded model has a right-channel model (stereo config).
     /// The slimmable rebuild slices an R model only when this is true.
     pub has_model_r: bool,
@@ -71,7 +73,7 @@ pub fn playback_dsp_cycle(
     // no processed audio may reach the hardware. Deterministic silence is
     // delivered instead, reusing the starvation silence policy — the DAC never
     // repeats stale audio and never plays garbled wrong-format data.
-    if rt_status.format_contract_ok.load(Ordering::Relaxed) == 0 {
+    if !rt_status.is_audio_unmuted() {
         deliver_silence_block(stream, rt_status);
         return;
     }
@@ -309,13 +311,18 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
 /// pointer writes (no `&mut` aliasing is formed).
 #[inline(always)]
 fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
+    let align = std::mem::align_of::<f32>();
+    let stride = std::mem::size_of::<f32>();
+    let max_safe_bytes = MAX_BRIDGE_BUF * stride;
+
     for data in datas.iter_mut() {
         let raw = data.as_raw();
-        if !raw.data.is_null() && raw.maxsize > 0 {
-            // SAFETY: `maxsize` is the host-declared writable span of the SPA
-            // data region; the memory is owned by the PipeWire buffer and
-            // stable for the callback duration.
-            unsafe { std::ptr::write_bytes(raw.data as *mut u8, 0, raw.maxsize as usize) };
+        let ptr = raw.data as usize;
+        let maxsize = raw.maxsize as usize;
+        if ptr != 0 && ptr.is_multiple_of(align) && maxsize > 0 && maxsize.is_multiple_of(stride) {
+            let safe_len = maxsize.min(max_safe_bytes);
+            // SAFETY: `ptr` is aligned to f32, `safe_len` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, safe_len) };
         }
     }
 }
@@ -429,6 +436,8 @@ pub enum ContractViolation {
     NotF32Planar(pw::spa::param::audio::AudioFormat),
     /// The negotiated channel count is not exactly 2 (stereo FL/FR).
     NotStereo(u32),
+    /// The negotiated channel layout does not match FL at channel 0 and FR at channel 1.
+    InvalidChannelPositions { ch0: u32, ch1: u32 },
 }
 
 impl core::fmt::Display for ContractViolation {
@@ -445,6 +454,12 @@ impl core::fmt::Display for ContractViolation {
                 write!(
                     f,
                     "channel count is {got} (contract requires 2 stereo channels)"
+                )
+            }
+            Self::InvalidChannelPositions { ch0, ch1 } => {
+                write!(
+                    f,
+                    "channel positions are [ch0={ch0}, ch1={ch1}] (contract requires FL at ch0 and FR at ch1)"
                 )
             }
         }
@@ -482,6 +497,16 @@ pub fn validate_audio_raw_format(param: &pw::spa::pod::Pod) -> Result<u32, Contr
     if channels != 2 {
         return Err(ContractViolation::NotStereo(channels));
     }
+    let pos = format.position();
+    if pos.len() < 2
+        || pos[0] != pw::spa::sys::SPA_AUDIO_CHANNEL_FL
+        || pos[1] != pw::spa::sys::SPA_AUDIO_CHANNEL_FR
+    {
+        return Err(ContractViolation::InvalidChannelPositions {
+            ch0: pos.first().copied().unwrap_or(0),
+            ch1: pos.get(1).copied().unwrap_or(0),
+        });
+    }
     Ok(format.rate())
 }
 
@@ -501,6 +526,11 @@ pub fn reject_negotiated_format_violation(
     violation: ContractViolation,
 ) {
     rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+    if stream_name == "capture" {
+        rt_status.capture_format_ok.store(0, Ordering::Relaxed);
+    } else if stream_name == "playback" {
+        rt_status.playback_format_ok.store(0, Ordering::Relaxed);
+    }
     rt_status.format_contract_ok.store(0, Ordering::Relaxed);
     log::error!(
         "Audio host renegotiated an incompatible SPA format on the {stream_name} stream — \
@@ -514,8 +544,17 @@ pub fn reject_negotiated_format_violation(
 /// Called by the `param_changed` listeners on the successful path; re-arms the
 /// RT mute guard so audio processing resumes automatically.
 #[inline]
-pub fn mark_format_contract_ok(rt_status: &RtStatusFlags) {
-    rt_status.format_contract_ok.store(1, Ordering::Relaxed);
+pub fn mark_format_contract_ok(rt_status: &RtStatusFlags, stream_name: &str) {
+    if stream_name == "capture" {
+        rt_status.capture_format_ok.store(1, Ordering::Relaxed);
+    } else if stream_name == "playback" {
+        rt_status.playback_format_ok.store(1, Ordering::Relaxed);
+    }
+    let cap = rt_status.capture_format_ok.load(Ordering::Relaxed);
+    let pb = rt_status.playback_format_ok.load(Ordering::Relaxed);
+    rt_status
+        .format_contract_ok
+        .store(if cap != 0 && pb != 0 { 1 } else { 0 }, Ordering::Relaxed);
 }
 
 /// Returns `Some((capture, playback))` when both streams have negotiated a
@@ -808,8 +847,9 @@ mod tests {
         );
         assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
         assert!(
-            l.iter().all(|&s| s == 0.0) && r.iter().all(|&s| s == 0.0),
-            "oversized playback window must silence both output channels"
+            l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
+                && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+            "oversized playback window must silence both output channels up to max bridge bound"
         );
     }
 
@@ -1072,6 +1112,10 @@ mod tests {
         info.set_format(format);
         info.set_channels(channels);
         info.set_rate(48_000);
+        let mut pos = [0u32; 64];
+        pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+        pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+        info.set_position(pos);
         info
     }
 
@@ -1082,6 +1126,58 @@ mod tests {
         let mut storage = SpaPodStorage::new();
         let pod = build_raw_format_pod(&info, &mut storage);
         assert_eq!(validate_audio_raw_format(pod), Ok(48_000));
+    }
+
+    #[test]
+    fn validate_audio_raw_format_rejects_swapped_positions_fr_fl() {
+        pw::init();
+        let mut info = raw_audio_info(pw::spa::param::audio::AudioFormat::F32P, 2);
+        let mut pos = [0u32; 64];
+        pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+        pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+        info.set_position(pos);
+        let mut storage = SpaPodStorage::new();
+        let pod = build_raw_format_pod(&info, &mut storage);
+        assert_eq!(
+            validate_audio_raw_format(pod),
+            Err(ContractViolation::InvalidChannelPositions {
+                ch0: pw::spa::sys::SPA_AUDIO_CHANNEL_FR,
+                ch1: pw::spa::sys::SPA_AUDIO_CHANNEL_FL,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_audio_raw_format_rejects_fc_lfe_positions() {
+        pw::init();
+        let mut info = raw_audio_info(pw::spa::param::audio::AudioFormat::F32P, 2);
+        let mut pos = [0u32; 64];
+        pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FC;
+        pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_LFE;
+        info.set_position(pos);
+        let mut storage = SpaPodStorage::new();
+        let pod = build_raw_format_pod(&info, &mut storage);
+        assert_eq!(
+            validate_audio_raw_format(pod),
+            Err(ContractViolation::InvalidChannelPositions {
+                ch0: pw::spa::sys::SPA_AUDIO_CHANNEL_FC,
+                ch1: pw::spa::sys::SPA_AUDIO_CHANNEL_LFE,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_audio_raw_format_rejects_missing_positions() {
+        pw::init();
+        let mut info = raw_audio_info(pw::spa::param::audio::AudioFormat::F32P, 2);
+        let pos = [0u32; 64];
+        info.set_position(pos);
+        let mut storage = SpaPodStorage::new();
+        let pod = build_raw_format_pod(&info, &mut storage);
+        assert_eq!(
+            validate_audio_raw_format(pod),
+            Err(ContractViolation::InvalidChannelPositions { ch0: 0, ch1: 0 })
+        );
     }
 
     #[test]
@@ -1187,7 +1283,7 @@ mod tests {
         );
         assert_eq!(rt.format_contract_ok.load(Ordering::Relaxed), 0);
 
-        mark_format_contract_ok(&rt);
+        mark_format_contract_ok(&rt, "playback");
         assert_eq!(
             rt.format_contract_ok.load(Ordering::Relaxed),
             1,

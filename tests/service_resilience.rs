@@ -666,6 +666,10 @@ fn raw_audio_info(
     info.set_format(format);
     info.set_channels(channels);
     info.set_rate(48_000);
+    let mut pos = [0u32; 64];
+    pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+    pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    info.set_position(pos);
     info
 }
 
@@ -754,7 +758,7 @@ fn spa_format_rejection_signals_contract_violation_fail_closed() {
             0,
             "{label}: the RT mute guard must be latched (fail-closed)"
         );
-        mark_format_contract_ok(&rt);
+        mark_format_contract_ok(&rt, "capture");
         assert_eq!(
             rt.format_contract_ok.load(Ordering::Relaxed),
             1,
@@ -804,6 +808,12 @@ fn stream_error_observable_and_shutdown_within_sla() {
     );
 
     // Streaming -> Running.
+    observe_stream_state(
+        "playback",
+        pw::stream::StreamState::Connecting,
+        pw::stream::StreamState::Streaming,
+        &backend,
+    );
     observe_stream_state(
         "capture",
         pw::stream::StreamState::Connecting,
@@ -910,6 +920,12 @@ fn stream_error_observable_and_shutdown_within_sla() {
     );
     observe_stream_state(
         "playback",
+        pw::stream::StreamState::Paused,
+        pw::stream::StreamState::Streaming,
+        &backend2,
+    );
+    observe_stream_state(
+        "capture",
         pw::stream::StreamState::Paused,
         pw::stream::StreamState::Streaming,
         &backend2,

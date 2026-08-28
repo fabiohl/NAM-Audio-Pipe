@@ -27,8 +27,10 @@ pub fn setup_communication_channels() -> SpscChannels {
 
 /// Result of loading the initial neural model.
 pub struct InitialModelSetup {
-    /// Full WaveNet model clone if slimmable WaveNet architecture, used for dynamic slim rebuilds.
-    pub full_wavenet_model: Option<Box<StaticModel>>,
+    /// Full WaveNet model clone (L channel) if slimmable WaveNet architecture.
+    pub full_wavenet_model_l: Option<Box<StaticModel>>,
+    /// Full WaveNet model clone (R channel) if slimmable WaveNet architecture in stereo setup.
+    pub full_wavenet_model_r: Option<Box<StaticModel>>,
     /// Whether the loaded model includes a right-channel model (stereo config).
     /// The slimmable rebuild slices an R model only when this is true.
     pub has_model_r: bool,
@@ -42,7 +44,8 @@ pub fn load_initial_model(
     sys: &SystemSnapshot,
     producer: &mut Producer<ParamPayload>,
 ) -> InitialModelSetup {
-    let mut full_wavenet_model = None;
+    let mut full_wavenet_model_l = None;
+    let mut full_wavenet_model_r = None;
     let mut architecture = String::new();
     let mut has_model_r = false;
 
@@ -64,7 +67,15 @@ pub fn load_initial_model(
 
                 has_model_r = loaded.model_r.is_some();
 
-                full_wavenet_model = loaded.model_l.as_ref().and_then(|m| {
+                full_wavenet_model_l = loaded.model_l.as_ref().and_then(|m| {
+                    if let StaticModel::WavenetDyn(w) = m.as_ref() {
+                        clone_wavenet_for_slimmable_storage(w).ok()
+                    } else {
+                        None
+                    }
+                });
+
+                full_wavenet_model_r = loaded.model_r.as_ref().and_then(|m| {
                     if let StaticModel::WavenetDyn(w) = m.as_ref() {
                         clone_wavenet_for_slimmable_storage(w).ok()
                     } else {
@@ -91,7 +102,8 @@ pub fn load_initial_model(
     }
 
     InitialModelSetup {
-        full_wavenet_model,
+        full_wavenet_model_l,
+        full_wavenet_model_r,
         has_model_r,
         architecture,
     }
@@ -136,7 +148,7 @@ pub(crate) fn initial_cabsim_partition_size(buffer_size: u32) -> usize {
 pub fn load_initial_cabsim(
     cab_path: Option<&Path>,
     buffer_size: u32,
-    cabsim_producer: &mut Producer<Option<Box<CabSimPair>>>,
+    cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
 ) -> anyhow::Result<Option<InitialCabSimIr>> {
     let cab_path = match cab_path {
         Some(p) => p,
@@ -171,7 +183,12 @@ pub fn load_initial_cabsim(
                 r: Box::new(r),
                 sample_rate: source_rate,
             };
-            let _ = cabsim_producer.push(Some(Box::new(pair)));
+            let _ = cabsim_producer.push(Box::new(
+                neural_amp_modeler_rs::common::spsc::CabSimSwapPayload {
+                    generation: 0,
+                    pair: Some(Box::new(pair)),
+                },
+            ));
             Ok(Some(InitialCabSimIr {
                 raw_samples: cabsim.samples,
                 source_rate,
@@ -203,7 +220,8 @@ mod tests {
         let mut channels = setup_communication_channels();
         let sys = SystemSnapshot::capture();
         let result = load_initial_model(None, &sys, &mut channels.param_producer);
-        assert!(result.full_wavenet_model.is_none());
+        assert!(result.full_wavenet_model_l.is_none());
+        assert!(result.full_wavenet_model_r.is_none());
         assert!(result.architecture.is_empty());
     }
 
