@@ -53,14 +53,15 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="0.5.0" date="2026-08-19">
+    <release version="0.7.0" date="2026-08-24" type="stable">
       <description>
-        <p>NAM-Audio-Pipe 0.5.0 release with Flatpak metadata and PipeWire integration.</p>
+        <p>This release hardens the service lifecycle and the PipeWire boundary:</p>
         <ul>
-          <li>Native low-latency PipeWire client support.</li>
-          <li>WaveNet and LSTM neural model inference with SIMD AVX2 acceleration.</li>
-          <li>Integrated CabSim IR convolver and io_uring WAV recorder.</li>
-          <li>Polyphase oversampling and adaptive compute.</li>
+          <li>Strict SPA format contract validation (F32P, stereo) with fail-closed behavior and typed contract-violation signals.</li>
+          <li>PipeWire backend state machine with bounded reconnect and observable, fail-fast shutdown.</li>
+          <li>Graceful SIGINT/SIGTERM handling with immediate double-signal termination and bit-exact WAV finalization.</li>
+          <li>Recording hardening: atomic file creation, checked RIFF limits, RAII worker guard and fault-injection test harness.</li>
+          <li>Stereo engine support, real-time drain budgets and deterministic silence/recycling under bridge starvation.</li>
         </ul>
       </description>
     </release>

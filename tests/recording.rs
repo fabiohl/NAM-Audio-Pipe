@@ -10,61 +10,26 @@ use nam_audio_pipe::recording::buffer::{
     AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, RING_CAPACITY, RingPayload,
     create_audio_ring_buffer,
 };
+use nam_audio_pipe::recording::{
+    RecordingStartupError, RecordingStatus, RecordingWorkerGuard, RecordingWorkerOutcome,
+    spawn_recording_worker, wait_for_recording_init,
+};
 use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{self, GcOverflowBuffer, RtStatusFlags, SHUTDOWN};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 use rtrb::RingBuffer;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 mod common;
 
-static TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nam-recording-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
-}
-
-fn wav_sample_count(path: &std::path::Path) -> u32 {
-    let reader = hound::WavReader::open(path).expect("failed to open WAV for reading");
-    let spec = reader.spec();
-    assert_eq!(spec.channels, 2);
-    assert_eq!(spec.sample_rate, 48000);
-    assert_eq!(spec.bits_per_sample, 32);
-    assert_eq!(spec.sample_format, hound::SampleFormat::Float);
-    reader.duration()
-}
-
-/// RAII guard that resets SHUTDOWN after each test.
-struct ShutdownGuard;
-
-impl ShutdownGuard {
-    fn new() -> Self {
-        SHUTDOWN.store(false, Ordering::SeqCst);
-        Self
-    }
-}
-
-impl Drop for ShutdownGuard {
-    fn drop(&mut self) {
-        SHUTDOWN.store(false, Ordering::SeqCst);
-    }
-}
-
-/// RAII guard that cleans up the temp directory on drop.
-struct DirGuard(PathBuf);
-
-impl Drop for DirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use common::{
+    DirGuard, ShutdownGuard, TEST_MUTEX, recording_init_for, spawn_ready_worker, temp_dir,
+};
 
 /// RAII guard that changes CWD for the duration of a test.
 struct CwdGuard(PathBuf);
@@ -83,6 +48,16 @@ impl Drop for CwdGuard {
     }
 }
 
+fn wav_sample_count(path: &std::path::Path) -> u32 {
+    let reader = hound::WavReader::open(path).expect("failed to open WAV for reading");
+    let spec = reader.spec();
+    assert_eq!(spec.channels, 2);
+    assert_eq!(spec.sample_rate, 48000);
+    assert_eq!(spec.bits_per_sample, 32);
+    assert_eq!(spec.sample_format, hound::SampleFormat::Float);
+    reader.duration()
+}
+
 #[test]
 #[ignore = "requires io_uring support"]
 fn disk_writer_loop_creates_valid_wav() {
@@ -90,20 +65,13 @@ fn disk_writer_loop_creates_valid_wav() {
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
-    let _guard = DirGuard(dir.clone());
+    let _guard = DirGuard::new(dir.clone());
 
     let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
 
-    let handle = std::thread::Builder::new()
-        .name("nam-test-recording-io".into())
-        .spawn(move || {
-            tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
-                    .await
-                    .expect("disk_writer_loop should succeed");
-            });
-        })
-        .expect("failed to spawn test I/O thread");
+    // The worker must complete the startup handshake (io_uring + writable dir)
+    // before we push any payload — F-RB-009 / T3.3.
+    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
 
     let meta = AudioMetadata {
         sample_rate: 48000.0,
@@ -134,11 +102,16 @@ fn disk_writer_loop_creates_valid_wav() {
         .push(RingPayload::StreamStop)
         .expect("StreamStop push should succeed");
 
-    // Signal shutdown so disk_writer_loop exits after draining.
-    // StreamStop finalizes the WAV; SHUTDOWN triggers the loop to exit.
+    // StreamStop is now the sole termination token (F-RB-009 / T3.4): the
+    // worker finalizes the WAV and exits on it. SHUTDOWN is set afterwards on
+    // purpose as a regression guard — the worker must ignore the global flag
+    // (a SIGINT during a momentary empty ring must never truncate the tail).
     SHUTDOWN.store(true, Ordering::SeqCst);
 
-    handle.join().expect("I/O thread should complete");
+    handle
+        .join()
+        .expect("I/O thread should complete")
+        .expect("integral drain must finalize the WAV successfully");
 
     let mut found: Option<PathBuf> = None;
     for entry in std::fs::read_dir(&dir).expect("failed to read temp dir") {
@@ -168,20 +141,13 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
-    let _guard = DirGuard(dir.clone());
+    let _guard = DirGuard::new(dir.clone());
 
     let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
 
-    let handle = std::thread::Builder::new()
-        .name("nam-test-recording-io".into())
-        .spawn(move || {
-            tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
-                    .await
-                    .expect("disk_writer_loop should succeed");
-            });
-        })
-        .expect("failed to spawn test I/O thread");
+    // The worker must complete the startup handshake (io_uring + writable dir)
+    // before we push any payload — F-RB-009 / T3.3.
+    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
 
     let meta = AudioMetadata {
         sample_rate: 44100.0,
@@ -196,9 +162,14 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
         .push(RingPayload::StreamStop)
         .expect("StreamStop push should succeed");
 
+    // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
+    // regression guard proving the global flag is no longer consulted.
     SHUTDOWN.store(true, Ordering::SeqCst);
 
-    handle.join().expect("I/O thread should complete");
+    handle
+        .join()
+        .expect("I/O thread should complete")
+        .expect("clean StreamStop shutdown must succeed");
 
     let mut found: Option<PathBuf> = None;
     for entry in std::fs::read_dir(&dir).expect("failed to read temp dir") {
@@ -224,20 +195,13 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
-    let _guard = DirGuard(dir.clone());
+    let _guard = DirGuard::new(dir.clone());
 
     let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
 
-    let handle = std::thread::Builder::new()
-        .name("nam-test-recording-io".into())
-        .spawn(move || {
-            tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(consumer, None)
-                    .await
-                    .expect("disk_writer_loop should succeed");
-            });
-        })
-        .expect("failed to spawn test I/O thread");
+    // The worker must complete the startup handshake (io_uring + writable dir)
+    // before we push any payload — F-RB-009 / T3.3.
+    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
 
     // Push Audio BEFORE Metadata — should be discarded silently
     let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
@@ -265,9 +229,14 @@ fn disk_writer_loop_discards_audio_before_metadata() {
         .push(RingPayload::StreamStop)
         .expect("StreamStop push should succeed");
 
+    // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
+    // regression guard proving the global flag is no longer consulted.
     SHUTDOWN.store(true, Ordering::SeqCst);
 
-    handle.join().expect("I/O thread should complete");
+    handle
+        .join()
+        .expect("I/O thread should complete")
+        .expect("clean StreamStop shutdown must succeed");
 
     let mut found: Option<PathBuf> = None;
     for entry in std::fs::read_dir(&dir).expect("failed to read temp dir") {
@@ -301,8 +270,10 @@ fn disk_writer_loop_discards_audio_before_metadata() {
 /// FAILS this test — a clean stop must never produce a silent/incomplete WAV.
 ///
 /// Requires a running PipeWire daemon AND io_uring. If the daemon is absent
-/// the test prints an honest `SKIP:` (Phase 4 of `utils/tests-quick.sh`
-/// recognizes it and never emits `RECORDING_IO_URING=RAN` for a skip).
+/// the test prints an honest `TEST_RESULT[record_e2e]=SKIP:daemon_unavailable`
+/// marker (Phase 4 of `utils/tests-quick.sh` matches that typed marker and
+/// never emits `RECORDING_IO_URING=RAN` for a skip; on success it emits
+/// `TEST_RESULT[record_e2e]=PASS`).
 #[test]
 #[ignore = "E2E recording: requires running PipeWire daemon + io_uring; auto-detected by utils/tests-quick.sh Phase 4"]
 fn record_e2e_pipewire_wav_header_matches_bytes() {
@@ -310,9 +281,10 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let _sd = ShutdownGuard::new();
     let dir = temp_dir();
     let _cwd = CwdGuard::enter(&dir);
-    let _guard = DirGuard(dir.clone());
+    let _guard = DirGuard::new(dir.clone());
 
     if !common::probe_pipewire_daemon() {
+        eprintln!("TEST_RESULT[record_e2e]=SKIP:daemon_unavailable");
         eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
         return;
     }
@@ -331,20 +303,21 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
 
     let (recording_producer, recording_consumer) =
         create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
-    let io_handle = std::thread::Builder::new()
-        .name("nam-e2e-recording-io".into())
-        .spawn(move || {
-            tokio_uring::start(async {
-                nam_audio_pipe::recording::disk_writer_loop(recording_consumer, None)
-                    .await
-                    .expect("disk_writer_loop should succeed");
-            });
-        })
+    let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
+    let io_handle = spawn_recording_worker(recording_consumer, None, init)
         .expect("failed to spawn recording I/O thread");
+    wait_for_recording_init(init_rx, Duration::from_secs(5))
+        .expect("recording worker must confirm readiness");
 
     let rt_clone = rt_status.clone();
     let gc_overflow_clone = gc_overflow.clone();
     let sys = SystemSnapshot::capture();
+
+    // F-RB-009 / T3.5: the worker thread, its ring producer and the failure
+    // flag travel together in the RAII guard, so the host's early `?` returns
+    // and the normal shutdown both terminate and formally join the worker.
+    let recording_worker =
+        RecordingWorkerGuard::new(io_handle, Some(recording_producer), Some(failed_flag));
 
     let pw_thread = thread::spawn(move || {
         pw_host::run_pipewire_host(
@@ -360,17 +333,20 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 buffer_size: 0,
                 sys,
                 ir_raw_samples: None,
+                ir_source_rate: 0,
                 full_wavenet_model: None,
+                has_model_r: false,
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
+                // Fail-fast under the deterministic harness (see pw_integration).
+                fail_fast: true,
             },
             gc_cons,
             sl_cons,
             os_cons,
-            Some(recording_producer),
             None,
-            Some(io_handle),
+            Some(recording_worker),
         )
     });
 
@@ -391,9 +367,14 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let host_result = pw_thread
         .join()
         .expect("the PipeWire host thread suffered a fatal panic");
-    if let Err(e) = host_result {
-        panic!("run_pipewire_host failed while the PipeWire daemon is up: {e:#}");
-    }
+    let recording_outcome = match host_result {
+        Ok(outcome) => outcome,
+        Err(e) => panic!("run_pipewire_host failed while the PipeWire daemon is up: {e:#}"),
+    };
+    assert!(
+        matches!(recording_outcome, Some(RecordingWorkerOutcome::Success)),
+        "a clean stop must yield a successful recording outcome, got {recording_outcome:?}"
+    );
 
     assert!(
         last_n_samples > 0,
@@ -438,4 +419,85 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
         data_size > 0,
         "R-13: WAV 'data' size is 0 after a clean stop — header rewrite never completed"
     );
+    eprintln!("TEST_RESULT[record_e2e]=PASS");
+}
+
+// ---------------------------------------------------------------------------
+// F-RB-009 / T3.3 — fail-fast startup handshake under unusable output dirs
+// ---------------------------------------------------------------------------
+
+/// The worker must reject a missing output directory at startup: the handshake
+/// reports `Failed`, the observable status transitions to `Failed`, the RT
+/// failure flag is raised and the thread exits on its own — no silent success.
+#[test]
+#[ignore = "requires io_uring support"]
+fn disk_writer_loop_fails_fast_on_missing_output_dir() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let missing =
+        std::env::temp_dir().join(format!("nam-recording-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+
+    let (_producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (init, init_rx, status, failed_flag) = recording_init_for(&missing);
+    let handle = spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+
+    let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
+        .expect_err("a missing output dir must fail the startup handshake");
+    assert!(
+        matches!(&err, RecordingStartupError::Failed { reason } if reason.contains("does not exist")),
+        "unexpected error: {err:?}"
+    );
+
+    match &*status.lock().unwrap() {
+        RecordingStatus::Failed { reason } => assert!(reason.contains("does not exist")),
+        other => panic!("status must be Failed, got {other:?}"),
+    }
+    assert!(
+        failed_flag.load(Ordering::Acquire),
+        "RT failure flag must be raised on a startup failure"
+    );
+
+    // The worker must exit on its own and must never create anything. The join
+    // also surfaces the startup error (F-RB-009 / T3.5).
+    handle
+        .join()
+        .expect("worker must finish cleanly")
+        .expect_err("a missing output dir must surface as an Err on the join");
+    assert!(
+        !missing.exists(),
+        "no artifact may be created for a failed recording"
+    );
+}
+
+/// The worker must reject a regular file used as the output directory
+/// (`ENOTDIR` equivalent) at startup, through the same handshake.
+#[test]
+#[ignore = "requires io_uring support"]
+fn disk_writer_loop_fails_fast_on_file_as_output_dir() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let file_dir = std::env::temp_dir().join(format!("nam-recording-file-{}", std::process::id()));
+    std::fs::write(&file_dir, b"i am a file, not a directory").unwrap();
+
+    let (_producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (init, init_rx, status, failed_flag) = recording_init_for(&file_dir);
+    let handle = spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+
+    let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
+        .expect_err("a file-as-dir must fail the startup handshake");
+    assert!(
+        matches!(&err, RecordingStartupError::Failed { reason } if reason.contains("does not exist")),
+        "unexpected error: {err:?}"
+    );
+
+    match &*status.lock().unwrap() {
+        RecordingStatus::Failed { .. } => {}
+        other => panic!("status must be Failed, got {other:?}"),
+    }
+    assert!(failed_flag.load(Ordering::Acquire));
+
+    handle
+        .join()
+        .expect("worker must finish cleanly")
+        .expect_err("a file-as-dir must surface as an Err on the join");
+    std::fs::remove_file(&file_dir).unwrap();
 }

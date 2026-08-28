@@ -6,6 +6,6 @@
 
 mod listeners;
 mod setup;
-mod state;
+pub(crate) mod state;
 
 pub use setup::setup_capture_stream;

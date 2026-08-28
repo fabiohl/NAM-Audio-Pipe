@@ -137,6 +137,21 @@ The audio callback thread (`nam-audio-pipe-loop`) executes with hard real-time d
 3. **Zero Blocking I/O:** File operations, standard output printing, and logging macros (`log::*`) are strictly prohibited in the RT callback. State transitions are signaled via atomic bitmasks (`RtStatusFlags`).
 4. **Zero Stack Unwinding Panics:** Array index bounds checks are eliminated statically or clamped safely. Any unexpected failure sets emergency atomic flags.
 
+### 3.2 Backend Lifecycle: State Machine, Fail-Fast & Bounded Reconnect
+
+The PipeWire host lifecycle is governed by a thread-safe backend state machine (`src/standalone/pw_host/status.rs`):
+
+- **`BackendState`** transitions: `Starting → Running → Degraded/Failed → Terminated`, plus the recoverable `Reconnecting { attempt, total_attempts, next_backoff }` state. `Failed` is **sticky** (a late `Running`/`Degraded` event never erases it) and is published through an `AtomicBool` fast-path so the main control loop observes it within its ≤ 100 ms poll (fail-fast SLA < 500 ms).
+- **Stream observers** on both capture and playback map `StreamState::Error` and post-streaming `StreamState::Unconnected` (daemon crash/restart) to `Failed`.
+
+On a fatal connectivity loss the control loop enters the **bounded reconnect cycle** (F-RB-010 / T4.5, `src/standalone/pw_host/reconnect.rs`):
+
+1. The **DSP state** (`CaptureState`: models, resampler, cab-sim, gains, gate) and the **RT-side SPSC channels** (`RtHostChannels`) live in heap `Box`es reached via raw pointers — never moved into the stream closures. Re-instantiating the streams after a daemon restart **preserves every piece of internal state** (models, IRs, recording worker).
+2. A `ReconnectCycle` (production policy: 3 attempts, progressive 250 → 500 → 1000 ms exponential backoff, total ceiling 1.75 s) hands out at most `max_attempts` backoffs and then `None` forever — the retry phase is **strictly bounded in number and time** by construction; no infinite reconnect loop can exist.
+3. Each attempt re-creates a fresh `ThreadLoop`/`Context`/`Core` and both streams (the old instance is torn down first: `thread_loop.stop()`, R-04 final GC drain, `thread_configured` reset so RT setup re-runs on the new data thread).
+4. On success the streams renegotiate the format and rate; the existing rebuild handlers re-sync sample rates and audio resumes. On budget exhaustion the host falls back to the **T4.4 fail-fast path**: integral teardown (RT stop, GC drain, recording `StreamStop` + bounded join) and a non-zero process exit.
+5. `--fail-fast` disables the cycle entirely (first failure → immediate teardown). The backoff sleep is interruptible in 25 ms slices so SIGINT/SIGTERM is honored even while waiting for the daemon.
+
 ---
 
 ## 4. Linux Real-Time & Kernel Tuning Layer (`rt_setup`)
@@ -182,7 +197,7 @@ Inter-thread communication between the non-RT Main Thread and the RT Audio Threa
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  param_channel:     Consumer<ParamPayload>       (Gains, Bypass, Modes)     │
 │  resampler_channel: Consumer<Box<NamResampler>>  (Off-RT Rebuilt Resamplers)│
-│  cabsim_channel:    Consumer<Option<CabSimAdapter>> (Off-RT Rebuilt IRs)    │
+│  cabsim_channel:    Consumer<Option<Box<CabSimPair>>> (Off-RT Rebuilt IRs)  │
 │  slimmable_channel: Consumer<Option<Box<StaticModel>>> (A2 Submodels)       │
 │  os_channel:        Consumer<Box<OsEnginePair>>  (Oversampling Engines)     │
 │  gc_channel:        Producer<GcItem>             (Replaced Asset Dealloc)   │
@@ -265,6 +280,53 @@ For multi-profile `.namb` containers (`--slim auto`), an internal state machine 
 - If processing time exceeds 80% of the quantum deadline, the engine transitions to degraded state (`DEGRADE`), dynamically swapping to a lighter submodel without audio dropouts.
 - When CPU pressure stabilizes, the watchdog restores the full neural model profile.
 
+### 6.3 Pipeline Limits & Buffer/Quantum Negotiation (G-RB-003)
+
+The DSP pipeline has **hard, static buffer ceilings** that every input — CLI, PipeWire graph or SPA descriptor — is validated against before it can influence allocation:
+
+| Limit | Value | Origin / Enforcement |
+|:----- |:----- |:-------------------- |
+| `MAX_BRIDGE_BUF` | 8192 samples | `neural_amp_modeler_rs::dsp::pipeline` — the `DspBridge` double-buffer width; the RT callbacks reject any quantum with `n_samples > MAX_BRIDGE_BUF` **fail-closed** (see §2.1) |
+| `MAX_RESAMP_BUF` | 8192 samples | Same module — bounds every resampler and oversampling engine construction |
+| CabSim partition | clamped to `[16, MAX_RESAMP_BUF]` | Off-RT rebuild handler (`handlers.rs`): a spurious requested partition is clamped before any `ConvEngine` instantiation, so no oversized UPOLS FFT can be built |
+| `--buffer-size` domain | `{0} ∪ {2^k | 16 ≤ 2^k ≤ 8192}` | `src/standalone/cli.rs::validate_buffer_size` — pure, typed, runs before any PipeWire connection or allocation |
+
+**Negotiation flow** (CLI → PipeWire → RT bounds → CabSim):
+
+```text
+CLI (--buffer-size N)
+  │  validate_buffer_size(N): 0 | 16..8192 power-of-two, else typed
+  │  BufferSizeError (exit != 0 before any graph connection)
+  ▼
+run.rs — capture/playback property build
+  │  N == 0 (BUFFER_SIZE_AUTO)  → no node.latency → PipeWire auto-negotiation
+  │  N  > 0                     → node.latency = "{N}/48000" (capture + playback)
+  ▼
+PipeWire graph quantum
+  │  graph may also renegotiate the quantum at runtime (param_changed)
+  ▼
+RT callback (process_dsp) — hard bounds check
+  │  n_samples > MAX_BRIDGE_BUF (8192)  → reject descriptor fail-closed,
+  │                                       RT mute guard latched (contract violation)
+  │  n_samples ≤ 8192                   → process DSP within the quantum budget
+  ▼
+Telemetry & renegotiation logging
+  │  requested_buffer_frames / previous_buffer_frames (RtStatusFlags)
+  ▼
+handle_quantum_log (handlers.rs)
+  │  new_quantum != old_quantum → "PipeWire quantum renegotiated: N -> M samples"
+  ▼
+Off-RT rebuild handlers (quantum/rate change)
+     requested_cabsim_partition_size clamped to [16, MAX_RESAMP_BUF]
+     → CabSimPair rebuilt (UPOLS partitioned convolution, FFT sized from partition)
+```
+
+The domain ceiling ties directly to the deadlines: at 48 kHz a `MAX_BRIDGE_BUF` (8192) quantum
+is the 170,7 ms worst case, while the smallest certified size (16) is 0,33 ms — and a
+64-sample quantum (the low-latency target) carries a 1,33 ms budget that the RT Deadline
+gate (`tests/rt_metrics.rs`, `utils/tests-long.sh` Phase 3) requires the pipeline to beat
+with an 85% safety margin.
+
 ---
 
 ## 7. Asynchronous WAV Recording Subsystem (`src/recording/`)
@@ -286,7 +348,10 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 │    - Reuses internal I/O buffer (io_buf) to eliminate heap allocations      │
 │    - Enters 10ms idle sleep when channel is drained to eliminate busy spin  │
 │    - Automatically splits files at 4 GiB RIFF size limit (_partN.wav)       │
-│    - Graceful shutdown: push_stream_stop (200ms retry) + bounded join (5s)  │
+│    - Lifecycle decoupled from SHUTDOWN (T3.4): exits only on StreamStop or  │
+│      producer drop + drained ring                                          │
+│    - Graceful shutdown: push_stream_stop (200ms retry) → producer drop →   │
+│      bounded join (5s)                                                      │
 │    - Rewrites WAV header with exact data byte count & issues fsync          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -294,7 +359,11 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 ### 7.1 Recording Guarantees & File Integrity
 
 - **Zero Blocking in RT:** The RT callback pushes to `rtrb::Producer<RingPayload>`. If the ring fills (e.g. disk stalled), `OVERRUN_COUNT` is incremented atomically; audio playback is never blocked.
-- **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `RingPayload::StreamStop`, waits up to 200 ms for queue delivery, and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
+- **Startup Handshake & Fail-Fast (F-RB-009 / T3.3):** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded into the ring.
+- **Runtime Failure Propagation (F-RB-009 / T3.3):** On a fatal mid-stream error (`EIO`, `ENOSPC`), the worker transitions the observable `RecordingStatus` to `Failed` and raises an atomic flag the RT callback polls to suspend enqueueing without panics; the error is logged visibly.
+- **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `RingPayload::StreamStop` (bounded retry), explicitly drops the recording producer, and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
+- **Lifecycle Decoupling & Integral Drain (F-RB-009 / T3.4):** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the ring is momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped, or (2) the ring `Producer` was dropped **and** the ring is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent.
+- **RAII Worker Custody & Observable Join (F-RB-009 / T3.5):** The worker thread, its ring producer (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see `src/recording/guard.rs`). The guard owns the `JoinHandle` and the producer, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → producer drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — the old `let _ = handle.join()` that silently swallowed worker failures is gone.
 
 ---
 
@@ -317,7 +386,7 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 | Range   | Category            | Representative Error Codes                                                                                          |
 |:------- |:------------------- |:------------------------------------------------------------------------------------------------------------------- |
 | `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE |
-| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2200` RESAMPLER_BUILD_FAILED, `E2300` SCHED_FIFO_DENIED                                |
+| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2200` RESAMPLER_BUILD_FAILED, `E2300` SCHED_FIFO_DENIED, `E2302` BACKEND_FAILURE, `E2304` SPA_FORMAT_CONTRACT_VIOLATION |
 | `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                                               |
 | `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` IR_LOAD_FAILED                                                                  |
 | `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                               |
@@ -405,11 +474,13 @@ modules:
 Flatpak packaging is embedded directly into Phase 7 of `utils/build-release.sh`:
 
 1. **Environment Initialization:** Runs `flatpak build-init` configuring `org.freedesktop.Sdk//25.08` (falling back to `org.freedesktop.Platform` if SDK is uninstalled).
-2. **Artifact Installation:** Installs optimized binary, desktop entry, AppStream XML, hicolor icon hierarchy, and GPL-3.0 license.
-3. **Sandbox Finalization:** Applies `flatpak build-finish` with sandbox grants (`--socket=pipewire`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--socket=wayland`, `--socket=fallback-x11`).
-4. **OSTree Repository Export:** Runs `flatpak build-export --update-appstream` to create a local OSTree repository.
-5. **Bundle Export:** Runs `flatpak build-bundle` outputting `~/nam-audio-pipe-v<VERSION>-linux-x86_64-v3.flatpak`.
-6. **Automated User Installation:** If `--install` is supplied, registers and installs the package locally (`flatpak install --user --reinstall -y`).
+2. **Artifact Installation:** Installs optimized binary, desktop entry, AppStream XML, hicolor icon hierarchy, and GPL-3.0 license. The desktop entry, metainfo and icon theme are **mandatory** — any missing file aborts the release (fail-closed).
+3. **AppStream Validation:** Runs `appstreamcli validate --no-net --strict` against the metainfo and refuses to export a Flatpak with structural or semantic errors.
+4. **Catalog Payload Synthesis:** Generates the per-app `share/app-info` payload (AppStream XML + icons, the `appstream-compose` equivalent) so `flatpak build-export --update-appstream` aggregates a real, indexable catalog instead of emitting "No appstream data".
+5. **Sandbox Finalization:** Applies `flatpak build-finish` with sandbox grants (`--socket=pipewire`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--socket=wayland`, `--socket=fallback-x11`).
+6. **OSTree Repository Export:** Runs `flatpak build-export --update-appstream` and verifies the AppStream catalog refs were synthesized inside the OSTree repository (fail-closed on "No appstream data").
+7. **Bundle Export & Smoke Test:** Runs `flatpak build-bundle` outputting `~/nam-audio-pipe-v<VERSION>-linux-x86_64-v3.flatpak`, then imports the bundle into a fresh temporary OSTree repository to verify its integrity and manifest (`command=nam-audio-pipe`).
+8. **Automated User Installation:** If `--install` is supplied, registers and installs the package locally (`flatpak install --user --reinstall -y`) and runs an in-sandbox `flatpak run --command=nam-audio-pipe ... --diagnose` smoke test.
 
 ### 9.5 Developer Build & Sandbox Inspection Commands
 

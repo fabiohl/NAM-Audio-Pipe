@@ -103,9 +103,9 @@ For maximum performance in live setups, `NAM-Audio-Pipe` includes a 5-phase opti
 #### What `build-release.sh` does under the hood
 
 1. **Phase 1 — Environment Verification:** Validates toolchain prerequisites (`rustc`, `cargo`, `python3`, `tar`, `zstd`, `flatpak`, `llvm-profdata`, `llvm-bolt`, and `perf`) and verifies target CPU flags from `.cargo/config.toml`.
-2. **Phase 2 — PGO Trace Generation:** Compiles the `pgo_workload` binary with `-Cprofile-generate`, executing synthetic neural DSP workloads to collect realistic hardware branch and execution profile files (`.profraw`), merging them into `merged.profdata`.
+2. **Phase 2 — PGO Trace Generation:** Compiles the `pgo_workload` binary with `-Cprofile-generate`, executing synthetic neural DSP workloads across the mandatory topology families (WaveNet A1, WaveNet A2, LSTM) with the deterministic CabSim IR fixture (`tests/fixtures/models/cabsim_ir_pgo.wav`). The workload is fail-closed: any model/IR corruption aborts, and it emits `target/logs/pgo-workload-receipt.json` proving per-topology block counts (≥ 1000 each), oversampling coverage (`Off`/`2x`/`4x`) and the stereo CabSim frame counter. The receipt is formally validated before the `.profraw` files are merged into `merged.profdata`.
 3. **Phase 3 — PGO-Optimized Compilation:** Recompiles `nam-audio-pipe` using `-Cprofile-use=merged.profdata` and relocation symbols (`-Clink-arg=-Wl,-q`), allowing LLVM to optimize hot loops, inline critical neural activation functions, and unroll vector SIMD loops based on real execution data.
-4. **Phase 4 — LLVM BOLT Machine Code Reordering:** Uses Linux `perf` to record CPU cycle samples during live execution, parses performance counters via `perf2bolt`, and reorders machine code binary instructions via `llvm-bolt` to minimize Instruction Cache (I-Cache) misses and TLB pressure.
+4. **Phase 4 — LLVM BOLT Machine Code Reordering:** Uses Linux `perf` to record CPU cycle samples during live execution, parses performance counters via `perf2bolt`, and reorders machine code binary instructions via `llvm-bolt` to minimize Instruction Cache (I-Cache) misses and TLB pressure. Readiness is proven by PipeWire node registration plus CPU sample consumption (no blind sleep); `perf.data`/`perf.fdata` are validated for minimum samples and DSP symbol coverage; the ELF Build-ID is strictly matched against the collected traces (no `--ignore-build-id`). BOLT failure/unavailability is recorded explicitly in `target/logs/release-receipt.json` as `PGO-ONLY (BOLT_FAILED/BOLT_UNAVAILABLE)` and is fatal under `--strict-release`.
 5. **Phase 4.5 — Assembly Hotspot Disassembly Report:** Generates an AI-ready assembly hotspot report at `target/dsp_hotpath.asm` for low-level inspection.
 6. **Phase 5 — Automated Deployment:** Strips and installs the finalized, hyper-optimized binary directly into `~/.local/bin/nam-audio-pipe`.
 7. **Phase 6 — Release Packaging (.tar.zst):** Generates a release distribution archive at `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.tar.zst` containing the optimized binary, documentation, license, and a 1-click installation script.
@@ -120,6 +120,7 @@ For maximum performance in live setups, `NAM-Audio-Pipe` includes a 5-phase opti
 | `--no-tarball`  | Skips Phase 6 (.tar.zst archive creation).                                                                      |
 | `--no-pgo`      | Skips Phase 2/3 (Profile-Guided Optimization) and compiles directly with the `dist` release profile.            |
 | `--no-bolt`     | Skips Phase 4 (LLVM BOLT post-link optimization).                                                               |
+| `--strict-release` | Fails the release whenever the declared optimization cannot be proven (BOLT failure/unavailability is fatal instead of degrading to PGO-ONLY). |
 | `-h, --help`    | Displays command-line help screen and exits.                                                                    |
 
 ---

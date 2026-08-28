@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-PHASE_TOTAL=5
+PHASE_TOTAL=7
 source "$(dirname "$0")/_lib.sh"
 
 echo -e "${BLUE}${BOLD}========================================${NC}"
@@ -20,13 +20,14 @@ echo -e "${BLUE}${BOLD} NAM-Audio-Pipe Linting & Quality Suite${NC}"
 echo -e "${BLUE}${BOLD}========================================${NC}"
 
 # ---------------------------------------------------------------------------
-# [1/5] Code formatting (cargo fmt)
+# [1/7] Code formatting check (cargo fmt --check) — strictly read-only: the
+# lint gate must never mutate the worktree; a style divergence fails the gate.
 # ---------------------------------------------------------------------------
-phase "Applying code formatting (cargo fmt)..."
-cargo fmt --all
+phase "Checking code formatting (cargo fmt --all -- --check)..."
+cargo fmt --all -- --check
 
 # ---------------------------------------------------------------------------
-# [2/5] Compilation checks (cargo check) — broad feature matrix
+# [2/7] Compilation checks (cargo check) — broad feature matrix
 # ---------------------------------------------------------------------------
 phase "Executing compilation checks (cargo check)..."
 
@@ -37,7 +38,7 @@ echo -e "  ${YELLOW}${BOLD}Checking: All Targets (no default features)...${NC}"
 cargo check --all-targets --no-default-features
 
 # ---------------------------------------------------------------------------
-# [3/5] Static analysis (cargo clippy) — strict, broad feature matrix
+# [3/7] Static analysis (cargo clippy) — strict, broad feature matrix
 # ---------------------------------------------------------------------------
 phase "Executing strict static analysis (cargo clippy)..."
 
@@ -48,7 +49,7 @@ echo -e "  ${YELLOW}${BOLD}Clippy: All Targets (no default features)...${NC}"
 cargo clippy --all-targets --no-default-features -- -D warnings
 
 # ---------------------------------------------------------------------------
-# [4/5] SPDX license header validation (deterministic, no external tooling)
+# [4/7] SPDX license header validation (deterministic, no external tooling)
 # ---------------------------------------------------------------------------
 phase "Validating SPDX license headers..."
 
@@ -57,13 +58,16 @@ phase "Validating SPDX license headers..."
 rs_dirs=( src tests )
 [ -d benches ] && rs_dirs+=( benches )
 
+# Enumeration is fail-closed: with `set -euo pipefail` and no `|| true`, any
+# failure in the find/test commands aborts the gate instead of silently
+# producing an empty (or partial) scope.
 spdx_scope=$(
     {
         find "${rs_dirs[@]}" -type f -name '*.rs'
         find utils -maxdepth 1 -type f -name '*.sh'
         test -f build.rs && echo build.rs
         test -f Cargo.toml && echo Cargo.toml
-    } || true
+    }
 )
 
 missing=$(printf '%s\n' "$spdx_scope" | xargs grep -L "SPDX-License-Identifier" 2>/dev/null || true)
@@ -83,7 +87,7 @@ fi
 ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT)."
 
 # ---------------------------------------------------------------------------
-# [5/5] Undocumented #[allow(clippy::)] check (enforce allow_attributes policy)
+# [5/7] Undocumented #[allow(clippy::)] check (enforce allow_attributes policy)
 #
 # The project sets `allow_attributes = "warn"` in [lints.clippy], meaning every
 # #[allow(clippy::...)] must carry a justification comment immediately above it
@@ -122,6 +126,93 @@ if [ -n "$undocumented_allows" ]; then
     exit 1
 fi
 ok "All #[allow(clippy::)] suppressions are documented."
+
+# ---------------------------------------------------------------------------
+# [6/7] AppStream packaging metadata validation (mandatory, fail-closed)
+# ---------------------------------------------------------------------------
+phase "Validating AppStream packaging metadata (mandatory files + official validators)..."
+
+packaging_dir="packaging/flatpak"
+metainfo_file="$packaging_dir/io.github.fabiohl.NAMAudioPipe.metainfo.xml"
+desktop_file="$packaging_dir/io.github.fabiohl.NAMAudioPipe.desktop"
+icon_theme_dir="$packaging_dir/icons/hicolor"
+
+# Presence of the packaging metadata is mandatory: a Flatpak-ready release
+# requires the AppStream metainfo, the desktop launcher and the hicolor icon
+# theme. Any missing file aborts the lint gate (fail-closed).
+missing_pkg=0
+for pkg_path in "$metainfo_file" "$desktop_file" "$icon_theme_dir"; do
+    if [ ! -e "$pkg_path" ]; then
+        echo -e "  ${RED}${BOLD}ERROR: Mandatory packaging file/dir missing: $pkg_path${NC}"
+        missing_pkg=1
+    fi
+done
+if [ "$missing_pkg" -eq 1 ]; then
+    die "Packaging metadata is incomplete; Flatpak distribution requires metainfo, desktop entry and hicolor icons."
+fi
+ok "Mandatory packaging files present."
+
+command -v appstreamcli >/dev/null 2>&1 \
+    || die "appstreamcli is required to validate AppStream metadata (install appstream-compose/appstream-util)."
+command -v desktop-file-validate >/dev/null 2>&1 \
+    || die "desktop-file-validate is required to validate the .desktop launcher (install desktop-file-utils)."
+
+echo -e "  ${YELLOW}${BOLD}appstreamcli validate --no-net --strict $metainfo_file${NC}"
+if ! appstreamcli validate --no-net --strict "$metainfo_file"; then
+    die "AppStream metainfo validation failed (structural or semantic errors, see output above)."
+fi
+ok "appstreamcli validation passed with zero errors/warnings."
+
+echo -e "  ${YELLOW}${BOLD}desktop-file-validate $desktop_file${NC}"
+if ! desktop-file-validate "$desktop_file"; then
+    die "Desktop entry validation failed (see output above)."
+fi
+ok "Desktop entry validation passed."
+
+# Semantic alignment: <id>, <name> and <launchable> must match the desktop file.
+desktop_id="$(basename "$desktop_file")"
+desktop_name="$(grep -m1 '^Name=' "$desktop_file" | cut -d= -f2-)"
+meta_id="$(grep -m1 -oP '(?<=<id>)[^<]+' "$metainfo_file")"
+meta_launchable="$(grep -m1 -oP '(?<=<launchable type="desktop-id">)[^<]+' "$metainfo_file")"
+meta_name="$(grep -m1 -oP '(?<=<name>)[^<]+' "$metainfo_file")"
+
+if [ "$meta_id" != "$desktop_id" ]; then
+    die "Metainfo <id> ($meta_id) does not match desktop file ID ($desktop_id)."
+fi
+if [ "$meta_launchable" != "$desktop_id" ]; then
+    die "Metainfo <launchable desktop-id> ($meta_launchable) does not match desktop file ID ($desktop_id)."
+fi
+if [ "$meta_name" != "$desktop_name" ]; then
+    die "Metainfo <name> ($meta_name) does not match desktop Name= ($desktop_name)."
+fi
+ok "Metainfo id/name/launchable aligned with desktop entry."
+
+# ---------------------------------------------------------------------------
+# [7/7] AppStream release version sync check
+# ---------------------------------------------------------------------------
+phase "Checking AppStream release version sync with Cargo.toml..."
+
+cargo_ver=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+# Extract version and date from the most recent <release> entry.
+release_line=$(grep -m1 -oP '<release version="[^"]+"[^>]*>' "$metainfo_file")
+if [ -z "$release_line" ]; then
+    die "No <release version=\"...\"> entry found in $metainfo_file."
+fi
+xml_ver=$(printf '%s' "$release_line" | sed -E 's/.*version="([^"]+)".*/\1/')
+release_date=$(printf '%s' "$release_line" | sed -nE 's/.*date="([^"]+)".*/\1/p')
+
+if [ -z "$xml_ver" ]; then
+    die "Could not extract version from <release> in $metainfo_file."
+fi
+if [ "$cargo_ver" != "$xml_ver" ]; then
+    echo -e "  ${RED}${BOLD}ERROR: Version mismatch between Cargo.toml ($cargo_ver) and $metainfo_file ($xml_ver)!${NC}"
+    exit 1
+fi
+if [ -z "$release_date" ]; then
+    echo -e "  ${RED}${BOLD}ERROR: AppStream release $xml_ver is missing the mandatory date attribute!${NC}"
+    exit 1
+fi
+ok "AppStream release $xml_ver ($release_date) matches Cargo.toml ($cargo_ver)."
 
 echo -e "${GREEN}${BOLD}=======================================${NC}"
 echo -e "${GREEN}${BOLD} Quality suite completed successfully!${NC}"

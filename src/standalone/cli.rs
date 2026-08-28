@@ -16,6 +16,68 @@ use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 
 use std::path::PathBuf;
 
+// Domain contract for `--buffer-size` (G-RB-003 / T6.1).
+//
+// The accepted set is `{0} ∪ {2^k | 4 <= k <= 13}`:
+// - `BUFFER_SIZE_AUTO` (`0`) delegates the quantum choice to the PipeWire
+//   audio graph (auto-negotiation; no `node.latency` property is set).
+// - Explicit sizes must be exact powers of two in `[16, 8192]`. The ceiling
+//   matches the engine's static DSP buffers (`MAX_RESAMP_BUF` /
+//   `MAX_BRIDGE_BUF`, both 8192 in `neural_amp_modeler_rs::dsp::pipeline`),
+//   so no `--buffer-size` value can drive an out-of-bounds access or an
+//   over-allocation panic downstream (latency, CabSim partition, FFT).
+pub const BUFFER_SIZE_AUTO: u32 = 0;
+pub const BUFFER_SIZE_MIN: u32 = 16;
+pub const BUFFER_SIZE_MAX: u32 = 8192;
+
+/// Structured rejection reason for an out-of-domain `--buffer-size` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferSizeError {
+    /// Non-zero `size` below [`BUFFER_SIZE_MIN`].
+    BelowMinimum { size: u32 },
+    /// `size` above [`BUFFER_SIZE_MAX`] (max bridge capacity).
+    AboveMaximum { size: u32 },
+    /// `size` inside the inclusive range but not an exact power of two.
+    NotPowerOfTwo { size: u32 },
+}
+
+impl std::fmt::Display for BufferSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            BufferSizeError::BelowMinimum { size } => write!(
+                f,
+                "Buffer size must be at least {BUFFER_SIZE_MIN} (or {BUFFER_SIZE_AUTO} for auto), got {size}"
+            ),
+            BufferSizeError::AboveMaximum { size } => write!(
+                f,
+                "Buffer size cannot exceed {BUFFER_SIZE_MAX} (max bridge capacity), got {size}"
+            ),
+            BufferSizeError::NotPowerOfTwo { size } => write!(
+                f,
+                "Buffer size must be a power of two (e.g. 64, 128, 256, 512, 1024, 2048, 4096, 8192), got {size}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BufferSizeError {}
+
+/// Validates a parsed `--buffer-size` value against the documented domain.
+///
+/// `0` is the auto-negotiation mode (valid). Any non-zero value must satisfy,
+/// cumulatively: `>= BUFFER_SIZE_MIN`, `<= BUFFER_SIZE_MAX`, and be an exact
+/// power of two. The check is pure and runs before any PipeWire connection or
+/// allocation, so malformed input fails fast with a typed, explainable error.
+pub fn validate_buffer_size(size: u32) -> Result<u32, BufferSizeError> {
+    match size {
+        BUFFER_SIZE_AUTO => Ok(size),
+        s if s < BUFFER_SIZE_MIN => Err(BufferSizeError::BelowMinimum { size: s }),
+        s if s > BUFFER_SIZE_MAX => Err(BufferSizeError::AboveMaximum { size: s }),
+        s if !s.is_power_of_two() => Err(BufferSizeError::NotPowerOfTwo { size: s }),
+        s => Ok(s),
+    }
+}
+
 // NOTA DE DESIGN: As funções abaixo usam `println!` (stdout) e `eprintln!` (stderr)
 // intencionalmente — o backend `NamLogger` ainda não foi inicializado no momento
 // do parsing dos argumentos CLI. Isso é prática POSIX padrão para ferramentas de
@@ -41,7 +103,7 @@ pub fn print_help() {
     println!("  -i, --input-gain <DB>   Input gain in dB (e.g. -3.5, 12, 0) [default: 0]");
     println!("  -o, --output-gain <DB>  Output gain in dB (e.g. 5.0, -10) [default: 0]");
     println!(
-        "  -b, --buffer-size <SAMPLES> Fixed block size (e.g. 64, 256, 512). Use 0 for auto [default: 256]"
+        "  -b, --buffer-size <SAMPLES> Fixed block size: 0 for auto, or a power of two in [16, 8192] (e.g. 64, 256, 512) [default: 256]"
     );
     println!("      --diagnose          Print technical support block and exit");
     println!("      --diagnose-full     Print technical support block with raw paths and exit");
@@ -55,6 +117,10 @@ pub fn print_help() {
         "      --activation MODE    Activation precision: standard (default, exact-grade) or fast"
     );
     println!("      --record             Record raw PipeWire input to a WAV file");
+    println!(
+        "      --fail-fast          Disable the bounded backend reconnect cycle (F-RB-010 / T4.5): \
+         exit with an error on the first PipeWire stream failure"
+    );
     println!("  -h, --help              Show this help message and exit");
 }
 
@@ -92,6 +158,10 @@ pub struct CliArgs {
     pub activation: Option<ActivationPrecision>,
     /// Enable WAV recording of the raw PipeWire capture stream.
     pub record: bool,
+    /// Disable the bounded backend reconnect cycle (`--fail-fast`): the first
+    /// PipeWire stream failure triggers the T4.4 fail-fast teardown instead of
+    /// a bounded reconnection attempt.
+    pub fail_fast: bool,
 }
 
 /// Parses command-line arguments.
@@ -112,6 +182,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut oversample = OversampleFactor::Off;
     let mut activation = None;
     let mut record = false;
+    let mut fail_fast = false;
     let mut has_args = false;
 
     while let Some(arg) = parser.next().unwrap_or_else(|e| exit_with_error(e)) {
@@ -129,6 +200,9 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
             }
             Long("record") => {
                 record = true;
+            }
+            Long("fail-fast") => {
+                fail_fast = true;
             }
             Long("slim") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -258,6 +332,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                         val_str
                     ))
                 });
+                validate_buffer_size(buffer_size).unwrap_or_else(|e| exit_with_error(e));
             }
             _ => exit_with_error(arg.unexpected()),
         }
@@ -280,6 +355,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         oversample,
         activation,
         record,
+        fail_fast,
     }
 }
 

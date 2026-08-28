@@ -5,23 +5,21 @@
 //! and its RT listener, with process, param_changed, and state_changed closures.
 
 use super::super::rt_callback;
-use super::state::CaptureState;
+use super::state::{CaptureState, RtHostChannels};
 use crate::recording::buffer::{MAX_BLOCK_SIZE, RingPayload};
 use crate::standalone::colors::Colorize;
-use crate::standalone::pw_host::output_pw::build_spa_format_pod;
+use crate::standalone::pw_host::SharedBackendStatus;
+use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
 use crate::standalone::rt_setup;
-use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, ParamPayload, RtStatusFlags};
-use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeRef, DspBridgeWriter, DspBuffers, DspPipelineContext,
+    BridgeRef, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_RESAMP_BUF,
 };
-use neural_amp_modeler_rs::models::StaticModel;
 
 use pipewire as pw;
 use pw::properties::properties;
-use rtrb::Consumer;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Assembles PipeWire property attributes for the capture Virtual Sink node.
 pub fn create_capture_properties(buffer_size: u32) -> pw::properties::PropertiesBox {
@@ -49,21 +47,32 @@ pub fn create_capture_properties(buffer_size: u32) -> pw::properties::Properties
 }
 
 /// Builds the SPA format specification POD for planar 2-channel F32 audio.
-pub fn build_capture_format_pod(format_buf: &mut [u8; 1024]) -> anyhow::Result<&pw::spa::pod::Pod> {
+pub fn build_capture_format_pod(
+    storage: &mut SpaPodStorage<1024>,
+) -> anyhow::Result<&pw::spa::pod::Pod> {
     let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
     audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
     audio_info.set_channels(2);
 
-    // SAFETY: format_buf is guaranteed to be a 1024-byte array on the stack,
-    // matching the layout and lifetime expected by build_spa_format_pod.
-    unsafe { build_spa_format_pod(&audio_info, format_buf) }
+    // SAFETY: `SpaPodStorage` guarantees the 8-byte alignment required by the
+    // libspa pod builder, and the returned pod borrows `storage`, which outlives
+    // the negotiation call below.
+    unsafe { build_spa_format_pod(&audio_info, storage) }
 }
 
 /// Configures the capture stream (Virtual Sink) and its RT listener.
 ///
-/// The `process()` closure captures all DSP state by `move` and executes
-/// the full pipeline: resampler draining, command reception,
-/// rate synchronization, and DSP processing via `capture_dsp_pipeline`.
+/// The `process()` closure executes the full DSP pipeline — resampler
+/// draining, command reception, rate synchronization, and DSP processing via
+/// `capture_dsp_pipeline` — against the [`CaptureState`] and [`RtHostChannels`]
+/// owned by `run_pipewire_host` and reached through raw pointers.
+///
+/// F-RB-010 / T4.5 (bounded reconnect): the DSP state and the SPSC channels
+/// are *not* moved into the closure — both survive a stream re-instantiation,
+/// so a daemon restart restores audio with the models, IRs and recorder
+/// intact. The main thread never aliases the pointed-to objects while the RT
+/// callback runs (it touches them only before `thread_loop.start()` and after
+/// `thread_loop.stop()`).
 #[expect(
     clippy::too_many_arguments,
     reason = "FFI design or complex DSP kernel signature required by construction"
@@ -72,24 +81,17 @@ pub fn setup_capture_stream<'c>(
     core: &'c pw::core::Core,
     bridge_ptr: BridgeRef,
     buffer_size: u32,
-    ir_raw_samples: Option<Vec<f32>>,
-    sys: &neural_amp_modeler_rs::common::diagnostics::SystemSnapshot,
     target_cpu: usize,
-    mut consumer: Consumer<ParamPayload>,
-    mut gc_producer: rtrb::Producer<GcItem>,
-    gc_overflow: Arc<GcOverflowBuffer>,
-    mut resampler_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::resampler::NamResampler>>,
-    mut cabsim_consumer: Consumer<
-        Option<neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimAdapter>,
-    >,
+    state_ptr: *mut CaptureState,
+    channels_ptr: *mut RtHostChannels,
+    rate_for_param: Arc<AtomicU32>,
     rt_status: Arc<RtStatusFlags>,
-    slimmable_consumer: Consumer<Option<Box<StaticModel>>>,
-    os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
-    oversample: OversampleFactor,
     recording_producer_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
     parking_lot_ptr: *mut [Option<GcItem>; 16],
     parking_lot_dirty_ptr: *const AtomicBool,
     recording_data_available: Option<Arc<AtomicBool>>,
+    recording_failed: Option<Arc<AtomicBool>>,
+    backend_status: Arc<SharedBackendStatus>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let capture_props = create_capture_properties(buffer_size);
 
@@ -99,31 +101,49 @@ pub fn setup_capture_stream<'c>(
         capture_props,
     )?;
 
-    let mut state = CaptureState::init(sys, oversample);
-    state.ir_raw_samples = ir_raw_samples;
-    state.slimmable_rx = Some(slimmable_consumer);
-    state.os_rx = Some(os_consumer);
-    let rate_for_param = state.shared_target_rate.clone();
-    let rate_for_process = state.shared_target_rate.clone();
-
+    let rate_for_process = rate_for_param.clone();
+    let rt_status_for_listener = rt_status.clone();
     let rt_status_for_process = rt_status.clone();
-    let gc_overflow_for_process = gc_overflow.clone();
+    let backend_for_state = backend_status.clone();
+    let backend_for_params = backend_status.clone();
 
     let lut = neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut();
 
     let capture_listener = capture_stream
         .add_local_listener::<()>()
-        .state_changed(super::listeners::state_changed_handler)
+        .state_changed(move |_stream, _user_data, old, new| {
+            super::listeners::state_changed_handler(old, new, &backend_for_state)
+        })
         .param_changed(move |stream, user_data, id, param| {
-            super::listeners::param_changed_handler(stream, user_data, id, param, &rate_for_param)
+            super::listeners::param_changed_handler(
+                stream,
+                user_data,
+                id,
+                param,
+                &rate_for_param,
+                &rt_status_for_listener,
+                &backend_for_params,
+            )
         })
         .process(move |stream: &pw::stream::Stream, _info| {
+            // SAFETY: state_ptr points to the `Box<CaptureState>` owned by
+            // run_pipewire_host. While this loop runs the RT callback is the
+            // sole accessor; the main thread touches the state only before
+            // `thread_loop.start()` and after `thread_loop.stop()`. The
+            // bounded reconnect cycle (F-RB-010 / T4.5) re-derives the same
+            // pointer for each fresh stream instance — the DSP state (models,
+            // resampler, cab-sim, gains) survives daemon restarts.
+            let state = unsafe { &mut *state_ptr };
+            // SAFETY: channels_ptr points to the `Box<RtHostChannels>` owned
+            // by run_pipewire_host — same exclusivity contract as state_ptr.
+            let channels = unsafe { &mut *channels_ptr };
             // SAFETY: recording_producer_ptr points to a stack-local in
             // run_pipewire_host that outlives this closure. The RT thread
             // is the only writer, and after thread_loop.stop() the shutdown
             // path takes sequential ownership. No concurrent access occurs.
             let recording_producer = unsafe { &mut *recording_producer_ptr };
             let recording_data_available_ref = recording_data_available.as_deref();
+            let recording_failed_ref = recording_failed.as_deref();
             // SAFETY: parking_lot_ptr and parking_lot_dirty_ptr point to stack-local slots in
             // run_pipewire_host that outlive this closure (same contract as
             // recording_producer_ptr). While the loop runs, the RT callback
@@ -148,7 +168,7 @@ pub fn setup_capture_stream<'c>(
                 let mut any_remaining = false;
                 for slot in parking_lot.iter_mut() {
                     let Some(old) = slot.take() else { continue };
-                    if let Err(rtrb::PushError::Full(old_back)) = gc_producer.push(old) {
+                    if let Err(rtrb::PushError::Full(old_back)) = channels.gc_producer.push(old) {
                         *slot = Some(old_back);
                         any_remaining = true;
                         break;
@@ -159,37 +179,50 @@ pub fn setup_capture_stream<'c>(
                 }
             }
 
+            // Command Budgeting (F-RB-011 / T2.5): at most one structural swap
+            // (resampler, cab-sim, model pair, oversampling) applies per
+            // callback. The counter is shared across every drain below; the
+            // excess is parked in the per-channel deferred slots of
+            // `CaptureState` and resolved at the start of the next callback.
+            let mut structural_applied = 0usize;
+
             rt_callback::drain_resamplers(
-                &mut resampler_consumer,
+                &mut channels.resampler_consumer,
+                &mut state.deferred_resampler,
+                &mut structural_applied,
                 &mut state.resampler,
-                &mut gc_producer,
+                &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
-                &gc_overflow_for_process,
+                &channels.gc_overflow,
                 &rt_status_for_process,
             );
 
             rt_callback::drain_cabsims(
-                &mut cabsim_consumer,
+                &mut channels.cabsim_consumer,
+                &mut state.deferred_cabsim,
+                &mut structural_applied,
                 &mut state.active_cabsim,
-                &mut gc_producer,
+                &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
-                &gc_overflow_for_process,
+                &channels.gc_overflow,
                 &rt_status_for_process,
             );
 
             let param_changed = rt_callback::receive_commands(
-                &mut consumer,
+                &mut channels.param_consumer,
+                &mut state.deferred_model,
+                &mut structural_applied,
                 &mut state.model_input_mult_adj,
                 &mut state.model_output_mult_adj,
                 &mut state.current_nam_rate,
                 &mut state.active_model_l,
                 &mut state.active_model_r,
-                &mut gc_producer,
+                &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
-                &gc_overflow_for_process,
+                &channels.gc_overflow,
                 &rt_status_for_process,
                 &mut state.user_input_gain_mult,
                 &mut state.user_output_gain_mult,
@@ -204,23 +237,27 @@ pub fn setup_capture_stream<'c>(
 
             rt_callback::drain_slimmable_models(
                 &mut state.slimmable_rx,
+                &mut state.deferred_slimmable,
+                &mut structural_applied,
                 &mut state.active_model_l,
                 &mut state.active_model_r,
-                &mut gc_producer,
+                &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
-                &gc_overflow_for_process,
+                &channels.gc_overflow,
                 &rt_status_for_process,
             );
 
             rt_callback::drain_os_engines(
                 &mut state.os_rx,
+                &mut state.deferred_os,
+                &mut structural_applied,
                 &mut state.os_l,
                 &mut state.os_r,
-                &mut gc_producer,
+                &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
-                &gc_overflow_for_process,
+                &channels.gc_overflow,
                 &rt_status_for_process,
             );
 
@@ -248,6 +285,19 @@ pub fn setup_capture_stream<'c>(
                 if rt_status_for_process.check_flag(
                     neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED,
                 ) {
+                    // Fail-open rollback (F-RB-004): the rebuild failed, so the
+                    // callback resumes with the previous resampler in safe
+                    // bypass/mute mode. Record the current request generation as
+                    // resolved so the invariant
+                    // `applied_rate_generation == requested_rate_generation`
+                    // holds on unmute — the old resampler is the accepted
+                    // fallback for this request, never a stale replacement.
+                    let current_gen = rt_status_for_process
+                        .requested_rate_generation
+                        .load(Ordering::Acquire);
+                    rt_status_for_process
+                        .applied_rate_generation
+                        .store(current_gen, Ordering::Release);
                     rt_status_for_process.clear_flag(
                         neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING,
                     );
@@ -279,7 +329,8 @@ pub fn setup_capture_stream<'c>(
                     rt_status: &rt_status_for_process,
                     adaptive: &mut state.adaptive_compute,
                     bridge_writer: DspBridgeWriter::from_ref(bridge_ptr),
-                    conv: state.active_cabsim.as_mut(),
+                    conv: None,
+                    conv_pair: state.active_cabsim.as_deref_mut(),
                 },
                 DspBuffers {
                     resamp_mid_l: &mut *state.resamp_mid_l,
@@ -303,6 +354,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.recording_meta_rate,
                 &mut state.recording_block,
                 recording_data_available_ref,
+                recording_failed_ref,
             );
 
             // Sample PipeWire clock for drift diagnostics (every 64 frames)
@@ -339,29 +391,40 @@ pub fn setup_capture_stream<'c>(
                 }
             }
 
-            // Detect cabsim partition mismatch and signal rebuild
-            if let Some(ref cabsim) = state.active_cabsim {
-                let n_samples =
-                    rt_status_for_process.last_n_samples.load(Ordering::Relaxed) as usize;
-                if n_samples > 0
-                    && cabsim.partition_size() != n_samples
-                    && state.ir_raw_samples.is_some()
-                {
-                    // Write data BEFORE raising the flag (Release barrier must cover
-                    // the preceding store so the consumer sees the correct value).
-                    rt_status_for_process
-                        .requested_cabsim_partition_size
-                        .store(n_samples as u32, Ordering::Relaxed);
-                    rt_status_for_process.set_flag_release(
-                        neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
-                    );
-                }
+            // Detect cabsim partition/rate mismatch and signal rebuild
+            // (F-RB-006): the IR must match both the host quantum
+            // (partition size) and the applied host output rate.
+            let last_n_samples =
+                rt_status_for_process.last_n_samples.load(Ordering::Relaxed) as usize;
+            if cabsim_rebuild_needed(
+                state.active_cabsim.as_deref(),
+                state.ir_raw_samples.is_some(),
+                last_n_samples,
+                current_host_rate,
+                rt_status_for_process.check_flag(
+                    neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
+                ),
+            ) {
+                // Write data BEFORE raising the flag (Release barrier must cover
+                // the preceding stores so the consumer sees the correct values).
+                rt_status_for_process
+                    .requested_cabsim_partition_size
+                    .store(last_n_samples as u32, Ordering::Relaxed);
+                rt_status_for_process
+                    .requested_cabsim_host_rate
+                    .store(current_host_rate, Ordering::Relaxed);
+                rt_status_for_process
+                    .requested_cabsim_generation
+                    .fetch_add(1, Ordering::Release);
+                rt_status_for_process.set_flag_release(
+                    neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
+                );
             }
         })
         .register()?;
 
-    let mut format_buf = [0u8; 1024];
-    let format_pod = build_capture_format_pod(&mut format_buf)?;
+    let mut format_storage = SpaPodStorage::new();
+    let format_pod = build_capture_format_pod(&mut format_storage)?;
 
     capture_stream.connect(
         pw::spa::utils::Direction::Input,
@@ -379,6 +442,36 @@ pub fn setup_capture_stream<'c>(
     );
 
     Ok((capture_stream, capture_listener))
+}
+
+/// Decides whether a cab-sim rebuild must be requested (F-RB-006).
+///
+/// A rebuild is needed when an IR is loaded and any of:
+/// * no pair is active yet — first install, or safe-bypass after a failed
+///   rebuild (`already_pending` suppresses duplicate requests while a
+///   previous rebuild is in flight);
+/// * the host quantum no longer matches the pair's partition size;
+/// * the pair's IR is calibrated for a different rate than the applied host
+///   output rate (rate calibration).
+fn cabsim_rebuild_needed(
+    active: Option<&neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>,
+    has_ir: bool,
+    n_samples: usize,
+    host_rate: u32,
+    already_pending: bool,
+) -> bool {
+    // G-RB-003 / T6.2: only quantums inside the convolution partition domain
+    // [16, MAX_RESAMP_BUF] may drive a rebuild. A spurious quantum above the
+    // ceiling (or below the floor) must never trigger successive rebuilds —
+    // the handler would clamp it, producing a pair whose partition never
+    // matches the anomalous quantum and re-requesting forever.
+    if !has_ir || !(16..=MAX_RESAMP_BUF).contains(&n_samples) {
+        return false;
+    }
+    match active {
+        None => !already_pending,
+        Some(pair) => pair.partition_size() != n_samples || pair.sample_rate != host_rate,
+    }
 }
 
 #[cfg(test)]

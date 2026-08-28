@@ -81,13 +81,23 @@ fi
 # Quick-runner gate infrastructure (typed receipt + fail-closed assertion)
 # ---------------------------------------------------------------------------
 
+# emit_to <receipt_file> <line>
+#   Appends one structured line to an arbitrary typed receipt file
+#   (e.g. target/logs/long-receipt.txt for the long suite), mirroring it on
+#   stdout. Single-line appends are atomic under O_APPEND.
+emit_to() {
+    local receipt_file="$1"
+    shift
+    mkdir -p target/logs
+    printf '%s\n' "$*" | tee -a "$receipt_file"
+}
+
 # emit <receipt-line>
 #   Appends one structured line to the typed quick-run receipt
 #   (target/logs/quick-receipt.txt), mirroring it on stdout. Single-line
 #   appends are atomic under O_APPEND.
 emit() {
-    mkdir -p target/logs
-    printf '%s\n' "$1" | tee -a target/logs/quick-receipt.txt
+    emit_to target/logs/quick-receipt.txt "$*"
 }
 
 # assert_ran_tests <log_file> [min_count]
@@ -127,5 +137,55 @@ assert_ran_tests() {
         return 1
     fi
     echo -e "  Gate: ${total_passed} test(s)/benchmark(s) executed ≥ ${min_count}  ✓"
+    return 0
+}
+
+# assert_ran_target <log_file> <target_name> [min_count]
+#   Verifies that a specific mandatory test target was actually executed in the
+#   log and that its nominal executed-test count (passed + measured) reached
+#   min_count. <target_name> is the text after the "Running " banner produced
+#   by cargo test, e.g. "unittests src/lib.rs", "unittests src/main.rs" or
+#   "tests/service_resilience.rs".
+#   Fail-closed against removed/renamed targets (no "Running ..." section),
+#   empty filters and full skips (executed count below min_count).
+assert_ran_target() {
+    local log_file="$1"
+    local target_name="$2"
+    local min_count="${3:-1}"
+
+    if [ ! -f "$log_file" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: log file not found: $log_file${NC}"
+        return 1
+    fi
+    if [ -z "$target_name" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: assert_ran_target called without a target name.${NC}"
+        return 1
+    fi
+
+    local run_line run_lineno result_line passed measured executed
+    run_line=$(grep -n -m1 -F "Running ${target_name} " "$log_file" 2>/dev/null || true)
+    if [ -z "$run_line" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' was not executed (no 'Running ...' section in $log_file). Target removed, renamed or filtered out?${NC}"
+        return 1
+    fi
+    run_lineno="${run_line%%:*}"
+
+    result_line=$(sed -n "$((run_lineno + 1)),\$p" "$log_file" | grep -m1 -E 'test result:' 2>/dev/null || true)
+    if [ -z "$result_line" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' has no 'test result:' summary in $log_file.${NC}"
+        return 1
+    fi
+
+    passed=$(printf '%s\n' "$result_line" | grep -oP '\d+(?=\s+passed)' | head -n1 || true)
+    passed="${passed:-0}"
+    measured=$(printf '%s\n' "$result_line" | grep -oP '\d+(?=\s+measured)' | head -n1 || true)
+    measured="${measured:-0}"
+    executed=$((passed + measured))
+
+    if [ "$executed" -lt "$min_count" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' executed $executed test(s)/benchmark(s) < $min_count (empty filter or full skip?).${NC}"
+        return 1
+    fi
+    echo -e "  Gate: target '${target_name}' executed $executed test(s)/benchmark(s) ≥ $min_count  ✓"
     return 0
 }

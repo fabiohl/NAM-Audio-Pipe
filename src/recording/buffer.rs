@@ -48,7 +48,11 @@ pub struct AlignedBlock<const SIZE: usize> {
     /// the whole 16 KiB array (see `new_uninit`).
     data: [MaybeUninit<f32>; SIZE],
     /// Number of valid f32 samples in `data[0..valid_len]`.
-    pub valid_len: usize,
+    ///
+    /// Strictly private: the only safe way to publish initialized samples is
+    /// [`Self::fill_planar`]. Allowing external mutation would let safe code
+    /// expose uninitialized `MaybeUninit` slots through `as_slice()`.
+    valid_len: usize,
 }
 
 impl<const SIZE: usize> AlignedBlock<SIZE> {
@@ -109,6 +113,55 @@ impl<const SIZE: usize> AlignedBlock<SIZE> {
         // region is not possible through this API.
         unsafe { self.data[..self.valid_len].assume_init_ref() }
     }
+
+    /// Returns the number of valid f32 samples in the block.
+    ///
+    /// Always `2 * frames()` and `<= SIZE` after a [`Self::fill_planar`].
+    #[inline]
+    pub fn valid_len(&self) -> usize {
+        self.valid_len
+    }
+
+    /// Returns the number of valid stereo frames (`valid_len / 2`).
+    #[inline]
+    pub fn frames(&self) -> usize {
+        self.valid_len / 2
+    }
+
+    /// Returns `true` if the block holds no valid samples.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.valid_len == 0
+    }
+
+    /// Returns the left channel plane `[0..frames]` as a `&[f32]`.
+    ///
+    /// # Safety
+    ///
+    /// Like [`Self::as_slice`], the projection is bounded by `valid_len`, which
+    /// is only ever published after the corresponding slots were initialized.
+    #[inline]
+    pub fn left_slice(&self) -> &[f32] {
+        let n = self.frames();
+        // SAFETY: `valid_len = 2 * frames` is only published by `fill_planar`
+        // after writing both planes, so `[0..frames]` is fully initialized.
+        unsafe { self.data[..n].assume_init_ref() }
+    }
+
+    /// Returns the right channel plane `[frames..2 * frames]` as a `&[f32]`.
+    ///
+    /// # Safety
+    ///
+    /// Like [`Self::as_slice`], the projection is bounded by `valid_len`, which
+    /// is only ever published after the corresponding slots were initialized.
+    #[inline]
+    pub fn right_slice(&self) -> &[f32] {
+        let n = self.frames();
+        // SAFETY: `valid_len = 2 * frames` is only published by `fill_planar`
+        // after writing both planes, so `[n..2n]` is fully initialized and
+        // `2n <= valid_len <= SIZE` bounds the projection.
+        unsafe { self.data[n..2 * n].assume_init_ref() }
+    }
 }
 
 impl<const SIZE: usize> Default for AlignedBlock<SIZE> {
@@ -158,7 +211,17 @@ pub fn create_audio_ring_buffer<const BLOCK_SIZE: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::assert_matches;
+
+    /// Asserts two `f32` slices are bit-identical (robust to `NaN` payloads,
+    /// which `assert_eq!` would treat as unequal).
+    fn assert_bits_eq(a: &[f32], b: &[f32]) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b) {
+            assert_eq!(x.to_bits(), y.to_bits(), "bitwise sample mismatch");
+        }
+    }
 
     #[test]
     fn ring_buffer_push_pop_round_trip() {
@@ -177,12 +240,12 @@ mod tests {
         let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
         let mut block = AlignedBlock::new();
         block.fill_planar(&[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]);
-        let expected_len = block.valid_len;
+        let expected_len = block.valid_len();
         let expected = block.as_slice().to_vec();
         assert!(p.push(RingPayload::Audio(block)).is_ok());
         match c.pop().unwrap() {
             RingPayload::Audio(b) => {
-                assert_eq!(b.valid_len, expected_len);
+                assert_eq!(b.valid_len(), expected_len);
                 assert_eq!(b.as_slice(), &expected[..]);
             }
             other => panic!(
@@ -221,14 +284,15 @@ mod tests {
     #[test]
     fn aligned_block_new_uninit_has_zero_valid_len() {
         let block = AlignedBlock::<MAX_BLOCK_SIZE>::new_uninit();
-        assert_eq!(block.valid_len, 0);
+        assert_eq!(block.valid_len(), 0);
     }
 
     #[test]
     fn aligned_block_default_is_zero_init() {
         let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::default();
-        assert_eq!(block.valid_len, 0);
-        block.valid_len = MAX_BLOCK_SIZE;
+        assert_eq!(block.valid_len(), 0);
+        let zero_plane = [0.0f32; MAX_BLOCK_SIZE / 2];
+        block.fill_planar(&zero_plane, &zero_plane);
         assert!(block.as_slice().iter().all(|&x| x == 0.0));
     }
 
@@ -248,12 +312,62 @@ mod tests {
     fn ring_buffer_full_push_fails_gracefully() {
         let (mut p, _c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(1);
         let mut block = AlignedBlock::new_uninit();
-        block.valid_len = 4;
+        block.fill_planar(&[1.0, 2.0], &[3.0, 4.0]);
         // Fill the only slot
         assert!(p.push(RingPayload::Audio(block)).is_ok());
         // Second push should fail (buffer full)
         let mut block2 = AlignedBlock::new_uninit();
-        block2.valid_len = 4;
+        block2.fill_planar(&[5.0, 6.0], &[7.0, 8.0]);
         assert!(p.push(RingPayload::Audio(block2)).is_err());
+    }
+
+    proptest! {
+        /// Property: for any input slices `left`/`right`, `fill_planar` publishes
+        /// exactly `n = min(len(L), len(R), SIZE/2)` stereo frames, keeping
+        /// `valid_len` even, bounded by `SIZE`, and bit-identical to the copied
+        /// inputs — the F-RB-001 soundness invariant.
+        #[test]
+        fn fill_planar_preserves_invariants(
+            left in proptest::collection::vec(any::<f32>(), 0..(MAX_BLOCK_SIZE / 2 + 16)),
+            right in proptest::collection::vec(any::<f32>(), 0..(MAX_BLOCK_SIZE / 2 + 16)),
+        ) {
+            let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new_uninit();
+            let n = left.len().min(right.len()).min(MAX_BLOCK_SIZE / 2);
+
+            let returned = block.fill_planar(&left, &right);
+
+            assert_eq!(returned, 2 * n);
+            assert!(block.valid_len() <= MAX_BLOCK_SIZE);
+            assert_eq!(block.valid_len() % 2, 0);
+            assert_eq!(block.frames(), n);
+            assert_eq!(block.is_empty(), n == 0);
+            assert_eq!(block.as_slice().len(), block.valid_len());
+            assert_eq!(block.left_slice().len(), n);
+            assert_eq!(block.right_slice().len(), n);
+
+            // Every published sample matches the copied input, bit for bit.
+            assert_bits_eq(block.left_slice(), &left[..n]);
+            assert_bits_eq(block.right_slice(), &right[..n]);
+            assert_bits_eq(&block.as_slice()[..n], &left[..n]);
+            assert_bits_eq(&block.as_slice()[n..], &right[..n]);
+        }
+
+        /// Property: `new()` (zeroed) + `fill_planar` with short inputs must never
+        /// expose samples past the published length, and the exposed region must
+        /// stay within the block capacity.
+        #[test]
+        fn fill_planar_small_inputs_never_overrun(
+            left in proptest::collection::vec(any::<f32>(), 0..64),
+            right in proptest::collection::vec(any::<f32>(), 0..64),
+        ) {
+            let mut block = AlignedBlock::<64>::new();
+            let n = left.len().min(right.len()).min(64 / 2);
+            block.fill_planar(&left, &right);
+            assert_eq!(block.valid_len(), 2 * n);
+            assert_eq!(block.frames(), n);
+            assert_eq!(block.as_slice().len(), 2 * n);
+            assert_bits_eq(block.left_slice(), &left[..n]);
+            assert_bits_eq(block.right_slice(), &right[..n]);
+        }
     }
 }

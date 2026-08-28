@@ -12,6 +12,11 @@ readme = "README.md"
 authors = ["Fábio Henrique de Lima Silva <fhl.bsb@gmail.com>"]
 keywords = ["audio", "dsp", "nam", "neural-amp-modeler", "guitar", "pipewire"]
 categories = ["multimedia::audio", "multimedia"]
+# All binary targets are declared explicitly via [[bin]] below. autobins = false
+# prevents Cargo from auto-discovering every src/bin/*.rs as a crate target,
+# which would otherwise compile pgo_workload_test.rs (a #[cfg(test)] module
+# included by pgo_workload.rs) as a standalone binary.
+autobins = false
 
 [[bin]]
 name = "nam-audio-pipe"
@@ -32,7 +37,7 @@ pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
 rtrb = "0.4.0"
-tokio = { version = "1", features = ["rt", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tokio-uring = "0.5"
 anyhow = "1.0.104"
 libc = "0.2.189"
@@ -43,8 +48,26 @@ env_logger = { version = "0.11.11", default-features = false }
 NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }
 
 [features]
-default = []
-testing = ["NeuralAmpModeler-rs/testing"]
+default = ["stereo"]
+# True stereo DSP (ER-2): enables the engine's stereo feature so the unified
+# L/R pipeline processes each channel independently instead of folding R as a
+# mono copy of L (mono detection becomes dynamic per-block).
+stereo = ["NeuralAmpModeler-rs/stereo"]
+testing = ["NeuralAmpModeler-rs/testing", "stereo"]
+# Enables the RT heap-audit allocator (CountingAllocator) and the swap
+# zero-allocation gates (F-RB-007).
+heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
+
+[dev-dependencies]
+# Property-based testing for AlignedBlock invariants (F-RB-001) and future fuzz targets.
+proptest = "1.11.0"
+# ER-5 / T5.6 distribution QA harness: strict XML well-formedness parsing for
+# the AppStream metainfo audit (tests/distribution_qa.rs).
+quick-xml = "0.41"
+# ER-5 / T5.6 distribution QA harness: JSON parsing + SHA-256 verification of
+# the release provenance receipt (tests/distribution_qa.rs).
+serde_json = "1"
+sha2 = "0.11"
 
 [lints.clippy]
 allow_attributes = "warn"

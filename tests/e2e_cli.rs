@@ -155,3 +155,97 @@ fn no_args_prints_help_and_exits_zero() {
         "no-args invocation should print usage information"
     );
 }
+
+// --buffer-size domain contract (G-RB-003 / T6.1) -------------------------
+// The negative acceptances must fail fast with a non-zero exit and a clear
+// stderr message BEFORE any PipeWire connection is attempted.
+
+#[test]
+fn buffer_size_non_power_of_two_exits_with_error_before_pipewire() {
+    let output = binary()
+        .args(["-b", "100"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit code for non-power-of-two buffer size"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("power of two"),
+        "stderr should explain the power-of-two requirement, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("PipeWire"),
+        "validation must reject before any PipeWire connection, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn buffer_size_below_minimum_exits_with_error_before_pipewire() {
+    let output = binary()
+        .args(["-b", "1"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit code for below-minimum buffer size"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("at least 16"),
+        "stderr should explain the minimum, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("PipeWire"),
+        "validation must reject before any PipeWire connection, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn buffer_size_above_max_exits_with_error_before_pipewire() {
+    let output = binary()
+        .args(["-b", "16384"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit code for above-max buffer size"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("cannot exceed 8192"),
+        "stderr should explain the maximum, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("PipeWire"),
+        "validation must reject before any PipeWire connection, got: {}",
+        stderr
+    );
+}

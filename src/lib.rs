@@ -8,3 +8,13 @@
 
 pub mod recording;
 pub mod standalone;
+
+/// Real-time heap-allocation audit allocator (feature `heap-audit`).
+///
+/// Intercepts every heap request so the RT-safety heap-audit unit tests
+/// (`cabsim_swap` swap transitions, F-RB-007) can prove zero allocations on
+/// the audio-thread paths via [`neural_amp_modeler_rs::common::alloc_audit`].
+#[cfg(feature = "heap-audit")]
+#[global_allocator]
+static GLOBAL: neural_amp_modeler_rs::common::alloc_audit::CountingAllocator =
+    neural_amp_modeler_rs::common::alloc_audit::CountingAllocator;

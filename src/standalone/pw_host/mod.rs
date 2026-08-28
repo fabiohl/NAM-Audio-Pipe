@@ -82,11 +82,19 @@ mod handlers;
 pub mod identity;
 pub mod output_pw;
 mod playback;
+mod reconnect;
 mod rt_callback;
 mod run;
+pub mod status;
 
 pub use output_pw::PipewireHostConfig;
 pub use run::run_pipewire_host;
+pub use status::{BackendState, BackendStatusSnapshot, SharedBackendStatus, observe_stream_state};
+
+/// Offline RT swap-stress harness (T2.6 / ER-2) — full capture-callback drain
+/// sequence + DSP with no PipeWire daemon. Compiled only under `testing`.
+#[cfg(feature = "testing")]
+pub use rt_callback::harness::RtSwapHarness;
 
 // Re-exports for test module compatibility (pw_host_test.rs).
 #[cfg(test)]

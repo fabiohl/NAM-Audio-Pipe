@@ -15,15 +15,18 @@
 //! - **ZERO ALLOCATIONS** in the Audio thread: The audio channel memory (`process()`) is always prepared 100% in advance. Audio never "requests more RAM" out of nowhere.
 
 use nam_audio_pipe::recording::{self, buffer};
-use nam_audio_pipe::standalone::{cli, colors::Colorize, pw_host, rt_setup, setup};
+use nam_audio_pipe::standalone::{cli, colors::Colorize, pw_host, rt_setup, setup, signals};
 
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+use neural_amp_modeler_rs::common::spsc::ParamPayload;
 use neural_amp_modeler_rs::math::activations::set_activation_tls;
-use neural_amp_modeler_rs::{common::spsc, common::spsc::ParamPayload};
 
 use std::ffi::CStr;
+use std::path::PathBuf;
+#[cfg(feature = "testing")]
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 /// Entry point for NAM-Audio-Pipe.
 fn main() -> anyhow::Result<()> {
@@ -89,31 +92,13 @@ fn main() -> anyhow::Result<()> {
         .bold()
     );
 
-    // 4. EMERGENCY BUTTON: Configures "Ctrl+C".
-    // If you want to close the program, it ensures the audio stops smoothly, without clicks.
-    extern "C" fn sigint_handler(_sig: libc::c_int) {
-        if spsc::SHUTDOWN.load(Ordering::Acquire) {
-            // Second Ctrl-C: graceful shutdown did not respond in time.
-            // `_exit(1)` terminates the process immediately without running destructors.
-            // The kernel reclaims ALL open resources (file descriptors, mmap, PM QoS,
-            // THP advice) — nothing persists after process exit.
-            // Prefer `_exit` over `abort` to avoid unneeded core dumps;
-            // use `abort()` only if core dumps are explicitly required for debugging.
-            unsafe { libc::_exit(1) };
-        }
-        spsc::SHUTDOWN.store(true, Ordering::Release); // Pairs with Acquire loads in panic_hook and main loop
-    }
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        // SAFETY: sigint_handler has the 1-arg signature expected by the kernel
-        // when SA_SIGINFO is not set; SA_RESTART alone triggers the 1-arg handler
-        // path. The cast to sighandler_t (usize) is a no-op ABI-compatible
-        // conversion — both `extern "C" fn(i32)` and `sighandler_t` (usize) are
-        // pointer-sized integers on this target.
-        sa.sa_sigaction = sigint_handler as *const () as libc::sighandler_t;
-        sa.sa_flags = libc::SA_RESTART;
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
-    }
+    // 4. EMERGENCY BUTTON: Configures "Ctrl+C" (SIGINT) and service shutdown
+    // (SIGTERM). The unified handler in `standalone::signals` is async-signal-safe:
+    // the first signal cooperatively sets the process-global `SHUTDOWN` flag so
+    // the main loop stops the audio cleanly (thread_loop.stop, recording drain,
+    // WAV header rewrite + fsync); a second signal force-exits via `_exit(1)`.
+    // Installation validates every `libc::sigaction` return code (F-RB-010).
+    signals::install_termination_signal_handlers()?;
 
     // 5. COMMUNICATION CHANNELS: Creates ultra-fast "pipes" for communication.
     let channels = setup::setup_communication_channels();
@@ -136,12 +121,19 @@ fn main() -> anyhow::Result<()> {
     // parse architecture & metadata, and push it to the audio thread.
     let model_setup = setup::load_initial_model(model_path.as_deref(), &sys, &mut producer);
     let full_wavenet_model = model_setup.full_wavenet_model;
+    let has_model_r = model_setup.has_model_r;
     let model_architecture = model_setup.architecture;
 
     // 7. LOAD THE CAB-SIM IR: If you said "use cabinet X",
     // this is where the computer opens that WAV file and builds the convolution engine.
-    let ir_raw_samples =
-        setup::load_initial_cabsim(args.cab_path.as_deref(), buffer_size, &mut cabsim_producer)?;
+    let (ir_raw_samples, ir_source_rate) = match setup::load_initial_cabsim(
+        args.cab_path.as_deref(),
+        buffer_size,
+        &mut cabsim_producer,
+    )? {
+        Some(ir) => (Some(ir.raw_samples), ir.source_rate),
+        None => (None, 0),
+    };
 
     // Initial gains
     if initial_in_gain != 0.0 {
@@ -187,28 +179,84 @@ fn main() -> anyhow::Result<()> {
     // syscalls that would cause jitter at the critical moment of the first audio delivery.
     rt_setup::configure_process_wide();
 
-    // Create the recording ring buffer and spawn the disk I/O thread (opt-in via --record)
-    let (recording_producer, recording_data_available, recording_io_handle) = if args.record {
+    // Create the recording ring buffer and spawn the disk I/O thread (opt-in via --record).
+    // The startup handshake (F-RB-009 / T3.3) is a hard fail-fast gate: PipeWire is only
+    // started with `--record` after the worker confirms io_uring is up and the output
+    // directory is writable — an invalid directory or an unavailable io_uring aborts the
+    // process here instead of silently discarding all audio into the ring.
+    //
+    // The worker thread, its ring producer (the stop channel) and the RT failure flag are
+    // handed to a `RecordingWorkerGuard` (F-RB-009 / T3.5): RAII custody guarantees the
+    // worker is signalled and joined with a bounded timeout even if the PipeWire host
+    // returns early via `?`, and the guard's shutdown outcome propagates recording
+    // failures into the process exit code.
+    let (recording_data_available, recording_status, recording_worker) = if args.record {
         let (producer, consumer) = recording::create_audio_ring_buffer::<{ buffer::MAX_BLOCK_SIZE }>(
             buffer::RING_CAPACITY,
         );
-        let data_available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_for_thread = std::sync::Arc::clone(&data_available);
-        // The JoinHandle is retained and awaited (bounded) during shutdown so the
-        // WAV header is finalized before PipeWire is deinitialized.
-        let io_handle = std::thread::Builder::new()
-            .name("nam-recording-io".into())
-            .spawn(move || {
-                tokio_uring::start(async {
-                    if let Err(e) =
-                        recording::disk_writer_loop(consumer, Some(flag_for_thread)).await
-                    {
-                        log::error!("Disk writer error: {e}");
-                    }
-                });
-            })
-            .expect("Failed to spawn recording I/O thread");
-        (Some(producer), Some(data_available), Some(io_handle))
+        let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_for_thread = Arc::clone(&data_available);
+
+        let recording_status: recording::SharedRecordingStatus =
+            Arc::new(Mutex::new(recording::RecordingStatus::Starting));
+        let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let failed_for_thread = Arc::clone(&failed_flag);
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel();
+        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let init = recording::RecordingInit::new(
+            recording_status.clone(),
+            init_tx,
+            failed_for_thread,
+            base_dir,
+        );
+
+        // The JoinHandle is retained by the guard and formally joined (bounded)
+        // during shutdown so the WAV header is finalized before PipeWire is
+        // deinitialized and recording failures surface as a non-zero exit.
+        let io_handle =
+            match recording::spawn_recording_worker(consumer, Some(flag_for_thread), init) {
+                Ok(h) => h,
+                Err(e) => {
+                    log::error!("🛑 Failed to spawn recording worker: {e}");
+                    eprintln!(
+                        "{}",
+                        format!("Failed to spawn recording worker: {e}")
+                            .bright_red()
+                            .bold()
+                    );
+                    std::process::exit(1);
+                }
+            };
+
+        // Fail-fast handshake: never start PipeWire with `--record` until the worker
+        // confirms readiness (io_uring + writable output dir). On failure or timeout,
+        // abort before any audio stream is connected (F-RB-009 / T3.3 rollback).
+        match recording::wait_for_recording_init(init_rx, recording::RECORDING_INIT_TIMEOUT) {
+            Ok(dir) => {
+                log::info!(
+                    "🎙️  Recording worker ready — capture directory: {}",
+                    dir.display()
+                );
+            }
+            Err(e) => {
+                log::error!("🛑 Recording startup FAILED: {e}");
+                eprintln!(
+                    "{}",
+                    format!("Recording startup FAILED: {e}").bright_red().bold()
+                );
+                std::process::exit(1);
+            }
+        }
+
+        (
+            Some(data_available),
+            Some(recording_status),
+            Some(recording::RecordingWorkerGuard::new(
+                io_handle,
+                Some(producer),
+                Some(failed_flag),
+            )),
+        )
     } else {
         (None, None, None)
     };
@@ -227,20 +275,30 @@ fn main() -> anyhow::Result<()> {
             buffer_size,
             sys,
             ir_raw_samples,
+            ir_source_rate,
             full_wavenet_model,
+            has_model_r,
             slimmable_producer,
             os_producer,
             oversample: args.oversample,
+            fail_fast: args.fail_fast,
         },
         gc_consumer,
         slimmable_consumer,
         os_consumer,
-        recording_producer,
         recording_data_available,
-        recording_io_handle,
+        recording_worker,
     );
 
     log::info!("{} Encerrando NAM-Audio-Pipe...", "🔌".yellow());
+
+    // Final observable state of the recording worker (F-RB-009 / T3.3): Stopped
+    // on a clean drain, Failed if a fatal error suspended the recording.
+    if let Some(status) = &recording_status
+        && let Ok(guard) = status.lock()
+    {
+        log::info!("Recording status at exit: {guard:?}");
+    }
 
     // Signal shutdown to bypass panic hook during cleanup
     neural_amp_modeler_rs::common::panic_hook::set_shutdown_in_progress();
@@ -248,7 +306,33 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         pipewire::deinit();
     }
-    res?;
+    let recording_outcome = match res {
+        Ok(outcome) => outcome,
+        // F-RB-010 / T4.4: a fatal backend failure surfaced by the host
+        // (PipeWire daemon crash/restart, stream Error, post-streaming
+        // disconnect) becomes a non-zero process exit — `main` returns
+        // `Result`, so the runtime reports the error and exits with code 1.
+        // The process never exits 0 after losing the audio backend.
+        Err(e) => {
+            log::error!("🛑 PipeWire backend terminated with an error: {e:#}");
+            return Err(e);
+        }
+    };
+
+    // Propagate recording failures into the process exit code (F-RB-009 / T3.5):
+    // a worker error, a panic or a join timeout must never masquerade as a
+    // successful run — scripts and automation rely on the non-zero exit.
+    match recording_outcome {
+        None | Some(recording::RecordingWorkerOutcome::Success) => {}
+        Some(outcome) => {
+            log::error!("🛑 Recording worker did not complete cleanly: {outcome}");
+            eprintln!(
+                "{}",
+                format!("Recording failed: {outcome}").bright_red().bold()
+            );
+            anyhow::bail!("recording worker failed: {outcome}");
+        }
+    }
     log::info!("{} NAM-Audio-Pipe encerrado. 🎸", "✅".green());
     Ok(())
 }

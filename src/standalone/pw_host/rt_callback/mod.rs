@@ -14,11 +14,18 @@ mod process;
 mod rate_sync;
 mod resampler_swap;
 
+/// Offline RT swap-stress harness (T2.6 / ER-2), available only under the
+/// `testing` feature. Reproduces the full capture-callback drain sequence with
+/// no PipeWire daemon so integration tests can soak concurrent swaps and run
+/// the zero-allocation heap audit.
+#[cfg(feature = "testing")]
+pub mod harness;
+
 pub use cabsim_swap::drain_cabsims;
 pub use commands::{
     drain_os_engines, drain_slimmable_models, receive_commands, try_slimmable_rebuild,
 };
-pub(crate) use process::check_ffi_contract;
+pub(crate) use process::handle_spa_pair_fail_closed;
 pub use process::process_dsp_buffer;
 pub use rate_sync::sync_rate;
 pub use resampler_swap::drain_resamplers;

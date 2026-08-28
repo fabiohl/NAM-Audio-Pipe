@@ -34,12 +34,21 @@ pub fn sync_rate(
     }
 
     if requires_rebuild && host_rate_to_request != 0 {
+        // F-RB-004: publish the requested rates FIRST, then increment the
+        // generation with Release. The main thread captures the generation
+        // with Acquire, which orders these rate stores into its build
+        // snapshot; a renegotiation arriving during a rebuild bumps the
+        // generation again, so a stale envelope can be detected by the RT
+        // drain and discarded without unmuting.
         rt_status_for_process
             .requested_host_rate
             .store(host_rate_to_request, Ordering::Relaxed);
         rt_status_for_process
             .requested_nam_rate
             .store(current_nam_rate, Ordering::Relaxed);
+        rt_status_for_process
+            .requested_rate_generation
+            .fetch_add(1, Ordering::Release);
         rt_status_for_process.set_flag_release(
             neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD,
         );
@@ -87,6 +96,11 @@ mod tests {
         assert!(flags.check_flag(RT_STATUS_NEEDS_RESAMPLER_REBUILD));
         assert!(flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
         assert_eq!(flags.requested_host_rate.load(Ordering::Relaxed), 44100);
+        assert_eq!(
+            flags.requested_rate_generation.load(Ordering::Relaxed),
+            1,
+            "first rebuild request must publish generation 1"
+        );
     }
 
     #[test]
@@ -149,5 +163,26 @@ mod tests {
         assert!(flags.check_flag(RT_STATUS_NEEDS_RESAMPLER_REBUILD));
         assert!(flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
         assert_eq!(flags.requested_nam_rate.load(Ordering::Relaxed), 48000);
+    }
+
+    #[test]
+    fn consecutive_renegotiations_increment_generation() {
+        let rate = AtomicU32::new(0);
+        let rs = make_resampler(48000, 48000);
+        let flags = RtStatusFlags::new();
+
+        // First detection: PW clock moves to 44100 → generation 1.
+        rate.store(44100, Ordering::Release);
+        sync_rate(&rate, &rs, 48000, &flags);
+        assert_eq!(flags.requested_rate_generation.load(Ordering::Relaxed), 1);
+
+        // The host renegotiates again while the first rebuild is still in
+        // flight: 96000 → generation 2. The request must not be erased.
+        rate.store(96000, Ordering::Release);
+        sync_rate(&rate, &rs, 48000, &flags);
+        assert_eq!(flags.requested_rate_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(flags.requested_host_rate.load(Ordering::Relaxed), 96000);
+        assert!(flags.check_flag(RT_STATUS_NEEDS_RESAMPLER_REBUILD));
+        assert!(flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
     }
 }

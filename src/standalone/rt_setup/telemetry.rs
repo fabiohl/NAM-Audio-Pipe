@@ -8,7 +8,7 @@
 
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
-use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
+use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -75,6 +75,38 @@ pub fn poll_rt_status(
                    This should never happen — report it.",
             )
             .emit();
+    }
+
+    // Command Budgeting telemetry (F-RB-011 / T2.5): the RT callback drains
+    // under fixed per-quantum budgets. These flags make saturation explicit —
+    // no command is ever lost; the excess is deferred to the next callback.
+    if rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_PARAM_QUEUE_BACKLOG)
+    {
+        NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
+            .message("Command queue backlog: the scalar parameter drain budget was exhausted.")
+            .hint(
+                "A producer (CLI/UI/automation) filled the command queue faster than the \
+                 per-callback budget (16) can drain. The remainder is processed by the \
+                 next callback — audio deadline preserved.",
+            )
+            .emit_warning();
+    }
+
+    if rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED)
+    {
+        log::info!(
+            "Structural command deferred to the next callback (structural budget 1/callback) — FIFO order preserved."
+        );
+    }
+
+    if rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED)
+    {
+        log::info!(
+            "Deferred structural command superseded by a newer same-kind command; obsolete resources discarded off-RT (coalescing)."
+        );
     }
 
     if rt_status
@@ -236,6 +268,40 @@ pub fn poll_rt_status(
             "{} PipeWire playback buffer miss ({} xruns). Check system load or buffer size.",
             "📢".yellow(),
             output_buffer_miss
+        );
+    }
+
+    // 5.55 HOST SPA FORMAT CONTRACT VIOLATION (T4.3 / G-RB-001):
+    // The audio host handed buffers or negotiated a format diverging from the
+    // strict F32P planar stereo contract (raised by the RT harness or by the
+    // param_changed listeners). The backend state machine acknowledges the
+    // degraded/error state here with a structured diagnostic.
+    if rt_status.check_and_clear_flag(RT_STATUS_HOST_CONTRACT_VIOLATION) {
+        NamDiagnostic::new(NamErrorCode::SpaFormatContractViolation, sys)
+            .message(
+                "Audio host violated the strict SPA format contract (F32P planar stereo, \
+                 2 channels FL/FR).",
+            )
+            .hint(
+                "Check that the PipeWire graph is not forcing a mono, interleaved, S16 or \
+                 surround negotiation onto the NAM streams (e.g. via WirePlumber rules).",
+            )
+            .emit();
+    }
+
+    // 5.6 PLAYBACK BRIDGE STARVATION (T4.2 / G-RB-001):
+    // The bridge produced no new DSP block (capture paused, resampler rebuild
+    // pending, clock drift or quantum miss). The playback callback delivered a
+    // recycled buffer filled with deterministic silence instead of repeating
+    // stale audio — expected behavior, surfaced as info telemetry.
+    let playback_bridge_starvation = rt_status
+        .playback_bridge_starvation
+        .swap(0, Ordering::Relaxed);
+    if playback_bridge_starvation > 0 {
+        log::info!(
+            "{} Playback delivered {} silence block(s) under bridge starvation (no stale audio repeated).",
+            "🔇".blue(),
+            playback_bridge_starvation
         );
     }
 

@@ -8,9 +8,12 @@
 
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
-use neural_amp_modeler_rs::common::spsc::{self, RtStatusFlags};
-use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimAdapter;
+use neural_amp_modeler_rs::common::spsc::{
+    self, ResamplerSwapPayload, RtStatusFlags, SlimModelPair,
+};
+use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
 use neural_amp_modeler_rs::dsp::cabsim::conv::ConvEngine;
+use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
@@ -19,14 +22,23 @@ use neural_amp_modeler_rs::models::slimmable::slice_wavenet_model;
 use std::sync::atomic::Ordering;
 
 /// Handles dynamic resampler rebuild requested by the audio thread.
+///
+/// Builds a consistent "photograph" of the pending request: the generation is
+/// captured with Acquire (which orders the rate stores published before the
+/// Release increment in `sync_rate`), then the resampler is built and pushed
+/// inside a [`ResamplerSwapPayload`] stamped with that generation. The rebuild
+/// request is only cleared if no newer generation was published while the build
+/// was in flight — otherwise `NEEDS_RESAMPLER_REBUILD` is re-armed so the next
+/// control-loop iteration rebuilds for the most recent request (F-RB-004).
 pub(super) fn handle_resampler_rebuild(
     rt_status: &RtStatusFlags,
     sys: &SystemSnapshot,
-    resampler_producer: &mut rtrb::Producer<Box<NamResampler>>,
+    resampler_producer: &mut rtrb::Producer<Box<ResamplerSwapPayload>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD) {
         return;
     }
+    let generation = rt_status.requested_rate_generation.load(Ordering::Acquire);
     let target_host_rate = rt_status.requested_host_rate.load(Ordering::Relaxed);
     let target_nam_rate = rt_status.requested_nam_rate.load(Ordering::Relaxed);
 
@@ -43,7 +55,11 @@ pub(super) fn handle_resampler_rebuild(
                     new_rs.is_bypass()
                 );
 
-                if resampler_producer.push(Box::new(new_rs)).is_err() {
+                let payload = Box::new(ResamplerSwapPayload {
+                    generation,
+                    resampler: Box::new(new_rs),
+                });
+                if resampler_producer.push(payload).is_err() {
                     // Fail-closed: the replacement was built but could not reach
                     // the RT callback. Keep NEEDS_RESAMPLER_REBUILD set so the
                     // next main-loop iteration retries the delivery. Clearing
@@ -61,6 +77,7 @@ pub(super) fn handle_resampler_rebuild(
                         .emit_warning();
                     return;
                 }
+                rearm_rebuild_if_superseded(rt_status, generation);
             }
             Err(e) => {
                 NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
@@ -78,9 +95,27 @@ pub(super) fn handle_resampler_rebuild(
                     .emit();
 
                 rt_status.set_flag(spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED);
+                rearm_rebuild_if_superseded(rt_status, generation);
             }
         }
-        rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
+    }
+}
+
+/// Lost-wakeup guard (F-RB-004) for the main-thread side of a resampler rebuild.
+///
+/// Clears `NEEDS_RESAMPLER_REBUILD` and re-arms it if the request generation
+/// advanced past the generation the just-completed build was stamped with. The
+/// clear runs *first* and the check *after* it: if the RT thread publishes a
+/// new request between the clear and the load, the load observes the advanced
+/// generation and the re-arm below restores the bit; if the publish happens
+/// after the load, the RT's own `set_flag` lands on the already-cleared bit and
+/// sticks. Either interleaving leaves the request visible — the request can
+/// never be erased by a stale build completion.
+#[inline(always)]
+fn rearm_rebuild_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
+    rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
+    if rt_status.requested_rate_generation.load(Ordering::Acquire) != generation {
+        rt_status.set_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
     }
 }
 
@@ -107,103 +142,281 @@ pub(super) fn handle_quantum_log(rt_status: &RtStatusFlags) {
     rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_QUANTUM_LOG);
 }
 
-/// Handles CabSim IR dynamic partition rebuild.
+/// Handles CabSim IR dynamic rebuild (quantum and rate calibration, F-RB-006).
+///
+/// The cab-sim stage runs at the applied host output rate, so the preserved
+/// original IR (`ir_raw_samples` at `ir_source_rate`) is resampled
+/// specifically for the requested host rate before building a
+/// stereo-decoupled [`CabSimPair`] (independent L/R adapters, identical IR).
+/// The pair is stamped with the host rate it was calibrated for so the RT
+/// can detect drift again.
+///
+/// Lost-wakeup guard (F-RB-004 pattern): the request generation is captured
+/// with Acquire before building; the flag is only cleared via
+/// [`rearm_cabsim_if_superseded`] if no newer generation was published while
+/// the build was in flight.
+///
+/// Rollback: on build failure the handler delivers `None` — safe cab-sim
+/// bypass — instead of letting the RT run an IR calibrated for a divergent
+/// rate. The RT re-requests while `active == None`, so transient failures
+/// recover automatically.
 pub(super) fn handle_cabsim_rebuild(
     rt_status: &RtStatusFlags,
     ir_raw_samples: Option<&[f32]>,
+    ir_source_rate: u32,
     sys: &SystemSnapshot,
-    cabsim_producer: &mut rtrb::Producer<Option<CabSimAdapter>>,
+    cabsim_producer: &mut rtrb::Producer<Option<Box<CabSimPair>>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD) {
         return;
     }
-    let partition_size = rt_status
+    let generation = rt_status
+        .requested_cabsim_generation
+        .load(Ordering::Acquire);
+    let requested_partition = rt_status
         .requested_cabsim_partition_size
         .load(Ordering::Relaxed) as usize;
-    if partition_size > 0 {
-        if let Some(samples) = ir_raw_samples {
-            match ConvEngine::new(samples, partition_size)
-                .map_err(|e| anyhow::anyhow!("Cab-sim engine: {e}"))
-                .and_then(|engine| {
-                    CabSimAdapter::new(Box::new(engine))
-                        .map_err(|e| anyhow::anyhow!("Cab-sim adapter: {e:?}"))
-                }) {
-                Ok(adapter) => {
-                    log::info!(
-                        "{} Cab-sim IR rebuilt: partition_size={} ({} partitions, FFT={})",
-                        "🔄".cyan(),
-                        partition_size,
-                        adapter.num_partitions(),
-                        adapter.engine().fft_size(),
-                    );
-                    if cabsim_producer.push(Some(adapter)).is_err() {
-                        // Fail-closed: keep NEEDS_CABSIM_REBUILD so the next
-                        // main-loop iteration retries. Clearing NEEDS here
-                        // would lock the RT on the stale partition size.
-                        NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                            .message("Cab-sim rebuild channel full. Rebuild will be retried.")
-                            .hint(
-                                "The audio engine is overloaded. \
-                                 The cab-sim swap is retried automatically until delivery succeeds.",
-                            )
-                            .param("partition_size", partition_size)
-                            .emit_warning();
-                        return;
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to rebuild Cab-sim IR: {e:#}");
-                }
-            }
-        }
+    let target_host_rate = rt_status.requested_cabsim_host_rate.load(Ordering::Relaxed);
+    if requested_partition == 0 || target_host_rate == 0 {
+        return;
+    }
+    // Fail-closed partition bound (G-RB-003 / T6.2): the RT-requested partition
+    // must lie in [16, MAX_RESAMP_BUF]. A spurious quantum outside that domain
+    // is clamped before any `ConvEngine` is instantiated, so no oversized FFT
+    // structure is ever allocated off-RT.
+    let partition_size = requested_partition.clamp(16, MAX_RESAMP_BUF);
+    if partition_size != requested_partition {
+        log::warn!(
+            "Requested cabsim partition_size {} clamped to {}",
+            requested_partition,
+            partition_size
+        );
+    }
+    let Some(raw_samples) = ir_raw_samples else {
         rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
+        return;
+    };
+
+    match build_cabsim_pair(
+        raw_samples,
+        ir_source_rate,
+        target_host_rate,
+        partition_size,
+    ) {
+        Ok(pair) => {
+            log::info!(
+                "{} Cab-sim IR rebuilt: rate={} Hz, partition_size={} ({} partitions, FFT={})",
+                "🔄".cyan(),
+                target_host_rate,
+                partition_size,
+                pair.l.num_partitions(),
+                pair.l.engine().fft_size(),
+            );
+            // Box::new runs exclusively on this (non-RT) main thread: the RT
+            // swap then moves the same allocation into the GC (F-RB-007).
+            if cabsim_producer.push(Some(Box::new(pair))).is_err() {
+                // Fail-closed: keep NEEDS_CABSIM_REBUILD so the next
+                // main-loop iteration retries. Clearing NEEDS here
+                // would lock the RT on the stale partition/rate.
+                NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
+                    .message("Cab-sim rebuild channel full. Rebuild will be retried.")
+                    .hint(
+                        "The audio engine is overloaded. \
+                         The cab-sim swap is retried automatically until delivery succeeds.",
+                    )
+                    .param("partition_size", partition_size)
+                    .param("target_host_rate", target_host_rate)
+                    .emit_warning();
+                return;
+            }
+            rearm_cabsim_if_superseded(rt_status, generation);
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to rebuild Cab-sim IR ({} -> {} Hz, partition={}): {e:#} — bypassing cab-sim",
+                ir_source_rate,
+                target_host_rate,
+                partition_size,
+            );
+            if cabsim_producer.push(None).is_err() {
+                NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
+                    .message("Cab-sim bypass channel full. Rebuild will be retried.")
+                    .hint(
+                        "The audio engine is overloaded. \
+                         The cab-sim swap is retried automatically until delivery succeeds.",
+                    )
+                    .param("partition_size", partition_size)
+                    .param("target_host_rate", target_host_rate)
+                    .emit_warning();
+                return;
+            }
+            rearm_cabsim_if_superseded(rt_status, generation);
+        }
     }
 }
 
-/// Handles WaveNet slimmable channel slicing rebuild.
+/// Builds a stereo-decoupled [`CabSimPair`] from the preserved original IR,
+/// resampled for the applied host output rate. Off-RT only (allocates).
+fn build_cabsim_pair(
+    raw_samples: &[f32],
+    ir_source_rate: u32,
+    target_host_rate: u32,
+    partition_size: usize,
+) -> anyhow::Result<CabSimPair> {
+    if raw_samples.is_empty() {
+        anyhow::bail!("IR has no samples");
+    }
+    let resampled: Option<Vec<f32>> = if ir_source_rate != 0 && ir_source_rate != target_host_rate {
+        Some(
+            CabSimIr::resample(raw_samples, ir_source_rate, target_host_rate).map_err(|e| {
+                anyhow::anyhow!("IR resample ({ir_source_rate} -> {target_host_rate} Hz): {e}")
+            })?,
+        )
+    } else {
+        None
+    };
+    let samples: &[f32] = resampled.as_deref().unwrap_or(raw_samples);
+
+    let build_adapter = || {
+        ConvEngine::new(samples, partition_size)
+            .map_err(|e| anyhow::anyhow!("Cab-sim engine: {e}"))
+            .and_then(|engine| {
+                CabSimAdapter::new(Box::new(engine))
+                    .map_err(|e| anyhow::anyhow!("Cab-sim adapter: {e:?}"))
+            })
+    };
+    let l = build_adapter()?;
+    let r = build_adapter()?;
+    Ok(CabSimPair {
+        l: Box::new(l),
+        r: Box::new(r),
+        sample_rate: target_host_rate,
+    })
+}
+
+/// Lost-wakeup guard (F-RB-004 pattern) for the main-thread side of a
+/// cab-sim rebuild.
+///
+/// Clears `NEEDS_CABSIM_REBUILD` and re-arms it if the cabsim generation
+/// advanced past the generation the just-completed build was stamped with.
+/// The clear runs *first* and the check *after* it, so a rebuild request
+/// published during the resample/build cannot be erased by the stale
+/// completion.
+#[inline(always)]
+fn rearm_cabsim_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
+    rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
+    if rt_status
+        .requested_cabsim_generation
+        .load(Ordering::Acquire)
+        != generation
+    {
+        rt_status.set_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
+    }
+}
+
+/// Handles WaveNet slimmable channel slicing rebuild (F-RB-005).
+///
+/// Slices and prewarms the L and (if stereo) R channel models **before** any
+/// delivery, then pushes both in a single [`SlimModelPair`] envelope over the
+/// SPSC channel. The RT drain consumes the pair with one `pop()` and swaps L
+/// and R in the same logical block — an all-or-nothing transaction. If the
+/// channel is full, neither channel is delivered and
+/// `RT_STATUS_NEEDS_SLIMMABLE_REBUILD` stays armed for a full retry in the next
+/// main-loop iteration.
 pub(super) fn handle_slimmable_rebuild(
     rt_status: &RtStatusFlags,
     full_wavenet_model: Option<&StaticModel>,
-    slimmable_producer: &mut rtrb::Producer<Option<Box<StaticModel>>>,
+    has_model_r: bool,
+    sys: &SystemSnapshot,
+    slimmable_producer: &mut rtrb::Producer<Box<SlimModelPair>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD) {
         return;
     }
     let target_ch = rt_status.requested_slimmable_ch.load(Ordering::Relaxed) as usize;
-    if target_ch >= 4
-        && let Some(m) = full_wavenet_model
-        && let StaticModel::WavenetDyn(w) = m
-    {
-        // Build L channel model
-        match slice_wavenet_model(w.as_ref(), target_ch) {
-            Ok(mut slimmed) => {
-                slimmed.prewarm();
-                let model_l = Box::new(StaticModel::WavenetDyn(Box::new(slimmed)));
-                if slimmable_producer.push(Some(model_l)).is_err() {
-                    // Fail-closed: keep NEEDS so the next cycle retries
-                    // instead of locking quality on the previous channel count.
-                    return;
-                }
-            }
-            Err(_) => {
-                rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
-            }
-        }
-        // Build R channel model (same weights, same target_ch)
-        match slice_wavenet_model(w.as_ref(), target_ch) {
-            Ok(mut slimmed) => {
-                slimmed.prewarm();
-                let model_r = Box::new(StaticModel::WavenetDyn(Box::new(slimmed)));
-                if slimmable_producer.push(Some(model_r)).is_err() {
-                    return;
-                }
-            }
-            Err(_) => {
-                rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
-            }
-        }
+    if target_ch < 4 {
+        return;
     }
+    let Some(m) = full_wavenet_model else {
+        return;
+    };
+    let StaticModel::WavenetDyn(w) = m else {
+        return;
+    };
+
+    let generation = rt_status
+        .requested_slimmable_generation
+        .load(Ordering::Acquire);
+
+    // Build L channel model (same weights, same target_ch).
+    let model_l = match slice_wavenet_model(w.as_ref(), target_ch) {
+        Ok(mut slimmed) => {
+            slimmed.prewarm();
+            Box::new(StaticModel::WavenetDyn(Box::new(slimmed)))
+        }
+        Err(_) => {
+            rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
+            return;
+        }
+    };
+
+    // Build R channel model only for stereo configurations (F-RB-005: the pair
+    // must not introduce a generation mismatch in the R channel).
+    let model_r = if has_model_r {
+        match slice_wavenet_model(w.as_ref(), target_ch) {
+            Ok(mut slimmed) => {
+                slimmed.prewarm();
+                Some(Box::new(StaticModel::WavenetDyn(Box::new(slimmed))))
+            }
+            Err(_) => {
+                rt_status.set_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let pair = Box::new(SlimModelPair {
+        generation,
+        channels: target_ch,
+        l: model_l,
+        r: model_r,
+    });
+    if slimmable_producer.push(pair).is_err() {
+        // Fail-closed (F-RB-005): neither channel is delivered; keep NEEDS so
+        // the next cycle retries the whole pair instead of delivering a
+        // half-swap that would desynchronize L/R generations.
+        NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
+            .message("Slimmable model channel full. Rebuild will be retried.")
+            .hint(
+                "The audio engine is overloaded. \
+                 The slimmable swap is retried automatically until delivery succeeds.",
+            )
+            .param("target_ch", target_ch)
+            .emit_warning();
+        return;
+    }
+    rearm_slimmable_if_superseded(rt_status, generation);
+}
+
+/// Lost-wakeup guard (F-RB-004 pattern) for the main-thread side of a
+/// slimmable rebuild.
+///
+/// Clears `NEEDS_SLIMMABLE_REBUILD` and re-arms it if the slimmable generation
+/// advanced past the generation the just-completed pair was stamped with. The
+/// clear runs *first* and the check *after* it, so a rebuild request published
+/// during the slice/prewarm cannot be erased by the stale completion.
+#[inline(always)]
+fn rearm_slimmable_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
     rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
+    if rt_status
+        .requested_slimmable_generation
+        .load(Ordering::Acquire)
+        != generation
+    {
+        rt_status.set_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
+    }
 }
 
 /// Handles oversampling engine dynamic rebuild.

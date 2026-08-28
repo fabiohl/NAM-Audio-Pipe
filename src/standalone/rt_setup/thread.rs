@@ -112,16 +112,6 @@ pub fn configure_process_wide() {
 #[cold]
 #[inline(never)]
 pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags>) {
-    let cpu_setsize = libc::CPU_SETSIZE as usize;
-    let cpu_in_bounds = target_cpu < cpu_setsize;
-
-    if !cpu_in_bounds {
-        rt_status.rt_affinity_err.store(-1, Ordering::Relaxed);
-        rt_status
-            .rt_target_cpu
-            .store(target_cpu as i32, Ordering::Relaxed);
-    }
-
     unsafe {
         neural_amp_modeler_rs::math::common::set_daz_ftz();
     }
@@ -133,25 +123,7 @@ pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags
         libc::pthread_setname_np(thread_id, name.as_ptr() as *const libc::c_char);
     }
 
-    if cpu_in_bounds {
-        let mut cpuset = std::mem::MaybeUninit::<libc::cpu_set_t>::uninit();
-        unsafe {
-            libc::CPU_ZERO(cpuset.assume_init_mut());
-            libc::CPU_SET(target_cpu, cpuset.assume_init_mut());
-        }
-        let cpuset = unsafe { cpuset.assume_init() };
-
-        let ret_aff = unsafe {
-            libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
-        };
-
-        if ret_aff != 0 {
-            rt_status.rt_affinity_err.store(ret_aff, Ordering::Relaxed);
-            rt_status
-                .rt_target_cpu
-                .store(target_cpu as i32, Ordering::Relaxed);
-        }
-    }
+    pin_thread_affinity(thread_id, target_cpu, &rt_status);
 
     let mut actual_policy = 0i32;
     let mut actual_param = libc::sched_param { sched_priority: 0 };
@@ -202,5 +174,61 @@ pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags
         rt_status
             .rt_getsched_err
             .store(ret_getsched, Ordering::Relaxed);
+    }
+}
+
+/// Builds the `cpu_set_t` affinity mask that pins a thread to `target_cpu`.
+///
+/// Returns `None` when `target_cpu` is outside the `[0, CPU_SETSIZE)` index
+/// range supported by `pthread_setaffinity_np`.
+pub(crate) fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set_t> {
+    if target_cpu >= libc::CPU_SETSIZE as usize {
+        return None;
+    }
+
+    // SAFETY: on the supported Linux targets (glibc/musl) `cpu_set_t` is a C
+    // bitmask whose all-zero bit pattern denotes the empty CPU set, so a
+    // zero-initialized `cpu_set_t` is a fully valid value — no Rust reference
+    // is formed over uninitialized storage.
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `CPU_ZERO`/`CPU_SET` only mutate the already-initialized bitmask
+    // in place; the bounds check above guarantees libc's
+    // `cpu / (8 * size_of::<u64>())` index stays within `cpu_set_t`'s
+    // `[u64; 16]` storage.
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        libc::CPU_SET(target_cpu, &mut cpuset);
+    }
+
+    Some(cpuset)
+}
+
+/// Pins `thread_id` to `target_cpu`, recording the outcome atomically in
+/// `rt_status` (RT-safe: no logging or allocation on this path).
+///
+/// Out-of-range CPUs are rejected before any syscall and recorded as
+/// `rt_affinity_err = -1`; kernel rejections record the errno.
+fn pin_thread_affinity(thread_id: libc::pthread_t, target_cpu: usize, rt_status: &RtStatusFlags) {
+    let Some(cpuset) = build_cpu_affinity_mask(target_cpu) else {
+        rt_status.rt_affinity_err.store(-1, Ordering::Relaxed);
+        rt_status
+            .rt_target_cpu
+            .store(target_cpu as i32, Ordering::Relaxed);
+        return;
+    };
+
+    // SAFETY: `cpuset` is a fully initialized `cpu_set_t` (built above); the
+    // mask size matches the type and the kernel consumes it synchronously,
+    // never retaining the pointer.
+    let ret_aff = unsafe {
+        libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
+    };
+
+    if ret_aff != 0 {
+        rt_status.rt_affinity_err.store(ret_aff, Ordering::Relaxed);
+        rt_status
+            .rt_target_cpu
+            .store(target_cpu as i32, Ordering::Relaxed);
     }
 }

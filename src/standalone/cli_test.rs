@@ -89,3 +89,124 @@ fn test_parse_args_activation_default() {
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.activation, None);
 }
+
+#[test]
+fn test_parse_args_fail_fast_defaults_to_disabled() {
+    let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert!(
+        !cli_args.fail_fast,
+        "reconnect must be enabled by default (F-RB-010 / T4.5)"
+    );
+}
+
+#[test]
+fn test_parse_args_fail_fast_flag_enables_fail_fast() {
+    let args = vec!["nam-audio-pipe", "--fail-fast", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert!(cli_args.fail_fast);
+}
+
+#[test]
+fn test_parse_args_record_keeps_reconnect_enabled() {
+    let args = vec!["nam-audio-pipe", "--record", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert!(cli_args.record);
+    assert!(!cli_args.fail_fast);
+}
+
+// --buffer-size domain contract (G-RB-003 / T6.1) -------------------------
+
+#[test]
+fn buffer_size_domain_constants_document_the_contract() {
+    assert_eq!(BUFFER_SIZE_AUTO, 0);
+    assert_eq!(BUFFER_SIZE_MIN, 16);
+    assert_eq!(BUFFER_SIZE_MAX, 8192);
+}
+
+#[test]
+fn validate_buffer_size_accepts_auto_and_all_valid_powers_of_two() {
+    for size in [0u32, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192] {
+        assert_eq!(
+            validate_buffer_size(size),
+            Ok(size),
+            "size {size} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn validate_buffer_size_rejects_out_of_domain_values() {
+    for size in [1u32, 2, 8, 15, 63, 100, 500, 8193, 16384, 65536, u32::MAX] {
+        assert!(
+            validate_buffer_size(size).is_err(),
+            "size {size} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn validate_buffer_size_rejects_with_typed_variants() {
+    assert_eq!(
+        validate_buffer_size(1),
+        Err(BufferSizeError::BelowMinimum { size: 1 })
+    );
+    assert_eq!(
+        validate_buffer_size(15),
+        Err(BufferSizeError::BelowMinimum { size: 15 })
+    );
+    assert_eq!(
+        validate_buffer_size(8193),
+        Err(BufferSizeError::AboveMaximum { size: 8193 })
+    );
+    assert_eq!(
+        validate_buffer_size(u32::MAX),
+        Err(BufferSizeError::AboveMaximum { size: u32::MAX })
+    );
+    assert_eq!(
+        validate_buffer_size(100),
+        Err(BufferSizeError::NotPowerOfTwo { size: 100 })
+    );
+    assert_eq!(
+        validate_buffer_size(500),
+        Err(BufferSizeError::NotPowerOfTwo { size: 500 })
+    );
+}
+
+#[test]
+fn validate_buffer_size_errors_are_explanatory_and_implement_std_error() {
+    fn assert_std_error<E: std::error::Error>() {}
+    assert_std_error::<BufferSizeError>();
+
+    assert_eq!(
+        validate_buffer_size(1).unwrap_err().to_string(),
+        "Buffer size must be at least 16 (or 0 for auto), got 1"
+    );
+    assert_eq!(
+        validate_buffer_size(16384).unwrap_err().to_string(),
+        "Buffer size cannot exceed 8192 (max bridge capacity), got 16384"
+    );
+    assert_eq!(
+        validate_buffer_size(100).unwrap_err().to_string(),
+        "Buffer size must be a power of two (e.g. 64, 128, 256, 512, 1024, 2048, 4096, 8192), got 100"
+    );
+}
+
+#[test]
+fn parse_args_accepts_buffer_size_auto_zero() {
+    let args = vec!["nam-audio-pipe", "-b", "0"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.buffer_size, 0);
+}
+
+#[test]
+fn parse_args_accepts_buffer_size_max_boundary() {
+    let args = vec!["nam-audio-pipe", "-b", "8192"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.buffer_size, 8192);
+}

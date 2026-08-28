@@ -6,7 +6,11 @@
 
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::identity;
-use crate::standalone::pw_host::output_pw::{build_spa_format_pod, playback_dsp_cycle};
+use crate::standalone::pw_host::output_pw::{
+    SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, mark_format_contract_ok,
+    playback_dsp_cycle, reject_negotiated_format_violation, validate_audio_raw_format,
+};
+use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 use neural_amp_modeler_rs::dsp::pipeline::{BridgeRef, DspBridgeReader};
 
@@ -14,6 +18,73 @@ use pipewire as pw;
 use pw::properties::properties;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+
+/// Handles playback stream state changes — feeds the backend state machine
+/// (F-RB-010 / T4.4).
+///
+/// Mirrors the capture `state_changed_handler`: a fatal `StreamState::Error` or
+/// a post-streaming `StreamState::Unconnected` (daemon crash/restart) marks the
+/// backend `Failed` through the canonical [`observe_stream_state`] mapping, so
+/// the main control loop tears the host down observably.
+///
+/// Note: this handler executes on the PipeWire `ThreadLoop` thread (cold
+/// path), never on the RT data thread that runs `playback_dsp_cycle`.
+pub fn playback_state_changed_handler(
+    old: pw::stream::StreamState,
+    new: pw::stream::StreamState,
+    backend: &SharedBackendStatus,
+) {
+    observe_stream_state("playback", old, new, backend);
+}
+
+/// Handles playback stream `param_changed` events (format negotiation).
+///
+/// Enforces the strict SPA format contract (G-RB-001 / T4.3) through the
+/// canonical [`validate_audio_raw_format`] gate: only `F32P` planar stereo is
+/// accepted. A diverging renegotiation (mono, interleaved, S16, surround) is
+/// rejected fail-closed — `RT_STATUS_HOST_CONTRACT_VIOLATION` is raised on
+/// `rt_status`, the structured diagnostic is emitted and the backend is marked
+/// `BackendState::Degraded` (audio muted), so the backend state machine
+/// observes the degraded state. A subsequent valid renegotiation restores the
+/// backend to `Running`.
+///
+/// On a valid renegotiation the negotiated rate is recorded and compared
+/// against the capture stream's negotiated rate; a discrepancy is surfaced as
+/// a warning ("Sincronização de Sample Rate").
+///
+/// Note: this handler executes on the PipeWire `ThreadLoop` thread (cold
+/// path), never on the RT data thread that runs `playback_dsp_cycle`.
+pub fn playback_param_changed_handler(
+    _stream: &pw::stream::Stream,
+    _user_data: &mut (),
+    id: u32,
+    param: Option<&pw::spa::pod::Pod>,
+    rt_status: &RtStatusFlags,
+    backend: &SharedBackendStatus,
+) {
+    let Some(param) = param else { return };
+    if id != pw::spa::param::ParamType::Format.as_raw() {
+        return;
+    }
+
+    match validate_audio_raw_format(param) {
+        Ok(rate) => {
+            rt_status
+                .playback_negotiated_rate
+                .store(rate, Ordering::Release);
+            mark_format_contract_ok(rt_status);
+            check_negotiated_rate_mismatch(rt_status);
+            backend.mark_running();
+        }
+        Err(violation) => {
+            let violation_msg = violation.to_string();
+            reject_negotiated_format_violation(rt_status, "playback", violation);
+            backend.mark_degraded(format!(
+                "SPA format contract violated on the playback stream: {violation_msg}"
+            ));
+        }
+    }
+}
 
 /// Configures the playback stream and its RT listener.
 ///
@@ -25,6 +96,7 @@ pub fn setup_playback_stream<'c>(
     buffer_size: u32,
     latency_str: &str,
     rt_status: Arc<RtStatusFlags>,
+    backend_status: Arc<SharedBackendStatus>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let bridge_ptr_playback = unsafe { DspBridgeReader::new(bridge_ptr.as_ptr()) };
     let rt_status_playback = rt_status.clone();
@@ -51,8 +123,25 @@ pub fn setup_playback_stream<'c>(
     let mut last_bridge_gen: u64 = 0;
     let mut pb_frame_count: u32 = 0;
 
+    let rt_status_for_params = rt_status_playback.clone();
+    let backend_for_state = backend_status.clone();
+    let backend_for_params = backend_status.clone();
+
     let playback_listener = playback_stream
         .add_local_listener::<()>()
+        .state_changed(move |_stream, _user_data, old, new| {
+            playback_state_changed_handler(old, new, &backend_for_state)
+        })
+        .param_changed(move |stream, user_data, id, param| {
+            playback_param_changed_handler(
+                stream,
+                user_data,
+                id,
+                param,
+                &rt_status_for_params,
+                &backend_for_params,
+            )
+        })
         .process(move |stream: &pw::stream::Stream, _info| {
             if (pb_frame_count & 0x3F) == 0
                 && let Ok(pw_time) = stream.time()
@@ -82,9 +171,9 @@ pub fn setup_playback_stream<'c>(
     playback_audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
     playback_audio_info.set_channels(2);
 
-    let mut playback_format_buf = [0u8; 1024];
+    let mut playback_format_storage = SpaPodStorage::new();
     let playback_format_pod =
-        unsafe { build_spa_format_pod(&playback_audio_info, &mut playback_format_buf)? };
+        unsafe { build_spa_format_pod(&playback_audio_info, &mut playback_format_storage)? };
 
     playback_stream.connect(
         pw::spa::utils::Direction::Output,

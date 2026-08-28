@@ -11,17 +11,42 @@
 use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
+use neural_amp_modeler_rs::common::spsc::{
+    GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, SlimModelPair,
+};
 use neural_amp_modeler_rs::dsp::adaptive::AdaptiveCompute;
-use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimAdapter;
+use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
-use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
+use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::math::dsp::gain_lut;
-use neural_amp_modeler_rs::models::StaticModel;
-use rtrb::Consumer;
+use rtrb::{Consumer, Producer};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+
+/// RT-side SPSC handles consumed by the capture `process()` closure.
+///
+/// Owned (heap-allocated) by `run_pipewire_host` and reached from the RT
+/// callback through a raw pointer — never moved into the stream closures — so
+/// the channels survive a bounded reconnect cycle (F-RB-010 / T4.5). The
+/// `slimmable` and `oversample` consumers live in [`CaptureState`] instead
+/// (`slimmable_rx` / `os_rx`); the main thread only touches its own separate
+/// `gc_overflow` handle (an [`Arc`] clone) during the control loop, so there
+/// is never concurrent aliasing of this struct between the RT callback
+/// (exclusive `&mut`) and the main thread.
+pub struct RtHostChannels {
+    /// CLI→DSP parameter channel consumer (gain, model, etc.).
+    pub param_consumer: Consumer<ParamPayload>,
+    /// RT→main GC recycle producer (drop-delegation of obsolete models).
+    pub gc_producer: Producer<GcItem>,
+    /// Overflow fallback for GC items (read-only from the RT callback).
+    pub gc_overflow: Arc<GcOverflowBuffer>,
+    /// Dedicated channel receiving pre-built resamplers from the main thread.
+    pub resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
+    /// Dedicated channel receiving pre-built cab-sim pairs from the main thread.
+    pub cabsim_consumer: Consumer<Option<Box<CabSimPair>>>,
+}
 
 /// Max oversampled buffer size: MAX_RESAMP_BUF × 4 (for X4 oversampling).
 const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
@@ -32,7 +57,10 @@ pub struct CaptureState {
     pub resampler: Box<NamResampler>,
     pub os_l: Box<OversampleEngine>,
     pub os_r: Box<OversampleEngine>,
-    pub active_cabsim: Option<CabSimAdapter>,
+    /// Active stereo-decoupled cab-sim pair (`None` = bypass, zero cost).
+    /// Transported `Box`ed end-to-end (state, SPSC channel, GC) so swaps move
+    /// the same allocation without RT heap traffic (F-RB-007).
+    pub active_cabsim: Option<Box<CabSimPair>>,
     pub current_nam_rate: u32,
     pub resamp_mid_l: Box<[f32; MAX_RESAMP_BUF]>,
     pub resamp_out_l: Box<[f32; MAX_RESAMP_BUF]>,
@@ -68,8 +96,26 @@ pub struct CaptureState {
     pub recording_block: AlignedBlock<MAX_BLOCK_SIZE>,
     pub thread_configured: bool,
     pub ir_raw_samples: Option<Vec<f32>>,
-    pub slimmable_rx: Option<Consumer<Option<Box<StaticModel>>>>,
+    /// Sample rate of `ir_raw_samples` (the IR file's native rate). The
+    /// main-thread rebuild resamples the preserved original IR specifically
+    /// for the applied host output rate (F-RB-006 rate calibration).
+    pub ir_source_rate: u32,
+    pub slimmable_rx: Option<Consumer<Box<neural_amp_modeler_rs::common::spsc::SlimModelPair>>>,
     pub os_rx: Option<Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>>,
+    /// Deferred structural command slots (F-RB-011 / T2.5 command budgeting).
+    ///
+    /// Each slot parks at most one structural command whose per-callback
+    /// structural budget (`STRUCTURAL_SWAPS_PER_CALLBACK`, shared across all
+    /// swap drains) was exhausted. The parked command is resolved at the start
+    /// of the next callback — applied if still current, superseded by a newer
+    /// same-kind command already queued (latest-wins coalescing), or discarded
+    /// if its request generation advanced while parked. Slots are only touched
+    /// by the RT callback; they never allocate.
+    pub deferred_resampler: Option<Box<ResamplerSwapPayload>>,
+    pub deferred_cabsim: Option<Option<Box<CabSimPair>>>,
+    pub deferred_model: Option<ParamPayload>,
+    pub deferred_slimmable: Option<Box<SlimModelPair>>,
+    pub deferred_os: Option<Box<OsEnginePair>>,
 }
 
 impl CaptureState {
@@ -152,8 +198,14 @@ impl CaptureState {
             recording_block: AlignedBlock::new(),
             thread_configured: false,
             ir_raw_samples: None,
+            ir_source_rate: 0,
             slimmable_rx: None,
             os_rx: None,
+            deferred_resampler: None,
+            deferred_cabsim: None,
+            deferred_model: None,
+            deferred_slimmable: None,
+            deferred_os: None,
         }
     }
 }
