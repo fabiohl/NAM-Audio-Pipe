@@ -17,6 +17,7 @@ use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::models::StaticModel;
 use neural_amp_modeler_rs::models::slimmable::slice_wavenet_model;
 use std::sync::atomic::Ordering;
@@ -43,8 +44,11 @@ pub(super) fn handle_resampler_rebuild(
     let target_nam_rate = rt_status.requested_nam_rate.load(Ordering::Relaxed);
 
     if target_host_rate != 0 && target_nam_rate != 0 {
-        match NamResampler::new(target_host_rate, target_nam_rate, 2048) {
-            Ok(new_rs) => {
+        match (
+            NamResampler::new(target_host_rate, target_nam_rate, 2048),
+            StreamingResampleBuffer::new(target_host_rate, target_nam_rate, MAX_RESAMP_BUF),
+        ) {
+            (Ok(new_rs), Ok(new_stream)) => {
                 rt_status
                     .resampler_failed_generation
                     .store(0, Ordering::Release);
@@ -60,6 +64,7 @@ pub(super) fn handle_resampler_rebuild(
                 let payload = Box::new(ResamplerSwapPayload {
                     generation,
                     resampler: Box::new(new_rs),
+                    stream: Box::new(new_stream),
                 });
                 if resampler_producer.push(payload).is_err() {
                     // Fail-closed: the replacement was built but could not reach
@@ -81,7 +86,7 @@ pub(super) fn handle_resampler_rebuild(
                 }
                 rearm_rebuild_if_superseded(rt_status, generation);
             }
-            Err(e) => {
+            (Err(e), _) => {
                 NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
                     .message(format!(
                         "Failed to rebuild resampler for PW={} Hz and NAM={} Hz.",
@@ -99,7 +104,27 @@ pub(super) fn handle_resampler_rebuild(
                 rt_status
                     .resampler_failed_generation
                     .store(generation, Ordering::Release);
-                rearm_rebuild_if_superseded(rt_status, generation);
+                rt_status.clear_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
+            }
+            (_, Err(e)) => {
+                NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
+                    .message(format!(
+                        "Failed to create streaming resample buffer for PW={} Hz and NAM={} Hz.",
+                        target_host_rate, target_nam_rate
+                    ))
+                    .hint(
+                        "Audio will continue with the previous resampler. \
+                         If the sample rate is incorrect, restart NAM-Audio-Pipe.",
+                    )
+                    .param("target_host_rate", target_host_rate)
+                    .param("target_nam_rate", target_nam_rate)
+                    .param("detail", format!("{:?}", e))
+                    .emit();
+
+                rt_status
+                    .resampler_failed_generation
+                    .store(generation, Ordering::Release);
+                rt_status.clear_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
             }
         }
     }
@@ -400,7 +425,7 @@ pub(super) fn handle_slimmable_rebuild(
     let pair = Box::new(SlimModelPair {
         generation,
         channels: target_ch,
-        l: model_l,
+        l: Some(model_l),
         r: model_r,
     });
     if slimmable_producer.push(pair).is_err() {
@@ -448,6 +473,7 @@ pub(super) fn handle_oversample_rebuild(
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_OS_REBUILD) {
         return;
     }
+    let generation = rt_status.requested_os_generation.load(Ordering::Acquire);
     let factor_val = rt_status.requested_os_factor.load(Ordering::Relaxed);
     let factor = OversampleFactor::from_f32(factor_val as f32);
     match (
@@ -456,6 +482,7 @@ pub(super) fn handle_oversample_rebuild(
     ) {
         (Ok(os_l), Ok(os_r)) => {
             let pair = Box::new(OsEnginePair {
+                generation,
                 l: Box::new(os_l),
                 r: Box::new(os_r),
             });
@@ -466,15 +493,15 @@ pub(super) fn handle_oversample_rebuild(
             );
             if os_producer.push(pair).is_err() {
                 NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                    .message("OS engine channel full. Rebuild discarded.")
+                    .message("OS engine channel full. Rebuild will be retried.")
                     .hint(
                         "The audio engine is overloaded. \
-                         If the problem persists, restart NAM-Audio-Pipe.",
+                         The oversampling swap is retried automatically until delivery succeeds.",
                     )
                     .emit_warning();
-            } else {
-                rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+                return;
             }
+            rearm_os_if_superseded(rt_status, generation);
         }
         (Err(e), _) | (_, Err(e)) => {
             NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
@@ -483,6 +510,21 @@ pub(super) fn handle_oversample_rebuild(
                 .param("detail", e)
                 .emit();
         }
+    }
+}
+
+/// Lost-wakeup guard (F-RB-004 pattern) for the main-thread side of an
+/// oversampling rebuild.
+///
+/// Clears `NEEDS_OS_REBUILD` and re-arms it if the oversample generation
+/// advanced past the generation the just-completed pair was stamped with. The
+/// clear runs *first* and the check *after* it, so an oversample request published
+/// during engine construction cannot be erased by the stale completion.
+#[inline(always)]
+fn rearm_os_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
+    rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+    if rt_status.requested_os_generation.load(Ordering::Acquire) != generation {
+        rt_status.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
     }
 }
 

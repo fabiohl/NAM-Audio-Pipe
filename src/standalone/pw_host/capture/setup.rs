@@ -6,7 +6,7 @@
 
 use super::super::rt_callback;
 use super::state::{CaptureState, RtHostChannels};
-use crate::recording::buffer::{MAX_BLOCK_SIZE, RingPayload};
+use crate::recording::transport::RecordingSender;
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::SharedBackendStatus;
 use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
@@ -90,7 +90,7 @@ pub fn setup_capture_stream<'c>(
     channels_ptr: *mut RtHostChannels,
     rate_for_param: Arc<AtomicU32>,
     rt_status: Arc<RtStatusFlags>,
-    recording_producer_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_sender_ptr: *mut RecordingSender,
     parking_lot_ptr: *mut [Option<GcItem>; 16],
     parking_lot_dirty_ptr: *const AtomicBool,
     recording_data_available: Option<Arc<AtomicBool>>,
@@ -106,6 +106,7 @@ pub fn setup_capture_stream<'c>(
     )?;
 
     let rate_for_process = rate_for_param.clone();
+    let rt_status_for_state = rt_status.clone();
     let rt_status_for_listener = rt_status.clone();
     let rt_status_for_process = rt_status.clone();
     let backend_for_state = backend_status.clone();
@@ -116,6 +117,20 @@ pub fn setup_capture_stream<'c>(
     let capture_listener = capture_stream
         .add_local_listener::<()>()
         .state_changed(move |_stream, _user_data, old, new| {
+            if matches!(
+                new,
+                pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming
+            ) {
+                // SAFETY: state_ptr points to the `Box<CaptureState>` owned by run_pipewire_host.
+                // This state transition runs on the data-loop thread before stream readiness,
+                // ensuring RT setup (DAZ/FTZ, thread naming, affinity, scheduler inspection)
+                // executes off the hot-path audio callback.
+                let state = unsafe { &mut *state_ptr };
+                if !state.thread_configured {
+                    rt_setup::configure_realtime_thread(target_cpu, rt_status_for_state.clone());
+                    state.thread_configured = true;
+                }
+            }
             super::listeners::state_changed_handler(old, new, &backend_for_state)
         })
         .param_changed(move |stream, user_data, id, param| {
@@ -138,14 +153,20 @@ pub fn setup_capture_stream<'c>(
             // pointer for each fresh stream instance — the DSP state (models,
             // resampler, cab-sim, gains) survives daemon restarts.
             let state = unsafe { &mut *state_ptr };
+            let should_measure = (state.frame_count & 0xF) == 0;
+            let t_cap_start = if should_measure {
+                rt_setup::rdtsc_nanos()
+            } else {
+                0
+            };
             // SAFETY: channels_ptr points to the `Box<RtHostChannels>` owned
             // by run_pipewire_host — same exclusivity contract as state_ptr.
             let channels = unsafe { &mut *channels_ptr };
-            // SAFETY: recording_producer_ptr points to a stack-local in
+            // SAFETY: recording_sender_ptr points to a stack-local in
             // run_pipewire_host that outlives this closure. The RT thread
             // is the only writer, and after thread_loop.stop() the shutdown
             // path takes sequential ownership. No concurrent access occurs.
-            let recording_producer = unsafe { &mut *recording_producer_ptr };
+            let recording_sender = unsafe { &mut *recording_sender_ptr };
             let recording_data_available_ref = recording_data_available.as_deref();
             let recording_failed_ref = recording_failed.as_deref();
             // SAFETY: parking_lot_ptr and parking_lot_dirty_ptr point to stack-local slots in
@@ -157,10 +178,12 @@ pub fn setup_capture_stream<'c>(
             // this slot — that would race with the RT flush below.
             let parking_lot = unsafe { &mut *parking_lot_ptr };
             let parking_lot_dirty = unsafe { &*parking_lot_dirty_ptr };
-            // Cold-path RT setup: must run on the actual DSP data thread (this callback),
-            // NOT in `state_changed_handler` (which executes on the separate PipeWire ThreadLoop thread).
-            // This ensures DAZ/FTZ (MXCSR), SCHED_FIFO, thread name, and CPU affinity apply directly
-            // to the active audio processing thread (H-06 / Sprint C-01).
+            // Harness RT setup fallback: in operational execution, RT thread setup is performed
+            // ahead-of-time during `state_changed` on the data-loop thread before stream readiness,
+            // guaranteeing zero setup syscalls in operational audio blocks (T3.1 / F-RES-003).
+            // This branch runs exclusively in test harnesses that invoke `process` directly
+            // without prior state transitions.
+            #[cfg(test)]
             if !state.thread_configured {
                 rt_setup::configure_realtime_thread(target_cpu, rt_status_for_process.clone());
                 state.thread_configured = true;
@@ -195,6 +218,7 @@ pub fn setup_capture_stream<'c>(
                 &mut state.deferred_resampler,
                 &mut structural_applied,
                 &mut state.resampler,
+                &mut state.stream,
                 &mut channels.gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -214,7 +238,7 @@ pub fn setup_capture_stream<'c>(
                 &rt_status_for_process,
             );
 
-            let param_changed = rt_callback::receive_commands(
+            let (param_changed, _param_pops) = rt_callback::receive_commands(
                 &mut channels.param_consumer,
                 &mut state.deferred_model,
                 &mut structural_applied,
@@ -343,6 +367,7 @@ pub fn setup_capture_stream<'c>(
                     conv: None,
                     conv_pair,
                 },
+                &mut state.stream,
                 DspBuffers {
                     resamp_mid_l: &mut *state.resamp_mid_l,
                     resamp_mid_r: &mut *state.resamp_mid_r,
@@ -360,12 +385,13 @@ pub fn setup_capture_stream<'c>(
                 current_host_rate,
                 &mut state.frame_count,
                 &rt_status_for_process,
-                recording_producer,
+                recording_sender,
                 &mut state.recording_meta_sent,
                 &mut state.recording_meta_rate,
                 &mut state.recording_block,
                 recording_data_available_ref,
                 recording_failed_ref,
+                t_cap_start,
             );
 
             // Sample PipeWire clock for drift diagnostics (every 64 frames)

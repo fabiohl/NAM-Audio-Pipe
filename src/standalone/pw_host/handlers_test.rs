@@ -34,7 +34,7 @@ fn fake_pair(generation: u64, ch: usize) -> Box<SlimModelPair> {
     Box::new(SlimModelPair {
         generation,
         channels: ch,
-        l: fake_wavenet(ch),
+        l: Some(fake_wavenet(ch)),
         r: Some(fake_wavenet(ch)),
     })
 }
@@ -94,7 +94,7 @@ fn slimmable_pair_built_and_pushed_atomically() {
     let pair = cons.pop().expect("one pair must be delivered");
     assert_eq!(pair.generation, 1, "pair must carry the request generation");
     assert_eq!(pair.channels, 4);
-    assert_eq!(pair.l.channels(), 4);
+    assert_eq!(pair.l.as_ref().unwrap().channels(), 4);
     assert!(
         pair.r.is_some(),
         "stereo config must build and deliver an R model"
@@ -117,7 +117,7 @@ fn slimmable_mono_pair_has_no_r() {
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
     let pair = cons.pop().expect("one pair must be delivered");
-    assert_eq!(pair.l.channels(), 4);
+    assert_eq!(pair.l.as_ref().unwrap().channels(), 4);
     assert!(pair.r.is_none(), "mono config must not build an R model");
 }
 
@@ -283,15 +283,14 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     );
 
     // The stale pair A (both channels, ch 4) went to GC whole.
-    let stale_l = gc_c.pop().unwrap();
-    let stale_r = gc_c.pop().unwrap();
-    match (stale_l, stale_r) {
-        (GcItem::Model(m1), GcItem::Model(m2)) => {
-            let mut chs = [m1.channels(), m2.channels()];
-            chs.sort_unstable();
-            assert_eq!(chs, [4, 4], "stale pair must be discarded whole");
+    let stale = gc_c.pop().unwrap();
+    match stale {
+        GcItem::SlimModelPair(p) => {
+            assert_eq!(p.channels, 4);
+            assert_eq!(p.l.as_ref().unwrap().channels(), 4);
+            assert_eq!(p.r.as_ref().unwrap().channels(), 4);
         }
-        _ => panic!("expected stale GcItem::Model pair"),
+        _ => panic!("expected stale GcItem::SlimModelPair"),
     }
 }
 
@@ -299,10 +298,24 @@ fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
     Box::new(NamResampler::new(pw, nam, 64).unwrap())
 }
 
+fn make_stream(
+    pw: u32,
+    nam: u32,
+) -> Box<neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer> {
+    Box::new(
+        neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(pw, nam, 2048)
+            .unwrap(),
+    )
+}
+
 fn make_payload(generation: u64, pw: u32, nam: u32) -> Box<ResamplerSwapPayload> {
     Box::new(ResamplerSwapPayload {
         generation,
         resampler: make_rs(pw, nam),
+        stream: Box::new(
+            neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(pw, nam, 2048)
+                .unwrap(),
+        ),
     })
 }
 
@@ -608,7 +621,7 @@ fn cabsim_full_protocol_installs_latest_and_gcs_retired_pair() {
     assert!(parking_lot_dirty.load(Ordering::Acquire));
     let old = gc_c.pop().unwrap();
     assert!(
-        matches!(old, GcItem::CabSimPair(_)),
+        matches!(old, GcItem::CabSimSwap(_)),
         "the retired pair must reach GC as a single moved Box"
     );
     assert!(gc_c.pop().is_err());
@@ -689,6 +702,7 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let mut active = make_rs(48000, 48000);
+    let mut active_stream = make_stream(48000, 48000);
     let mut deferred_resampler = None;
     let mut structural_applied = 0usize;
 
@@ -697,6 +711,7 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
         &mut deferred_resampler,
         &mut structural_applied,
         &mut active,
+        &mut active_stream,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -719,13 +734,13 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
     // GC received the stale A, then the original active resampler.
     let stale = gc_cons.pop().unwrap();
     match stale {
-        GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 44100),
-        _ => panic!("Expected stale GcItem::Resampler(44100)"),
+        GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 44100),
+        _ => panic!("Expected stale GcItem::ResamplerSwap(44100)"),
     }
     let previous = gc_cons.pop().unwrap();
     match previous {
-        GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 48000),
-        _ => panic!("Expected previous GcItem::Resampler(48000)"),
+        GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 48000),
+        _ => panic!("Expected previous GcItem::ResamplerSwap(48000)"),
     }
     assert!(gc_cons.pop().is_err());
 }
@@ -747,6 +762,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let mut active = make_rs(48000, 48000);
+    let mut active_stream = make_stream(48000, 48000);
     let mut deferred_resampler = None;
     let mut structural_applied = 0usize;
 
@@ -765,6 +781,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
         &mut deferred_resampler,
         &mut structural_applied,
         &mut active,
+        &mut active_stream,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -784,6 +801,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
         &mut deferred_resampler,
         &mut structural_applied,
         &mut active,
+        &mut active_stream,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -801,13 +819,13 @@ fn full_protocol_discards_stale_and_applies_latest() {
     // GC received the stale A, then the original active resampler.
     let stale = gc_cons.pop().unwrap();
     match stale {
-        GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 44100),
-        _ => panic!("Expected stale GcItem::Resampler(44100)"),
+        GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 44100),
+        _ => panic!("Expected stale GcItem::ResamplerSwap(44100)"),
     }
     let previous = gc_cons.pop().unwrap();
     match previous {
-        GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 48000),
-        _ => panic!("Expected previous GcItem::Resampler(48000)"),
+        GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 48000),
+        _ => panic!("Expected previous GcItem::ResamplerSwap(48000)"),
     }
     assert!(gc_cons.pop().is_err());
 }
@@ -854,6 +872,7 @@ fn lost_wakeup_stress_invariant() {
     let rt_worker = std::thread::spawn(move || {
         let mut cons = res_cons;
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let mut deferred_resampler = None;
         let mut structural_applied;
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
@@ -879,6 +898,7 @@ fn lost_wakeup_stress_invariant() {
                 &mut deferred_resampler,
                 &mut structural_applied,
                 &mut active,
+                &mut active_stream,
                 &mut gc_prod,
                 &mut parking_lot,
                 &parking_lot_dirty,
@@ -938,4 +958,96 @@ fn lost_wakeup_stress_invariant() {
             "final state unmuted with applied != requested"
         );
     }
+}
+
+/// F-RB-004 / T2.3: `handle_oversample_rebuild` builds both L/R engines,
+/// stamps the pair with the captured `requested_os_generation`, pushes to SPSC,
+/// and clears the rebuild flag.
+#[test]
+fn oversample_pair_built_stamped_and_pushed_atomically() {
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(2);
+
+    flags
+        .requested_os_factor
+        .store(OversampleFactor::X4.to_f32() as u32, Ordering::Relaxed);
+    flags.requested_os_generation.store(7, Ordering::Release);
+    flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+
+    handle_oversample_rebuild(&flags, &sys, &mut prod);
+
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
+        "successful push must clear the rebuild flag"
+    );
+
+    let pair = cons.pop().expect("one pair delivered");
+    assert_eq!(pair.generation, 7, "pair must carry generation 7");
+    assert_eq!(pair.l.factor(), OversampleFactor::X4);
+    assert_eq!(pair.r.factor(), OversampleFactor::X4);
+    assert!(
+        cons.pop().is_err(),
+        "both channels delivered in one envelope"
+    );
+}
+
+/// F-RB-004 / T2.3: Lost-wakeup guard for oversampling.
+///
+/// If `requested_os_generation` advances while the main thread is building the
+/// engines, `rearm_os_if_superseded` re-arms `NEEDS_OS_REBUILD` so the main
+/// loop triggers a follow-up rebuild immediately.
+#[test]
+fn oversample_rearm_when_superseded_during_build() {
+    let flags = RtStatusFlags::new();
+
+    flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+    flags.requested_os_generation.store(2, Ordering::Release);
+
+    // Pair was built with generation 1 (stale compared to current generation 2)
+    rearm_os_if_superseded(&flags, 1);
+
+    assert!(
+        flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
+        "superseded generation must re-arm the flag"
+    );
+
+    // If generation matches, the flag stays cleared
+    rearm_os_if_superseded(&flags, 2);
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
+        "matching generation must leave the flag cleared"
+    );
+}
+
+/// F-RB-004 / T2.3: Fail-closed delivery retry.
+///
+/// When the SPSC channel is full, `handle_oversample_rebuild` emits a diagnostic
+/// and retains `NEEDS_OS_REBUILD` so the swap is retried on the next cycle.
+#[test]
+fn oversample_channel_full_keeps_flag_for_retry() {
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, _cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(1);
+
+    // Saturate the queue
+    prod.push(Box::new(OsEnginePair {
+        generation: 0,
+        l: Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap()),
+        r: Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap()),
+    }))
+    .unwrap();
+
+    flags
+        .requested_os_factor
+        .store(OversampleFactor::X2.to_f32() as u32, Ordering::Relaxed);
+    flags.requested_os_generation.store(1, Ordering::Release);
+    flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+
+    handle_oversample_rebuild(&flags, &sys, &mut prod);
+
+    assert!(
+        flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
+        "channel full must retain the flag for automatic retry"
+    );
 }

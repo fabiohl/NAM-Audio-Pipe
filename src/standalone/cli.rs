@@ -116,6 +116,7 @@ pub fn print_help() {
     println!(
         "      --activation MODE    Activation precision: standard (default, exact-grade) or fast"
     );
+    println!("      --cpu INDEX          Pin RT audio thread to explicit CPU core index");
     println!("      --record             Record raw PipeWire input to a WAV file");
     println!(
         "      --fail-fast          Disable the bounded backend reconnect cycle (F-RB-010 / T4.5): \
@@ -156,6 +157,8 @@ pub struct CliArgs {
     /// `None` means the user did not pass `--activation`; the library-level
     /// default (`Standard`) applies.
     pub activation: Option<ActivationPrecision>,
+    /// Explicit CPU index to pin the RT audio thread (overrides auto-selection).
+    pub cpu: Option<usize>,
     /// Enable WAV recording of the raw PipeWire capture stream.
     pub record: bool,
     /// Disable the bounded backend reconnect cycle (`--fail-fast`): the first
@@ -181,6 +184,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut slim_override = SlimOverride::Auto;
     let mut oversample = OversampleFactor::Off;
     let mut activation = None;
+    let mut cpu = None;
     let mut record = false;
     let mut fail_fast = false;
     let mut has_args = false;
@@ -203,6 +207,19 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
             }
             Long("fail-fast") => {
                 fail_fast = true;
+            }
+            Long("cpu") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid CPU index value."));
+                let parsed_cpu = val_str.parse::<usize>().unwrap_or_else(|_| {
+                    exit_with_error(format!(
+                        "Invalid CPU index: '{}'. Must be a non-negative integer.",
+                        val_str
+                    ))
+                });
+                cpu = Some(parsed_cpu);
             }
             Long("slim") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -354,6 +371,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         slim_override,
         oversample,
         activation,
+        cpu,
         record,
         fail_fast,
     }

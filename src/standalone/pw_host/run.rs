@@ -10,8 +10,9 @@ use super::capture::state::{CaptureState, RtHostChannels};
 use super::handlers;
 use super::output_pw::AppState;
 use super::reconnect::{ReconnectCycle, ReconnectPolicy};
-use crate::recording::buffer::{MAX_BLOCK_SIZE, RingPayload};
+use super::wakeup::ControlPlaneWakeup;
 use crate::recording::guard::{RecordingWorkerGuard, RecordingWorkerOutcome};
+use crate::recording::transport::RecordingSender;
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::spsc::{
@@ -103,6 +104,7 @@ pub fn run_pipewire_host(
         mut slimmable_producer,
         mut os_producer,
         oversample,
+        requested_cpu,
         fail_fast,
     } = config;
 
@@ -150,19 +152,19 @@ pub fn run_pipewire_host(
     let full_wavenet_model_l = full_wavenet_model_l;
     let full_wavenet_model_r = full_wavenet_model_r;
 
-    // Place the recording producer (owned by the worker guard — RAII custody,
+    // Place the recording sender (owned by the worker guard — RAII custody,
     // F-RB-009 / T3.5) on a stack slot so the RT closure can access it via a
-    // raw pointer without locking. Producer is not cloneable; a raw pointer
-    // avoids shared-ownership plumbing while respecting the SPSC contract
-    // (single writer at a time). When recording is disabled the pointer
-    // targets a never-written dummy slot — the RT callback dereferences it
-    // unconditionally.
-    let mut dummy_recording_slot: Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>> = None;
-    let rec_ptr: *mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>> =
-        match &mut recording_worker {
-            Some(guard) => &raw mut *guard.producer_slot(),
-            None => &raw mut dummy_recording_slot,
-        };
+    // raw pointer without locking. The sender bundles the pool producer and
+    // the control-channel producer of the promoted transport (T4.3); it is not
+    // cloneable, so a raw pointer avoids shared-ownership plumbing while
+    // respecting the SPSC contract (single writer at a time). When recording
+    // is disabled the pointer targets a never-written dummy sender — the RT
+    // callback dereferences it unconditionally.
+    let mut dummy_recording_sender = RecordingSender::none();
+    let rec_ptr: *mut RecordingSender = match &mut recording_worker {
+        Some(guard) => &raw mut *guard.sender_slot(),
+        None => &raw mut dummy_recording_sender,
+    };
 
     // R-04: the RT parking lot (16 slots) lives HERE — a stack-local slot in
     // the main thread, accessed by the RT callback through a raw pointer
@@ -183,7 +185,8 @@ pub fn run_pipewire_host(
     // =========================================================
     // 2. CORE OPTIMIZATION (CPU Affinity)
     // =========================================================
-    let target_cpu = rt_setup::select_optimal_cpu().unwrap_or(0);
+    let cpu_receipt = rt_setup::select_optimal_cpu_with_receipt(requested_cpu);
+    let target_cpu = cpu_receipt.as_ref().map(|r| r.selected_cpu).unwrap_or(0);
 
     // =========================================================
     // 3. PROTECTED CONFIGURATION SCOPE (RAII)
@@ -194,7 +197,14 @@ pub fn run_pipewire_host(
     // survives as a functionally-dead zombie. F-RB-010 / T4.5: a failure with
     // reconnect budget left transitions to `Reconnecting` and re-instantiates
     // the streams; only a budget exhaustion triggers the fail-fast exit.
-    let backend_status = Arc::new(SharedBackendStatus::new());
+    //
+    // Event-driven control plane wakeup (T2.2): condition variable notification
+    // wakes the control loop immediately on rate renegotiations and stream state
+    // changes without waiting for the 100 ms health poll timer.
+    let wakeup = ControlPlaneWakeup::new();
+    let mut backend_init = SharedBackendStatus::with_rt_status(rt_status.clone());
+    backend_init.bind_wakeup(wakeup.clone());
+    let backend_status = Arc::new(backend_init);
     let backend_for_capture = backend_status.clone();
     let backend_for_playback = backend_status.clone();
     // The RT-observable failure flag lives in the worker guard; clone it here
@@ -218,9 +228,10 @@ pub fn run_pipewire_host(
     // =========================================================
     'host: loop {
         // Each instance spawns a fresh PipeWire RT data thread: real-time
-        // setup (DAZ/FTZ, SCHED_FIFO, CPU affinity) must re-run in its first
-        // callback. The previous instance (if any) already stopped its loop,
-        // so the main thread is the sole owner of the DSP state here.
+        // setup (DAZ/FTZ, SCHED_FIFO, CPU affinity) must re-run during its
+        // `state_changed` transition before stream readiness (T3.1 / F-RES-003).
+        // The previous instance (if any) already stopped its loop, so the main
+        // thread is the sole owner of the DSP state here.
         rt_state.thread_configured = false;
 
         // 4.1 PIPEWIRE LOOP INITIALIZATION (fresh per attempt)
@@ -355,7 +366,7 @@ pub fn run_pipewire_host(
         // =========================================================
         let mut was_silent = false;
         let mut was_fading = false;
-        let mut poll_state = rt_setup::PollState::default();
+        let mut poll_state = rt_setup::PollState::with_cpu_receipt(cpu_receipt.clone());
         // F-RB-010 / T4.4: set when the control loop observes a fatal backend
         // failure for this instance. Drives either the bounded reconnect
         // (T4.5) or the fail-fast teardown + `Err` return below.
@@ -424,7 +435,10 @@ pub fn run_pipewire_host(
                 .drains
                 .fetch_add(drained as u32, Ordering::Relaxed);
 
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            // T2.2: Event-driven wakeup — wakes up immediately on rate changes or
+            // stream state transitions, with 100 ms as health-poll fallback to ensure
+            // liveness and prevent busy-spin.
+            wakeup.wait_timeout(std::time::Duration::from_millis(100));
         }
 
         // =========================================================

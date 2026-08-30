@@ -28,20 +28,19 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
 
-use crate::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, RING_CAPACITY, RingPayload,
-    create_audio_ring_buffer,
-};
+use crate::recording::buffer::{AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE};
 use crate::recording::disk::{
     AsyncWavWriter, WavSink, create_new_capture, disk_writer_loop_inner, spawn_recording_worker,
     validate_output_dir,
 };
 use crate::recording::io::{FaultInjectingWriter, WriteAt};
+use crate::recording::pool::POOL_CAPACITY;
 use crate::recording::probe::IoUringSupport;
 use crate::recording::status::{
     RecordingInit, RecordingStartupError, RecordingStatus, SharedRecordingStatus,
     wait_for_recording_init,
 };
+use crate::recording::transport::create_recording_transport;
 use crate::recording::wav_header::{build_wav_header, capture_filename};
 
 const META: AudioMetadata = AudioMetadata {
@@ -496,11 +495,11 @@ fn validate_output_dir_rejects_regular_file() {
 fn spawn_recording_worker_fails_fast_when_io_uring_unavailable() {
     // An unavailable-kernel verdict must fail the handshake BEFORE the
     // tokio_uring runtime is entered — so this test needs no real io_uring.
-    let (_producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
+    let (_sender, receiver) = create_recording_transport();
     let (mut init, init_rx, status, failed_flag) = test_recording_init(std::env::temp_dir());
     init.io_uring_probe = Some(|| IoUringSupport::KernelUnsupported);
 
-    let handle = spawn_recording_worker(consumer, None, init).expect("spawn must succeed");
+    let handle = spawn_recording_worker(receiver, None, init).expect("spawn must succeed");
 
     let err = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect_err("unavailable io_uring must fail the startup handshake");
@@ -605,99 +604,123 @@ impl WavSink for MockWavSink {
 /// The F-RB-009 failure: SIGINT (`SHUTDOWN`) fires while the ring is
 /// momentarily empty; the old worker observed the flag during its idle poll,
 /// finalized and exited, orphaning every block the RT callback produced in
-/// the following main-loop iteration. Here the test parks the worker with an
-/// empty ring (barrier), then emits blocks **after** `SHUTDOWN` — the worker
-/// must ignore the flag, drain 100% of the samples and finalize a bit-exact
-/// WAV with exactly one `fsync`.
+/// the following main-loop iteration. Here the test parks the worker with
+/// empty channels (barrier), then emits blocks **after** `SHUTDOWN` through the
+/// promoted pool transport (T4.3) — the worker must ignore the flag, drain
+/// 100% of the samples and finalize a bit-exact WAV with exactly one `fsync`.
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
-    let (mut producer, mut consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
-    let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
-    let status_check = Arc::clone(&status);
-    let sink = MockWavSink::default();
-    let disks_handle = Arc::clone(&sink.disks);
+    // `InFlightBlock` owns a raw pointer into the pool slot and crosses an
+    // `.await` inside the drain loop, so the worker future is `!Send`; it must
+    // run inside a `LocalSet` (the production worker runs under the
+    // single-threaded `tokio_uring` runtime, which has the same shape).
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let status_check = Arc::clone(&status);
+            let sink = MockWavSink::default();
+            let disks_handle = Arc::clone(&sink.disks);
+            let worker = tokio::task::spawn_local(async move {
+                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+            });
 
-    let worker =
-        tokio::spawn(
-            async move { disk_writer_loop_inner(&sink, &mut consumer, None, &status).await },
-        );
+            // Barrier: push Metadata, then wait until the worker consumed it
+            // and both channels are empty again (`control` ring back to full
+            // capacity, every pool slot back in the free ring) — the worker is
+            // now parked in its idle poll with empty channels.
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
 
-    // Barrier: push Metadata, then wait until the worker consumed it and the
-    // ring is empty again (`slots()` back to full capacity) — the worker is
-    // now parked in its idle poll with an empty ring.
-    producer
-        .push(RingPayload::Metadata(META))
-        .expect("metadata push must succeed");
+            {
+                // Scope the producer borrows so they are released before the
+                // pushes below re-borrow `sender`.
+                let (control_prod, pool_prod) = match &mut sender {
+                    crate::recording::transport::RecordingSender::Pool { control, pool } => {
+                        (control.as_mut().unwrap(), pool.as_mut().unwrap())
+                    }
+                    crate::recording::transport::RecordingSender::Inline(_) => {
+                        panic!("pool transport expected")
+                    }
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
+                    || pool_prod.free_available() != POOL_CAPACITY
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "worker never drained the metadata barrier"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while producer.slots() != RING_CAPACITY {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "worker never drained the metadata barrier"
-        );
-        tokio::task::yield_now().await;
-    }
+            // F-RB-009 scenario: SHUTDOWN fires with empty channels. Keep the
+            // worker idle for several 10 ms poll cycles, so the OLD code —
+            // which exited on SHUTDOWN — would have finalized and quit before
+            // the blocks below land.
+            let _shutdown_guard = ShutdownGuard::new();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // F-RB-009 scenario: SHUTDOWN fires with an empty ring. Keep the worker
-    // idle for several 10 ms poll cycles, so the OLD code — which exited on
-    // SHUTDOWN — would have finalized and quit before the blocks below land.
-    let _shutdown_guard = ShutdownGuard::new();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // The RT callback still emits blocks after SHUTDOWN (up to one
+            // main-loop iteration before `thread_loop.stop()`).
+            const BLOCK_SAMPLES: usize = 256;
+            let mut expected_payload = Vec::new();
+            for block_idx in 0..8u32 {
+                let left: Vec<f32> = (0..BLOCK_SAMPLES)
+                    .map(|i| (block_idx * BLOCK_SAMPLES as u32 + i as u32) as f32 * 0.001)
+                    .collect();
+                let right: Vec<f32> = left.iter().map(|v| -v).collect();
+                expected_payload.extend_from_slice(&interleave(&left, &right));
 
-    // The RT callback still emits blocks after SHUTDOWN (up to one main-loop
-    // iteration before `thread_loop.stop()`).
-    const BLOCK_SAMPLES: usize = 256;
-    let mut expected_payload = Vec::new();
-    for block_idx in 0..8u32 {
-        let left: Vec<f32> = (0..BLOCK_SAMPLES)
-            .map(|i| (block_idx * BLOCK_SAMPLES as u32 + i as u32) as f32 * 0.001)
-            .collect();
-        let right: Vec<f32> = left.iter().map(|v| -v).collect();
-        expected_payload.extend_from_slice(&interleave(&left, &right));
+                assert!(
+                    sender.try_push_audio(&left, &right),
+                    "post-shutdown audio publish must succeed"
+                );
+            }
 
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(&left, &right);
-        producer
-            .push(RingPayload::Audio(block))
-            .expect("post-shutdown audio push must succeed");
-    }
+            // The main thread confirms the RT loop stopped
+            // (`thread_loop.stop()`) and only then sends the terminal
+            // StreamStop token.
+            assert!(
+                sender.try_push_stream_stop(),
+                "StreamStop push must succeed"
+            );
 
-    // The main thread confirms the RT loop stopped (`thread_loop.stop()`) and
-    // only then sends the terminal StreamStop token.
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push must succeed");
+            // The worker must drain 100% of the blocks and finalize before
+            // exiting.
+            tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+                .await
+                .expect("worker must exit after consuming StreamStop")
+                .expect("worker task must not panic")
+                .expect("integral drain must succeed");
 
-    // The worker must drain 100% of the blocks and finalize before exiting.
-    tokio::time::timeout(std::time::Duration::from_secs(5), worker)
-        .await
-        .expect("worker must exit after consuming StreamStop")
-        .expect("worker task must not panic")
-        .expect("integral drain must succeed");
+            // The observable status tracked the live capture file created on
+            // Metadata.
+            match &*status_check.lock().unwrap() {
+                RecordingStatus::Active { path } => {
+                    assert_eq!(path, &std::env::temp_dir().join("mock_capture_part1.wav"));
+                }
+                other => panic!("status must be Active after Metadata, got {other:?}"),
+            }
 
-    // The observable status tracked the live capture file created on Metadata.
-    match &*status_check.lock().unwrap() {
-        RecordingStatus::Active { path } => {
-            assert_eq!(path, &std::env::temp_dir().join("mock_capture_part1.wav"));
-        }
-        other => panic!("status must be Active after Metadata, got {other:?}"),
-    }
-
-    // 100% of the samples must be in the finalized WAV: bit-exact header +
-    // interleaved PCM, with exactly one fsync from `finalize`.
-    let disks = disks_handle.lock().unwrap();
-    assert_eq!(disks.len(), 1, "a single capture file must be produced");
-    let mut expected_wav =
-        build_wav_header(&META, expected_payload.len() as u32).expect("expected header build");
-    expected_wav.extend_from_slice(&expected_payload);
-    assert_eq!(
-        &*disks[0].bytes.lock().unwrap(),
-        &expected_wav[..],
-        "post-SHUTDOWN blocks must be fully drained into the finalized WAV"
-    );
-    assert_eq!(
-        disks[0].sync_calls.load(Ordering::Relaxed),
-        1,
-        "finalize must fsync exactly once"
-    );
+            // 100% of the samples must be in the finalized WAV: bit-exact
+            // header + interleaved PCM, with exactly one fsync from `finalize`.
+            let disks = disks_handle.lock().unwrap();
+            assert_eq!(disks.len(), 1, "a single capture file must be produced");
+            let mut expected_wav = build_wav_header(&META, expected_payload.len() as u32)
+                .expect("expected header build");
+            expected_wav.extend_from_slice(&expected_payload);
+            assert_eq!(
+                &*disks[0].bytes.lock().unwrap(),
+                &expected_wav[..],
+                "post-SHUTDOWN blocks must be fully drained into the finalized WAV"
+            );
+            assert_eq!(
+                disks[0].sync_calls.load(Ordering::Relaxed),
+                1,
+                "finalize must fsync exactly once"
+            );
+        })
+        .await;
 }

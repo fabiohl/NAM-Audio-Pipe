@@ -74,6 +74,7 @@ pub fn playback_param_changed_handler(
                 .store(rate, Ordering::Release);
             mark_format_contract_ok(rt_status, "playback");
             check_negotiated_rate_mismatch(rt_status);
+            backend.notify_wakeup();
         }
         Err(violation) => {
             let violation_msg = violation.to_string();
@@ -162,6 +163,7 @@ pub fn setup_playback_stream<'c>(
                 bridge_ptr_playback,
                 &mut last_bridge_gen,
                 &rt_status_playback,
+                pb_frame_count,
             );
         })
         .register()?;

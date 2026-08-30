@@ -14,7 +14,7 @@
 //! - **ZERO LOCKS** in the Audio thread (`pw_host` module): Audio does not "wait" for the visual interface. If there is no new instruction, it continues using the previous one. This avoids sound "glitching".
 //! - **ZERO ALLOCATIONS** in the Audio thread: The audio channel memory (`process()`) is always prepared 100% in advance. Audio never "requests more RAM" out of nowhere.
 
-use nam_audio_pipe::recording::{self, buffer};
+use nam_audio_pipe::recording;
 use nam_audio_pipe::standalone::{cli, colors::Colorize, pw_host, rt_setup, setup, signals};
 
 use neural_amp_modeler_rs::SystemSnapshot;
@@ -60,14 +60,16 @@ fn main() -> anyhow::Result<()> {
     let initial_out_gain = args.output_gain;
     let buffer_size = args.buffer_size;
 
-    // 2. PREPARE THE AUDIO: Initialize PipeWire (the Linux sound system)
-    // and calibrate internal "clocks" to ensure sound output without delays (latency).
-    pipewire::init();
-    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(pw_library_version());
-
-    // 2.1. IMMEDIATE DIAGNOSTIC EXITS: If the user requested an immediate diagnostic dump,
-    // we print it to stdout and exit immediately with code 0 (without starting audio processing).
+    // 1.1. IMMEDIATE DIAGNOSTIC EXITS: If the user requested an immediate diagnostic dump,
+    // initialise PipeWire just long enough to read the library version string (a pure C
+    // symbol — no daemon socket needed), emit the bundle, deinit, and exit 0.
+    //
+    // This branch intentionally runs before the main `pipewire::init()` below so that
+    // `--diagnose` works in sandboxed environments (e.g. `flatpak build-run`) where the
+    // PipeWire socket is not available and a full `pw_init()` would abort or return an error.
     if args.diagnose || args.diagnose_full {
+        pipewire::init();
+        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(pw_library_version());
         let bundle =
             neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
         println!("{}", bundle.render());
@@ -76,6 +78,11 @@ fn main() -> anyhow::Result<()> {
         }
         std::process::exit(0);
     }
+
+    // 2. PREPARE THE AUDIO: Initialize PipeWire (the Linux sound system)
+    // and calibrate internal "clocks" to ensure sound output without delays (latency).
+    pipewire::init();
+    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(pw_library_version());
 
     rt_setup::calibrate_tsc();
 
@@ -180,21 +187,23 @@ fn main() -> anyhow::Result<()> {
     // syscalls that would cause jitter at the critical moment of the first audio delivery.
     rt_setup::configure_process_wide();
 
-    // Create the recording ring buffer and spawn the disk I/O thread (opt-in via --record).
-    // The startup handshake (F-RB-009 / T3.3) is a hard fail-fast gate: PipeWire is only
-    // started with `--record` after the worker confirms io_uring is up and the output
-    // directory is writable — an invalid directory or an unavailable io_uring aborts the
-    // process here instead of silently discarding all audio into the ring.
+    // Create the recording transport (promoted preallocated-pool + control
+    // ring, or the T4.1 inline ring behind RECORDING_POOL_TRANSPORT) and spawn
+    // the disk I/O thread (opt-in via --record). The startup handshake
+    // (F-RB-009 / T3.3) is a hard fail-fast gate: PipeWire is only started
+    // with `--record` after the worker confirms io_uring is up and the output
+    // directory is writable — an invalid directory or an unavailable io_uring
+    // aborts the process here instead of silently discarding all audio into
+    // the transport.
     //
-    // The worker thread, its ring producer (the stop channel) and the RT failure flag are
-    // handed to a `RecordingWorkerGuard` (F-RB-009 / T3.5): RAII custody guarantees the
-    // worker is signalled and joined with a bounded timeout even if the PipeWire host
-    // returns early via `?`, and the guard's shutdown outcome propagates recording
-    // failures into the process exit code.
+    // The worker thread, the transport sender (the stop channel) and the RT
+    // failure flag are handed to a `RecordingWorkerGuard` (F-RB-009 / T3.5):
+    // RAII custody guarantees the worker is signalled and joined with a
+    // bounded timeout even if the PipeWire host returns early via `?`, and the
+    // guard's shutdown outcome propagates recording failures into the process
+    // exit code.
     let (recording_data_available, recording_status, recording_worker) = if args.record {
-        let (producer, consumer) = recording::create_audio_ring_buffer::<{ buffer::MAX_BLOCK_SIZE }>(
-            buffer::RING_CAPACITY,
-        );
+        let (sender, receiver) = recording::create_recording_transport();
         let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag_for_thread = Arc::clone(&data_available);
 
@@ -215,7 +224,7 @@ fn main() -> anyhow::Result<()> {
         // during shutdown so the WAV header is finalized before PipeWire is
         // deinitialized and recording failures surface as a non-zero exit.
         let io_handle =
-            match recording::spawn_recording_worker(consumer, Some(flag_for_thread), init) {
+            match recording::spawn_recording_worker(receiver, Some(flag_for_thread), init) {
                 Ok(h) => h,
                 Err(e) => {
                     log::error!("🛑 Failed to spawn recording worker: {e}");
@@ -254,7 +263,7 @@ fn main() -> anyhow::Result<()> {
             Some(recording_status),
             Some(recording::RecordingWorkerGuard::new(
                 io_handle,
-                Some(producer),
+                Some(sender),
                 Some(failed_flag),
             )),
         )
@@ -283,6 +292,7 @@ fn main() -> anyhow::Result<()> {
             slimmable_producer,
             os_producer,
             oversample: args.oversample,
+            requested_cpu: args.cpu,
             fail_fast: args.fail_fast,
         },
         gc_consumer,

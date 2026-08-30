@@ -2,67 +2,98 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! Extended soak and heap-audit harness for the PipeWire host (T6.4 / G-RB-002).
+//! Accelerated-timeline soak harness for the PipeWire host (T6.4 / G-RB-002;
+//! T5.3 / G-PERF-004).
+//!
+//! Purpose (declared in the long-suite receipt as `SOAK_ACCELERATED_PURPOSE`):
+//! the audio timeline is **compressed** — 320 000 continuous audio blocks
+//! (~7.1 min of nominal timeline at BLOCK=64 / 48 kHz, far less in wall clock)
+//! with thousands of concurrent swaps across WaveNet, LSTM and Linear models,
+//! CabSim IRs, oversampling factors and gain variations. Validation windows are
+//! mandatory and **fail-closed** (a window that cannot complete within the
+//! bounded retry budget is a hard failure — never a silent pass). Zero-frame
+//! sentinel skips (a callback that processed no frames) are counted and
+//! bounded, never silently ignored.
+//!
+//! Distinct from the real wall-clock endurance suite (`tests/endurance.rs`,
+//! T5.3): the accelerated soak compresses the timeline; the endurance suite
+//! runs in real wall-clock time with periodic raw RSS/faults/threads/FD
+//! telemetry.
 //!
 //! Two `#[ignore]`d tests run by Phase 1 of `utils/tests-long.sh`:
 //!
-//! - `test_soak_100k_multichannel_swaps` — 100 000 continuous audio blocks
-//!   (~2.2 min of continuous audio at BLOCK=64 / 48 kHz) with thousands of
-//!   concurrent swaps across WaveNet, LSTM and Linear models, CabSim IRs,
-//!   oversampling factors and gain variations. Validates continuous integrity
-//!   (no undue silence, no channel inversion, no gain asymmetry) during
-//!   periodic Linear-model windows.
+//! - `test_soak_320k_multichannel_swaps` — 320 000 continuous audio blocks
+//!   with thousands of concurrent swaps. Validates continuous integrity (no
+//!   undue silence, no channel inversion, no gain asymmetry) during periodic
+//!   Linear-model windows — every reached window must complete.
 //!
-//! - `test_soak_rss_memory_stability` — captures resident memory (VmRSS) at
-//!   block 1 000 and block 100 000 of the same soak and asserts the delta is
-//!   below the OS page-margin threshold (zero memory drift / leak).
+//! - `test_soak_rss_memory_stability` — captures **raw** resident memory
+//!   (VmRSS), page faults, thread and FD counts periodically across the same
+//!   soak and asserts the post-warmup drift is below the OS page-margin
+//!   threshold (zero memory leak; RSS shrinkage is never a failure).
+//!
+//! Medido: soak 320k blocos em <elapsed> s, RSS delta=<delta> MB, faults=0
+//! (filled by the operator after a calibrated run; the markers carry the live
+//! numbers every run).
 
 mod common;
 
-use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
-use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
-
+use common::proc::TelemetrySample;
 use common::swap::*;
+use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 
-/// Total continuous audio blocks for the soak (≈133 s at 48 kHz / BLOCK=64).
-const TOTAL_BLOCKS: usize = 100_000;
+/// Total continuous audio blocks for the soak (≈426 s of nominal timeline at
+/// 48 kHz / BLOCK=64 — the G-PERF-004 accelerated-timeline target).
+const TOTAL_BLOCKS: usize = 320_000;
 
-/// Swap cadence: a batch of model/cabsim/OS/gain commands every N blocks.
-const SWAP_INTERVAL: usize = 20;
-
-/// Validation window: every N blocks, install Linear A/B and verify polarity.
+/// Validation window: every N blocks, install Linear A/B and verify polarity
+/// (mandatory — fail-closed, never a vanished window).
 const VALIDATION_INTERVAL: usize = 500;
 
-/// Maximum allowed blocks of undue silence during the soak (gate-closed
-/// transitions and resampler-pending skips are legitimate).
+/// Maximum allowed blocks of undue (exact) silence during the soak.
 const MAX_UNDUE_SILENCE: usize = 200;
 
-/// Maximum allowed RSS drift (KiB) between block 1 000 and block 100 000.
-/// A single Linux page is 4 KiB; 64 KiB (16 pages) is a generous margin for
-/// allocator noise while still catching real leaks.
-const MAX_RSS_DRIFT_KB: usize = 64;
+/// Maximum allowed zero-frame sentinel skips (a callback that processed no
+/// frames, e.g. while a resampler swap is pending). Documented, bounded —
+/// never a silent validation skip.
+const MAX_SKIPPED_BLOCKS: usize = 200;
 
-/// Reads the current process resident set size in KiB from `/proc/self/status`.
-fn read_rss_kb() -> usize {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            return rest
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(0);
-        }
-    }
-    0
+/// Bounded retry budget per validation window: a window must complete within
+/// this many consecutive zero-frame attempts or the soak fails.
+const MAX_VALIDATION_ATTEMPTS: usize = 64;
+
+/// Maximum allowed RSS growth (KiB) between the first and last telemetry
+/// samples. Under continuous swapping the allocator's steady state wobbles
+/// ±~50 KiB (model sizes vary per swap batch), so 256 KiB (64 pages) is the
+/// leak-sensitive margin: a real leak grows by MBs per minute, far above it.
+/// RSS shrinkage is never a failure (reported as a negative delta).
+const MAX_RSS_DRIFT_KB: usize = 256;
+
+/// Maximum allowed major page faults over the whole soak.
+const MAX_MAJOR_FAULTS: u64 = 8;
+
+/// Aggregate soak metrics (T5.3): integrity signals that are either asserted
+/// fail-closed or reported in the measurement marker.
+#[derive(Debug, Default, Clone, Copy)]
+struct SoakMetrics {
+    /// Blocks where input was non-zero but both outputs were bit-exact zero.
+    undue_silence: usize,
+    /// Zero-frame sentinel skips (callbacks that processed no frames).
+    skipped_blocks: usize,
+    /// Validation windows that completed.
+    windows_completed: usize,
+    /// Validation windows that needed more than one attempt to complete.
+    windows_deferred: usize,
 }
 
 /// Runs the soak over `sig_l`/`sig_r` for the `[start, start + blocks)`
 /// segment of the audio timeline, performing periodic swap batches and (when
-/// `validate` is true) Linear-model validation windows. The signal buffers
-/// must hold at least `(start + blocks) * BLOCK` samples per channel.
+/// `validate` is true) mandatory Linear-model validation windows. The signal
+/// buffers must hold at least `(start + blocks) * BLOCK` samples per channel.
 ///
-/// Returns the number of undue-silence blocks observed.
+/// Validation windows are fail-closed: a window that cannot complete within
+/// `MAX_VALIDATION_ATTEMPTS` consecutive zero-frame attempts fails the soak —
+/// zero vanished windows.
 fn run_soak_blocks(
     h: &mut RtSwapHarness,
     start: usize,
@@ -70,8 +101,12 @@ fn run_soak_blocks(
     validate: bool,
     sig_l: &[f32],
     sig_r: &[f32],
-) -> usize {
-    let mut undue_silence = 0usize;
+) -> SoakMetrics {
+    let mut metrics = SoakMetrics::default();
+    let mut validation_pending = false;
+    let mut window_needed_retry = false;
+    let mut retry_budget = MAX_VALIDATION_ATTEMPTS;
+    let mut next_validation = VALIDATION_INTERVAL;
 
     for local in 0..blocks {
         let block = start + local;
@@ -79,8 +114,30 @@ fn run_soak_blocks(
             apply_swap_batch(h, block);
         }
 
-        if validate && block > 0 && block.is_multiple_of(VALIDATION_INTERVAL) {
-            validate_linear_window(h);
+        if validate && !validation_pending && block >= next_validation {
+            validation_pending = true;
+            retry_budget = MAX_VALIDATION_ATTEMPTS;
+        }
+        if validation_pending {
+            if validate_linear_window(h) {
+                validation_pending = false;
+                metrics.windows_completed += 1;
+                if window_needed_retry {
+                    metrics.windows_deferred += 1;
+                    window_needed_retry = false;
+                }
+                next_validation += VALIDATION_INTERVAL;
+            } else {
+                window_needed_retry = true;
+                retry_budget -= 1;
+                if retry_budget == 0 {
+                    panic!(
+                        "soak validation window {} vanished: {MAX_VALIDATION_ATTEMPTS} \
+                         consecutive zero-frame attempts",
+                        metrics.windows_completed
+                    );
+                }
+            }
         }
 
         // Production main loop drains the GC cascade periodically; the soak
@@ -94,159 +151,107 @@ fn run_soak_blocks(
         let mut in_r = [0.0f32; BLOCK];
         in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
         in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
-        h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        let frames_before = h.frame_count();
+        let n_pw = h.run_callback(&mut in_l, &mut in_r, BLOCK);
 
-        if h.frame_count() == 0 {
-            continue;
+        if h.frame_count() == frames_before {
+            // Zero-frame sentinel: the quantum was skipped (e.g. resampler
+            // swap pending). Counted and bounded — never a silent skip.
+            metrics.skipped_blocks += 1;
         }
 
-        let out_l = h.out_l();
-        let out_r = h.out_r();
-        if !out_l.is_empty()
+        // Exact-silence accounting: non-zero input, bit-exact zero output on
+        // both channels (undue silence is a real integrity failure, not
+        // float-noise).
+        if n_pw > 0
             && in_l.iter().any(|&s| s != 0.0)
-            && out_l.iter().all(|&s| s == 0.0)
-            && out_r.iter().all(|&s| s == 0.0)
+            && h.out_l().iter().all(|&s| s == 0.0)
+            && h.out_r().iter().all(|&s| s == 0.0)
         {
-            undue_silence += 1;
+            metrics.undue_silence += 1;
         }
     }
 
-    undue_silence
+    // Fail-closed resolution of a validation window that triggered near the
+    // end of the segment: it must complete within the bounded budget or the
+    // soak fails — a window that starts must never vanish with the loop exit.
+    let mut final_attempts = 0usize;
+    while validation_pending {
+        if validate_linear_window(h) {
+            validation_pending = false;
+            metrics.windows_completed += 1;
+            if window_needed_retry {
+                metrics.windows_deferred += 1;
+            }
+        } else {
+            final_attempts += 1;
+            if final_attempts >= MAX_VALIDATION_ATTEMPTS {
+                panic!(
+                    "soak final validation window vanished after {MAX_VALIDATION_ATTEMPTS} \
+                     zero-frame attempts"
+                );
+            }
+        }
+    }
+
+    metrics
 }
 
-/// Applies a mixed swap batch: model, CabSim, oversampling and gain.
-fn apply_swap_batch(h: &mut RtSwapHarness, block: usize) {
-    let cycle = block / SWAP_INTERVAL;
-
-    // Model rotation: Linear A/B → WaveNet → LSTM → Linear B/A → ...
-    let model = match cycle % 4 {
-        0 => linear_a(),
-        1 => wavenet_model(),
-        2 => lstm_model(),
-        _ => linear_b(),
-    };
-    let model_r = match cycle % 4 {
-        0 => linear_b(),
-        1 => wavenet_model(),
-        2 => lstm_model(),
-        _ => linear_a(),
-    };
-    h.push_load_model(Some(model), Some(model_r), 1.0, 1.0, SAMPLE_RATE);
-
-    // CabSim: install every 2nd batch, clear every 3rd batch.
-    if cycle.is_multiple_of(2) {
-        h.push_cabsim(Some(cabsim_pair()));
-    } else if cycle.is_multiple_of(3) {
-        h.push_cabsim(None);
-    }
-
-    // Oversampling: cycle through Off / X2 / X4.
-    let os_factor = match cycle % 3 {
-        0 => OversampleFactor::Off,
-        1 => OversampleFactor::X2,
-        _ => OversampleFactor::X4,
-    };
-    let os_max = BLOCK * 4;
-    if let (Ok(l), Ok(r)) = (
-        OversampleEngine::new(os_factor, os_max),
-        OversampleEngine::new(os_factor, os_max),
-    ) {
-        h.push_os_pair(l, r);
-    }
-
-    // Continuous gain variation.
-    let mult = 0.5 + 0.01 * ((cycle % 100) as f32);
-    h.push_input_gain(mult);
-    h.push_output_gain(mult);
-}
-
-/// Installs Linear A/B with unity gain and DC input, then verifies polarity
-/// and gain symmetry (L positive, R negative, symmetric scaling).
-///
-/// The validation must also neutralize any active CabSim and oversampling
-/// engine (pushed by the swap batch that shares this block), otherwise the
-/// IR convolution and/or resampled processing would distort the steady-state
-/// Linear gain tags.
-fn validate_linear_window(h: &mut RtSwapHarness) {
-    h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
-    h.push_cabsim(None);
-    h.push_os_pair(
-        OversampleEngine::new(OversampleFactor::Off, BLOCK * 4).expect("OS Off"),
-        OversampleEngine::new(OversampleFactor::Off, BLOCK * 4).expect("OS Off"),
-    );
-    h.push_output_gain(1.0);
-    h.push_input_gain(1.0);
-
-    let dc = 0.3f32;
-    let mut drained = 0usize;
-    while h.commands_pending() && drained < 32 {
-        let mut l = [dc; BLOCK];
-        let mut r = [dc; BLOCK];
-        h.run_callback(&mut l, &mut r, BLOCK);
-        drained += 1;
-    }
-    assert!(
-        !h.commands_pending(),
-        "validation commands not drained within 32 callbacks"
-    );
-    for _ in 0..8 {
-        let mut l = [dc; BLOCK];
-        let mut r = [dc; BLOCK];
-        h.run_callback(&mut l, &mut r, BLOCK);
-    }
-
-    let n = h.current_n_pw();
-    if n == 0 {
-        return;
-    }
-    let out_l = h.out_l().to_vec();
-    let out_r = h.out_r().to_vec();
-    if out_l.is_empty() || out_r.is_empty() {
-        return;
-    }
-
-    let expected_l = 1.875 * dc + 0.1;
-    let expected_r = -0.1596 * dc;
-    let idx = n.saturating_sub(4);
-    for i in idx..n {
-        assert!(
-            (out_l[i] - expected_l).abs() < 1e-2,
-            "soak validation: L at sample {i} = {} expected {expected_l}",
-            out_l[i]
-        );
-        assert!(
-            (out_r[i] - expected_r).abs() < 1e-2,
-            "soak validation: R at sample {i} = {} expected {expected_r}",
-            out_r[i]
-        );
-    }
-}
-
-/// 100 000 continuous audio blocks with thousands of concurrent swaps across
-/// WaveNet, LSTM and Linear models, CabSim IRs, oversampling factors and gain
-/// variations. Validates continuous integrity (no undue silence, no channel
-/// inversion, no gain asymmetry) during periodic Linear-model windows.
+/// 320 000 continuous audio blocks (~426 s of compressed timeline) with
+/// thousands of concurrent swaps across WaveNet, LSTM and Linear models,
+/// CabSim IRs, oversampling factors and gain variations. Validates continuous
+/// integrity (no undue silence, no channel inversion, no gain asymmetry)
+/// during mandatory Linear-model windows — fail-closed, zero vanished windows.
 #[test]
 #[ignore]
-fn test_soak_100k_multichannel_swaps() {
+fn test_soak_320k_multichannel_swaps() {
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
     let (sig_l, sig_r) = test_signal_blocks(TOTAL_BLOCKS);
+    let t0 = std::time::Instant::now();
 
-    let undue_silence = run_soak_blocks(&mut h, 0, TOTAL_BLOCKS, true, &sig_l, &sig_r);
+    let metrics = run_soak_blocks(&mut h, 0, TOTAL_BLOCKS, true, &sig_l, &sig_r);
+    let elapsed = t0.elapsed();
 
+    // Windows trigger at every VALIDATION_INTERVAL boundary processed *inside*
+    // the segment; the boundary at TOTAL_BLOCKS is exclusive, so the count is
+    // the number of boundaries strictly below TOTAL_BLOCKS.
+    let expected_windows = (TOTAL_BLOCKS - 1) / VALIDATION_INTERVAL;
     assert!(
-        undue_silence <= MAX_UNDUE_SILENCE,
-        "soak observed {undue_silence} undue-silence blocks (limit {MAX_UNDUE_SILENCE})"
+        metrics.windows_completed == expected_windows,
+        "zero vanished windows required: completed {}, reached {expected_windows} \
+         (deferred {})",
+        metrics.windows_completed,
+        metrics.windows_deferred,
+    );
+    assert!(
+        metrics.undue_silence <= MAX_UNDUE_SILENCE,
+        "soak observed {} undue-silence blocks (limit {MAX_UNDUE_SILENCE})",
+        metrics.undue_silence
+    );
+    assert!(
+        metrics.skipped_blocks <= MAX_SKIPPED_BLOCKS,
+        "zero-frame sentinel skips {} exceed the {MAX_SKIPPED_BLOCKS} bound",
+        metrics.skipped_blocks
+    );
+    eprintln!(
+        "SOAK_MEASURED blocks={TOTAL_BLOCKS} elapsed_s={:.1} windows_completed={} \
+         windows_deferred={} undue_silence={} skipped_blocks={}",
+        elapsed.as_secs_f64(),
+        metrics.windows_completed,
+        metrics.windows_deferred,
+        metrics.undue_silence,
+        metrics.skipped_blocks,
     );
 }
 
-/// Captures resident memory (VmRSS) at block 1 000 and block 100 000 of the
-/// same soak and asserts the post-warmup drift is strictly below the OS
-/// page-margin threshold (zero memory leak).
+/// Captures **raw** resident memory (VmRSS), page faults, thread and FD counts
+/// periodically across the full soak and asserts the post-warmup drift is
+/// strictly below the OS page-margin threshold (zero memory leak). RSS
+/// shrinkage is never a failure; growth beyond the margin is.
 ///
-/// The full-length signal is pre-allocated once and kept alive across both
-/// measurements so its heap footprint is part of the baseline (the delta
-/// isolates the soak's own allocation behavior).
+/// The full-length signal is pre-allocated once and kept alive across the
+/// soak so its heap footprint is part of the baseline (the delta isolates the
+/// soak's own allocation behavior).
 #[test]
 #[ignore]
 fn test_soak_rss_memory_stability() {
@@ -254,16 +259,59 @@ fn test_soak_rss_memory_stability() {
     let (sig_l, sig_r) = test_signal_blocks(TOTAL_BLOCKS);
 
     let _ = run_soak_blocks(&mut h, 0, 1_000, false, &sig_l, &sig_r);
-    let rss_1k = read_rss_kb();
-    assert!(rss_1k > 0, "VmRSS unavailable on this platform");
+    let mut telemetry: Vec<TelemetrySample> = vec![TelemetrySample::capture()];
 
-    let _ = run_soak_blocks(&mut h, 1_000, TOTAL_BLOCKS - 1_000, false, &sig_l, &sig_r);
-    let rss_final = read_rss_kb();
+    // Periodic raw telemetry across the rest of the soak (every 10k blocks).
+    let mut remaining = 1_000;
+    while remaining < TOTAL_BLOCKS {
+        let next = (remaining + 10_000).min(TOTAL_BLOCKS);
+        let _ = run_soak_blocks(&mut h, remaining, next - remaining, false, &sig_l, &sig_r);
+        telemetry.push(TelemetrySample::capture());
+        remaining = next;
+    }
 
-    let drift = rss_final.saturating_sub(rss_1k);
+    let first = telemetry.first().expect("telemetry baseline");
+    let last = telemetry.last().expect("telemetry final");
+    let rss_delta_kb = last.rss_kb as i64 - first.rss_kb as i64;
+    let minflt_delta = last.minflt.saturating_sub(first.minflt);
+    let majflt_delta = last.majflt.saturating_sub(first.majflt);
+    let threads_delta = last.threads as i64 - first.threads as i64;
+    let fds_delta = last.fds as i64 - first.fds as i64;
+
+    assert!(first.rss_kb > 0, "VmRSS unavailable on this platform");
     assert!(
-        drift < MAX_RSS_DRIFT_KB,
-        "RSS drift of {drift} KiB between block 1 000 ({rss_1k} KiB) and block {TOTAL_BLOCKS} \
-         ({rss_final} KiB) exceeds {MAX_RSS_DRIFT_KB} KiB margin — possible memory leak"
+        rss_delta_kb <= MAX_RSS_DRIFT_KB as i64,
+        "RSS growth of {rss_delta_kb} KiB between block 1 000 ({} KiB) and block {TOTAL_BLOCKS} \
+         ({} KiB) exceeds {MAX_RSS_DRIFT_KB} KiB margin — possible memory leak",
+        first.rss_kb,
+        last.rss_kb,
+    );
+    assert!(
+        majflt_delta <= MAX_MAJOR_FAULTS,
+        "major page faults {majflt_delta} exceed the {MAX_MAJOR_FAULTS} bound"
+    );
+    assert!(
+        threads_delta <= 2,
+        "thread leak: {threads_delta} extra threads (first {} → last {})",
+        first.threads,
+        last.threads,
+    );
+    assert!(
+        fds_delta <= 8,
+        "FD leak: {fds_delta} extra FDs (first {} → last {})",
+        first.fds,
+        last.fds,
+    );
+    eprintln!(
+        "SOAK_RSS_MEASURED rss_first_kb={} rss_last_kb={} rss_delta_kb={rss_delta_kb} \
+         minflt_delta={minflt_delta} majflt_delta={majflt_delta} threads_first={} threads_last={} \
+         fds_first={} fds_last={} telemetry_samples={}",
+        first.rss_kb,
+        last.rss_kb,
+        first.threads,
+        last.threads,
+        first.fds,
+        last.fds,
+        telemetry.len(),
     );
 }

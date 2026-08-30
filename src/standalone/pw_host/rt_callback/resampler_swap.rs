@@ -16,6 +16,7 @@ use neural_amp_modeler_rs::common::spsc::{
     ResamplerSwapPayload, RtStatusFlags, gc_cascade,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 
 use rtrb::Consumer;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,7 @@ pub fn drain_resamplers(
     deferred: &mut Option<Box<ResamplerSwapPayload>>,
     structural_applied: &mut usize,
     resampler: &mut Box<NamResampler>,
+    stream: &mut Box<StreamingResampleBuffer>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
@@ -59,7 +61,7 @@ pub fn drain_resamplers(
             // Stale while parked (F-RB-004): discard to GC without unmuting and
             // without clearing RESAMP_SWAP_PENDING.
             discard_resampler(
-                *pending,
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -69,7 +71,7 @@ pub fn drain_resamplers(
         } else if head_is_current {
             // A newer same-generation build is already queued (latest-wins).
             discard_resampler(
-                *pending,
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -82,8 +84,9 @@ pub fn drain_resamplers(
                 .fetch_add(1, Ordering::Relaxed);
         } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_resampler(
-                *pending,
+                pending,
                 resampler,
+                stream,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -117,7 +120,7 @@ pub fn drain_resamplers(
             // this resampler was being built. Discard it for GC without
             // unmuting and without clearing RESAMP_SWAP_PENDING.
             discard_resampler(
-                *payload,
+                payload,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -130,7 +133,7 @@ pub fn drain_resamplers(
             // Coalescing: an intermediate current-generation envelope is
             // obsolete — its resampler cascades to GC (latest-wins).
             discard_resampler(
-                *older,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -146,8 +149,9 @@ pub fn drain_resamplers(
     if let Some(payload) = candidate {
         if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_resampler(
-                *payload,
+                payload,
                 resampler,
+                stream,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -167,7 +171,7 @@ pub fn drain_resamplers(
             // (latest-wins).
             let older = deferred.take().expect("slot occupied, checked above");
             discard_resampler(
-                *older,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -188,20 +192,26 @@ pub fn drain_resamplers(
 }
 
 /// Installs a current-generation resampler envelope: swaps the active
-/// resampler, records the applied generation and active rates, unmutes
-/// (clears `RT_STATUS_RESAMP_SWAP_PENDING`) and cascades the previous
-/// resampler to GC.
+/// resampler and streaming adapter, records the applied generation and active rates,
+/// unmutes (clears `RT_STATUS_RESAMP_SWAP_PENDING`) and cascades the retired
+/// resampler envelope to GC.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Real-time swap helper receiving active resources, queues, parking lot, and flags"
+)]
 fn install_resampler(
-    payload: ResamplerSwapPayload,
+    mut payload: Box<ResamplerSwapPayload>,
     resampler: &mut Box<NamResampler>,
+    stream: &mut Box<StreamingResampleBuffer>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
     rt_status_for_process: &RtStatusFlags,
 ) {
-    let old_rs = std::mem::replace(resampler, payload.resampler);
+    std::mem::swap(&mut payload.resampler, resampler);
+    std::mem::swap(&mut payload.stream, stream);
 
     rt_status_for_process
         .applied_rate_generation
@@ -218,7 +228,7 @@ fn install_resampler(
 
     parking_lot_dirty.store(true, Ordering::Release);
     gc_cascade(
-        Some(GcItem::Resampler(old_rs)),
+        Some(GcItem::ResamplerSwap(payload)),
         gc_producer,
         parking_lot,
         gc_overflow_for_process,
@@ -231,7 +241,7 @@ fn install_resampler(
 /// builds never substitute the most recent request).
 #[inline(always)]
 fn discard_resampler(
-    payload: ResamplerSwapPayload,
+    payload: Box<ResamplerSwapPayload>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
@@ -240,7 +250,7 @@ fn discard_resampler(
 ) {
     parking_lot_dirty.store(true, Ordering::Release);
     gc_cascade(
-        Some(GcItem::Resampler(payload.resampler)),
+        Some(GcItem::ResamplerSwap(payload)),
         gc_producer,
         parking_lot,
         gc_overflow_for_process,
@@ -255,14 +265,21 @@ mod tests {
     use std::assert_matches;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
+
     fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
         Box::new(NamResampler::new(pw, nam, 64).unwrap())
+    }
+
+    fn make_stream(pw: u32, nam: u32) -> Box<StreamingResampleBuffer> {
+        Box::new(StreamingResampleBuffer::new(pw, nam, 2048).unwrap())
     }
 
     fn make_payload(generation: u64, pw: u32, nam: u32) -> Box<ResamplerSwapPayload> {
         Box::new(ResamplerSwapPayload {
             generation,
             resampler: make_rs(pw, nam),
+            stream: make_stream(pw, nam),
         })
     }
 
@@ -270,6 +287,7 @@ mod tests {
     fn empty_consumer_no_change() {
         let (_prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -283,6 +301,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -300,6 +319,7 @@ mod tests {
     fn single_swap_updates_active_and_clears_flag() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -317,6 +337,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -337,13 +358,14 @@ mod tests {
         assert!(parking_lot_dirty.load(Ordering::Acquire));
 
         let old = gc_c.pop().unwrap();
-        assert_matches!(old, GcItem::Resampler(_));
+        assert_matches!(old, GcItem::ResamplerSwap(_));
     }
 
     #[test]
     fn multiple_swaps_keep_last() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -363,6 +385,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -379,13 +402,13 @@ mod tests {
         // GC received the stale 44.1k envelope, then the previous active 48k.
         let stale = gc_c.pop().unwrap();
         match stale {
-            GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 44100),
-            _ => panic!("Expected stale GcItem::Resampler(44100)"),
+            GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 44100),
+            _ => panic!("Expected stale GcItem::ResamplerSwap(44100)"),
         }
         let previous = gc_c.pop().unwrap();
         match previous {
-            GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 48000),
-            _ => panic!("Expected previous GcItem::Resampler(48000)"),
+            GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 48000),
+            _ => panic!("Expected previous GcItem::ResamplerSwap(48000)"),
         }
         assert!(gc_c.pop().is_err());
     }
@@ -394,6 +417,7 @@ mod tests {
     fn swap_cascades_old_resampler_to_gc() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -410,6 +434,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -419,10 +444,10 @@ mod tests {
 
         let gc_item = gc_c.pop().unwrap();
         match gc_item {
-            GcItem::Resampler(old_rs) => {
-                assert_eq!(old_rs.host_rate(), 48000);
+            GcItem::ResamplerSwap(payload) => {
+                assert_eq!(payload.resampler.host_rate(), 48000);
             }
-            _ => panic!("Expected GcItem::Resampler"),
+            _ => panic!("Expected GcItem::ResamplerSwap"),
         }
     }
 
@@ -439,6 +464,7 @@ mod tests {
     fn stale_generation_is_gc_discarded_without_unmute() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -464,6 +490,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -480,8 +507,8 @@ mod tests {
 
         let stale = gc_c.pop().unwrap();
         match stale {
-            GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 44100),
-            _ => panic!("Expected stale GcItem::Resampler(44100)"),
+            GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 44100),
+            _ => panic!("Expected stale GcItem::ResamplerSwap(44100)"),
         }
 
         // (5) Main delivers B (generation 2) → applied and unmuted.
@@ -491,6 +518,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -507,8 +535,8 @@ mod tests {
         assert!(!flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
         let previous = gc_c.pop().unwrap();
         match previous {
-            GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 48000),
-            _ => panic!("Expected previous GcItem::Resampler(48000)"),
+            GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 48000),
+            _ => panic!("Expected previous GcItem::ResamplerSwap(48000)"),
         }
     }
 
@@ -518,6 +546,7 @@ mod tests {
     fn unversioned_payload_never_applied_when_request_exists() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -535,6 +564,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -547,8 +577,8 @@ mod tests {
         assert_eq!(flags.applied_rate_generation.load(Ordering::Relaxed), 0);
         let stale = gc_c.pop().unwrap();
         match stale {
-            GcItem::Resampler(rs) => assert_eq!(rs.host_rate(), 44100),
-            _ => panic!("Expected stale GcItem::Resampler(44100)"),
+            GcItem::ResamplerSwap(payload) => assert_eq!(payload.resampler.host_rate(), 44100),
+            _ => panic!("Expected stale GcItem::ResamplerSwap(44100)"),
         }
     }
 
@@ -562,6 +592,7 @@ mod tests {
     fn budget_applies_one_and_coalesces_backlog() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -582,6 +613,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -610,7 +642,7 @@ mod tests {
         // GC: 2 superseded envelopes + the replaced active resampler = 3.
         let mut resamplers = 0usize;
         while let Ok(item) = gc_c.pop() {
-            assert_matches!(item, GcItem::Resampler(_));
+            assert_matches!(item, GcItem::ResamplerSwap(_));
             resamplers += 1;
         }
         assert_eq!(resamplers, 3);
@@ -623,6 +655,7 @@ mod tests {
     fn budget_exhausted_parks_envelope_resolved_next_callback() {
         let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
         let mut active = make_rs(48000, 48000);
+        let mut active_stream = make_stream(48000, 48000);
         let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::new(8);
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
@@ -640,6 +673,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
@@ -661,6 +695,7 @@ mod tests {
             &mut deferred,
             &mut structural_applied,
             &mut active,
+            &mut active_stream,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,

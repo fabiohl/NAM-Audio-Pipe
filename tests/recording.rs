@@ -3,16 +3,15 @@
 
 //! Integration tests for the recording subsystem.
 //!
-//! Validates end-to-end recording via the SPSC ring buffer → `disk_writer_loop`
-//! → valid WAV file on disk. Requires `io_uring` support (Linux >= 5.1).
+//! Validates end-to-end recording via the promoted pool transport (audio pool
+//! + control ring) → `disk_writer_loop` → valid WAV file on disk.
+//!
+//! Requires `io_uring` support (Linux >= 5.1).
 
-use nam_audio_pipe::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, RING_CAPACITY, RingPayload,
-    create_audio_ring_buffer,
-};
+use nam_audio_pipe::recording::buffer::{AudioMetadata, OVERRUN_COUNT};
 use nam_audio_pipe::recording::{
     RecordingStartupError, RecordingStatus, RecordingWorkerGuard, RecordingWorkerOutcome,
-    spawn_recording_worker, wait_for_recording_init,
+    create_recording_transport, spawn_recording_worker, wait_for_recording_init,
 };
 use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
@@ -67,24 +66,24 @@ fn disk_writer_loop_creates_valid_wav() {
     let _cwd = CwdGuard::enter(&dir);
     let _guard = DirGuard::new(dir.clone());
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
     // before we push any payload — F-RB-009 / T3.3.
-    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
+    let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     let meta = AudioMetadata {
         sample_rate: 48000.0,
         bit_depth: 32,
         channels: 2,
     };
-    producer
-        .push(RingPayload::Metadata(meta))
-        .expect("metadata push should succeed");
+    assert!(
+        sender.try_push_metadata(meta),
+        "metadata push should succeed"
+    );
 
     const BLOCK_SAMPLES: usize = 480;
     for block_idx in 0..10u32 {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
         let mut left = [0.0f32; BLOCK_SAMPLES];
         let mut right = [0.0f32; BLOCK_SAMPLES];
         for i in 0..BLOCK_SAMPLES {
@@ -92,15 +91,16 @@ fn disk_writer_loop_creates_valid_wav() {
             left[i] = v;
             right[i] = -v;
         }
-        block.fill_planar(&left, &right);
-        producer
-            .push(RingPayload::Audio(block))
-            .expect("audio push should succeed");
+        assert!(
+            sender.try_push_audio(&left, &right),
+            "audio push should succeed"
+        );
     }
 
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push should succeed");
+    assert!(
+        sender.try_push_stream_stop(),
+        "StreamStop push should succeed"
+    );
 
     // StreamStop is now the sole termination token (F-RB-009 / T3.4): the
     // worker finalizes the WAV and exits on it. SHUTDOWN is set afterwards on
@@ -143,24 +143,26 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
     let _cwd = CwdGuard::enter(&dir);
     let _guard = DirGuard::new(dir.clone());
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
     // before we push any payload — F-RB-009 / T3.3.
-    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
+    let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     let meta = AudioMetadata {
         sample_rate: 44100.0,
         bit_depth: 32,
         channels: 2,
     };
-    producer
-        .push(RingPayload::Metadata(meta))
-        .expect("metadata push should succeed");
+    assert!(
+        sender.try_push_metadata(meta),
+        "metadata push should succeed"
+    );
 
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push should succeed");
+    assert!(
+        sender.try_push_stream_stop(),
+        "StreamStop push should succeed"
+    );
 
     // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
     // regression guard proving the global flag is no longer consulted.
@@ -197,37 +199,37 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     let _cwd = CwdGuard::enter(&dir);
     let _guard = DirGuard::new(dir.clone());
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
     // before we push any payload — F-RB-009 / T3.3.
-    let (handle, _, _) = spawn_ready_worker(consumer, &dir);
+    let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     // Push Audio BEFORE Metadata — should be discarded silently
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    block.fill_planar(&[1.0f32; 64], &[-1.0f32; 64]);
-    producer
-        .push(RingPayload::Audio(block))
-        .expect("audio push should succeed");
+    assert!(
+        sender.try_push_audio(&[1.0f32; 64], &[-1.0f32; 64]),
+        "audio push should succeed"
+    );
 
     let meta = AudioMetadata {
         sample_rate: 48000.0,
         bit_depth: 32,
         channels: 2,
     };
-    producer
-        .push(RingPayload::Metadata(meta))
-        .expect("metadata push should succeed");
+    assert!(
+        sender.try_push_metadata(meta),
+        "metadata push should succeed"
+    );
 
-    let mut block2 = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    block2.fill_planar(&[0.5, 0.6], &[-0.5, -0.6]);
-    producer
-        .push(RingPayload::Audio(block2))
-        .expect("audio push should succeed");
+    assert!(
+        sender.try_push_audio(&[0.5f32, 0.6], &[-0.5f32, -0.6]),
+        "audio push should succeed"
+    );
 
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push should succeed");
+    assert!(
+        sender.try_push_stream_stop(),
+        "StreamStop push should succeed"
+    );
 
     // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
     // regression guard proving the global flag is no longer consulted.
@@ -301,10 +303,9 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
     let rt_status = Arc::new(RtStatusFlags::default());
 
-    let (recording_producer, recording_consumer) =
-        create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (recording_sender, recording_receiver) = create_recording_transport();
     let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
-    let io_handle = spawn_recording_worker(recording_consumer, None, init)
+    let io_handle = spawn_recording_worker(recording_receiver, None, init)
         .expect("failed to spawn recording I/O thread");
     wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect("recording worker must confirm readiness");
@@ -313,11 +314,11 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let gc_overflow_clone = gc_overflow.clone();
     let sys = SystemSnapshot::capture();
 
-    // F-RB-009 / T3.5: the worker thread, its ring producer and the failure
+    // F-RB-009 / T3.5: the worker thread, its transport sender and the failure
     // flag travel together in the RAII guard, so the host's early `?` returns
     // and the normal shutdown both terminate and formally join the worker.
     let recording_worker =
-        RecordingWorkerGuard::new(io_handle, Some(recording_producer), Some(failed_flag));
+        RecordingWorkerGuard::new(io_handle, Some(recording_sender), Some(failed_flag));
 
     let pw_thread = thread::spawn(move || {
         pw_host::run_pipewire_host(
@@ -340,6 +341,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
+                requested_cpu: None,
                 // Fail-fast under the deterministic harness (see pw_integration).
                 fail_fast: true,
             },
@@ -438,9 +440,9 @@ fn disk_writer_loop_fails_fast_on_missing_output_dir() {
         std::env::temp_dir().join(format!("nam-recording-missing-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&missing);
 
-    let (_producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&missing);
-    let handle = spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a missing output dir must fail the startup handshake");
@@ -479,9 +481,9 @@ fn disk_writer_loop_fails_fast_on_file_as_output_dir() {
     let file_dir = std::env::temp_dir().join(format!("nam-recording-file-{}", std::process::id()));
     std::fs::write(&file_dir, b"i am a file, not a directory").unwrap();
 
-    let (_producer, consumer) = create_audio_ring_buffer::<{ MAX_BLOCK_SIZE }>(RING_CAPACITY);
+    let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&file_dir);
-    let handle = spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a file-as-dir must fail the startup handshake");

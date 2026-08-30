@@ -25,8 +25,21 @@
 //! thread does in production; `run_callback` then drains them inside a single
 //! audio quantum, exactly as the RT thread does.
 //!
+//! Since T5.3 (G-PERF-004) the harness is **splittable** into its two
+//! production faces via [`RtSwapHarness::into_parts`]:
+//!
+//! - [`SwapProducer`] — the main-thread producer face (the SPSC writers plus
+//!   the shared rate signal). It counts every push (`attempted`/`enqueued`/
+//!   `dropped`) so a concurrency-throughput harness can account for command
+//!   loss through the bounded production ring.
+//! - [`SwapRtSide`] — the RT side (consumers, `CaptureState`, GC cascade, DSP
+//!   bridge). Its `run_callback_accounted` returns the per-quantum swap
+//!   accounting (`applied`/`pops`/`commands_remaining`).
+//!
 //! This is the substrate for the T2.6 concurrency/soak and zero-allocation
-//! heap-audit gates (ER-2). It is compiled only under `feature = "testing"`.
+//! heap-audit gates (ER-2) and for the T5.3 production-SPSC throughput
+//! measurement (no global mutex on the measured path). It is compiled only
+//! under `feature = "testing"`.
 
 use crate::standalone::pw_host::capture::state::CaptureState;
 use crate::standalone::pw_host::rt_callback::{
@@ -36,101 +49,86 @@ use crate::standalone::pw_host::rt_callback::{
 use crate::standalone::rt_setup::compute_gain_multipliers;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags, SlimModelPair,
-    setup_spsc,
+    CabSimSwapPayload, GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags,
+    SlimModelPair, setup_spsc,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
     BridgeBuffer, BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspBuffers,
-    DspPipelineContext, MAX_RESAMP_BUF, capture_dsp_pipeline,
+    DspPipelineContext, MAX_RESAMP_BUF, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::math::dsp::gain_lut::{GainLUT, get_gain_lut};
 use neural_amp_modeler_rs::models::StaticModel;
 
 use rtrb::{Consumer, Producer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Maximum oversampled buffer size: `MAX_RESAMP_BUF × 4` (for X4 oversampling).
 const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
 
-/// Offline RT swap-stress harness — full drain sequence + DSP in one quantum.
-pub struct RtSwapHarness {
-    /// The complete RT mutable state (models, resampler, OS, cab-sim, gains,
-    /// gate, hysteresis, adaptive, deferred slots, working buffers).
-    pub state: CaptureState,
-    param_producer: Producer<ParamPayload>,
-    param_consumer: Consumer<ParamPayload>,
-    gc_producer: Producer<GcItem>,
-    gc_consumer: Consumer<GcItem>,
-    gc_overflow: Arc<GcOverflowBuffer>,
-    resampler_producer: Producer<Box<ResamplerSwapPayload>>,
-    resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
-    cabsim_producer: Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
-    cabsim_consumer: Consumer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
-    slimmable_producer: Producer<Box<SlimModelPair>>,
-    os_producer: Producer<Box<OsEnginePair>>,
-    parking_lot: [Option<GcItem>; 16],
-    parking_lot_dirty: AtomicBool,
-    rt_status: Arc<RtStatusFlags>,
-    bridge: Box<DspBridge>,
-    lut: &'static GainLUT,
-    /// Last host rate applied by `run_callback`.
-    current_host_rate: u32,
-    /// `n_pw` of the most recent `run_callback` (valid output frames).
-    last_n_pw: usize,
+/// Per-quantum swap accounting returned by [`SwapRtSide::run_callback_accounted`].
+///
+/// T5.3 (G-PERF-004): the concurrency-throughput harness records, per callback,
+/// how many structural swaps were actually applied, how many payloads the
+/// drains consumed (param vs structural channels) and how many commands are
+/// still queued/parked after the quantum — the "contabilidade completa de
+/// swaps" the acceptance requires. The producer-side attempt counters
+/// (`attempted`/`enqueued`/`dropped`) live in [`SwapProducer`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CallbackAccounting {
+    /// Valid output frames produced by the DSP pipeline (`0` when the quantum
+    /// was skipped, e.g. a resampler swap is pending).
+    pub n_pw: usize,
+    /// Structural swaps installed during this quantum (shared F-RB-011 budget).
+    pub structural_applied: usize,
+    /// `ParamPayload` payloads popped from the param SPSC this quantum.
+    pub param_pops: usize,
+    /// Structural payloads popped from the resampler/cabsim/slimmable/OS SPSC
+    /// channels this quantum. Ring-pop lower bound: payloads parked in
+    /// deferred slots are resolved without a ring pop and are reflected in
+    /// `structural_applied` instead.
+    pub structural_pops: usize,
+    /// Commands still queued or parked after this quantum ([`SwapRtSide::commands_pending`]).
+    pub commands_remaining: usize,
 }
 
-impl RtSwapHarness {
-    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
-    /// rates already consistent, so the first `run_callback` processes
-    /// immediately without a resampler renegotiation).
-    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
-        let sys = SystemSnapshot::capture();
-        let mut state = CaptureState::init(&sys, OversampleFactor::Off);
-        state.resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
-        state.current_nam_rate = nam_rate;
-        state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
+/// Main-thread producer face of the swap harness (production SPSC writers).
+///
+/// T5.3: this handle is movable to a separate producer thread with **no global
+/// mutex** — it mirrors the production single-writer main thread, pushing
+/// commands through the same bounded ring buffers the real `process()`
+/// callback drains. Every push is counted (`attempted`/`enqueued`/`dropped`)
+/// so the throughput harness can prove full swap accounting.
+pub struct SwapProducer {
+    param_producer: Producer<ParamPayload>,
+    resampler_producer: Producer<Box<ResamplerSwapPayload>>,
+    cabsim_producer: Producer<Box<CabSimSwapPayload>>,
+    slimmable_producer: Producer<Box<SlimModelPair>>,
+    os_producer: Producer<Box<OsEnginePair>>,
+    shared_target_rate: Arc<AtomicU32>,
+    rt_status: Arc<RtStatusFlags>,
+    /// Total push attempts (every `push_*` call).
+    attempted: AtomicU64,
+    /// Successful pushes (command entered the SPSC ring).
+    enqueued: AtomicU64,
+    /// Rejected pushes (ring full — the bounded channel dropped the command).
+    dropped: AtomicU64,
+}
 
-        let spsc = setup_spsc(neural_amp_modeler_rs::common::spsc::SPSC_CAPACITY);
-        state.slimmable_rx = Some(spsc.slimmable_consumer);
-        state.os_rx = Some(spsc.os_consumer);
-
-        let bridge = Box::new(DspBridge {
-            buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
-            active_read_idx: Default::default(),
-            generation: Default::default(),
-            consumed_gen: Default::default(),
-            dropped_frames: Default::default(),
-        });
-
-        Ok(Self {
-            state,
-            param_producer: spsc.param_producer,
-            param_consumer: spsc.param_consumer,
-            gc_producer: spsc.gc_producer,
-            gc_consumer: spsc.gc_consumer,
-            gc_overflow: spsc.gc_overflow,
-            resampler_producer: spsc.resampler_producer,
-            resampler_consumer: spsc.resampler_consumer,
-            cabsim_producer: spsc.cabsim_producer,
-            cabsim_consumer: spsc.cabsim_consumer,
-            slimmable_producer: spsc.slimmable_producer,
-            os_producer: spsc.os_producer,
-            parking_lot: Default::default(),
-            parking_lot_dirty: AtomicBool::new(false),
-            rt_status: spsc.rt_status,
-            bridge,
-            lut: get_gain_lut(),
-            current_host_rate: host_rate,
-            last_n_pw: 0,
-        })
+impl SwapProducer {
+    fn count_push<T>(&self, result: Result<(), rtrb::PushError<T>>) {
+        self.attempted.fetch_add(1, Ordering::Relaxed);
+        if result.is_ok() {
+            self.enqueued.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
-
-    // ── Producer face (main-thread side) ────────────────────────────────────
 
     /// Pushes a `LoadModel` command (both channels transported atomically).
     pub fn push_load_model(
@@ -141,28 +139,32 @@ impl RtSwapHarness {
         output_mult_adj: f32,
         sample_rate: u32,
     ) {
-        let _ = self.param_producer.push(ParamPayload::LoadModel {
+        let result = self.param_producer.push(ParamPayload::LoadModel {
             model_l,
             model_r,
             input_mult_adj,
             output_mult_adj,
             sample_rate,
         });
+        self.count_push(result);
     }
 
     /// Pushes a scalar input-gain command (latest-wins coalescing).
     pub fn push_input_gain(&mut self, mult: f32) {
-        let _ = self.param_producer.push(ParamPayload::InputGain(mult));
+        let result = self.param_producer.push(ParamPayload::InputGain(mult));
+        self.count_push(result);
     }
 
     /// Pushes a scalar output-gain command (latest-wins coalescing).
     pub fn push_output_gain(&mut self, mult: f32) {
-        let _ = self.param_producer.push(ParamPayload::OutputGain(mult));
+        let result = self.param_producer.push(ParamPayload::OutputGain(mult));
+        self.count_push(result);
     }
 
     /// Pushes a gate-configuration command.
     pub fn push_gate(&mut self, params: GateParams) {
-        let _ = self.param_producer.push(ParamPayload::GateConfig(params));
+        let result = self.param_producer.push(ParamPayload::GateConfig(params));
+        self.count_push(result);
     }
 
     /// Pushes an atomic slimmable L/R pair (F-RB-005).
@@ -173,15 +175,17 @@ impl RtSwapHarness {
         l: Box<StaticModel>,
         r: Option<Box<StaticModel>>,
     ) {
-        let _ = self.slimmable_producer.push(Box::new(SlimModelPair {
+        let result = self.slimmable_producer.push(Box::new(SlimModelPair {
             generation,
             channels,
-            l,
+            l: Some(l),
             r,
         }));
+        self.count_push(result);
     }
 
-    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None` clears/bypasses the cab-sim (F-RB-007).
+    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None`
+    /// clears/bypasses the cab-sim (F-RB-007).
     pub fn push_cabsim(&mut self, pair: Option<Box<CabSimPair>>) {
         let generation = self
             .rt_status
@@ -192,17 +196,29 @@ impl RtSwapHarness {
 
     /// Pushes a cab-sim pair with explicit generation timestamp.
     pub fn push_cabsim_with_gen(&mut self, generation: u64, pair: Option<Box<CabSimPair>>) {
-        let _ = self.cabsim_producer.push(Box::new(
-            neural_amp_modeler_rs::common::spsc::CabSimSwapPayload { generation, pair },
-        ));
+        let result = self
+            .cabsim_producer
+            .push(Box::new(CabSimSwapPayload { generation, pair }));
+        self.count_push(result);
     }
 
-    /// Pushes an oversampling engine pair for an atomic L/R OS swap.
+    /// Pushes an oversampling engine pair stamped with current requested OS generation.
     pub fn push_os_pair(&mut self, l: OversampleEngine, r: OversampleEngine) {
-        let _ = self.os_producer.push(Box::new(OsEnginePair {
+        let generation = self
+            .rt_status
+            .requested_os_generation
+            .load(Ordering::Acquire);
+        self.push_os_with_gen(generation, l, r);
+    }
+
+    /// Pushes an oversampling engine pair with explicit generation timestamp.
+    pub fn push_os_with_gen(&mut self, generation: u64, l: OversampleEngine, r: OversampleEngine) {
+        let result = self.os_producer.push(Box::new(OsEnginePair {
+            generation,
             l: Box::new(l),
             r: Box::new(r),
         }));
+        self.count_push(result);
     }
 
     /// Requests a resampler renegotiation and delivers the rebuilt resampler.
@@ -217,25 +233,65 @@ impl RtSwapHarness {
             .requested_rate_generation
             .load(Ordering::Acquire);
         let resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
-        let _ = self.resampler_producer.push(Box::new(ResamplerSwapPayload {
+        let stream = Box::new(StreamingResampleBuffer::new(
+            host_rate,
+            nam_rate,
+            MAX_RESAMP_BUF,
+        )?);
+        let result = self.resampler_producer.push(Box::new(ResamplerSwapPayload {
             generation,
             resampler,
+            stream,
         }));
+        self.count_push(result);
         Ok(())
     }
 
     /// Publishes a detected host rate so `sync_rate` requests a rebuild.
     pub fn publish_host_rate(&mut self, rate: u32) {
-        self.state.shared_target_rate.store(rate, Ordering::Release);
+        self.shared_target_rate.store(rate, Ordering::Release);
     }
 
-    /// Changes the model's active NAM rate (drives `current_nam_rate`).
-    pub fn set_nam_rate(&mut self, rate: u32) {
-        self.state.current_nam_rate = rate;
+    /// Total push attempts made through this producer face.
+    pub fn attempted(&self) -> u64 {
+        self.attempted.load(Ordering::Relaxed)
     }
 
-    // ── RT face ─────────────────────────────────────────────────────────────
+    /// Successful pushes (commands enqueued into the SPSC rings).
+    pub fn enqueued(&self) -> u64 {
+        self.enqueued.load(Ordering::Relaxed)
+    }
 
+    /// Rejected pushes (ring full — bounded channel dropped the command).
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// RT side of the split harness: the complete RT mutable state plus the SPSC
+/// consumers and the GC cascade — exclusively owned by the audio thread.
+pub struct SwapRtSide {
+    /// The complete RT mutable state (models, resampler, OS, cab-sim, gains,
+    /// gate, hysteresis, adaptive, deferred slots, working buffers).
+    pub state: CaptureState,
+    param_consumer: Consumer<ParamPayload>,
+    gc_producer: Producer<GcItem>,
+    gc_consumer: Consumer<GcItem>,
+    gc_overflow: Arc<GcOverflowBuffer>,
+    resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
+    cabsim_consumer: Consumer<Box<CabSimSwapPayload>>,
+    parking_lot: [Option<GcItem>; 16],
+    parking_lot_dirty: AtomicBool,
+    rt_status: Arc<RtStatusFlags>,
+    bridge: Box<DspBridge>,
+    lut: &'static GainLUT,
+    /// Last host rate applied by `run_callback`.
+    current_host_rate: u32,
+    /// `n_pw` of the most recent `run_callback` (valid output frames).
+    last_n_pw: usize,
+}
+
+impl SwapRtSide {
     /// Executes one audio quantum: GC flush, all budgeted drains, rate sync,
     /// gain recompute, pending-resampler guard and the full DSP pipeline.
     ///
@@ -243,6 +299,12 @@ impl RtSwapHarness {
     /// pipeline); `n` is the frame count. Returns `n_pw` — the number of
     /// processed samples available in [`Self::out_l`]/[`Self::out_r`], or `0`
     /// when the callback was skipped (e.g. a resampler swap is in flight).
+    ///
+    /// This is the plain quantum used by the RT measurement gates (deadline,
+    /// jitter, soak, endurance): the instruction profile mirrors the real
+    /// callback exactly — no accounting reads (T5.3). Use
+    /// [`Self::run_callback_accounted`] only where the per-quantum swap
+    /// accounting is actually consumed.
     ///
     /// Zero heap allocations: mirrors the real callback exactly.
     pub fn run_callback(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize) -> usize {
@@ -273,6 +335,7 @@ impl RtSwapHarness {
             &mut self.state.deferred_resampler,
             &mut structural_applied,
             &mut self.state.resampler,
+            &mut self.state.stream,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
@@ -292,7 +355,7 @@ impl RtSwapHarness {
             &rt_status,
         );
 
-        let param_changed = receive_commands(
+        let (param_changed, _param_pops) = receive_commands(
             &mut self.param_consumer,
             &mut self.state.deferred_model,
             &mut structural_applied,
@@ -382,6 +445,11 @@ impl RtSwapHarness {
                     .resampler_failed_generation
                     .store(0, Ordering::Release);
             } else {
+                // The quantum was skipped: no output was produced. Publish the
+                // skip through `last_n_pw = 0` so `current_n_pw()`/`out_l()`
+                // reflect the skip and zero-frame sentinels (T5.3) fire instead
+                // of exposing stale pre-swap output.
+                self.last_n_pw = 0;
                 return 0;
             }
         }
@@ -393,10 +461,209 @@ impl RtSwapHarness {
         n_pw
     }
 
+    /// Same quantum as [`Self::run_callback`] but also returns the per-quantum
+    /// swap accounting (T5.3 / G-PERF-004). The drains run in the exact
+    /// production order; `structural_pops` is the ring-pop lower bound across
+    /// the four structural channels, `param_pops` is the exact scalar pops.
+    ///
+    /// Only used where the accounting is consumed (the production-SPSC
+    /// throughput gate) — the RT measurement gates keep using the plain
+    /// [`Self::run_callback`] so their instruction profile stays a mirror of
+    /// the production callback.
+    pub fn run_callback_accounted(
+        &mut self,
+        in_l: &mut [f32],
+        in_r: &mut [f32],
+        n: usize,
+    ) -> CallbackAccounting {
+        let rt_status = self.rt_status.clone();
+
+        // 1. GC parking-lot flush (fast-path skip on clean lot).
+        if self.parking_lot_dirty.load(Ordering::Acquire) {
+            let mut any_remaining = false;
+            for slot in self.parking_lot.iter_mut() {
+                let Some(old) = slot.take() else { continue };
+                if let Err(rtrb::PushError::Full(old_back)) = self.gc_producer.push(old) {
+                    *slot = Some(old_back);
+                    any_remaining = true;
+                    break;
+                }
+            }
+            if !any_remaining {
+                self.parking_lot_dirty.store(false, Ordering::Release);
+            }
+        }
+
+        // 2. Command budgeting (F-RB-011 / T2.5): shared structural budget.
+        let mut structural_applied = 0usize;
+
+        // 3. Budgeted drains in production order. Ring-pop accounting is
+        //    captured through queue-occupancy deltas (single-threaded read of
+        //    the consumers within the quantum).
+        let resamp_before = self.resampler_consumer.slots();
+        drain_resamplers(
+            &mut self.resampler_consumer,
+            &mut self.state.deferred_resampler,
+            &mut structural_applied,
+            &mut self.state.resampler,
+            &mut self.state.stream,
+            &mut self.gc_producer,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &self.gc_overflow,
+            &rt_status,
+        );
+        let resamp_after = self.resampler_consumer.slots();
+
+        let cabsim_before = self.cabsim_consumer.slots();
+        drain_cabsims(
+            &mut self.cabsim_consumer,
+            &mut self.state.deferred_cabsim,
+            &mut structural_applied,
+            &mut self.state.active_cabsim,
+            &mut self.gc_producer,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &self.gc_overflow,
+            &rt_status,
+        );
+        let cabsim_after = self.cabsim_consumer.slots();
+
+        let (param_changed, param_pops) = receive_commands(
+            &mut self.param_consumer,
+            &mut self.state.deferred_model,
+            &mut structural_applied,
+            &mut self.state.model_input_mult_adj,
+            &mut self.state.model_output_mult_adj,
+            &mut self.state.current_nam_rate,
+            &mut self.state.active_model_l,
+            &mut self.state.active_model_r,
+            &mut self.gc_producer,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &self.gc_overflow,
+            &rt_status,
+            &mut self.state.user_input_gain_mult,
+            &mut self.state.user_output_gain_mult,
+            &mut self.state.gate_params,
+            &mut self.state.threshold_open_sq,
+            &mut self.state.threshold_close_sq,
+            self.lut,
+            &mut self.state.adaptive_compute,
+        );
+
+        try_slimmable_rebuild(&mut self.state.adaptive_compute, &rt_status);
+
+        let slimmable_before = self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots);
+        drain_slimmable_models(
+            &mut self.state.slimmable_rx,
+            &mut self.state.deferred_slimmable,
+            &mut structural_applied,
+            &mut self.state.active_model_l,
+            &mut self.state.active_model_r,
+            &mut self.gc_producer,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &self.gc_overflow,
+            &rt_status,
+        );
+        let slimmable_after = self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots);
+
+        let os_before = self.state.os_rx.as_ref().map_or(0, Consumer::slots);
+        drain_os_engines(
+            &mut self.state.os_rx,
+            &mut self.state.deferred_os,
+            &mut structural_applied,
+            &mut self.state.os_l,
+            &mut self.state.os_r,
+            &mut self.gc_producer,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &self.gc_overflow,
+            &rt_status,
+        );
+        let os_after = self.state.os_rx.as_ref().map_or(0, Consumer::slots);
+
+        // 4. Rate synchronization.
+        let current_host_rate = sync_rate(
+            self.state.shared_target_rate.as_ref(),
+            &self.state.resampler,
+            self.state.current_nam_rate,
+            &rt_status,
+        );
+        self.current_host_rate = current_host_rate;
+
+        // 5. Gain recompute on parameter change.
+        if param_changed {
+            compute_gain_multipliers(
+                self.state.user_input_gain_mult,
+                self.state.user_output_gain_mult,
+                self.state.model_input_mult_adj,
+                self.state.model_output_mult_adj,
+                &mut self.state.input_gain_mult,
+                &mut self.state.output_gain_mult,
+            );
+        }
+
+        // 6. Fail-open rollback guard (F-RB-004).
+        if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
+        {
+            let failed_gen = rt_status
+                .resampler_failed_generation
+                .load(Ordering::Acquire);
+            let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
+
+            if failed_gen != 0 && failed_gen == requested_gen {
+                rt_status
+                    .applied_rate_generation
+                    .store(requested_gen, Ordering::Release);
+                rt_status
+                    .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
+                rt_status
+                    .resampler_failed_generation
+                    .store(0, Ordering::Release);
+            } else {
+                // The quantum was skipped: publish the skip through
+                // `last_n_pw = 0` so `current_n_pw()`/`out_l()` reflect it and
+                // zero-frame sentinels (T5.3) fire instead of exposing stale
+                // pre-swap output.
+                self.last_n_pw = 0;
+                return CallbackAccounting {
+                    n_pw: 0,
+                    structural_applied,
+                    param_pops,
+                    structural_pops: resamp_before
+                        .saturating_sub(resamp_after)
+                        .saturating_add(cabsim_before.saturating_sub(cabsim_after))
+                        .saturating_add(slimmable_before.saturating_sub(slimmable_after))
+                        .saturating_add(os_before.saturating_sub(os_after)),
+                    commands_remaining: self.commands_pending_count(),
+                };
+            }
+        }
+
+        // 7. DSP pipeline.
+        let n_pw = self.process_dsp(in_l, in_r, n, current_host_rate);
+        self.state.frame_count = self.state.frame_count.wrapping_add(1);
+        self.last_n_pw = n_pw;
+
+        CallbackAccounting {
+            n_pw,
+            structural_applied,
+            param_pops,
+            structural_pops: resamp_before
+                .saturating_sub(resamp_after)
+                .saturating_add(cabsim_before.saturating_sub(cabsim_after))
+                .saturating_add(slimmable_before.saturating_sub(slimmable_after))
+                .saturating_add(os_before.saturating_sub(os_after)),
+            commands_remaining: self.commands_pending_count(),
+        }
+    }
+
     /// Runs `capture_dsp_pipeline` with the exact context/buffers the real
     /// capture callback builds (see `capture/setup.rs` lines 301-334).
     fn process_dsp(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize, rate: u32) -> usize {
-        // SAFETY: `self.bridge` is owned by the harness and outlives this call;
+        // SAFETY: `self.bridge` is owned by the RT side and outlives this call;
         // the writer is used only within `capture_dsp_pipeline` below.
         let bridge_ref = unsafe { BridgeRef::new(&mut *self.bridge as *mut DspBridge) };
         let writer = DspBridgeWriter::from_ref(bridge_ref)
@@ -442,7 +709,7 @@ impl RtSwapHarness {
             crossfade_scratch_l: &mut *self.state.xfd_scratch_l,
             crossfade_scratch_r: &mut *self.state.xfd_scratch_r,
         };
-        capture_dsp_pipeline(in_l, in_r, n, ctx, bufs, rate)
+        capture_dsp_pipeline_streaming(in_l, in_r, n, ctx, &mut self.state.stream, bufs, rate)
     }
 
     /// Drains and drops the GC channel (main-thread side). Returns the number
@@ -454,8 +721,6 @@ impl RtSwapHarness {
         }
         count
     }
-
-    // ── Accessors (RT state inspection for tests) ───────────────────────────
 
     pub fn out_l(&self) -> &[f32] {
         let n = self.last_n_pw.min(MAX_RESAMP_BUF);
@@ -537,12 +802,22 @@ impl RtSwapHarness {
             || self.parking_lot_dirty.load(Ordering::Acquire)
     }
 
-    /// Maximum working-buffer length for input slices (the pipeline clamps to
-    /// `MAX_RESAMP_BUF` anyway).
-    pub const MAX_BUF: usize = MAX_RESAMP_BUF;
-
-    /// Oversampled working-buffer length.
-    pub const MAX_OS_BUF: usize = MAX_OS_BUF;
+    /// Number of commands still queued or parked (the numeric form of
+    /// [`Self::commands_pending`]) — queued SPSC payloads plus deferred slots,
+    /// plus the parking-lot dirty latch.
+    pub fn commands_pending_count(&self) -> usize {
+        self.param_consumer.slots()
+            + self.resampler_consumer.slots()
+            + self.cabsim_consumer.slots()
+            + self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots)
+            + self.state.os_rx.as_ref().map_or(0, Consumer::slots)
+            + usize::from(self.state.deferred_resampler.is_some())
+            + usize::from(self.state.deferred_cabsim.is_some())
+            + usize::from(self.state.deferred_model.is_some())
+            + usize::from(self.state.deferred_slimmable.is_some())
+            + usize::from(self.state.deferred_os.is_some())
+            + usize::from(self.parking_lot_dirty.load(Ordering::Acquire))
+    }
 
     /// The shared RT status flags (main-thread read face for gates).
     pub fn rt_status_arc(&self) -> Arc<RtStatusFlags> {
@@ -556,9 +831,274 @@ impl RtSwapHarness {
     /// The reader only performs atomic reads; the bridge outlives the harness.
     pub fn bridge_reader(&self) -> DspBridgeReader {
         // SAFETY: `self.bridge` is a heap-immortal boxed `DspBridge` that
-        // outlives the harness. `DspBridgeReader` only performs read accesses
+        // outlives the RT side. `DspBridgeReader` only performs read accesses
         // synchronized by the bridge atomics, so forming a raw pointer from a
         // shared reference is sound.
         unsafe { DspBridgeReader::new(self.bridge.as_ref() as *const DspBridge as *mut DspBridge) }
+    }
+
+    /// Changes the model's active NAM rate (drives `current_nam_rate`).
+    pub fn set_nam_rate(&mut self, rate: u32) {
+        self.state.current_nam_rate = rate;
+    }
+
+    /// Maximum working-buffer length for input slices (the pipeline clamps to
+    /// `MAX_RESAMP_BUF` anyway).
+    pub const MAX_BUF: usize = MAX_RESAMP_BUF;
+
+    /// Oversampled working-buffer length.
+    pub const MAX_OS_BUF: usize = MAX_OS_BUF;
+}
+
+/// Offline RT swap-stress harness — full drain sequence + DSP in one quantum.
+///
+/// Thin wrapper over the two production faces ([`SwapProducer`] + [`SwapRtSide`]).
+/// All pre-T5.3 callers keep the single-handle API; concurrency-throughput
+/// tests split it via [`RtSwapHarness::into_parts`] to remove the global mutex
+/// from the measured path.
+pub struct RtSwapHarness {
+    producer: SwapProducer,
+    rt: SwapRtSide,
+}
+
+impl RtSwapHarness {
+    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
+    /// rates already consistent, so the first `run_callback` processes
+    /// immediately without a resampler renegotiation).
+    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
+        let sys = SystemSnapshot::capture();
+        let mut state = CaptureState::init(&sys, OversampleFactor::Off);
+        state.resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
+        state.current_nam_rate = nam_rate;
+        state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
+
+        let spsc = setup_spsc(neural_amp_modeler_rs::common::spsc::SPSC_CAPACITY);
+        state.slimmable_rx = Some(spsc.slimmable_consumer);
+        state.os_rx = Some(spsc.os_consumer);
+
+        let bridge = Box::new(DspBridge {
+            buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
+            active_read_idx: Default::default(),
+            generation: Default::default(),
+            consumed_gen: Default::default(),
+            dropped_frames: Default::default(),
+        });
+
+        let producer = SwapProducer {
+            param_producer: spsc.param_producer,
+            resampler_producer: spsc.resampler_producer,
+            cabsim_producer: spsc.cabsim_producer,
+            slimmable_producer: spsc.slimmable_producer,
+            os_producer: spsc.os_producer,
+            shared_target_rate: Arc::clone(&state.shared_target_rate),
+            rt_status: Arc::clone(&spsc.rt_status),
+            attempted: AtomicU64::new(0),
+            enqueued: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+        };
+        let rt = SwapRtSide {
+            state,
+            param_consumer: spsc.param_consumer,
+            gc_producer: spsc.gc_producer,
+            gc_consumer: spsc.gc_consumer,
+            gc_overflow: spsc.gc_overflow,
+            resampler_consumer: spsc.resampler_consumer,
+            cabsim_consumer: spsc.cabsim_consumer,
+            parking_lot: Default::default(),
+            parking_lot_dirty: AtomicBool::new(false),
+            rt_status: spsc.rt_status,
+            bridge,
+            lut: get_gain_lut(),
+            current_host_rate: host_rate,
+            last_n_pw: 0,
+        };
+
+        Ok(Self { producer, rt })
+    }
+
+    /// Splits the harness into its two production faces (T5.3 / G-PERF-004).
+    ///
+    /// The producer face moves to the main-thread side (single writer, exact
+    /// production SPSC protocol); the RT side is exclusively owned by the audio
+    /// thread. No global mutex guards the measured path.
+    pub fn into_parts(self) -> (SwapProducer, SwapRtSide) {
+        (self.producer, self.rt)
+    }
+
+    // ── Producer face (main-thread side) ────────────────────────────────────
+
+    /// Pushes a `LoadModel` command (both channels transported atomically).
+    pub fn push_load_model(
+        &mut self,
+        model_l: Option<Box<StaticModel>>,
+        model_r: Option<Box<StaticModel>>,
+        input_mult_adj: f32,
+        output_mult_adj: f32,
+        sample_rate: u32,
+    ) {
+        self.producer.push_load_model(
+            model_l,
+            model_r,
+            input_mult_adj,
+            output_mult_adj,
+            sample_rate,
+        );
+    }
+
+    /// Pushes a scalar input-gain command (latest-wins coalescing).
+    pub fn push_input_gain(&mut self, mult: f32) {
+        self.producer.push_input_gain(mult);
+    }
+
+    /// Pushes a scalar output-gain command (latest-wins coalescing).
+    pub fn push_output_gain(&mut self, mult: f32) {
+        self.producer.push_output_gain(mult);
+    }
+
+    /// Pushes a gate-configuration command.
+    pub fn push_gate(&mut self, params: GateParams) {
+        self.producer.push_gate(params);
+    }
+
+    /// Pushes an atomic slimmable L/R pair (F-RB-005).
+    pub fn push_slimmable(
+        &mut self,
+        generation: u64,
+        channels: usize,
+        l: Box<StaticModel>,
+        r: Option<Box<StaticModel>>,
+    ) {
+        self.producer.push_slimmable(generation, channels, l, r);
+    }
+
+    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None` clears/bypasses the cab-sim (F-RB-007).
+    pub fn push_cabsim(&mut self, pair: Option<Box<CabSimPair>>) {
+        self.producer.push_cabsim(pair);
+    }
+
+    /// Pushes a cab-sim pair with explicit generation timestamp.
+    pub fn push_cabsim_with_gen(&mut self, generation: u64, pair: Option<Box<CabSimPair>>) {
+        self.producer.push_cabsim_with_gen(generation, pair);
+    }
+
+    /// Pushes an oversampling engine pair stamped with current requested OS generation.
+    pub fn push_os_pair(&mut self, l: OversampleEngine, r: OversampleEngine) {
+        self.producer.push_os_pair(l, r);
+    }
+
+    /// Pushes an oversampling engine pair with explicit generation timestamp.
+    pub fn push_os_with_gen(&mut self, generation: u64, l: OversampleEngine, r: OversampleEngine) {
+        self.producer.push_os_with_gen(generation, l, r);
+    }
+
+    /// Requests a resampler renegotiation and delivers the rebuilt resampler.
+    pub fn request_resampler_swap(&mut self, host_rate: u32, nam_rate: u32) -> anyhow::Result<()> {
+        self.producer.request_resampler_swap(host_rate, nam_rate)
+    }
+
+    /// Publishes a detected host rate so `sync_rate` requests a rebuild.
+    pub fn publish_host_rate(&mut self, rate: u32) {
+        self.producer.publish_host_rate(rate);
+    }
+
+    /// Changes the model's active NAM rate (drives `current_nam_rate`).
+    pub fn set_nam_rate(&mut self, rate: u32) {
+        self.rt.set_nam_rate(rate);
+    }
+
+    // ── RT face ─────────────────────────────────────────────────────────────
+
+    /// Executes one audio quantum (see [`SwapRtSide::run_callback`]).
+    pub fn run_callback(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize) -> usize {
+        self.rt.run_callback(in_l, in_r, n)
+    }
+
+    /// Drains and drops the GC channel (main-thread side). Returns the number
+    /// of retired items — a progress signal that swaps actually cascade.
+    pub fn consume_gc(&mut self) -> usize {
+        self.rt.consume_gc()
+    }
+
+    // ── Accessors (RT state inspection for tests) ───────────────────────────
+
+    pub fn out_l(&self) -> &[f32] {
+        self.rt.out_l()
+    }
+
+    pub fn out_r(&self) -> &[f32] {
+        self.rt.out_r()
+    }
+
+    pub fn current_n_pw(&self) -> usize {
+        self.rt.current_n_pw()
+    }
+
+    pub fn active_model_l(&self) -> Option<&StaticModel> {
+        self.rt.active_model_l()
+    }
+
+    pub fn active_model_r(&self) -> Option<&StaticModel> {
+        self.rt.active_model_r()
+    }
+
+    pub fn active_cabsim(&self) -> Option<&CabSimPair> {
+        self.rt.active_cabsim()
+    }
+
+    pub fn process_mono(&self) -> bool {
+        self.rt.process_mono()
+    }
+
+    pub fn input_gain_mult(&self) -> f32 {
+        self.rt.input_gain_mult()
+    }
+
+    pub fn output_gain_mult(&self) -> f32 {
+        self.rt.output_gain_mult()
+    }
+
+    pub fn rt_status(&self) -> &RtStatusFlags {
+        self.rt.rt_status()
+    }
+
+    pub fn frame_count(&self) -> u32 {
+        self.rt.frame_count()
+    }
+
+    pub fn current_host_rate(&self) -> u32 {
+        self.rt.current_host_rate()
+    }
+
+    pub fn gc_pending(&self) -> usize {
+        self.rt.gc_pending()
+    }
+
+    /// Number of retired items still queued for off-RT disposal, including
+    /// both the SPSC GC channel and the 16-slot parking lot.
+    pub fn gc_in_flight(&self) -> usize {
+        self.rt.gc_in_flight()
+    }
+
+    /// `true` while any structural/scalar command is still queued or parked —
+    /// the RT callback has not yet finished absorbing the current burst.
+    pub fn commands_pending(&self) -> bool {
+        self.rt.commands_pending()
+    }
+
+    /// Maximum working-buffer length for input slices (the pipeline clamps to
+    /// `MAX_RESAMP_BUF` anyway).
+    pub const MAX_BUF: usize = MAX_RESAMP_BUF;
+
+    /// Oversampled working-buffer length.
+    pub const MAX_OS_BUF: usize = MAX_OS_BUF;
+
+    /// The shared RT status flags (main-thread read face for gates).
+    pub fn rt_status_arc(&self) -> Arc<RtStatusFlags> {
+        self.rt.rt_status_arc()
+    }
+
+    /// Returns a playback-side reader for the harness's internal `DspBridge`.
+    pub fn bridge_reader(&self) -> DspBridgeReader {
+        self.rt.bridge_reader()
     }
 }

@@ -4,8 +4,9 @@
 //! Unit tests for the PGO workload (`pgo_workload.rs`).
 //!
 //! Validates the deterministic CabSim IR fixture against its documented
-//! generation formula, the topology classification table, the JSON receipt
-//! emitter and the mandatory-stage gates (F-RB-013 / T5.3).
+//! generation formula, the topology classification table, the coverage-matrix
+//! weights (T5.2), the per-group/per-topology minimum progress aggregation and
+//! the structured receipt (schema v2).
 
 use super::*;
 
@@ -128,51 +129,306 @@ fn json_emitter_escapes_strings_and_sorts_keys() {
     );
 }
 
+// ── T5.2 coverage-matrix tests ───────────────────────────────────────────────
+
 #[test]
-fn receipt_json_contains_mandatory_stage_fields() {
+fn matrix_weights_sum_to_one_per_dimension() {
+    assert!(
+        (RATE_WEIGHTS.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+        "rate weights must sum to 1 (typical use distribution)"
+    );
+    assert!(
+        (QUANTUM_WEIGHTS.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+        "quantum weights must sum to 1"
+    );
+    let os_sum: f64 = OS_WEIGHTS.iter().map(|(_, w)| *w).sum();
+    assert!(
+        (os_sum - 1.0).abs() < 1e-9,
+        "oversampling weights must sum to 1"
+    );
+    assert!(
+        (CABSIM_IR_WEIGHT + CABSIM_BYPASS_WEIGHT - 1.0).abs() < 1e-9,
+        "CabSim weights must sum to 1"
+    );
+    assert!(
+        (RECORDING_NO_WEIGHT + RECORDING_YES_WEIGHT - 1.0).abs() < 1e-9,
+        "recording weights must sum to 1"
+    );
+    // Documented typical-use dominance: 48 kHz and 64-frame quantum are the
+    // most-weighted cells (low-latency default first).
+    const {
+        assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[0]);
+        assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[2]);
+        assert!(QUANTUM_WEIGHTS[0] > QUANTUM_WEIGHTS[1]);
+        assert!(QUANTUM_WEIGHTS[0] > QUANTUM_WEIGHTS[2]);
+    }
+}
+
+#[test]
+fn matrix_dimensions_cover_all_mandatory_values() {
+    assert_eq!(RATES_HZ, [44_100, 48_000, 96_000]);
+    assert_eq!(QUANTUMS, [64, 256, 512]);
+    let os: Vec<&str> = OS_WEIGHTS.iter().map(|(m, _)| *m).collect();
+    assert_eq!(os, [MODE_OFF, MODE_2X, MODE_4X]);
+}
+
+#[test]
+fn per_topology_min_progress_aggregates_group_minima() {
+    // Emulate the aggregation over a small set of cells for one topology:
+    // resampler/inference/bridge run on every cell, oversample only on 2x/4x,
+    // cabsim only on ir, recording only on recording cells.
+    let topo = TOPOLOGY_WAVENET_A1;
+    let mut progress = ProgressReport::default();
+    progress.min_blocks_per_topology.insert(topo, u64::MAX);
+    progress.min_frames_per_topology.insert(topo, u64::MAX);
+    for group in [
+        "resampler",
+        "inference",
+        "oversample",
+        "cabsim",
+        "bridge",
+        "recording",
+    ] {
+        progress
+            .groups
+            .entry(group)
+            .or_default()
+            .min_frames_per_topology
+            .insert(topo, 0);
+    }
+
+    let tighten_min = |slot: &mut u64, v: u64| *slot = (*slot).min(v);
+    let tighten_group = |slot: &mut u64, v: u64| {
+        if *slot == 0 || v < *slot {
+            *slot = v;
+        }
+    };
+
+    // Cells: (blocks, frames, os_on, ir, rec_on)
+    for (blocks, frames, os_on, ir, rec) in [
+        (4, 256, false, true, false),
+        (4, 128, true, true, false),
+        (4, 512, true, false, true),
+        (4, 64, false, false, true),
+    ] {
+        let resampler = blocks * 64;
+        tighten_min(
+            progress.min_blocks_per_topology.get_mut(topo).unwrap(),
+            blocks,
+        );
+        tighten_min(
+            progress.min_frames_per_topology.get_mut(topo).unwrap(),
+            frames,
+        );
+        tighten_group(
+            progress
+                .groups
+                .get_mut("resampler")
+                .unwrap()
+                .min_frames_per_topology
+                .get_mut(topo)
+                .unwrap(),
+            resampler,
+        );
+        tighten_group(
+            progress
+                .groups
+                .get_mut("inference")
+                .unwrap()
+                .min_frames_per_topology
+                .get_mut(topo)
+                .unwrap(),
+            frames,
+        );
+        tighten_group(
+            progress
+                .groups
+                .get_mut("bridge")
+                .unwrap()
+                .min_frames_per_topology
+                .get_mut(topo)
+                .unwrap(),
+            frames,
+        );
+        if os_on {
+            tighten_group(
+                progress
+                    .groups
+                    .get_mut("oversample")
+                    .unwrap()
+                    .min_frames_per_topology
+                    .get_mut(topo)
+                    .unwrap(),
+                frames,
+            );
+        }
+        if ir {
+            tighten_group(
+                progress
+                    .groups
+                    .get_mut("cabsim")
+                    .unwrap()
+                    .min_frames_per_topology
+                    .get_mut(topo)
+                    .unwrap(),
+                frames,
+            );
+        }
+        if rec {
+            tighten_group(
+                progress
+                    .groups
+                    .get_mut("recording")
+                    .unwrap()
+                    .min_frames_per_topology
+                    .get_mut(topo)
+                    .unwrap(),
+                frames,
+            );
+        }
+    }
+
+    assert_eq!(progress.min_blocks_per_topology.get(topo).copied(), Some(4));
+    assert_eq!(
+        progress.min_frames_per_topology.get(topo).copied(),
+        Some(64),
+        "min frames is the smallest cell"
+    );
+    // Oversample only ran on the os cells (128, 512) → min 128.
+    assert_eq!(
+        progress
+            .groups
+            .get("oversample")
+            .unwrap()
+            .min_frames_per_topology
+            .get(topo)
+            .copied(),
+        Some(128)
+    );
+    // Cabsim only ran on ir cells (256, 128) → min 128.
+    assert_eq!(
+        progress
+            .groups
+            .get("cabsim")
+            .unwrap()
+            .min_frames_per_topology
+            .get(topo)
+            .copied(),
+        Some(128)
+    );
+    // Recording only ran on rec cells (512, 64) → min 64.
+    assert_eq!(
+        progress
+            .groups
+            .get("recording")
+            .unwrap()
+            .min_frames_per_topology
+            .get(topo)
+            .copied(),
+        Some(64)
+    );
+    // Resampler ran on every cell → min over {256,128,512,64} → 256.
+    assert_eq!(
+        progress
+            .groups
+            .get("resampler")
+            .unwrap()
+            .min_frames_per_topology
+            .get(topo)
+            .copied(),
+        Some(256)
+    );
+    // The ProgressReport renders min_samples_per_topology as 2× min_frames.
+    let report_json = progress.to_json().to_json_string();
+    assert!(
+        report_json.contains(r#""wavenet_a1":128"#),
+        "min_samples_per_topology must double the min frames: {report_json}"
+    );
+}
+
+#[test]
+fn receipt_json_contains_matrix_fields() {
     let mut receipt = WorkloadReceipt::new();
     receipt.ir = "tests/fixtures/models/cabsim_ir_pgo.wav".to_string();
-    let mut os = BTreeMap::new();
-    os.insert(MODE_OFF, 1200u64);
-    os.insert(MODE_2X, 600);
-    os.insert(MODE_4X, 600);
-    receipt.models.push(ModelReceipt {
-        path: "tests/fixtures/models/wavenet_a1_standard.nam".to_string(),
-        topology: TOPOLOGY_WAVENET_A1,
-        sample_rate: 48_000,
-        blocks: 2400,
-        oversampling: os,
-        cabsim_frames: 2400 * 64,
-        cabsim_blocks: 2400,
-    });
-    *receipt
-        .topology_blocks
-        .get_mut(TOPOLOGY_WAVENET_A1)
-        .expect("bucket") = 2400;
-    *receipt
-        .oversampling_blocks
-        .get_mut(MODE_OFF)
-        .expect("bucket") = 1200;
-    *receipt
-        .oversampling_blocks
-        .get_mut(MODE_2X)
-        .expect("bucket") = 600;
-    *receipt
-        .oversampling_blocks
-        .get_mut(MODE_4X)
-        .expect("bucket") = 600;
-    receipt.cabsim_frames = 2400 * 64;
-    receipt.cabsim_blocks = 2400;
+    receipt.gate_disabled = true;
     receipt.no_stage_skipped = true;
+    Coverage::bump(&mut receipt.coverage.topologies, TOPOLOGY_WAVENET_A1, 2400);
+    Coverage::bump(&mut receipt.coverage.topologies, TOPOLOGY_WAVENET_A2, 2400);
+    Coverage::bump(&mut receipt.coverage.topologies, TOPOLOGY_LSTM, 2400);
+    Coverage::bump(&mut receipt.coverage.oversampling, MODE_OFF, 3600);
+    Coverage::bump(&mut receipt.coverage.oversampling, MODE_2X, 1800);
+    Coverage::bump(&mut receipt.coverage.oversampling, MODE_4X, 1800);
+    for rate in [44_100, 48_000, 96_000] {
+        Coverage::bump(&mut receipt.coverage.rates, &rate.to_string(), 2400);
+    }
+    for q in [64, 256, 512] {
+        Coverage::bump(&mut receipt.coverage.quantums, &q.to_string(), 2400);
+    }
+    Coverage::bump(&mut receipt.coverage.cabsim, "ir", 3600);
+    Coverage::bump(&mut receipt.coverage.cabsim, "bypass", 3600);
+    Coverage::bump(&mut receipt.coverage.recording, REC_NO, 3600);
+    Coverage::bump(&mut receipt.coverage.recording, REC_YES, 3600);
+
+    for topo in [TOPOLOGY_WAVENET_A1, TOPOLOGY_WAVENET_A2, TOPOLOGY_LSTM] {
+        receipt.progress.min_blocks_per_topology.insert(topo, 2400);
+        receipt
+            .progress
+            .min_frames_per_topology
+            .insert(topo, 153600);
+        for group in [
+            "resampler",
+            "inference",
+            "oversample",
+            "cabsim",
+            "bridge",
+            "recording",
+        ] {
+            receipt
+                .progress
+                .groups
+                .entry(group)
+                .or_default()
+                .min_frames_per_topology
+                .insert(topo, 153600);
+        }
+    }
+    receipt.progress.total_frames = 460800;
+    receipt.progress.total_samples = 921600;
+    receipt.cabsim_total_frames = 460800;
+
+    receipt.cells.push(CellRecord {
+        rate: 48_000,
+        quantum: 64,
+        topology: TOPOLOGY_WAVENET_A1,
+        os_mode: MODE_OFF,
+        cabsim_ir: true,
+        recording: true,
+        progress: CellProgress {
+            blocks: 2400,
+            frames: 153600,
+            resampler_frames: 153600,
+            oversample_frames: 0,
+            cabsim_frames: 153600,
+            recording_frames: 153600,
+            recording_accepted: 2400,
+            recording_overruns: 0,
+        },
+    });
 
     let json = receipt.to_json().to_json_string();
     for needle in [
-        r#""schema_version":1"#,
+        r#""schema_version":2"#,
         r#""tool":"pgo_workload""#,
-        r#""topology_blocks":{"lstm":0,"wavenet_a1":2400,"wavenet_a2":0}"#,
-        r#""oversampling_blocks":{"2x":600,"4x":600,"Off":1200}"#,
-        r#""stereo_convolved_frames":153600"#,
+        r#""rates_hz":[44100,48000,96000]"#,
+        r#""quantums_frames":[64,256,512]"#,
         r#""no_stage_skipped":true"#,
+        r#""disabled":true"#,
+        r#""min_blocks_per_topology"#,
+        r#""min_frames_per_topology"#,
+        r#""min_samples_per_topology"#,
+        r#""topology_blocks":{"lstm":2400,"wavenet_a1":2400,"wavenet_a2":2400}"#,
+        r#""oversampling_blocks":{"2x":1800,"4x":1800,"Off":3600}"#,
+        r#""recording":{"no":3600,"yes":3600}"#,
     ] {
         assert!(
             json.contains(needle),
@@ -182,25 +438,13 @@ fn receipt_json_contains_mandatory_stage_fields() {
 }
 
 #[test]
-fn mandatory_topology_gates_cover_all_families() {
-    // The fail-closed gate set must list the three mandatory topologies so a
-    // future edit cannot silently drop one from the validation loop.
-    let receipt = WorkloadReceipt::new();
-    assert_eq!(
-        receipt.topology_blocks.len(),
-        3,
-        "receipt must track exactly the mandatory topologies"
-    );
-    for topology in [TOPOLOGY_WAVENET_A1, TOPOLOGY_WAVENET_A2, TOPOLOGY_LSTM] {
-        assert!(
-            receipt.topology_blocks.contains_key(topology),
-            "mandatory topology {topology} missing from the receipt"
-        );
-    }
-    for mode in [MODE_OFF, MODE_2X, MODE_4X] {
-        assert!(
-            receipt.oversampling_blocks.contains_key(mode),
-            "oversampling mode {mode} missing from the receipt"
-        );
-    }
+fn mandatory_gate_sets_cover_all_families() {
+    // The receipt matrix metadata must enumerate the exact mandatory values so
+    // a future edit cannot silently drop one dimension value.
+    assert_eq!(RATES_HZ.len(), 3);
+    assert_eq!(QUANTUMS.len(), 3);
+    assert_eq!(OS_WEIGHTS.len(), 3);
+    let coverage = Coverage::default();
+    assert!(coverage.topologies.is_empty());
+    assert!(coverage.recording.is_empty());
 }

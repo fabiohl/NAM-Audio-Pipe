@@ -18,6 +18,23 @@ use std::time::Duration;
 pub struct PollState {
     pub hugepage_synced: bool,
     pub telemetry_throttle: u32,
+    pub cpu_receipt: Option<super::affinity::CpuSelectionReceipt>,
+}
+
+impl PollState {
+    /// Creates a default `PollState`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a `PollState` carrying a CPU selection receipt for honest telemetry reporting.
+    pub fn with_cpu_receipt(receipt: Option<super::affinity::CpuSelectionReceipt>) -> Self {
+        Self {
+            hugepage_synced: false,
+            telemetry_throttle: 0,
+            cpu_receipt: receipt,
+        }
+    }
 }
 
 /// Reads atomic RT status flags and emits monitoring logs to the user.
@@ -165,9 +182,10 @@ pub fn poll_rt_status(
     }
 
     // 4. REAL-TIME PRIORITY & ATOMIC ERRORS:
-    // Reads error flags set atomically by configure_realtime_thread in the DSP callback
-    // and emits the corresponding diagnostic messages from the main thread.
-    // On full success, prints the classic thread optimization confirmation.
+    // Reads error flags set atomically by configure_realtime_thread during stream
+    // state transition before readiness (T3.1 / F-RES-003) and emits the corresponding
+    // diagnostic messages from the main thread. On full success, prints the classic
+    // thread optimization confirmation.
 
     let aff_err = rt_status.rt_affinity_err.swap(0, Ordering::Relaxed);
     let sched_err = rt_status.rt_sched_err.swap(0, Ordering::Relaxed);
@@ -213,23 +231,74 @@ pub fn poll_rt_status(
     if prio != -1 {
         let is_fifo =
             rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+        let policy = rt_status.rt_policy.load(Ordering::Relaxed);
+        let tid = rt_status.rt_tid.load(Ordering::Relaxed);
+        let cpu = rt_status.rt_cpu.load(Ordering::Relaxed);
 
         rt_status.rt_priority.store(-1, Ordering::Relaxed);
 
-        if is_fifo {
-            let cpu = rt_status.rt_cpu.load(Ordering::Relaxed);
-            log::info!(
-                "{} Thread Optimization: Dedicated core {} with Real-Time priority (FIFO, Prio={})",
-                "🔍".blue(),
-                cpu.to_string().cyan(),
-                prio.to_string().green()
-            );
+        if is_fifo || policy == libc::SCHED_RR {
+            let policy_name = if policy == libc::SCHED_RR {
+                "RR"
+            } else {
+                "FIFO"
+            };
+
+            let is_dedicated = state
+                .cpu_receipt
+                .as_ref()
+                .map(|r| r.is_dedicated)
+                .unwrap_or(false);
+
+            if is_dedicated {
+                log::info!(
+                    "{} Thread Optimization: Dedicated core {} with Real-Time priority ({}, Prio={}, TID={})",
+                    "🔍".blue(),
+                    cpu.to_string().cyan(),
+                    policy_name,
+                    prio.to_string().green(),
+                    tid
+                );
+            } else {
+                let reason_str = state
+                    .cpu_receipt
+                    .as_ref()
+                    .map(|r| match &r.reason {
+                        super::affinity::CpuSelectionReason::ConservativeHeuristic {
+                            explanation,
+                            ..
+                        } => *explanation,
+                        super::affinity::CpuSelectionReason::ExplicitCli { .. } => {
+                            "Explicit CLI pinning (non-isolated)"
+                        }
+                        super::affinity::CpuSelectionReason::FullyIsolated { .. } => {
+                            "Fully isolated core"
+                        }
+                    })
+                    .unwrap_or("Conservative heuristic / unverified topology");
+
+                log::info!(
+                    "{} Thread Optimization: Conservative heuristic core {} with Real-Time priority ({}, Prio={}, TID={}) [Reason: {}]",
+                    "🔍".blue(),
+                    cpu.to_string().cyan(),
+                    policy_name,
+                    prio.to_string().green(),
+                    tid,
+                    reason_str
+                );
+            }
         } else {
+            let policy_str = match policy {
+                libc::SCHED_OTHER => "OTHER",
+                libc::SCHED_BATCH => "BATCH",
+                libc::SCHED_IDLE => "IDLE",
+                _ => "NON-RT",
+            };
             NamDiagnostic::new(NamErrorCode::RtPriorityDenied, sys)
                 .message(format!(
-                    "DSP thread is NOT in SCHED_FIFO (priority = {}). \
+                    "DSP thread is NOT in a Real-Time scheduling policy (policy = {}, priority = {}, TID = {}). \
                      Audio may experience jitter and xruns.",
-                    prio
+                    policy_str, prio, tid
                 ))
                 .hint(
                     "Check if your user has RT permission (ulimit -r) \
@@ -328,20 +397,79 @@ pub fn poll_rt_status(
         let duration = Duration::from_nanos(nanos);
         state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
         if state.telemetry_throttle.wrapping_rem(100) == 0 {
-            let p50 = rt_status.latency_hist.get_percentile(0.50) / 1000;
-            let p99 = rt_status.latency_hist.get_percentile(0.99) / 1000;
-            let exact = rt_status.latency_hist.take_exact_max() / 1000;
+            let cap_min = rt_status.capture_hist.get_exact_min() / 1000;
+            let cap_mean = rt_status.capture_hist.get_mean() / 1000;
+            let cap_p50 = rt_status.capture_hist.get_percentile(0.50) / 1000;
+            let cap_p99 = rt_status.capture_hist.get_percentile(0.99) / 1000;
+            let cap_max = rt_status.capture_hist.take_exact_max() / 1000;
+
+            let dsp_min = rt_status.latency_hist.get_exact_min() / 1000;
+            let dsp_mean = rt_status.latency_hist.get_mean() / 1000;
+            let dsp_p50 = rt_status.latency_hist.get_percentile(0.50) / 1000;
+            let dsp_p99 = rt_status.latency_hist.get_percentile(0.99) / 1000;
+            let dsp_max = rt_status.latency_hist.take_exact_max() / 1000;
+
+            let rec_min = rt_status.record_hist.get_exact_min() / 1000;
+            let rec_mean = rt_status.record_hist.get_mean() / 1000;
+            let rec_p50 = rt_status.record_hist.get_percentile(0.50) / 1000;
+            let rec_p99 = rt_status.record_hist.get_percentile(0.99) / 1000;
+            let rec_max = rt_status.record_hist.take_exact_max() / 1000;
+
+            let pb_min = rt_status.playback_hist.get_exact_min() / 1000;
+            let pb_mean = rt_status.playback_hist.get_mean() / 1000;
+            let pb_p50 = rt_status.playback_hist.get_percentile(0.50) / 1000;
+            let pb_p99 = rt_status.playback_hist.get_percentile(0.99) / 1000;
+            let pb_max = rt_status.playback_hist.take_exact_max() / 1000;
+
+            let e2e_min = rt_status.e2e_hist.get_exact_min() / 1000;
+            let e2e_mean = rt_status.e2e_hist.get_mean() / 1000;
+            let e2e_p50 = rt_status.e2e_hist.get_percentile(0.50) / 1000;
+            let e2e_p99 = rt_status.e2e_hist.get_percentile(0.99) / 1000;
+            let e2e_max = rt_status.e2e_hist.take_exact_max() / 1000;
+
             let total_calls = rt_status.latency_hist.total_count();
 
             log::info!(
-                "{} DSP Telemetry (10s): {}µs (Median) | {}µs (P99) | {}µs (Exact Max) [{} blocks]",
+                "{} RT Latency Breakdown (10s) [{} blocks]:\n\
+                 ├─ 1. Capture Total:        min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
+                 ├─ 2. DSP Core:             min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
+                 ├─ 3. Record Enqueue:       min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
+                 ├─ 4. Playback Total:       min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
+                 └─ 5. Capture↦Playback E2E: min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs",
                 "📊".bright_blue(),
-                p50,
-                p99,
-                exact,
-                total_calls
+                total_calls,
+                cap_min,
+                cap_mean,
+                cap_p50,
+                cap_p99,
+                cap_max,
+                dsp_min,
+                dsp_mean,
+                dsp_p50,
+                dsp_p99,
+                dsp_max,
+                rec_min,
+                rec_mean,
+                rec_p50,
+                rec_p99,
+                rec_max,
+                pb_min,
+                pb_mean,
+                pb_p50,
+                pb_p99,
+                pb_max,
+                e2e_min,
+                e2e_mean,
+                e2e_p50,
+                e2e_p99,
+                e2e_max,
             );
+
+            rt_status.capture_hist.reset();
             rt_status.latency_hist.reset();
+            rt_status.record_hist.reset();
+            rt_status.playback_hist.reset();
+            rt_status.e2e_hist.reset();
 
             let cap_ticks = rt_status.capture_host_ticks.load(Ordering::Relaxed);
             let pb_ticks = rt_status.playback_host_ticks.load(Ordering::Relaxed);

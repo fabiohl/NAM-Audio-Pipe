@@ -89,92 +89,191 @@ pub fn configure_process_wide() {
     }
 }
 
-/// Configures the current DSP thread for real-time operation.
+/// Injectable system abstraction for thread real-time configuration.
+pub trait ThreadConfigurator {
+    /// Enables Denormals-Are-Zero and Flush-To-Zero.
+    fn set_daz_ftz(&self);
+
+    /// Obtains the current thread ID (`libc::pthread_t`).
+    fn current_thread_id(&self) -> libc::pthread_t;
+
+    /// Sets the thread name.
+    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &[u8]) -> i32;
+
+    /// Sets thread CPU affinity.
+    fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32;
+
+    /// Gets scheduling policy and parameters.
+    fn get_sched_param(&self, thread_id: libc::pthread_t) -> Result<(i32, libc::sched_param), i32>;
+
+    /// Sets scheduling policy and parameters.
+    fn set_sched_param(
+        &self,
+        thread_id: libc::pthread_t,
+        policy: i32,
+        param: &libc::sched_param,
+    ) -> i32;
+
+    /// Gets current running CPU core ID.
+    fn get_current_cpu(&self) -> i32;
+}
+
+/// Default system-backed thread configurator using libc.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemThreadConfigurator;
+
+impl ThreadConfigurator for SystemThreadConfigurator {
+    fn set_daz_ftz(&self) {
+        unsafe {
+            neural_amp_modeler_rs::math::common::set_daz_ftz();
+        }
+    }
+
+    fn current_thread_id(&self) -> libc::pthread_t {
+        unsafe { libc::pthread_self() }
+    }
+
+    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &[u8]) -> i32 {
+        unsafe { libc::pthread_setname_np(thread_id, name.as_ptr() as *const libc::c_char) }
+    }
+
+    fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32 {
+        unsafe {
+            libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<libc::cpu_set_t>(), cpuset)
+        }
+    }
+
+    fn get_sched_param(&self, thread_id: libc::pthread_t) -> Result<(i32, libc::sched_param), i32> {
+        let mut policy = 0i32;
+        let mut param = libc::sched_param { sched_priority: 0 };
+        let ret = unsafe { libc::pthread_getschedparam(thread_id, &mut policy, &mut param) };
+        if ret == 0 {
+            Ok((policy, param))
+        } else {
+            Err(ret)
+        }
+    }
+
+    fn set_sched_param(
+        &self,
+        thread_id: libc::pthread_t,
+        policy: i32,
+        param: &libc::sched_param,
+    ) -> i32 {
+        unsafe { libc::pthread_setschedparam(thread_id, policy, param) }
+    }
+
+    fn get_current_cpu(&self) -> i32 {
+        unsafe { libc::sched_getcpu() }
+    }
+}
+
+/// Configures the current DSP thread for real-time operation using the provided configurator.
 ///
-/// Executed **only once** in the cold-path of the first `process()` callback frame,
-/// before the data flow actually begins. Applies:
+/// Executed off the audio hot-path during PipeWire data-loop state transition before declaring readiness.
+/// Applies:
 ///
 /// 1. **DAZ/FTZ** — Enables Denormals-Are-Zero and Flush-To-Zero in the MXCSR register
 ///    to avoid FPU penalties on silence blocks ("death spiral").
 /// 2. **Core Affinity** — Pins the thread to the ideal physical core via
 ///    `pthread_setaffinity_np`, avoiding core migration and L1/L2 cache misses.
-/// 3. **SCHED_FIFO** — Elevates priority to real-time scheduling (prio 90).
-///
-/// The process-wide operations (THP disable, mlockall) have been moved to
-/// `configure_process_wide()`, called from `main()` before PipeWire.
+/// 3. **Scheduler Policy** — Inspects the existing scheduler policy honestly:
+///    - `SCHED_FIFO`: keeps FIFO, records confirmed priority, sets `RT_STATUS_RT_IS_FIFO`.
+///    - `SCHED_RR`: legitimate PipeWire / RTKit RT policy; keeps RR, records confirmed priority,
+///      clears `RT_STATUS_RT_IS_FIFO` (it is RR, not FIFO), does NOT force elevation to FIFO 90.
+///    - `SCHED_OTHER` (or other non-RT): attempts elevation to `SCHED_FIFO 90`. If elevation fails,
+///      records errno in `rt_sched_err` and reports policy honestly without panicking.
 ///
 /// After configuring, publishes the result via `rt_status` (atomic flags):
-/// - `rt_is_fifo`: `true` if `SCHED_FIFO` was confirmed by `pthread_getschedparam`.
-/// - `rt_priority`: effective priority granted by the kernel (or `0` if FIFO not obtained).
-///
-/// The main loop in `run_pipewire_host` reads these flags and emits an auditable
-/// confirmation log (or warning) — **zero additional I/O inside the RT callback**.
+/// - `rt_is_fifo`: `true` if `SCHED_FIFO` was obtained.
+/// - `rt_policy`: effective policy (`SCHED_FIFO`, `SCHED_RR`, or other).
+/// - `rt_priority` / `confirmed_priority`: effective priority granted by the kernel.
+/// - `rt_tid`: thread ID (kernel TID / pthread ID).
+/// - `rt_cpu`: physical CPU core where the thread is running.
+#[cold]
+#[inline(never)]
+pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
+    target_cpu: usize,
+    rt_status: &RtStatusFlags,
+    cfg: &C,
+) {
+    cfg.set_daz_ftz();
+
+    let thread_id = cfg.current_thread_id();
+    cfg.set_thread_name(thread_id, b"nam_pipe_dsp\0");
+
+    pin_thread_affinity_with(thread_id, target_cpu, rt_status, cfg);
+
+    let actual_cpu = cfg.get_current_cpu();
+    rt_status.rt_cpu.store(actual_cpu, Ordering::Relaxed);
+    rt_status.rt_tid.store(thread_id as i64, Ordering::Relaxed);
+
+    match cfg.get_sched_param(thread_id) {
+        Ok((actual_policy, mut actual_param)) => {
+            let mut base_policy = actual_policy & !0x40000000i32;
+
+            if base_policy == libc::SCHED_FIFO {
+                rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                rt_status
+                    .rt_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status
+                    .confirmed_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status
+                    .rt_policy
+                    .store(libc::SCHED_FIFO, Ordering::Relaxed);
+            } else if base_policy == libc::SCHED_RR {
+                // Legitimate PipeWire / RTKit real-time policy.
+                // Do NOT convert RR to FIFO 90: report honestly.
+                rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                rt_status
+                    .rt_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status
+                    .confirmed_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status.rt_policy.store(libc::SCHED_RR, Ordering::Relaxed);
+            } else {
+                // Non-RT policy (e.g. SCHED_OTHER): attempt elevation to SCHED_FIFO 90.
+                let param = libc::sched_param { sched_priority: 90 };
+                let ret_sched = cfg.set_sched_param(thread_id, libc::SCHED_FIFO, &param);
+
+                if ret_sched == 0 {
+                    base_policy = libc::SCHED_FIFO;
+                    actual_param.sched_priority = 90;
+                    rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                } else {
+                    rt_status.rt_sched_err.store(ret_sched, Ordering::Relaxed);
+                    rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                }
+
+                rt_status
+                    .rt_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status
+                    .confirmed_priority
+                    .store(actual_param.sched_priority, Ordering::Relaxed);
+                rt_status.rt_policy.store(base_policy, Ordering::Relaxed);
+            }
+        }
+        Err(ret_getsched) => {
+            rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+            rt_status.rt_priority.store(0, Ordering::Relaxed);
+            rt_status.confirmed_priority.store(-1, Ordering::Relaxed);
+            rt_status.rt_policy.store(-1, Ordering::Relaxed);
+            rt_status
+                .rt_getsched_err
+                .store(ret_getsched, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Configures the current DSP thread for real-time operation using the default `SystemThreadConfigurator`.
 #[cold]
 #[inline(never)]
 pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags>) {
-    unsafe {
-        neural_amp_modeler_rs::math::common::set_daz_ftz();
-    }
-
-    let thread_id = unsafe { libc::pthread_self() };
-
-    unsafe {
-        let name = b"nam_pipe_dsp\0";
-        libc::pthread_setname_np(thread_id, name.as_ptr() as *const libc::c_char);
-    }
-
-    pin_thread_affinity(thread_id, target_cpu, &rt_status);
-
-    let mut actual_policy = 0i32;
-    let mut actual_param = libc::sched_param { sched_priority: 0 };
-    let ret_getsched =
-        unsafe { libc::pthread_getschedparam(thread_id, &mut actual_policy, &mut actual_param) };
-
-    let actual_cpu = unsafe { libc::sched_getcpu() };
-    rt_status.rt_cpu.store(actual_cpu, Ordering::Relaxed);
-
-    if ret_getsched == 0 {
-        let mut base_policy = actual_policy & !0x40000000i32;
-
-        if base_policy != libc::SCHED_FIFO {
-            let param = libc::sched_param { sched_priority: 90 };
-
-            let ret_sched =
-                unsafe { libc::pthread_setschedparam(thread_id, libc::SCHED_FIFO, &param) };
-
-            if ret_sched != 0 {
-                rt_status.rt_sched_err.store(ret_sched, Ordering::Relaxed);
-            } else {
-                base_policy = libc::SCHED_FIFO;
-                actual_param.sched_priority = 90;
-            }
-        }
-
-        let confirmed_fifo = base_policy == libc::SCHED_FIFO;
-
-        if confirmed_fifo {
-            rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-        } else {
-            rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-        }
-
-        rt_status
-            .rt_priority
-            .store(actual_param.sched_priority, Ordering::Relaxed);
-        rt_status
-            .confirmed_priority
-            .store(actual_param.sched_priority, Ordering::Relaxed);
-        rt_status.rt_policy.store(base_policy, Ordering::Relaxed);
-    } else {
-        rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-        rt_status.rt_priority.store(0, Ordering::Relaxed);
-        rt_status.confirmed_priority.store(-1, Ordering::Relaxed);
-        rt_status.rt_policy.store(-1, Ordering::Relaxed);
-
-        rt_status
-            .rt_getsched_err
-            .store(ret_getsched, Ordering::Relaxed);
-    }
+    configure_realtime_thread_with(target_cpu, &rt_status, &SystemThreadConfigurator);
 }
 
 /// Builds the `cpu_set_t` affinity mask that pins a thread to `target_cpu`.
@@ -204,12 +303,17 @@ pub(crate) fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set
     Some(cpuset)
 }
 
-/// Pins `thread_id` to `target_cpu`, recording the outcome atomically in
+/// Pins `thread_id` to `target_cpu` using `cfg`, recording the outcome atomically in
 /// `rt_status` (RT-safe: no logging or allocation on this path).
 ///
 /// Out-of-range CPUs are rejected before any syscall and recorded as
 /// `rt_affinity_err = -1`; kernel rejections record the errno.
-fn pin_thread_affinity(thread_id: libc::pthread_t, target_cpu: usize, rt_status: &RtStatusFlags) {
+pub(crate) fn pin_thread_affinity_with<C: ThreadConfigurator>(
+    thread_id: libc::pthread_t,
+    target_cpu: usize,
+    rt_status: &RtStatusFlags,
+    cfg: &C,
+) {
     let Some(cpuset) = build_cpu_affinity_mask(target_cpu) else {
         rt_status.rt_affinity_err.store(-1, Ordering::Relaxed);
         rt_status
@@ -218,12 +322,7 @@ fn pin_thread_affinity(thread_id: libc::pthread_t, target_cpu: usize, rt_status:
         return;
     };
 
-    // SAFETY: `cpuset` is a fully initialized `cpu_set_t` (built above); the
-    // mask size matches the type and the kernel consumes it synchronously,
-    // never retaining the pointer.
-    let ret_aff = unsafe {
-        libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<libc::cpu_set_t>(), &cpuset)
-    };
+    let ret_aff = cfg.set_thread_affinity(thread_id, &cpuset);
 
     if ret_aff != 0 {
         rt_status.rt_affinity_err.store(ret_aff, Ordering::Relaxed);
@@ -231,4 +330,14 @@ fn pin_thread_affinity(thread_id: libc::pthread_t, target_cpu: usize, rt_status:
             .rt_target_cpu
             .store(target_cpu as i32, Ordering::Relaxed);
     }
+}
+
+/// Pins `thread_id` to `target_cpu` using `SystemThreadConfigurator`.
+#[expect(dead_code, reason = "helper for standalone thread pinning")]
+pub(crate) fn pin_thread_affinity(
+    thread_id: libc::pthread_t,
+    target_cpu: usize,
+    rt_status: &RtStatusFlags,
+) {
+    pin_thread_affinity_with(thread_id, target_cpu, rt_status, &SystemThreadConfigurator);
 }

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use crate::standalone::rt_setup::affinity::{CpuSelectionReason, CpuSelectionReceipt};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_GC_CORRUPTED, RT_STATUS_GC_OVERFLOW, RT_STATUS_GC_TIER3, RT_STATUS_HAS_CLIPPED,
@@ -31,6 +32,7 @@ fn test_poll_state_default_and_independent_instances() {
     let mut state2 = PollState {
         hugepage_synced: true,
         telemetry_throttle: 42,
+        ..Default::default()
     };
     assert!(state2.hugepage_synced);
     assert_eq!(state2.telemetry_throttle, 42);
@@ -140,4 +142,206 @@ fn test_poll_rt_status_clears_diagnostic_flags() {
     assert!(!rt_status.check_flag(RT_STATUS_HAS_CLIPPED));
     assert!(!rt_status.check_flag(RT_STATUS_HUGEPAGE_OK));
     assert!(!rt_status.check_flag(RT_STATUS_THP_ACTIVE));
+}
+
+#[test]
+fn test_5_stage_latency_metrics_and_telemetry_reporting() {
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    // 1. Record samples across all 5 metrics
+    rt_status.capture_hist.record(1_500);
+    rt_status.capture_hist.record(2_500);
+    rt_status.capture_cycle_time.store(2_500, Ordering::Relaxed);
+
+    rt_status.latency_hist.record(10_000);
+    rt_status.latency_hist.record(20_000);
+    rt_status.dsp_cycle_time.store(20_000, Ordering::Relaxed);
+
+    rt_status.record_hist.record(300);
+    rt_status.record_hist.record(700);
+    rt_status.record_cycle_time.store(700, Ordering::Relaxed);
+
+    rt_status.playback_hist.record(1_200);
+    rt_status.playback_hist.record(1_800);
+    rt_status
+        .playback_cycle_time
+        .store(1_800, Ordering::Relaxed);
+
+    rt_status.e2e_hist.record(25_000);
+    rt_status.e2e_hist.record(35_000);
+    rt_status.e2e_cycle_time.store(35_000, Ordering::Relaxed);
+
+    assert_eq!(rt_status.capture_hist.total_count(), 2);
+    assert_eq!(rt_status.latency_hist.total_count(), 2);
+    assert_eq!(rt_status.record_hist.total_count(), 2);
+    assert_eq!(rt_status.playback_hist.total_count(), 2);
+    assert_eq!(rt_status.e2e_hist.total_count(), 2);
+
+    assert_eq!(rt_status.capture_hist.get_exact_min(), 1_500);
+    assert_eq!(rt_status.capture_hist.get_mean(), 2_000);
+    assert_eq!(rt_status.latency_hist.get_mean(), 15_000);
+    assert_eq!(rt_status.record_hist.get_mean(), 500);
+    assert_eq!(rt_status.playback_hist.get_mean(), 1_500);
+    assert_eq!(rt_status.e2e_hist.get_mean(), 30_000);
+
+    // Set throttle to 99 so the next poll triggers the 100-cycle log & reset block
+    state.telemetry_throttle = 99;
+    rt_status.active_rate.store(48_000, Ordering::Relaxed);
+    rt_status.last_n_samples.store(64, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    assert_eq!(state.telemetry_throttle, 100);
+    // After logging at throttle = 100, all 5 histograms are reset
+    assert_eq!(rt_status.capture_hist.total_count(), 0);
+    assert_eq!(rt_status.latency_hist.total_count(), 0);
+    assert_eq!(rt_status.record_hist.total_count(), 0);
+    assert_eq!(rt_status.playback_hist.total_count(), 0);
+    assert_eq!(rt_status.e2e_hist.total_count(), 0);
+}
+
+fn init_test_logger() {
+    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+    let _ = NamLogger::init(LoggerConfig {
+        level_filter: log::LevelFilter::Info,
+        emit_stderr: false,
+    });
+}
+
+#[test]
+fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let isolated_receipt = CpuSelectionReceipt {
+        selected_cpu: 3,
+        is_dedicated: true,
+        package_id: Some(0),
+        core_id: Some(3),
+        smt_siblings: vec![3],
+        is_isolated: true,
+        is_nohz_full: true,
+        reason: CpuSelectionReason::FullyIsolated {
+            cpu: 3,
+            package_id: Some(0),
+            core_id: Some(3),
+            smt_siblings: vec![3],
+            nohz_full: true,
+        },
+        housekeeping_cpus: vec![0, 1, 2],
+        topology: vec![],
+    };
+
+    let mut state = PollState::with_cpu_receipt(Some(isolated_receipt));
+    rt_status.rt_priority.store(90, Ordering::Relaxed);
+    rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+    rt_status
+        .rt_policy
+        .store(libc::SCHED_FIFO, Ordering::Relaxed);
+    rt_status.rt_cpu.store(3, Ordering::Relaxed);
+    rt_status.rt_tid.store(12345, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_dedicated_log = records.iter().any(|r| {
+        r.message.contains("Dedicated core")
+            && r.message.contains("Real-Time priority (FIFO")
+            && r.message.contains("TID=12345")
+    });
+    assert!(
+        has_dedicated_log,
+        "LogBuffer must contain 'Dedicated core' log for proven isolated core"
+    );
+}
+
+#[test]
+fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let smt_receipt = CpuSelectionReceipt {
+        selected_cpu: 1,
+        is_dedicated: false,
+        package_id: Some(0),
+        core_id: Some(1),
+        smt_siblings: vec![1, 3],
+        is_isolated: false,
+        is_nohz_full: false,
+        reason: CpuSelectionReason::ConservativeHeuristic {
+            cpu: 1,
+            capacity: 1024,
+            irq_count: 10,
+            explanation: "Highest capacity with lowest IRQ load and SMT primary preference (non-isolated)",
+        },
+        housekeeping_cpus: vec![0, 2],
+        topology: vec![],
+    };
+
+    let mut state = PollState::with_cpu_receipt(Some(smt_receipt));
+    rt_status.rt_priority.store(90, Ordering::Relaxed);
+    rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+    rt_status
+        .rt_policy
+        .store(libc::SCHED_FIFO, Ordering::Relaxed);
+    rt_status.rt_cpu.store(1, Ordering::Relaxed);
+    rt_status.rt_tid.store(12346, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_heuristic_log = records.iter().any(|r| {
+        r.message.contains("Conservative heuristic core")
+            && r.message.contains("Real-Time priority (FIFO")
+            && r.message.contains("TID=12346")
+            && r.message.contains(
+                "Highest capacity with lowest IRQ load and SMT primary preference (non-isolated)",
+            )
+    });
+    assert!(
+        has_heuristic_log,
+        "LogBuffer must contain 'Conservative heuristic core' with typed reason for non-isolated core"
+    );
+}
+
+#[test]
+fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let mut state = PollState::default();
+    rt_status.rt_priority.store(85, Ordering::Relaxed);
+    rt_status.rt_policy.store(libc::SCHED_RR, Ordering::Relaxed);
+    rt_status.rt_cpu.store(2, Ordering::Relaxed);
+    rt_status.rt_tid.store(12347, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_heuristic_log = records.iter().any(|r| {
+        r.message.contains("Conservative heuristic core")
+            && r.message.contains("Real-Time priority (RR")
+            && r.message.contains("TID=12347")
+            && r.message
+                .contains("Conservative heuristic / unverified topology")
+    });
+    assert!(
+        has_heuristic_log,
+        "LogBuffer must contain 'Conservative heuristic core' fallback when receipt is None"
+    );
 }

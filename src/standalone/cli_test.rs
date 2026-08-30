@@ -210,3 +210,19 @@ fn parse_args_accepts_buffer_size_max_boundary() {
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.buffer_size, 8192);
 }
+
+#[test]
+fn parse_args_accepts_cpu_flag() {
+    let args = vec!["nam-audio-pipe", "--cpu", "3"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.cpu, Some(3));
+}
+
+#[test]
+fn parse_args_accepts_cpu_zero() {
+    let args = vec!["nam-audio-pipe", "--cpu", "0"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.cpu, Some(0));
+}

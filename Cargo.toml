@@ -31,6 +31,32 @@ name = "pgo_workload"
 path = "src/bin/pgo_workload.rs"
 required-features = ["testing"]
 
+# T5.1 / T8.1: fail-closed semantic verifier for the long-suite receipt. Used
+# by utils/build-release.sh --release-ceremony as the strict-receipt gate (no
+# substring search). Deliberately free of `required-features`: the release
+# ceremony must be able to build it without the `testing` feature.
+[[bin]]
+name = "long_receipt_check"
+path = "src/bin/long_receipt_check.rs"
+
+# T4.2 / EP-PERF-4: A/B benchmark of the recording transports (inline SPSC ring
+# vs preallocated pool + small descriptor). A profiling-only harness like
+# pgo_workload: excluded from the standard test path, compiled only when the
+# `testing` feature is active.
+[[bin]]
+name = "recording_ab_bench"
+path = "src/bin/recording_ab_bench.rs"
+required-features = ["testing"]
+
+# T5.2 / G-PERF-003: A/B optimization benchmark of the DSP hot-path envelope
+# (plain → PGO → PGO+BOLT). A profiling-only harness like pgo_workload: excluded
+# from the standard test path, compiled only when the `testing` feature is
+# active. The comparison ceremony is executed by utils/ab-opt-ceremony.sh.
+[[bin]]
+name = "ab_opt_bench"
+path = "src/bin/ab_opt_bench.rs"
+required-features = ["testing"]
+
 [dependencies]
 NeuralAmpModeler-rs = "0.7.0"
 pipewire = "0.10"

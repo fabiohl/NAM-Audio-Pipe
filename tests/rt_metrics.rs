@@ -32,14 +32,28 @@
 //!   asserts sample-rate reads stay within the published set; the joined
 //!   completion proves deadlock freedom. Emits
 //!   `TEST_RESULT[concurrency_stress]=PASS ...`.
+//! - `concurrent_spsc_throughput_swap_accounting` (filter `concurrent`,
+//!   Phase 5, T5.3 / G-PERF-004): **state-machine throughput** through the
+//!   production SPSC protocol — [`RtSwapHarness::into_parts`] splits the
+//!   harness into its two production faces, so a single-writer producer thread
+//!   pushes swap commands through the real ring buffers while the RT side runs
+//!   continuous DSP quantums with per-callback accounting
+//!   (applied/pops/backlog). The producer counts every push
+//!   (attempted/enqueued/dropped), the RT side counts applied/superseded/
+//!   deferred/pending. Emits
+//!   `TEST_RESULT[spsc_throughput]=PASS dsp_quantums=... swaps_attempted=...`.
+//!   The harness throughput is **never** labelled "audio callbacks".
 //!
 //! All timing uses `libc::clock_gettime(libc::CLOCK_MONOTONIC_RAW, ...)` and
 //! absolute `clock_nanosleep` (`TIMER_ABSTIME`) sleeps bridged from the RAW
 //! clock domain through the measured RAW→MONOTONIC offset — immune to NTP
 //! adjustments. Environment calibration is probed from `/proc/self/status`
 //! (`Cpus_allowed_list`), `/sys/devices/system/cpu/isolated` and
-//! `sched_getscheduler`. `NAM_RT_STRICT=1` promotes every GAP condition to a
-//! hard assertion failure.
+//! `sched_getscheduler`. `NAM_RT_STRICT=1` (propagated by
+//! `utils/tests-long.sh --strict-pre-release`, T5.1) promotes every GAP
+//! condition to a hard assertion failure AND refuses to certify a PASS
+//! measured on an uncalibrated environment — a numeric pass below the limits
+//! on a non-calibrated host must fail, never emit a silent pass.
 
 mod common;
 
@@ -296,6 +310,17 @@ fn rt_deadline_gate_10k_quantums() {
     );
 
     if max_ns <= budget_ns {
+        // T5.1: under NAM_RT_STRICT=1 a PASS is only certifiable on a
+        // calibrated RT environment — numbers below the budget on an
+        // uncalibrated host must fail, never emit a silent pass.
+        if env.strict && !env.calibrated() {
+            panic!(
+                "RT deadline gate FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
+                 environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
+                 current environment is not calibrated — refusing a silent pass on an \
+                 uncalibrated host (T5.1)"
+            );
+        }
         eprintln!(
             "TEST_RESULT[rt_deadline]=PASS max_ns={max_ns} budget_ns={budget_ns} margin_pct={margin_pct:.1}"
         );
@@ -402,6 +427,17 @@ fn rt_jitter_gate_10k_callbacks() {
     );
 
     if max_jitter_ns <= budget_max_ns && p99_ns <= budget_p99_ns {
+        // T5.1: under NAM_RT_STRICT=1 a PASS is only certifiable on a
+        // calibrated RT environment — dispersion numbers within budget on an
+        // uncalibrated host must fail, never emit a silent pass.
+        if env.strict && !env.calibrated() {
+            panic!(
+                "RT jitter gate FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
+                 environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
+                 current environment is not calibrated — refusing a silent pass on an \
+                 uncalibrated host (T5.1)"
+            );
+        }
         eprintln!(
             "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1} std_dev_us={:.1}",
             std_dev / 1e3,
@@ -757,8 +793,207 @@ fn concurrent_state_interleaving_stress_16_threads() {
         swaps > 0,
         "rate-renegotiation workers never pushed a resampler swap request — test is vacuous"
     );
+    // T5.3 (G-PERF-004): the marker names the harness metric honestly — DSP
+    // quantums processed, never "audio callbacks" (the harness throughput is
+    // state-machine throughput, not RT audio throughput).
     eprintln!(
-        "TEST_RESULT[concurrency_stress]=PASS profile=release+testing threads={MODEL_CHECK_THREADS} window_ms={} callbacks={callbacks} swaps_requested={swaps}",
+        "TEST_RESULT[concurrency_stress]=PASS profile=release+testing threads={MODEL_CHECK_THREADS} window_ms={} dsp_quantums={callbacks} swaps_requested={swaps}",
         STRESS_WINDOW.as_millis(),
+    );
+}
+
+// ── 3b. State-machine throughput (T5.3 / G-PERF-004) ────────────────────────
+
+/// DSP quantums for the SPSC throughput gate.
+const THROUGHPUT_QUANTUMS: usize = 20_000;
+
+/// Upper bound on pushes the producer thread attempts.
+const THROUGHPUT_MAX_PUSHES: u64 = 60_000;
+
+/// Hard bound on the command backlog any single callback may leave behind.
+/// Each SPSC ring holds `SPSC_CAPACITY` (64) payloads; with 5 channels plus 5
+/// deferred slots plus the parking-lot latch, the worst structural backlog is
+/// 64×5 + 6 = 326 — the per-callback drain budgets (F-RB-011: 16 scalar + 8
+/// structural pops) keep the backlog inside the channel capacity, never
+/// unbounded.
+const MAX_BACKLOG_PER_QUANTUM: usize = 64 * 5 + 6;
+
+/// Production-SPSC state-machine throughput (T5.3 / G-PERF-004).
+///
+/// Unlike the 16-thread interleaving stress above, this gate measures
+/// *throughput* — and only through the production protocol. The harness is
+/// split into its two production faces ([`RtSwapHarness::into_parts`]): a
+/// single-writer producer thread pushes swap commands through the real bounded
+/// ring buffers (exactly the production main-thread face) while the RT side
+/// runs continuous DSP quantums. There is **no global mutex** on the measured
+/// path. Accounting:
+///
+/// - producer face: `attempted` / `enqueued` / `dropped` (every push counted);
+/// - RT face, per callback: `structural_applied`, `param_pops`,
+///   `structural_pops`, `commands_remaining`;
+/// - RT face, cumulative: `swaps_superseded`, `swaps_deferred` (coalescing
+///   telemetry from `RtStatusFlags`).
+///
+/// The receipt marker names the metric honestly (`dsp_quantums`, `swaps_*`),
+/// never "audio callbacks" — harness throughput is state-machine throughput,
+/// not RT audio throughput.
+#[test]
+#[ignore = "Concurrency SPSC throughput: production-SPSC swap accounting without a global mutex — long suite only (tests-long.sh Phase 5)"]
+fn concurrent_spsc_throughput_swap_accounting() {
+    let _shutdown = common::ShutdownGuard::new();
+
+    let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("throughput harness");
+    h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
+    for _ in 0..8 {
+        let mut l = [0f32; BLOCK];
+        let mut r = [0f32; BLOCK];
+        h.run_callback(&mut l, &mut r, BLOCK);
+    }
+    h.consume_gc();
+
+    // Split into the two production faces: no mutex between producer and RT.
+    let (mut producer, mut rt) = h.into_parts();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let producer_handle = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut iter = 0u64;
+            while iter < THROUGHPUT_MAX_PUSHES && !stop.load(Ordering::Acquire) {
+                match iter % 5 {
+                    0 => {
+                        producer.push_load_model(
+                            Some(linear_a()),
+                            Some(linear_b()),
+                            1.0,
+                            1.0,
+                            SAMPLE_RATE,
+                        );
+                    }
+                    1 => producer.push_slimmable(iter, 2, linear_a(), Some(linear_b())),
+                    2 => producer.push_cabsim(Some(cabsim_pair())),
+                    3 => {
+                        producer.push_input_gain(0.5 + 0.01 * (iter % 100) as f32);
+                        producer.push_output_gain(1.0);
+                    }
+                    _ => producer.push_os_pair(
+                        neural_amp_modeler_rs::dsp::oversample::OversampleEngine::new(
+                            neural_amp_modeler_rs::dsp::oversample::OversampleFactor::X2,
+                            BLOCK * 2,
+                        )
+                        .expect("OS engine"),
+                        neural_amp_modeler_rs::dsp::oversample::OversampleEngine::new(
+                            neural_amp_modeler_rs::dsp::oversample::OversampleFactor::X2,
+                            BLOCK * 2,
+                        )
+                        .expect("OS engine"),
+                    ),
+                }
+                iter += 1;
+                if iter.is_multiple_of(16) {
+                    std::thread::yield_now();
+                }
+            }
+            producer
+        })
+    };
+
+    let (sig_l, sig_r) = test_signal_blocks(THROUGHPUT_QUANTUMS);
+    let mut in_l = [0f32; BLOCK];
+    let mut in_r = [0f32; BLOCK];
+    let mut total_applied = 0u64;
+    let mut total_param_pops = 0u64;
+    let mut total_structural_pops = 0u64;
+    let mut max_backlog = 0usize;
+    let mut busy_quantums = 0u64;
+
+    for block in 0..THROUGHPUT_QUANTUMS {
+        in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+        in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+        let acc = rt.run_callback_accounted(&mut in_l, &mut in_r, BLOCK);
+        total_applied += acc.structural_applied as u64;
+        total_param_pops += acc.param_pops as u64;
+        total_structural_pops += acc.structural_pops as u64;
+        max_backlog = max_backlog.max(acc.commands_remaining);
+        if acc.structural_applied > 0 || acc.param_pops > 0 || acc.structural_pops > 0 {
+            busy_quantums += 1;
+        }
+        if block.is_multiple_of(64) {
+            rt.consume_gc();
+        }
+    }
+
+    // Stop the producer and absorb whatever it enqueued before noticing.
+    stop.store(true, Ordering::Release);
+    let producer = producer_handle.join().expect("producer thread panicked");
+    let mut drained = 0usize;
+    while rt.commands_pending() && drained < 8192 {
+        let acc = rt.run_callback_accounted(&mut in_l, &mut in_r, BLOCK);
+        total_applied += acc.structural_applied as u64;
+        total_param_pops += acc.param_pops as u64;
+        total_structural_pops += acc.structural_pops as u64;
+        max_backlog = max_backlog.max(acc.commands_remaining);
+        if acc.structural_applied > 0 || acc.param_pops > 0 || acc.structural_pops > 0 {
+            busy_quantums += 1;
+        }
+        rt.consume_gc();
+        drained += 1;
+    }
+    let swaps_pending = rt.commands_pending_count();
+
+    let attempted = producer.attempted();
+    let enqueued = producer.enqueued();
+    let dropped = producer.dropped();
+    let superseded = rt
+        .rt_status()
+        .structural_superseded_total
+        .load(Ordering::Relaxed);
+    let deferred = rt
+        .rt_status()
+        .structural_deferred_total
+        .load(Ordering::Relaxed);
+    let dsp_quantums = rt.frame_count();
+
+    // Complete swap accounting (G-PERF-004 acceptance): every attempt either
+    // entered a ring or was dropped by the bounded channel.
+    assert_eq!(
+        attempted,
+        enqueued + dropped,
+        "producer accounting must balance: attempted={attempted} enqueued={enqueued} dropped={dropped}"
+    );
+    assert!(
+        enqueued > 0,
+        "no command reached the SPSC rings — vacuous throughput"
+    );
+    assert!(
+        total_applied > 0,
+        "no structural swap was ever applied — vacuous throughput"
+    );
+    assert!(
+        dsp_quantums > 0,
+        "no DSP quantum executed — vacuous throughput"
+    );
+    assert!(
+        busy_quantums > 0,
+        "per-callback accounting recorded no quantum with drained work"
+    );
+    assert!(
+        max_backlog <= MAX_BACKLOG_PER_QUANTUM,
+        "command backlog {max_backlog} exceeds the channel-capacity bound \
+         {MAX_BACKLOG_PER_QUANTUM} (5 SPSC rings × 64 + deferred + parking)"
+    );
+    assert!(
+        swaps_pending == 0,
+        "complete swap accounting requires full absorption after the drain: \
+         {swaps_pending} commands still queued/parked"
+    );
+
+    eprintln!(
+        "TEST_RESULT[spsc_throughput]=PASS profile=release+testing dsp_quantums={dsp_quantums} \
+         swaps_attempted={attempted} swaps_enqueued={enqueued} swaps_dropped={dropped} \
+         swaps_applied={total_applied} swaps_superseded={superseded} swaps_deferred={deferred} \
+         swaps_pending={swaps_pending} param_pops={total_param_pops} \
+         structural_pops={total_structural_pops} busy_quantums={busy_quantums} \
+         max_backlog={max_backlog} spsc=production mutex=none"
     );
 }

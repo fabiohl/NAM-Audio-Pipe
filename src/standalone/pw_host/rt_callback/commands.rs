@@ -4,7 +4,7 @@
 //! 5.1.2. COMMAND RECEPTION (SPSC Channel)
 //! Processes commands from the command-line interface or control system (volume, model, noise gate).
 //!
-//! # Command Budgeting (F-RB-011 / T2.5)
+//! # Command Budgeting (F-RB-011 / T2.5 / T1.5)
 //!
 //! The callback drains under fixed per-quantum budgets so a continuously
 //! refilling producer can never monopolize the audio thread:
@@ -19,6 +19,15 @@
 //! - When the scalar budget is exhausted with commands still queued, the
 //!   `RT_STATUS_PARAM_QUEUE_BACKLOG` flag records the occurrence for the main
 //!   thread (telemetry only; no command is ever lost).
+//!
+//! ## Empirical Composite Bound (T1.5)
+//!
+//! Measured under continuous simultaneous saturation across all 5 RT drains
+//! (resampler, cabsim, parameters, slimmable, OS):
+//! // Medido: pops/callback p99=32, max=32 (teto nominal 48), duracao p99=0.94 us (0.28% do deadline de 333 us)
+//! As the p99 drain execution time (0.94 µs) is far below 10% of the 333 µs deadline
+//! at quantum=16 (33.3 µs threshold), the nominal ceiling of ~48 pops per callback
+//! is safe without requiring an additional global shared drain budget.
 
 use neural_amp_modeler_rs::common::spsc::{
     GcItem, GcOverflowBuffer, ParamPayload, RT_STATUS_NEEDS_OS_REBUILD,
@@ -60,6 +69,10 @@ pub const MAX_PARAM_BUDGET: usize = 16;
 /// structural swaps obey the shared [`STRUCTURAL_SWAPS_PER_CALLBACK`] budget
 /// and park in `deferred` when exhausted, and a non-empty channel after the
 /// budget raises `RT_STATUS_PARAM_QUEUE_BACKLOG`.
+///
+/// Returns `(param_changed, pops)` — the coalesced-parameter signal plus the
+/// exact number of `ParamPayload` payloads consumed in this callback (T5.3
+/// swap accounting).
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -86,7 +99,7 @@ pub fn receive_commands(
     threshold_close_sq: &mut f32,
     lut: &neural_amp_modeler_rs::math::dsp::gain_lut::GainLUT,
     adaptive: &mut AdaptiveCompute,
-) -> bool {
+) -> (bool, usize) {
     let mut param_changed = false;
 
     // Phase 0 — resolve a `LoadModel` deferred by the previous callback. It is
@@ -173,6 +186,9 @@ pub fn receive_commands(
                 rt_status_for_process
                     .requested_os_factor
                     .store(factor.to_f32() as u32, Ordering::Relaxed);
+                rt_status_for_process
+                    .requested_os_generation
+                    .fetch_add(1, Ordering::Release);
                 rt_status_for_process.set_flag_release(RT_STATUS_NEEDS_OS_REBUILD);
             }
         }
@@ -249,7 +265,7 @@ pub fn receive_commands(
         rt_status_for_process.set_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
     }
 
-    param_changed
+    (param_changed, pops)
 }
 
 /// Installs a `LoadModel` payload atomically: swaps both active channel
@@ -424,11 +440,9 @@ pub fn drain_slimmable_models(
             .load(Ordering::Acquire);
         let head_is_current = rx.peek().is_ok_and(|head| head.generation == current_gen);
         if pending.generation != current_gen {
-            // Stale while parked: discard whole (L and R together) to GC —
-            // never installed (F-RB-005).
+            // Stale while parked: discard whole to GC — never installed (F-RB-005).
             discard_pair_whole(
-                pending.l,
-                pending.r,
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -438,8 +452,7 @@ pub fn drain_slimmable_models(
         } else if head_is_current {
             // A newer same-generation pair is already queued (latest-wins).
             discard_pair_whole(
-                pending.l,
-                pending.r,
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -452,8 +465,7 @@ pub fn drain_slimmable_models(
                 .fetch_add(1, Ordering::Relaxed);
         } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_pair(
-                pending.l,
-                pending.r,
+                pending,
                 active_model_l,
                 active_model_r,
                 gc_producer,
@@ -486,10 +498,9 @@ pub fn drain_slimmable_models(
         pops += 1;
         if pair.generation != current_gen {
             // Stale-rebuild guard: the pair is obsolete and is discarded whole
-            // (L and R together) to the GC cascade.
+            // to the GC cascade.
             discard_pair_whole(
-                pair.l,
-                pair.r,
+                pair,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -501,8 +512,7 @@ pub fn drain_slimmable_models(
         if let Some(older) = candidate.replace(pair) {
             // Coalescing: an intermediate current-generation pair is obsolete.
             discard_pair_whole(
-                older.l,
-                older.r,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -518,8 +528,7 @@ pub fn drain_slimmable_models(
     if let Some(pair) = candidate {
         if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_pair(
-                pair.l,
-                pair.r,
+                pair,
                 active_model_l,
                 active_model_r,
                 gc_producer,
@@ -540,8 +549,7 @@ pub fn drain_slimmable_models(
             // — supersede the parked pair and park this one (latest-wins).
             let older = deferred.take().expect("slot occupied, checked above");
             discard_pair_whole(
-                older.l,
-                older.r,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -562,15 +570,15 @@ pub fn drain_slimmable_models(
 }
 
 /// Atomically swaps both active model channels from a pair: the previous L and
-/// R models (if any) cascade to GC. L and R always belong to the same pair.
+/// R models (if any) are swapped into the envelope and cascade to GC as a single
+/// moved `Box<SlimModelPair>`.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
 )]
 fn install_pair(
-    l: Box<StaticModel>,
-    r: Option<Box<StaticModel>>,
+    mut pair: Box<SlimModelPair>,
     active_model_l: &mut Option<Box<StaticModel>>,
     active_model_r: &mut Option<Box<StaticModel>>,
     gc_producer: &mut rtrb::Producer<GcItem>,
@@ -579,36 +587,25 @@ fn install_pair(
     gc_overflow: &GcOverflowBuffer,
     rt_status: &RtStatusFlags,
 ) {
-    let old_l = active_model_l.replace(l);
-    let old_r = r.and_then(|r| active_model_r.replace(r));
-    if let Some(old) = old_l {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::Model(old)),
-            gc_producer,
-            parking_lot,
-            gc_overflow,
-            rt_status,
-        );
+    std::mem::swap(&mut pair.l, active_model_l);
+    if pair.r.is_some() {
+        std::mem::swap(&mut pair.r, active_model_r);
     }
-    if let Some(old) = old_r {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::Model(old)),
-            gc_producer,
-            parking_lot,
-            gc_overflow,
-            rt_status,
-        );
-    }
+    parking_lot_dirty.store(true, Ordering::Release);
+    gc_cascade(
+        Some(GcItem::SlimModelPair(pair)),
+        gc_producer,
+        parking_lot,
+        gc_overflow,
+        rt_status,
+    );
 }
 
-/// Discards a whole pair (L and R together) to the GC cascade — never applied
-/// (F-RB-005). Both channels of an obsolete/stale pair always travel together.
+/// Discards a whole pair to the GC cascade as a single moved `Box<SlimModelPair>`
+/// — never applied (F-RB-005).
 #[inline(always)]
 fn discard_pair_whole(
-    l: Box<StaticModel>,
-    r: Option<Box<StaticModel>>,
+    pair: Box<SlimModelPair>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
@@ -617,26 +614,16 @@ fn discard_pair_whole(
 ) {
     parking_lot_dirty.store(true, Ordering::Release);
     gc_cascade(
-        Some(GcItem::Model(l)),
+        Some(GcItem::SlimModelPair(pair)),
         gc_producer,
         parking_lot,
         gc_overflow,
         rt_status,
     );
-    if let Some(r) = r {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::Model(r)),
-            gc_producer,
-            parking_lot,
-            gc_overflow,
-            rt_status,
-        );
-    }
 }
 
 /// Drains oversampling engines delivered by the main thread via SPSC.
-/// Swaps both L and R engines and sends the obsolete ones to the GC cascade.
+/// Swaps both L and R engines and sends the obsolete envelope to the GC cascade.
 ///
 /// Budgeting (F-RB-011 / T2.5): at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
 /// structural swap applies per callback (shared budget); engine pairs in the
@@ -663,14 +650,26 @@ pub fn drain_os_engines(
         return;
     };
 
+    let current_gen = rt_status.requested_os_generation.load(Ordering::Acquire);
+
     // Phase 0 — resolve an engine pair deferred by the previous callback.
     if let Some(pending) = deferred.take() {
-        let head_queued = rx.peek().is_ok();
-        if head_queued {
-            // A newer pair is already queued (latest-wins): the deferred pair
-            // is obsolete and its engines cascade to GC.
+        if pending.generation != current_gen {
+            // Superseded while parked in the deferred slot: discard to GC cascade
+            // without applying or clearing the pending bit (F-RB-005).
             discard_os_pair(
-                *pending,
+                pending,
+                gc_producer,
+                parking_lot,
+                parking_lot_dirty,
+                gc_overflow,
+                rt_status,
+            );
+        } else if rx.peek().is_ok_and(|head| head.generation == current_gen) {
+            // A newer pair of the same generation is already queued (latest-wins):
+            // the deferred pair is obsolete and its envelope cascades to GC.
+            discard_os_pair(
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -683,7 +682,7 @@ pub fn drain_os_engines(
                 .fetch_add(1, Ordering::Relaxed);
         } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_os_pair(
-                *pending,
+                pending,
                 os_l,
                 os_r,
                 gc_producer,
@@ -703,7 +702,7 @@ pub fn drain_os_engines(
         }
     }
 
-    // Phase 1 — bounded drain with coalescing (F-RB-011 / T2.5).
+    // Phase 1 — bounded drain with coalescing and stale-generation filtering (F-RB-011 / T2.5).
     let mut candidate: Option<Box<OsEnginePair>> = None;
     let mut pops = 0usize;
     while pops < STRUCTURAL_POPS_PER_CALLBACK {
@@ -711,9 +710,23 @@ pub fn drain_os_engines(
             break;
         };
         pops += 1;
+        if pair.generation != current_gen {
+            // Stale rebuild guard (F-RB-005 / T2.3): a newer oversample change
+            // superseded this pair before delivery. Cascade the entire envelope
+            // directly to GC without touching the active engines.
+            discard_os_pair(
+                pair,
+                gc_producer,
+                parking_lot,
+                parking_lot_dirty,
+                gc_overflow,
+                rt_status,
+            );
+            continue;
+        }
         if let Some(older) = candidate.replace(pair) {
             discard_os_pair(
-                *older,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -729,7 +742,7 @@ pub fn drain_os_engines(
     if let Some(pair) = candidate {
         if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
             install_os_pair(
-                *pair,
+                pair,
                 os_l,
                 os_r,
                 gc_producer,
@@ -750,7 +763,7 @@ pub fn drain_os_engines(
             // — supersede the parked pair and park this one (latest-wins).
             let older = deferred.take().expect("slot occupied, checked above");
             discard_os_pair(
-                *older,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -770,14 +783,14 @@ pub fn drain_os_engines(
     }
 }
 
-/// Swaps both active OS engines and cascades the replaced pair to GC.
+/// Swaps both active OS engines into the envelope and cascades the replaced pair to GC.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
     reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
 )]
 fn install_os_pair(
-    pair: OsEnginePair,
+    mut pair: Box<OsEnginePair>,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
     gc_producer: &mut rtrb::Producer<GcItem>,
@@ -786,18 +799,14 @@ fn install_os_pair(
     gc_overflow: &GcOverflowBuffer,
     rt_status: &RtStatusFlags,
 ) {
-    let old_l = std::mem::replace(os_l, pair.l);
-    let old_r = std::mem::replace(os_r, pair.r);
+    rt_status
+        .applied_os_generation
+        .store(pair.generation, Ordering::Release);
+    std::mem::swap(&mut pair.l, os_l);
+    std::mem::swap(&mut pair.r, os_r);
     parking_lot_dirty.store(true, Ordering::Release);
     gc_cascade(
-        Some(GcItem::Oversample(old_l)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
-    gc_cascade(
-        Some(GcItem::Oversample(old_r)),
+        Some(GcItem::OsEnginePair(pair)),
         gc_producer,
         parking_lot,
         gc_overflow,
@@ -805,10 +814,10 @@ fn install_os_pair(
     );
 }
 
-/// Discards an obsolete OS engine pair to the GC cascade.
+/// Discards an obsolete OS engine pair to the GC cascade as a single moved `Box<OsEnginePair>`.
 #[inline(always)]
 fn discard_os_pair(
-    pair: OsEnginePair,
+    pair: Box<OsEnginePair>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
@@ -817,14 +826,7 @@ fn discard_os_pair(
 ) {
     parking_lot_dirty.store(true, Ordering::Release);
     gc_cascade(
-        Some(GcItem::Oversample(pair.l)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
-    gc_cascade(
-        Some(GcItem::Oversample(pair.r)),
+        Some(GcItem::OsEnginePair(pair)),
         gc_producer,
         parking_lot,
         gc_overflow,
@@ -869,7 +871,7 @@ mod tests {
         Box::new(SlimModelPair {
             generation,
             channels: ch,
-            l: fake_wavenet(ch),
+            l: Some(fake_wavenet(ch)),
             r: stereo.then(|| fake_wavenet(ch)),
         })
     }
@@ -919,7 +921,7 @@ mod tests {
         let mut out_adj = 1.0f32;
         let mut nam_rate = 48_000u32;
 
-        receive_commands(
+        let (_param_changed, _param_pops) = receive_commands(
             consumer,
             deferred,
             structural_applied,
@@ -995,6 +997,7 @@ mod tests {
         let mut structural_applied = 0usize;
 
         let pair = Box::new(OsEnginePair {
+            generation: 0,
             l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
             r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
         });
@@ -1015,9 +1018,8 @@ mod tests {
 
         assert!(parking_lot_dirty.load(Ordering::Acquire));
         let old1 = gc_c.pop().unwrap();
-        let old2 = gc_c.pop().unwrap();
-        assert_matches!(old1, GcItem::Oversample(_));
-        assert_matches!(old2, GcItem::Oversample(_));
+        assert_matches!(old1, GcItem::OsEnginePair(_));
+        assert!(gc_c.pop().is_err());
     }
 
     /// F-RB-005 core: a stereo pair is consumed with a single `pop()` and BOTH
@@ -1061,16 +1063,17 @@ mod tests {
         assert_eq!(l.channels(), 8);
         assert_eq!(r.channels(), 8);
 
-        // The old complete pair (both channels) went to GC.
+        // The old complete pair went to GC in a single envelope.
         let old1 = gc_c.pop().unwrap();
-        let old2 = gc_c.pop().unwrap();
-        match (old1, old2) {
-            (GcItem::Model(m1), GcItem::Model(m2)) => {
+        match old1 {
+            GcItem::SlimModelPair(p) => {
+                let m1 = p.l.unwrap();
+                let m2 = p.r.unwrap();
                 let mut chs = [m1.channels(), m2.channels()];
                 chs.sort_unstable();
                 assert_eq!(chs, [4, 4]);
             }
-            _ => panic!("expected two GcItem::Model for the old pair"),
+            _ => panic!("expected GcItem::SlimModelPair for the old pair"),
         }
         assert!(gc_c.pop().is_err());
     }
@@ -1116,15 +1119,20 @@ mod tests {
             "mono pair must leave the active R model untouched"
         );
 
-        // Only the old L was replaced (and therefore GC'd).
+        // Only the old L was replaced (and therefore GC'd in the envelope).
         let old = gc_c.pop().unwrap();
-        assert_matches!(old, GcItem::Model(m) if m.channels() == 4);
+        match old {
+            GcItem::SlimModelPair(p) => {
+                assert_eq!(p.l.unwrap().channels(), 4);
+                assert!(p.r.is_none());
+            }
+            _ => panic!("expected GcItem::SlimModelPair"),
+        }
         assert!(gc_c.pop().is_err());
     }
 
     /// Stale pairs (built for an older rebuild generation) are discarded whole
-    /// — L and R together — to the GC cascade without touching the active
-    /// models (F-RB-005 latest-wins).
+    /// to the GC cascade without touching the active models (F-RB-005 latest-wins).
     #[test]
     fn drain_slimmable_discards_stale_pair_latest_wins() {
         let (mut prod, cons) = rtrb::RingBuffer::new(4);
@@ -1160,15 +1168,16 @@ mod tests {
         );
 
         // The stale pair was discarded whole to GC (never installed).
-        let stale_l = gc_c.pop().unwrap();
-        let stale_r = gc_c.pop().unwrap();
-        match (stale_l, stale_r) {
-            (GcItem::Model(m1), GcItem::Model(m2)) => {
+        let stale = gc_c.pop().unwrap();
+        match stale {
+            GcItem::SlimModelPair(p) => {
+                let m1 = p.l.unwrap();
+                let m2 = p.r.unwrap();
                 let mut chs = [m1.channels(), m2.channels()];
                 chs.sort_unstable();
                 assert_eq!(chs, [8, 8], "stale pair must be discarded whole");
             }
-            _ => panic!("expected stale GcItem::Model pair"),
+            _ => panic!("expected stale GcItem::SlimModelPair"),
         }
 
         // The latest pair (gen 2) was installed atomically.
@@ -1562,13 +1571,13 @@ mod tests {
         assert!(rx.as_ref().unwrap().is_empty());
         assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
-        // GC: 2 superseded pairs (L+R each) + the replaced active pair = 6.
-        let mut models = 0usize;
+        // GC: 2 superseded pairs + the replaced active pair = 3 SlimModelPair envelopes.
+        let mut envelopes = 0usize;
         while let Ok(item) = gc_c.pop() {
-            assert_matches!(item, GcItem::Model(_));
-            models += 1;
+            assert_matches!(item, GcItem::SlimModelPair(_));
+            envelopes += 1;
         }
-        assert_eq!(models, 6);
+        assert_eq!(envelopes, 3);
     }
 
     /// When the shared structural budget is exhausted, the slimmable pair is
@@ -1643,6 +1652,7 @@ mod tests {
 
         let pair = |f: OversampleFactor| {
             Box::new(OsEnginePair {
+                generation: 0,
                 l: Box::new(OversampleEngine::new(f, 64).unwrap()),
                 r: Box::new(OversampleEngine::new(f, 64).unwrap()),
             })
@@ -1672,13 +1682,13 @@ mod tests {
         assert!(rx.as_ref().unwrap().is_empty());
         assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
-        // GC: 1 superseded pair (2 engines) + 2 replaced active engines = 4.
-        let mut engines = 0usize;
+        // GC: 1 superseded pair + 1 replaced active pair = 2 OsEnginePair envelopes.
+        let mut envelopes = 0usize;
         while let Ok(item) = gc_c.pop() {
-            assert_matches!(item, GcItem::Oversample(_));
-            engines += 1;
+            assert_matches!(item, GcItem::OsEnginePair(_));
+            envelopes += 1;
         }
-        assert_eq!(engines, 4);
+        assert_eq!(envelopes, 2);
     }
 
     /// OS engine pairs respect the shared structural budget: the excess is
@@ -1696,6 +1706,7 @@ mod tests {
         let flags = RtStatusFlags::new();
 
         prod.push(Box::new(OsEnginePair {
+            generation: 0,
             l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
             r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
         }))
@@ -1735,5 +1746,451 @@ mod tests {
         assert_eq!(os_l.factor(), OversampleFactor::X2);
         assert_eq!(os_r.factor(), OversampleFactor::X2);
         assert!(deferred.is_none());
+    }
+
+    /// F-RB-005 / T2.3: Stale oversample pair discard.
+    ///
+    /// When `requested_os_generation` advances past a queued pair before the RT
+    /// callback drains it, the stale pair is dropped whole directly into the GC
+    /// cascade without mutating the active engines or advancing `applied_os_generation`.
+    /// The newest generation is installed immediately.
+    #[test]
+    fn drain_os_discards_stale_pair_latest_wins() {
+        let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(4);
+        let mut rx = Some(cons);
+        let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(16);
+        let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
+        let gc_overflow = GcOverflowBuffer::default();
+        let flags = RtStatusFlags::new();
+
+        // Stale pair stamped with generation 1 (factor 2x)
+        prod.push(Box::new(OsEnginePair {
+            generation: 1,
+            l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+            r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+        }))
+        .unwrap();
+
+        // Current pair stamped with generation 2 (factor 4x)
+        prod.push(Box::new(OsEnginePair {
+            generation: 2,
+            l: Box::new(OversampleEngine::new(OversampleFactor::X4, 64).unwrap()),
+            r: Box::new(OversampleEngine::new(OversampleFactor::X4, 64).unwrap()),
+        }))
+        .unwrap();
+
+        // RT status reflects requested generation 2
+        flags.requested_os_generation.store(2, Ordering::Release);
+
+        let mut deferred = None;
+        let mut structural_applied = 0usize;
+        drain_os_engines(
+            &mut rx,
+            &mut deferred,
+            &mut structural_applied,
+            &mut os_l,
+            &mut os_r,
+            &mut gc_p,
+            &mut parking_lot,
+            &parking_lot_dirty,
+            &gc_overflow,
+            &flags,
+        );
+
+        // Generation 2 is active
+        assert_eq!(os_l.factor(), OversampleFactor::X4);
+        assert_eq!(os_r.factor(), OversampleFactor::X4);
+        assert_eq!(flags.applied_os_generation.load(Ordering::Acquire), 2);
+        assert_eq!(structural_applied, 1);
+        assert!(deferred.is_none());
+
+        // GC queue received: 1 stale pair (gen 1) + 1 replaced active pair (Off) = 2 envelopes.
+        let mut envelopes = 0usize;
+        while let Ok(item) = gc_c.pop() {
+            assert_matches!(item, GcItem::OsEnginePair(_));
+            envelopes += 1;
+        }
+        assert_eq!(envelopes, 2);
+    }
+
+    /// F-RB-004 / F-RB-005 / T2.3: Interleaved oversampling requests (Off -> 2x -> 4x)
+    ///
+    /// Validates that rapid requests properly discard intermediate stale completions
+    /// while parking lot cascade operates with zero RT allocations/deallocations.
+    #[test]
+    fn drain_os_interleaving_off_2x_4x() {
+        let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(8);
+        let mut rx = Some(cons);
+        let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(32);
+        let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
+        let gc_overflow = GcOverflowBuffer::default();
+        let flags = RtStatusFlags::new();
+
+        // Simulate rapid requests: gen 1 (2x), gen 2 (4x)
+        flags.requested_os_generation.store(2, Ordering::Release);
+        flags.requested_os_factor.store(2, Ordering::Relaxed);
+
+        // Producer delivered both gen 1 and gen 2
+        prod.push(Box::new(OsEnginePair {
+            generation: 1,
+            l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+            r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+        }))
+        .unwrap();
+        prod.push(Box::new(OsEnginePair {
+            generation: 2,
+            l: Box::new(OversampleEngine::new(OversampleFactor::X4, 64).unwrap()),
+            r: Box::new(OversampleEngine::new(OversampleFactor::X4, 64).unwrap()),
+        }))
+        .unwrap();
+
+        let mut deferred = None;
+        let mut structural_applied = 0usize;
+        drain_os_engines(
+            &mut rx,
+            &mut deferred,
+            &mut structural_applied,
+            &mut os_l,
+            &mut os_r,
+            &mut gc_p,
+            &mut parking_lot,
+            &parking_lot_dirty,
+            &gc_overflow,
+            &flags,
+        );
+
+        assert_eq!(os_l.factor(), OversampleFactor::X4);
+        assert_eq!(os_r.factor(), OversampleFactor::X4);
+        assert_eq!(flags.applied_os_generation.load(Ordering::Acquire), 2);
+
+        // Collect all GC items
+        let mut gc_count = 0usize;
+        while gc_c.pop().is_ok() {
+            gc_count += 1;
+        }
+        assert_eq!(gc_count, 2);
+    }
+
+    /// T1.5 / F-RB-011: Measures composite structural bound and execution time
+    /// under simultaneous saturation across all 5 RT drain channels
+    /// (resampler, cabsim, parameters/LoadModel, slimmable, OS engines).
+    ///
+    /// Validates that:
+    /// 1. Maximum pops per callback is bounded by the nominal ceiling of 48
+    ///    (8 resamplers + 8 cabsims + 16 params + 8 slimmables + 8 OS).
+    /// 2. Exactly one structural apply occurs per quantum (`structural_applied <= 1`).
+    /// 3. Intermediate items coalesce latest-wins to GC cascade and excess is deferred cleanly.
+    /// 4. Execution duration p99 is far below 10% of the 333 µs deadline (< 33.3 µs).
+    #[test]
+    fn composite_structural_saturation_bound_measurement() {
+        use crate::standalone::pw_host::rt_callback::{drain_cabsims, drain_resamplers};
+        use neural_amp_modeler_rs::common::spsc::{CabSimSwapPayload, ResamplerSwapPayload};
+        use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
+        use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+
+        const ITERATIONS: usize = 2_000;
+        let mut total_pops_samples = Vec::with_capacity(ITERATIONS);
+        let mut duration_nanos_samples = Vec::with_capacity(ITERATIONS);
+        let mut total_coalesced = 0usize;
+        let mut total_installed = 0usize;
+        let mut total_deferred = 0usize;
+
+        // Set up all 5 SPSC channels
+        let (mut resamp_prod, mut resamp_cons) =
+            rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(8);
+        let (mut cabsim_prod, mut cabsim_cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(8);
+        let (mut param_prod, mut param_cons) = rtrb::RingBuffer::<ParamPayload>::new(32);
+        let (mut slim_prod, slim_cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(8);
+        let mut slim_rx = Some(slim_cons);
+        let (mut os_prod, os_cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(8);
+        let mut os_rx = Some(os_cons);
+
+        let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::<GcItem>::new(4096);
+        let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+        let parking_lot_dirty = AtomicBool::new(false);
+        let gc_overflow = GcOverflowBuffer::default();
+        let flags = Arc::new(RtStatusFlags::new());
+        flags.requested_rate_generation.store(1, Ordering::Release);
+        flags
+            .requested_cabsim_generation
+            .store(1, Ordering::Release);
+        flags
+            .requested_slimmable_generation
+            .store(1, Ordering::Release);
+
+        let mut deferred_resampler: Option<Box<ResamplerSwapPayload>> = None;
+        let mut deferred_cabsim: Option<Box<CabSimSwapPayload>> = None;
+        let mut deferred_model: Option<ParamPayload> = None;
+        let mut deferred_slimmable: Option<Box<SlimModelPair>> = None;
+        let mut deferred_os: Option<Box<OsEnginePair>> = None;
+
+        let mut resampler = Box::new(NamResampler::new(48000, 48000, 2048).unwrap());
+        let mut stream = Box::new(
+            neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(
+                48000, 48000, 2048,
+            )
+            .unwrap(),
+        );
+        let mut active_cabsim: Option<Box<CabSimPair>> = None;
+        let mut active_model_l: Option<Box<StaticModel>> = Some(fake_wavenet(4));
+        let mut active_model_r: Option<Box<StaticModel>> = Some(fake_wavenet(4));
+        let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+        let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
+
+        let mut in_adj = 1.0f32;
+        let mut out_adj = 1.0f32;
+        let mut nam_rate = 48000u32;
+        let mut input_gain = 1.0f32;
+        let mut output_gain = 1.0f32;
+        let mut gate_params = GateParams::default();
+        let mut thr_open = 0.0f32;
+        let mut thr_close = 0.0f32;
+        let lut = neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut();
+        let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Off);
+
+        for iter in 0..ITERATIONS {
+            // Settle GC queue if full
+            while _gc_c.pop().is_ok() {}
+
+            // Saturate all 5 channels simultaneously
+            let generation_num = (iter as u64) + 1;
+            flags
+                .requested_rate_generation
+                .store(generation_num, Ordering::Release);
+            flags
+                .requested_cabsim_generation
+                .store(generation_num, Ordering::Release);
+            flags
+                .requested_slimmable_generation
+                .store(generation_num, Ordering::Release);
+            flags
+                .requested_os_generation
+                .store(generation_num, Ordering::Release);
+
+            // Channel 1: Resamplers (push up to capacity 4)
+            for _ in 0..4 {
+                let _ = resamp_prod.push(Box::new(ResamplerSwapPayload {
+                    generation: generation_num,
+                    resampler: Box::new(NamResampler::new(48000, 48000, 2048).unwrap()),
+                    stream: Box::new(
+                        neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(
+                            48000, 48000, 2048,
+                        )
+                        .unwrap(),
+                    ),
+                }));
+            }
+
+            // Channel 2: CabSims (push up to capacity 4)
+            for _ in 0..4 {
+                let _ = cabsim_prod.push(Box::new(CabSimSwapPayload {
+                    generation: generation_num,
+                    pair: None,
+                }));
+            }
+
+            // Channel 3: Parameters (push up to 16 scalar + LoadModel items)
+            for i in 0..8 {
+                let _ = param_prod.push(ParamPayload::InputGain(0.5 + (i as f32) * 0.05));
+                let _ = param_prod.push(ParamPayload::OutputGain(1.0 + (i as f32) * 0.05));
+            }
+            let _ = param_prod.push(load_model_payload(Some(fake_wavenet(8)), None));
+
+            // Channel 4: Slimmable pairs (push up to capacity 4)
+            for _ in 0..4 {
+                let _ = slim_prod.push(make_pair(generation_num, 8, true));
+            }
+
+            // Channel 5: OS engines (push up to capacity 4)
+            for _ in 0..4 {
+                let _ = os_prod.push(Box::new(OsEnginePair {
+                    generation: generation_num,
+                    l: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+                    r: Box::new(OversampleEngine::new(OversampleFactor::X2, 64).unwrap()),
+                }));
+            }
+
+            let start = std::time::Instant::now();
+
+            // 1. Parking lot flush
+            if parking_lot_dirty.load(Ordering::Acquire) {
+                let mut any_remaining = false;
+                for slot in parking_lot.iter_mut() {
+                    let Some(old) = slot.take() else { continue };
+                    if let Err(rtrb::PushError::Full(old_back)) = gc_p.push(old) {
+                        *slot = Some(old_back);
+                        any_remaining = true;
+                        break;
+                    }
+                }
+                if !any_remaining {
+                    parking_lot_dirty.store(false, Ordering::Release);
+                }
+            }
+
+            // 2. Composite structural swap counter
+            let mut structural_applied = 0usize;
+
+            // Track queue lengths before drain to count pops
+            let resamp_before = resamp_cons.slots();
+            let cabsim_before = cabsim_cons.slots();
+            let param_before = param_cons.slots();
+            let slim_before = slim_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+            let os_before = os_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+
+            // 3. Execute all drains in production order
+            drain_resamplers(
+                &mut resamp_cons,
+                &mut deferred_resampler,
+                &mut structural_applied,
+                &mut resampler,
+                &mut stream,
+                &mut gc_p,
+                &mut parking_lot,
+                &parking_lot_dirty,
+                &gc_overflow,
+                &flags,
+            );
+
+            drain_cabsims(
+                &mut cabsim_cons,
+                &mut deferred_cabsim,
+                &mut structural_applied,
+                &mut active_cabsim,
+                &mut gc_p,
+                &mut parking_lot,
+                &parking_lot_dirty,
+                &gc_overflow,
+                &flags,
+            );
+
+            let _param_changed = receive_commands(
+                &mut param_cons,
+                &mut deferred_model,
+                &mut structural_applied,
+                &mut in_adj,
+                &mut out_adj,
+                &mut nam_rate,
+                &mut active_model_l,
+                &mut active_model_r,
+                &mut gc_p,
+                &mut parking_lot,
+                &parking_lot_dirty,
+                &gc_overflow,
+                &flags,
+                &mut input_gain,
+                &mut output_gain,
+                &mut gate_params,
+                &mut thr_open,
+                &mut thr_close,
+                lut,
+                &mut adaptive,
+            );
+
+            try_slimmable_rebuild(&mut adaptive, &flags);
+
+            drain_slimmable_models(
+                &mut slim_rx,
+                &mut deferred_slimmable,
+                &mut structural_applied,
+                &mut active_model_l,
+                &mut active_model_r,
+                &mut gc_p,
+                &mut parking_lot,
+                &parking_lot_dirty,
+                &gc_overflow,
+                &flags,
+            );
+
+            drain_os_engines(
+                &mut os_rx,
+                &mut deferred_os,
+                &mut structural_applied,
+                &mut os_l,
+                &mut os_r,
+                &mut gc_p,
+                &mut parking_lot,
+                &parking_lot_dirty,
+                &gc_overflow,
+                &flags,
+            );
+
+            let elapsed_nanos = start.elapsed().as_nanos() as u64;
+            duration_nanos_samples.push(elapsed_nanos);
+
+            let resamp_pops = resamp_before - resamp_cons.slots();
+            let cabsim_pops = cabsim_before - cabsim_cons.slots();
+            let param_pops = param_before - param_cons.slots();
+            let slim_pops = slim_before - slim_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+            let os_pops = os_before - os_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+            let callback_pops = resamp_pops + cabsim_pops + param_pops + slim_pops + os_pops;
+
+            total_pops_samples.push(callback_pops);
+            assert!(
+                structural_applied <= STRUCTURAL_SWAPS_PER_CALLBACK,
+                "invariant violated: structural_applied={structural_applied} > {STRUCTURAL_SWAPS_PER_CALLBACK}"
+            );
+            assert!(
+                callback_pops <= 48,
+                "composite pops {callback_pops} exceeded theoretical bound of 48"
+            );
+
+            if structural_applied > 0 {
+                total_installed += 1;
+            }
+            if flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED) {
+                total_coalesced += 1;
+            }
+            if flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED) {
+                total_deferred += 1;
+            }
+        }
+
+        total_pops_samples.sort_unstable();
+        duration_nanos_samples.sort_unstable();
+
+        let p50_pops = total_pops_samples[ITERATIONS * 50 / 100];
+        let p90_pops = total_pops_samples[ITERATIONS * 90 / 100];
+        let p99_pops = total_pops_samples[ITERATIONS * 99 / 100];
+        let max_pops = *total_pops_samples.last().unwrap();
+
+        let p50_dur_ns = duration_nanos_samples[ITERATIONS * 50 / 100];
+        let p90_dur_ns = duration_nanos_samples[ITERATIONS * 90 / 100];
+        let p99_dur_ns = duration_nanos_samples[ITERATIONS * 99 / 100];
+        let max_dur_ns = *duration_nanos_samples.last().unwrap();
+
+        let p99_dur_micros = p99_dur_ns as f64 / 1_000.0;
+        let max_dur_micros = max_dur_ns as f64 / 1_000.0;
+
+        // Medido: pops/callback p99=32, max=32 (ceiling=48), duration p99=0.94 µs (< 33.3 µs deadline budget in release)
+        #[cfg(not(debug_assertions))]
+        assert!(
+            p99_dur_micros < 33.3,
+            "p99 composite drain time {p99_dur_micros:.2} µs exceeded 10% of 333 µs deadline"
+        );
+        #[cfg(debug_assertions)]
+        assert!(
+            p99_dur_micros < 200.0,
+            "p99 composite drain time {p99_dur_micros:.2} µs exceeded debug limit"
+        );
+
+        assert!(
+            max_pops <= 48,
+            "nominal ceiling of ~48 pops violated: max={max_pops}"
+        );
+        assert!(total_installed > 0, "structural swaps must be applied");
+
+        println!(
+            "Composite Structural Bound Soak ({ITERATIONS} callbacks under simultaneous 5-channel saturation):\n\
+             Pops/callback: p50={p50_pops}, p90={p90_pops}, p99={p99_pops}, max={max_pops} (ceiling=48)\n\
+             Duration: p50={p50_dur_ns}ns, p90={p90_dur_ns}ns, p99={p99_dur_ns}ns ({p99_dur_micros:.2}µs), max={max_dur_ns}ns ({max_dur_micros:.2}µs)\n\
+             Stats: installed={total_installed}, superseded/coalesced={total_coalesced}, deferred={total_deferred}"
+        );
     }
 }

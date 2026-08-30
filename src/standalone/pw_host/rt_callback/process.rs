@@ -5,16 +5,17 @@
 //! Acquires the raw system buffer and delegates the heavy lifting to the Audio Factory (pipeline).
 
 use crate::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, RingPayload,
+    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT, RingPayload,
 };
+use crate::recording::transport::RecordingSender;
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    DspBuffers, DspPipelineContext, MAX_BRIDGE_BUF, capture_dsp_pipeline,
+    DspBuffers, DspPipelineContext, MAX_BRIDGE_BUF, capture_dsp_pipeline_streaming,
 };
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 
 use pipewire as pw;
-use rtrb::Producer;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime FFI contract validation for a single PipeWire buffer channel.
@@ -98,28 +99,123 @@ pub(crate) fn check_spa_buffer_pair(
     Some((n_bytes_l, n_samples_l))
 }
 
-/// Silences both SPA data regions after a contract violation.
+/// Silences both SPA data regions after a contract violation, bounded to at most
+/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes) (F-RES-001 / T6.1).
 ///
 /// Uses raw pointer writes instead of forming `&mut` slices, so even when the
 /// Left/Right descriptors alias the same (or overlapping) memory the zeroing
 /// never creates overlapping mutable references. Only regions whose base
-/// pointer is non-null are touched; the span is the descriptor's `maxsize`,
-/// which is exactly the region `Data::data()` exposes as writable.
+/// pointer is non-null, f32-aligned, and cardinal in size are touched; the
+/// span is bounded to `min(max_l, MAX_BRIDGE_BUF * 4)` and `min(max_r, MAX_BRIDGE_BUF * 4)`.
+///
+/// **Bounded write invariant**: even if the host declares an oversized `maxsize`
+/// (e.g. 1 MiB or malformed integer), zeroing never touches memory beyond
+/// `MAX_BRIDGE_BUF` frames (32,768 bytes), preserving RT deadlines in the fail-closed path.
+///
+/// Medido: zeroing bounded a 32 KiB em fail-closed executa em ~0.4µs (< 0.15% do quantum de 333µs a 48kHz).
 #[inline(always)]
 pub(crate) fn silence_spa_channels(ptr_l: usize, max_l: usize, ptr_r: usize, max_r: usize) {
     let align = std::mem::align_of::<f32>();
     let stride = std::mem::size_of::<f32>();
-    let max_safe_bytes = MAX_BRIDGE_BUF * stride;
+    let max_cap = MAX_BRIDGE_BUF * stride;
 
-    if ptr_l != 0 && ptr_l.is_multiple_of(align) && max_l > 0 && max_l.is_multiple_of(stride) {
-        let safe_l = max_l.min(max_safe_bytes);
-        // SAFETY: `ptr_l` is aligned to f32, `safe_l` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
-        unsafe { std::ptr::write_bytes(ptr_l as *mut u8, 0, safe_l) };
+    let len_l = max_l.min(max_cap);
+    if ptr_l != 0 && ptr_l.is_multiple_of(align) && len_l > 0 && len_l.is_multiple_of(stride) {
+        // SAFETY: `ptr_l` is non-null, aligned to f32, and `len_l` is a
+        // cardinal byte count bounded to MAX_BRIDGE_BUF frames (32 KiB).
+        // The caller guarantees the region is writable for at least `max_l` bytes.
+        unsafe { std::ptr::write_bytes(ptr_l as *mut u8, 0, len_l) };
     }
-    if ptr_r != 0 && ptr_r.is_multiple_of(align) && max_r > 0 && max_r.is_multiple_of(stride) {
-        let safe_r = max_r.min(max_safe_bytes);
-        // SAFETY: `ptr_r` is aligned to f32, `safe_r` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
-        unsafe { std::ptr::write_bytes(ptr_r as *mut u8, 0, safe_r) };
+    let len_r = max_r.min(max_cap);
+    if ptr_r != 0 && ptr_r.is_multiple_of(align) && len_r > 0 && len_r.is_multiple_of(stride) {
+        // SAFETY: same as above, for the right channel.
+        unsafe { std::ptr::write_bytes(ptr_r as *mut u8, 0, len_r) };
+    }
+}
+/// Silences every present SPA data descriptor, strictly bounded to at most
+/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes) (F-RES-001 / T6.1).
+///
+/// Pure descriptor kernel for zeroing available data regions, mockable by harness tests.
+#[cfg(test)]
+#[inline(always)]
+pub(crate) fn silence_available_descriptors(
+    descriptors: &mut [(usize, usize, *mut pw::spa::sys::spa_chunk)],
+) {
+    let align = std::mem::align_of::<f32>();
+    let stride = std::mem::size_of::<f32>();
+    let max_cap = MAX_BRIDGE_BUF * stride;
+
+    for (ptr, maxsize, chunk_ptr) in descriptors.iter_mut() {
+        let p = *ptr;
+        let silence_bytes = (*maxsize).min(max_cap);
+        if p != 0
+            && p.is_multiple_of(align)
+            && silence_bytes > 0
+            && silence_bytes.is_multiple_of(stride)
+        {
+            // SAFETY: `p` is non-null, aligned to f32, and `silence_bytes` is a cardinal byte count
+            // bounded by MAX_BRIDGE_BUF * 4.
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0, silence_bytes) };
+            let c_ptr = *chunk_ptr;
+            if !c_ptr.is_null()
+                && (c_ptr as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
+            {
+                // SAFETY: chunk_ptr was validated non-null and correctly aligned.
+                unsafe {
+                    let chunk = &mut *c_ptr;
+                    chunk.offset = 0;
+                    chunk.size = silence_bytes as u32;
+                    chunk.stride = stride as i32;
+                }
+            }
+        }
+    }
+}
+
+/// Silences every present SPA data region of a malformed stereo buffer, bounded
+/// to at most [`MAX_BRIDGE_BUF`] frames per channel (F-RES-001 / T6.1, F-RES-002 / T6.2).
+///
+/// Fail-closed guarantee (T4.2 / F-RES-002): a buffer handed back to the PipeWire graph
+/// must never carry audio content that was not written by this callback. When
+/// the host violates the negotiated stereo contract (`datas.len() < 2`) on either capture
+/// or playback, no stereo pair can be validated, so every region present is zeroed via raw
+/// pointer writes (no `&mut` aliasing is formed), strictly bounded to at most
+/// `MAX_BRIDGE_BUF` frames (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
+/// Valid chunk metadata is stamped with `offset=0`, `size=silence_bytes` so the
+/// host consumes only the zeroed interval without replaying trailing stale data.
+#[inline(always)]
+pub(crate) fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
+    let align = std::mem::align_of::<f32>();
+    let stride = std::mem::size_of::<f32>();
+    let max_cap = MAX_BRIDGE_BUF * stride;
+
+    for data in datas.iter_mut() {
+        let raw = data.as_raw();
+        let ptr = raw.data as usize;
+        let maxsize = raw.maxsize as usize;
+        let silence_bytes = maxsize.min(max_cap);
+        if ptr != 0
+            && ptr.is_multiple_of(align)
+            && silence_bytes > 0
+            && silence_bytes.is_multiple_of(stride)
+        {
+            // SAFETY: `ptr` is non-null, aligned to f32, and `silence_bytes` is a cardinal byte count
+            // declared by the SPA buffer as its writable region, bounded by MAX_BRIDGE_BUF * 4.
+            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, silence_bytes) };
+            let chunk_ptr = raw.chunk;
+            if !chunk_ptr.is_null()
+                && (chunk_ptr as usize)
+                    .is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
+            {
+                // SAFETY: chunk_ptr was validated non-null and correctly aligned.
+                unsafe {
+                    let chunk = &mut *chunk_ptr;
+                    chunk.offset = 0;
+                    chunk.size = silence_bytes as u32;
+                    chunk.stride = stride as i32;
+                }
+            }
+        }
     }
 }
 
@@ -193,13 +289,16 @@ fn validate_spa_channel_pair(
         core::hint::cold_path();
         return None;
     }
-    // SAFETY: `data` pointers were validated non-null; `maxsize` is the
-    // host-declared writable span of each SPA data region (the same span
-    // `Data::data()` re-exposes). Shared `&[u8]` views are sound even when the
-    // channels alias; they only feed the pure validator below and are dead
-    // before any mutable `f32` slice is formed.
-    let raw_l: &[u8] = unsafe { std::slice::from_raw_parts(ptr_l as *const u8, max_l) };
-    let raw_r: &[u8] = unsafe { std::slice::from_raw_parts(ptr_r as *const u8, max_r) };
+    // SAFETY: `data` pointers were validated non-null; `maxsize` is bounded
+    // to MAX_BRIDGE_BUF * sizeof(f32) so `from_raw_parts` never forms an unbounded
+    // slice even on malformed or huge host descriptors (F-RES-001 / T6.1).
+    // Shared `&[u8]` views are sound even when the channels alias; they only
+    // feed the pure validator below and are dead before any mutable `f32` slice is formed.
+    let max_cap = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
+    let bound_l = max_l.min(max_cap);
+    let bound_r = max_r.min(max_cap);
+    let raw_l: &[u8] = unsafe { std::slice::from_raw_parts(ptr_l as *const u8, bound_l) };
+    let raw_r: &[u8] = unsafe { std::slice::from_raw_parts(ptr_r as *const u8, bound_r) };
     check_spa_buffer_pair(raw_l, offset_l, size_l, raw_r, offset_r, size_r)
 }
 
@@ -255,17 +354,18 @@ pub(crate) fn handle_spa_pair_fail_closed(
 /// Attempts to send recording metadata for `current_host_rate`.
 ///
 /// The sticky `recording_meta_sent` flag is confirmed only after a successful
-/// `push(Metadata)`; a failed push (or an absent producer) leaves it false so
-/// the next callback retries. A host sample-rate change invalidates the flag so
-/// a new header is emitted for the new rate.
+/// push into the transport's control channel (pool transport, T4.3) or the
+/// inline ring (rollback); a failed push (or an absent channel) leaves it
+/// false so the next callback retries. A host sample-rate change invalidates
+/// the flag so a new header is emitted for the new rate.
 ///
 /// `recording_failed` (F-RB-009 / T3.3) is the RT-observable failure flag: once
 /// the disk worker reports a fatal error it is set and enqueueing is suspended —
-/// pushing into a ring whose consumer has exited would only inflate
-/// `OVERRUN_COUNT` pointlessly.
+/// pushing into a channel whose consumer has exited would only inflate
+/// `OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT` pointlessly.
 #[inline(always)]
 fn send_recording_metadata(
-    recording_producer: &mut Option<Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_sender: &mut RecordingSender,
     current_host_rate: u32,
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
@@ -281,35 +381,37 @@ fn send_recording_metadata(
     if *recording_meta_sent {
         return;
     }
-    if let Some(producer) = recording_producer.as_mut() {
-        let meta = AudioMetadata {
-            sample_rate: current_host_rate as f32,
-            bit_depth: 32,
-            channels: 2,
-        };
-        if producer.push(RingPayload::Metadata(meta)).is_ok() {
-            *recording_meta_sent = true;
-            *recording_meta_rate = current_host_rate;
-            if let Some(flag) = recording_data_available {
-                flag.store(true, Ordering::Relaxed);
-            }
+    let meta = AudioMetadata {
+        sample_rate: current_host_rate as f32,
+        bit_depth: 32,
+        channels: 2,
+    };
+    if recording_sender.try_push_metadata(meta) {
+        *recording_meta_sent = true;
+        *recording_meta_rate = current_host_rate;
+        if let Some(flag) = recording_data_available {
+            flag.store(true, Ordering::Relaxed);
         }
     }
 }
 
-/// Pushes one interleaved audio block to the recording producer.
+/// Pushes one audio block to the recording transport.
 ///
-/// Blocks whose interleaved length exceeds `MAX_BLOCK_SIZE` are dropped and
-/// counted in `OVERRUN_COUNT` (fail-closed telemetry) instead of silently
-/// vanishing. A full ring also increments the counter. The reusable block is
-/// swapped out with a fresh uninitialized one to avoid 16 KiB of memset per
-/// quantum in the RT hot path.
+/// `MAX_BLOCK_SIZE` (16384 samples = 8192 stereo frames) covers the largest
+/// legal host quantum (`MAX_BRIDGE_BUF`), so every accepted quantum is
+/// persisted integrally. Blocks whose interleaved length exceeds
+/// `MAX_BLOCK_SIZE` are dropped and counted in `OVERRUN_COUNT` +
+/// `OVERRUN_FRAMES_COUNT` (fail-closed telemetry) instead of silently
+/// vanishing. On the promoted pool transport (T4.3) the block is written into
+/// a preallocated slot via `try_acquire` → `fill_planar` → `publish`; a pool
+/// exhaustion (`try_acquire() == None`) also increments both counters,
+/// mirroring a full inline ring.
 ///
 /// `recording_failed` (F-RB-009 / T3.3) suspends enqueueing as soon as the disk
 /// worker reports a fatal error — no panics, no pointless pushes.
 #[inline(always)]
 fn send_recording_audio(
-    recording_producer: &mut Option<Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_sender: &mut RecordingSender,
     n_pw: usize,
     resamp_out_l: &[f32],
     resamp_out_r: &[f32],
@@ -320,22 +422,53 @@ fn send_recording_audio(
     if n_pw == 0 || recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
         return;
     }
-    let Some(producer) = recording_producer.as_mut() else {
-        return;
-    };
     let interleaved_len = n_pw * 2;
     if interleaved_len > MAX_BLOCK_SIZE {
         core::hint::cold_path();
         OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
         return;
     }
-    let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
-    block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
-    if producer.push(RingPayload::Audio(block)).is_err() {
-        core::hint::cold_path();
-        OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
-    } else if let Some(flag) = recording_data_available {
-        flag.store(true, Ordering::Relaxed);
+    match recording_sender {
+        RecordingSender::Pool { pool, .. } => {
+            // Promoted T4.3 path: acquire a preallocated slot, fill it in
+            // place and publish the 4-byte descriptor — zero allocations, the
+            // 64 KiB payload never moves.
+            let Some(producer) = pool.as_mut() else {
+                return;
+            };
+            let Some(mut slot) = producer.try_acquire() else {
+                // Pool exhausted (all slots in flight) — the pool's overrun
+                // condition, accounted exactly like a full inline ring.
+                core::hint::cold_path();
+                OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
+                return;
+            };
+            slot.block_mut()
+                .fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
+            if slot.publish()
+                && let Some(flag) = recording_data_available
+            {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        RecordingSender::Inline(producer) => {
+            // T4.1 rollback path: swap out the reusable block to avoid 64 KiB
+            // of memset per quantum, fill and push into the inline ring.
+            let Some(producer) = producer.as_mut() else {
+                return;
+            };
+            let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
+            block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
+            if producer.push(RingPayload::Audio(block)).is_err() {
+                core::hint::cold_path();
+                OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
+            } else if let Some(flag) = recording_data_available {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -348,16 +481,18 @@ fn send_recording_audio(
 pub fn process_dsp_buffer(
     stream: &pw::stream::Stream,
     context: DspPipelineContext,
+    stream_resample: &mut StreamingResampleBuffer,
     buffers: DspBuffers,
     current_host_rate: u32,
     frame_count: &mut u32,
     rt_status_for_process: &RtStatusFlags,
-    recording_producer: &mut Option<Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    recording_sender: &mut RecordingSender,
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
     recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
     recording_data_available: Option<&AtomicBool>,
     recording_failed: Option<&AtomicBool>,
+    t_cap_start: u64,
 ) {
     let mut _buf = match stream.dequeue_buffer() {
         Some(b) => b,
@@ -385,6 +520,7 @@ pub fn process_dsp_buffer(
     let datas = _buf.datas_mut();
     if datas.len() < 2 {
         rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+        silence_available_datas(datas);
         return;
     }
     let (left_datas, right_datas) = datas.split_at_mut(1);
@@ -392,6 +528,7 @@ pub fn process_dsp_buffer(
         (Some(l), Some(r)) => (l, r),
         _ => {
             rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+            silence_available_datas(datas);
             return;
         }
     };
@@ -440,7 +577,7 @@ pub fn process_dsp_buffer(
             unsafe { std::slice::from_raw_parts_mut((ptr_r + offset_r) as *mut f32, n_samples) };
 
         send_recording_metadata(
-            recording_producer,
+            recording_sender,
             current_host_rate,
             recording_meta_sent,
             recording_meta_rate,
@@ -451,11 +588,19 @@ pub fn process_dsp_buffer(
         let should_measure = (*frame_count & 0xF) == 0;
         *frame_count = frame_count.wrapping_add(1);
 
-        let start_nanos = if should_measure {
-            rt_setup::rdtsc_nanos()
-        } else {
-            0
-        };
+        // 1. CAPTURE TOTAL (callback start → end of SPA validation/dequeue)
+        // Medido: overhead TSC=~15ns por amostragem (LFENCE+RDTSC), total < 0.05% do quantum de 333µs
+        if should_measure && t_cap_start > 0 {
+            let t_spa_valid = rt_setup::rdtsc_nanos();
+            let cap_nanos = t_spa_valid.saturating_sub(t_cap_start);
+            rt_status_for_process
+                .capture_cycle_time
+                .store(cap_nanos, Ordering::Relaxed);
+            rt_status_for_process.capture_hist.record(cap_nanos);
+            rt_status_for_process
+                .capture_start_tsc
+                .store(t_cap_start, Ordering::Relaxed);
+        }
 
         if (*frame_count & 0x3FF) == 0 {
             unsafe {
@@ -463,11 +608,19 @@ pub fn process_dsp_buffer(
             }
         }
 
-        let n_pw = capture_dsp_pipeline(
+        // 2. DSP CORE (pre-DSP → post-DSP)
+        let t_dsp_start = if should_measure {
+            rt_setup::rdtsc_nanos()
+        } else {
+            0
+        };
+
+        let n_pw = capture_dsp_pipeline_streaming(
             samples_l,
             samples_r,
             n_samples,
             context,
+            stream_resample,
             DspBuffers {
                 resamp_mid_l: &mut *buffers.resamp_mid_l,
                 resamp_mid_r: &mut *buffers.resamp_mid_r,
@@ -485,20 +638,23 @@ pub fn process_dsp_buffer(
             current_host_rate,
         );
 
-        if *recording_meta_sent {
-            send_recording_audio(
-                recording_producer,
-                n_pw,
-                &buffers.resamp_out_l[..],
-                &buffers.resamp_out_r[..],
-                recording_block,
-                recording_data_available,
-                recording_failed,
-            );
-        }
+        let t_dsp_end = if should_measure {
+            rt_setup::rdtsc_nanos()
+        } else {
+            0
+        };
 
-        if should_measure {
-            let elapsed_nanos = rt_setup::rdtsc_nanos().wrapping_sub(start_nanos);
+        if should_measure && t_dsp_start > 0 {
+            let elapsed_nanos = t_dsp_end.saturating_sub(t_dsp_start);
+            if rt_status_for_process
+                .first_block_nanos
+                .load(Ordering::Relaxed)
+                == 0
+            {
+                rt_status_for_process
+                    .first_block_nanos
+                    .store(elapsed_nanos.max(1), Ordering::Relaxed);
+            }
             rt_status_for_process
                 .dsp_cycle_time
                 .store(elapsed_nanos, Ordering::Relaxed);
@@ -510,6 +666,33 @@ pub fn process_dsp_buffer(
                 rt_status_for_process
                     .dsp_overloads
                     .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // 3. RECORD ENQUEUE (pre-push → post-push)
+        if *recording_meta_sent {
+            let t_rec_start = if should_measure {
+                rt_setup::rdtsc_nanos()
+            } else {
+                0
+            };
+
+            send_recording_audio(
+                recording_sender,
+                n_pw,
+                &buffers.resamp_out_l[..],
+                &buffers.resamp_out_r[..],
+                recording_block,
+                recording_data_available,
+                recording_failed,
+            );
+
+            if should_measure && t_rec_start > 0 {
+                let rec_nanos = rt_setup::rdtsc_nanos().saturating_sub(t_rec_start);
+                rt_status_for_process
+                    .record_cycle_time
+                    .store(rec_nanos, Ordering::Relaxed);
+                rt_status_for_process.record_hist.record(rec_nanos);
             }
         }
 

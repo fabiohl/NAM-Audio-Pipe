@@ -17,11 +17,13 @@
 //!
 //! The `swap` submodule holds deterministic model builders and synthetic
 //! signal factories shared by the swap-stress and extended-soak harnesses
-//! (T6.4).
+//! (T6.4); the `proc` submodule holds the `/proc` telemetry readers shared by
+//! the accelerated-soak and real-endurance harnesses (T5.3 / G-PERF-004).
 
+pub mod proc;
 pub mod swap;
 
-use nam_audio_pipe::recording::buffer::{MAX_BLOCK_SIZE, RingPayload};
+use nam_audio_pipe::recording::transport::RecordingReceiver;
 use nam_audio_pipe::recording::{
     RecordingInit, RecordingStatus, SharedRecordingStatus, spawn_recording_worker,
     wait_for_recording_init,
@@ -264,10 +266,10 @@ pub fn recording_init_for(
     (init, init_rx, status, failed_flag)
 }
 
-/// Spawns a recording worker for `consumer`, waits for the startup handshake
+/// Spawns a recording worker for `receiver`, waits for the startup handshake
 /// and returns the join handle plus the observable handles (F-RB-009 / T3.3).
 pub fn spawn_ready_worker(
-    consumer: rtrb::Consumer<RingPayload<MAX_BLOCK_SIZE>>,
+    receiver: RecordingReceiver,
     dir: &Path,
 ) -> (
     std::thread::JoinHandle<anyhow::Result<()>>,
@@ -275,7 +277,7 @@ pub fn spawn_ready_worker(
     Arc<AtomicBool>,
 ) {
     let (init, init_rx, status, failed_flag) = recording_init_for(dir);
-    let handle = spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
     let ready_dir = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect("recording worker must confirm readiness via the startup handshake");
     assert_eq!(

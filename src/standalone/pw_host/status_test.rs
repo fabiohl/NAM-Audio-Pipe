@@ -345,10 +345,10 @@ fn concurrent_transitions_never_leak_incoherent_snapshots() {
 
 #[test]
 fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
-    let rt = RtStatusFlags::default();
+    let rt = Arc::new(RtStatusFlags::default());
     rt.capture_format_ok.store(0, Ordering::Relaxed);
     rt.playback_format_ok.store(0, Ordering::Relaxed);
-    let backend = SharedBackendStatus::new();
+    let backend = SharedBackendStatus::with_rt_status(rt.clone());
 
     // Case 1: Capture valid format, playback not-yet-ok
     output_pw::mark_format_contract_ok(&rt, "capture");
@@ -359,10 +359,10 @@ fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
     assert_ne!(backend.state(), BackendState::Running);
 
     // Case 2: Playback valid format, capture not-yet-ok
-    let rt2 = RtStatusFlags::default();
+    let rt2 = Arc::new(RtStatusFlags::default());
     rt2.capture_format_ok.store(0, Ordering::Relaxed);
     rt2.playback_format_ok.store(0, Ordering::Relaxed);
-    let backend2 = SharedBackendStatus::new();
+    let backend2 = SharedBackendStatus::with_rt_status(rt2.clone());
     output_pw::mark_format_contract_ok(&rt2, "playback");
     backend2.set_stream_active("playback", true);
 
@@ -379,8 +379,8 @@ fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
 
 #[test]
 fn invalid_stream_format_rejection_prevents_unmute() {
-    let rt = RtStatusFlags::default();
-    let backend = SharedBackendStatus::new();
+    let rt = Arc::new(RtStatusFlags::default());
+    let backend = SharedBackendStatus::with_rt_status(rt.clone());
 
     // Valid capture format & active stream
     output_pw::mark_format_contract_ok(&rt, "capture");
@@ -398,8 +398,8 @@ fn invalid_stream_format_rejection_prevents_unmute() {
     assert!(!rt.is_audio_unmuted());
 
     // Inverse: valid playback format & active stream, rejected capture format
-    let rt2 = RtStatusFlags::default();
-    let backend2 = SharedBackendStatus::new();
+    let rt2 = Arc::new(RtStatusFlags::default());
+    let backend2 = SharedBackendStatus::with_rt_status(rt2.clone());
 
     output_pw::mark_format_contract_ok(&rt2, "playback");
     backend2.set_stream_active("playback", true);
@@ -411,4 +411,157 @@ fn invalid_stream_format_rejection_prevents_unmute() {
     backend2.set_stream_active("capture", true);
 
     assert!(!rt2.is_audio_unmuted());
+}
+
+#[test]
+fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
+    let rt = Arc::new(RtStatusFlags::default());
+    let backend = SharedBackendStatus::with_rt_status(rt.clone());
+
+    // Formats negotiated as valid F32P planar stereo
+    output_pw::mark_format_contract_ok(&rt, "capture");
+    output_pw::mark_format_contract_ok(&rt, "playback");
+
+    // Initially streams are not streaming yet -> muted
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
+    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
+    assert!(!rt.is_audio_unmuted());
+
+    // Condition 1: Connect / Stream (Streaming)
+    observe_stream_state(
+        "capture",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
+    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
+    assert!(!rt.is_audio_unmuted()); // Still muted because playback not streaming yet
+
+    observe_stream_state(
+        "playback",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    assert_eq!(rt.playback_active.load(Ordering::Acquire), 1);
+    assert_eq!(backend.state(), BackendState::Running);
+    assert!(
+        rt.is_audio_unmuted(),
+        "Both streams streaming + format ok -> unmuted"
+    );
+
+    // Condition 2: Disconnect / Pause (e.g. node switch or stream pause)
+    observe_stream_state(
+        "capture",
+        StreamState::Streaming,
+        StreamState::Paused,
+        &backend,
+    );
+    assert_eq!(
+        rt.capture_active.load(Ordering::Acquire),
+        0,
+        "Capture pause sets latch to 0"
+    );
+    assert!(
+        !rt.is_audio_unmuted(),
+        "Stream pause immediately mutes RT audio"
+    );
+    assert_eq!(backend.state(), BackendState::Starting);
+
+    // Resuming streaming restores RT unmuting
+    observe_stream_state(
+        "capture",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
+    assert!(rt.is_audio_unmuted(), "Resume restores unmuted audio");
+    assert_eq!(backend.state(), BackendState::Running);
+
+    // Condition 3: Disconnect & Bounded Reconnect Cycle
+    observe_stream_state(
+        "capture",
+        StreamState::Streaming,
+        StreamState::Unconnected,
+        &backend,
+    );
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
+    assert!(!rt.is_audio_unmuted());
+    assert!(backend.is_failed());
+
+    backend.begin_reconnect(1, 3, Duration::from_millis(100));
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
+    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
+    assert!(
+        !rt.is_audio_unmuted(),
+        "Audio stays muted while reconnecting"
+    );
+
+    // Reconnection establishes streams again
+    observe_stream_state(
+        "capture",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    observe_stream_state(
+        "playback",
+        StreamState::Paused,
+        StreamState::Streaming,
+        &backend,
+    );
+    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
+    assert_eq!(rt.playback_active.load(Ordering::Acquire), 1);
+    assert!(
+        rt.is_audio_unmuted(),
+        "Reconnected streams restore unmuted audio"
+    );
+    assert_eq!(backend.state(), BackendState::Running);
+
+    // Condition 4: Fatal Stream Failure / Error
+    observe_stream_state(
+        "playback",
+        StreamState::Streaming,
+        StreamState::Error("Fatal PipeWire node failure".to_string()),
+        &backend,
+    );
+    assert_eq!(
+        rt.playback_active.load(Ordering::Acquire),
+        0,
+        "Error sets playback latch to 0"
+    );
+    assert!(!rt.is_audio_unmuted(), "Error mutes audio immediately");
+    assert!(backend.is_failed());
+}
+
+#[test]
+fn wakeup_notifies_on_state_transitions() {
+    let mut backend = SharedBackendStatus::new();
+    let wakeup = crate::standalone::pw_host::wakeup::ControlPlaneWakeup::new();
+    backend.bind_wakeup(wakeup.clone());
+
+    // Spawn a worker thread to trigger state change after 20ms
+    let backend_arc = Arc::new(backend);
+    let backend_cloned = backend_arc.clone();
+
+    let start = Instant::now();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(20));
+        backend_cloned.mark_running();
+    });
+
+    // Control plane waits up to 500ms, should wake up around 20ms
+    let notified = wakeup.wait_timeout(Duration::from_millis(500));
+    let elapsed = start.elapsed();
+
+    assert!(notified, "Wakeup must report true when notified");
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "Wakeup must wake immediately upon state transition (elapsed: {elapsed:?})"
+    );
+    assert_eq!(backend_arc.state(), BackendState::Running);
+
+    handle.join().unwrap();
 }

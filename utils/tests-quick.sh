@@ -88,11 +88,15 @@ phase "Structural: unit & integration tests (debug)..."
 # T5.6 / ER-5: the distribution-QA harness (distribution_qa) contributes the
 # release audit acceptances here (strict AppStream XML, typed receipt
 # validator, provenance integrity, dist binary smoke).
+# T5.3 / G-PERF-004: the endurance telemetry parsers (endurance) contribute
+# the fast /proc diagnostics gate; the wall-clock endurance stays #[ignore]d
+# and runs exclusively in tests-long.sh Phase 6.
 timeout 420 cargo test --features testing \
     --lib \
     --bin nam-audio-pipe \
     --test stereo_fidelity \
     --test swap_stress \
+    --test endurance \
     --test recording \
     --test recording_fault_injection \
     --test e2e_cli \
@@ -107,6 +111,7 @@ for t in \
     "unittests src/lib.rs" \
     "tests/stereo_fidelity.rs" \
     "tests/swap_stress.rs" \
+    "tests/endurance.rs" \
     "tests/recording_fault_injection.rs" \
     "tests/e2e_cli.rs" \
     "tests/service_resilience.rs" \
@@ -138,9 +143,11 @@ phase "Release verification: integration tests (release)..."
 # (the codegen-sensitive surface, alongside recording/e2e_cli).
 # T4.6 / ER-4: service_resilience daemon-free acceptances run in release too.
 # T5.6 / ER-5: distribution_qa release audit acceptances run in release too.
+# T5.3 / G-PERF-004: endurance parser gate runs in release too.
 timeout 420 cargo test --features testing \
     --test stereo_fidelity \
     --test swap_stress \
+    --test endurance \
     --test recording \
     --test recording_fault_injection \
     --test e2e_cli \
@@ -154,6 +161,7 @@ assert_ran_tests target/logs/quick-phase2.log 1
 for t in \
     "tests/stereo_fidelity.rs" \
     "tests/swap_stress.rs" \
+    "tests/endurance.rs" \
     "tests/recording_fault_injection.rs" \
     "tests/e2e_cli.rs" \
     "tests/service_resilience.rs" \

@@ -33,12 +33,16 @@
 mod common;
 
 use common::{DirGuard, temp_dir};
+use nam_audio_pipe::receipt::long::{
+    ENDURANCE_PURPOSE_TOKEN, LongPhaseStatus, SOAK_PURPOSE_TOKEN, parse_long_receipt,
+};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 /// AppStream metainfo location relative to the crate root (F-RB-012 / T5.1).
 const METAINFO_REL: &str = "packaging/flatpak/io.github.fabiohl.NAMAudioPipe.metainfo.xml";
@@ -54,16 +58,24 @@ const PROVENANCE_REL: &str = "target/logs/release-provenance.json";
 const LONG_SUITE_REL: &str = "utils/tests-long.sh";
 /// Structured long-suite receipt produced by `utils/tests-long.sh`.
 const LONG_RECEIPT_REL: &str = "target/logs/long-receipt.txt";
-/// The five canonical long-audit phases (G-RB-002 / T6.3).
-const LONG_PHASE_IDS: [&str; 5] = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5"];
+/// The six canonical long-audit phases (G-RB-002 / T6.3; PHASE6 = real
+/// wall-clock endurance, T5.3 / G-PERF-004).
+const LONG_PHASE_IDS: [&str; 6] = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6"];
 /// Canonical `run_phase` names the runner must declare verbatim.
-const LONG_PHASE_NAMES: [&str; 5] = [
-    "Phase 1: Soak prolongado & concorrência de swaps",
+const LONG_PHASE_NAMES: [&str; 6] = [
+    "Phase 1: Soak acelerado (timeline comprimida) & concorrência de swaps",
     "Phase 2: RT-Safety heap-audit (zero-alloc)",
     "Phase 3: RT Deadline gate (nanosecond budget)",
     "Phase 4: RT Jitter gate (inter-callback dispersion)",
     "Phase 5: Concurrency interleaving stress & state resilience",
+    "Phase 6: Endurance real & state-machine throughput",
 ];
+
+/// Serializes tests that replace `target/logs/long-receipt.txt` (T5.1 strict
+/// propagation validation via `utils/tests-long.sh --simulate`) against the
+/// ER-6 live audit that reads it — a concurrent read must never observe a
+/// half-replaced receipt.
+static LONG_RECEIPT_MUTEX: Mutex<()> = Mutex::new(());
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -563,9 +575,9 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
     let doc: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| format!("provenance receipt is not valid JSON: {e}"))?;
 
-    if doc.get("schema_version").and_then(|v| v.as_u64()) != Some(1) {
+    if doc.get("schema_version").and_then(|v| v.as_u64()) != Some(2) {
         return Err(format!(
-            "unexpected schema_version: {:?}",
+            "unexpected schema_version: {:?} (T5.1 identity schema requires version 2)",
             doc.get("schema_version")
         ));
     }
@@ -638,7 +650,69 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         ));
     }
 
-    // 3. Validate ceremony_chain (Mandatory schema component, T8.2)
+    // 3. Validate build identity (T5.1): the receipt must identify the exact
+    //    artifact — build profile, active features, the explicit opt-out of
+    //    harness-measured performance claims for the final ELF — and the build
+    //    environment (kernel release + pw-cli version).
+    let build = doc
+        .get("build")
+        .and_then(|v| v.as_object())
+        .ok_or("'build' object missing from receipt")?;
+    let build_profile = build
+        .get("profile")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'build.profile'")?;
+    if build_profile != "dist" && build_profile != "testing" {
+        return Err(format!(
+            "invalid build.profile: {build_profile:?} (expected 'dist' or 'testing')"
+        ));
+    }
+    let features = build
+        .get("features")
+        .and_then(|v| v.as_array())
+        .ok_or("missing 'build.features' (active feature list)")?;
+    if features.is_empty() {
+        return Err("'build.features' must not be empty — the ELF was built with features".into());
+    }
+    for f in features {
+        f.as_str()
+            .ok_or("'build.features' entries must be strings")?;
+    }
+    let measured_claims = build
+        .get("optimizations")
+        .and_then(|v| v.as_object())
+        .and_then(|v| v.get("measured_performance_claims"))
+        .and_then(|v| v.as_bool())
+        .ok_or("missing 'build.optimizations.measured_performance_claims'")?;
+    if measured_claims {
+        return Err(
+            "measured_performance_claims must be false: no harness metric may be attributed to the final PGO+BOLT ELF (T5.1)"
+                .into(),
+        );
+    }
+
+    let environment = doc
+        .get("environment")
+        .and_then(|v| v.as_object())
+        .ok_or("'environment' object missing from receipt")?;
+    let kernel_release = environment
+        .get("kernel_release")
+        .and_then(|v| v.as_str())
+        .ok_or("missing 'environment.kernel_release' (uname -r)")?;
+    if kernel_release.is_empty() {
+        return Err("'environment.kernel_release' must not be empty".into());
+    }
+    match environment.get("pw_cli_version") {
+        Some(v) if v.is_string() => {}
+        Some(v) if v.is_null() => {}
+        _ => {
+            return Err(
+                "missing 'environment.pw_cli_version' (a string or null — absent only when pw-cli is unavailable)".into(),
+            );
+        }
+    }
+
+    // 4. Validate ceremony_chain (Mandatory schema component, T8.2)
     let chain = doc
         .get("ceremony_chain")
         .and_then(|v| v.as_object())
@@ -737,12 +811,22 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         };
         let long_text = std::fs::read_to_string(&long_abs)
             .map_err(|e| format!("read long_receipt {}: {e}", long_abs.display()))?;
-        if !long_text.contains("STRICT: 1")
-            || !long_text.contains("MODE: full")
-            || !long_text.contains("OVERALL: PASSED")
-        {
-            return Err("certified_release requires long_receipt with STRICT: 1, MODE: full, and OVERALL: PASSED".into());
-        }
+        // Semantic strict certification (T5.1/T8.1) — never a substring search:
+        // the shared parser must accept the receipt and certify it as a real
+        // strict passed run (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1,
+        // MODE: full, OVERALL: PASSED).
+        let long_receipt = parse_long_receipt(&long_text).map_err(|e| {
+            format!(
+                "certified_release long_receipt {} is not parseable: {e}",
+                long_abs.display()
+            )
+        })?;
+        long_receipt.verify_release_certification().map_err(|e| {
+            format!(
+                "certified_release long_receipt {} failed strict certification: {e}",
+                long_abs.display()
+            )
+        })?;
     } else {
         // Optional receipt verification when uncertified
         for key in [
@@ -810,7 +894,7 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
     }
 
     let doc = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "tool": "distribution_qa.rs",
         "kind": "release-provenance",
         "project": {
@@ -826,13 +910,19 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
         },
         "build": {
             "profile": "dist",
+            "features": ["stereo"],
             "rustflags": "-C target-cpu=x86-64-v3",
             "optimizations": {
                 "status": "PGO+BOLT",
                 "cpu_baseline": "x86-64-v3",
                 "pgo": true,
-                "bolt": true
+                "bolt": true,
+                "measured_performance_claims": false
             }
+        },
+        "environment": {
+            "kernel_release": "6.12-test-kernel",
+            "pw_cli_version": null
         },
         "dependencies": {
             "cargo_lock_sha256": lock_sha,
@@ -882,6 +972,96 @@ fn provenance_validator_rejects_old_schema_without_ceremony_chain() {
         err.contains("ceremony_chain") && err.contains("old schema rejected"),
         "receipt without ceremony_chain must be rejected, got: {err}"
     );
+}
+
+/// (c) Negative: the T5.1 identity schema bumps `schema_version` to 2 — a
+/// stale v1 receipt must be rejected fail-closed.
+#[test]
+fn provenance_validator_rejects_schema_v1_receipt() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["schema_version"] = 1.into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("unexpected schema_version") && err.contains("version 2"),
+        "schema v1 receipt must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: `measured_performance_claims: true` must be rejected — no
+/// harness metric may ever be attributed to the final PGO+BOLT ELF (T5.1).
+#[test]
+fn provenance_validator_rejects_measured_performance_claims() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["build"]["optimizations"]["measured_performance_claims"] = true.into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("measured_performance_claims")
+            && err.contains("no harness metric may be attributed"),
+        "measured_performance_claims=true must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: the T5.1 identity fields are mandatory — a receipt without
+/// `build.features` or without the `environment` block cannot identify the
+/// exact artifact and build host.
+#[test]
+fn provenance_validator_rejects_missing_identity_fields() {
+    for (field, expected) in [
+        ("build.features", "missing 'build.features'"),
+        ("environment", "'environment' object missing"),
+    ] {
+        let dir = temp_dir();
+        let _guard = DirGuard::new(dir.clone());
+        let file = dir.join("payload.bin");
+        std::fs::write(&file, b"certified artifact payload").expect("write payload");
+        let receipt = dir.join("release-provenance.json");
+        write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        match field {
+            "build.features" => {
+                doc.as_object_mut()
+                    .unwrap()
+                    .get_mut("build")
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("features");
+            }
+            "environment" => {
+                doc.as_object_mut().unwrap().remove("environment");
+            }
+            _ => unreachable!(),
+        }
+        write_synthetic_receipt_with_doc(&receipt, doc);
+
+        let err = validate_provenance_receipt(&receipt).unwrap_err();
+        assert!(
+            err.contains(expected),
+            "receipt missing {field} must be rejected, got: {err}"
+        );
+    }
 }
 
 /// (c) Negative: mismatched `project.commit` must be rejected (T8.2).
@@ -1165,7 +1345,7 @@ fn dist_binary_smoke_under_panic_abort_profile() {
 /// gates depend on it being runnable by a human operator (and never silently
 /// replaced by a non-executable stub), so this structural audit is mandatory:
 /// `+x` permissions, `GPL-3.0-or-later` SPDX header, the AI-safety governance
-/// warning (human-operator-only execution), all 5 canonical phases declared
+/// warning (human-operator-only execution), all 6 canonical phases declared
 /// verbatim, and the `--strict-pre-release` / `--simulate` argument parsing.
 #[test]
 fn long_suite_script_is_executable_and_fully_specified() {
@@ -1230,9 +1410,11 @@ fn long_suite_script_is_executable_and_fully_specified() {
     );
 }
 
-/// (e) Structural audit: `utils/build-release.sh` must enforce a real, strict long-suite
-/// receipt (`SUITE: tests-long`, `STRICT: 1`, `MODE: full`, `OVERALL: PASSED`) during `--release-ceremony`
-/// and strictly reject `SIMULATED`, `STRICT: 0`, `COMPLETED_WITH_GAPS`, `FAILED` or missing receipts (T8.1).
+/// (e) Structural audit: `utils/build-release.sh` must enforce a real, strict
+/// long-suite receipt during `--release-ceremony` through the *semantic*
+/// verifier (`long_receipt_check` + `NAM_RT_STRICT: 1` propagation, T5.1/T8.1)
+/// — never a substring search — and strictly reject `SIMULATED`, `STRICT: 0`,
+/// `COMPLETED_WITH_GAPS`, `FAILED` or missing receipts.
 #[test]
 fn build_release_script_requires_real_strict_long_receipt() {
     let path = repo_root().join("utils/build-release.sh");
@@ -1240,11 +1422,17 @@ fn build_release_script_requires_real_strict_long_receipt() {
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
 
     assert!(
+        text.contains("long_receipt_check"),
+        "{} must verify the long receipt through the semantic long_receipt_check gate (T5.1), not a substring search",
+        path.display()
+    );
+    assert!(
         text.contains("SUITE: tests-long")
             && text.contains("STRICT: 1")
+            && text.contains("NAM_RT_STRICT: 1")
             && text.contains("MODE: full")
             && text.contains("OVERALL: PASSED"),
-        "{} must check for SUITE: tests-long, STRICT: 1, MODE: full, OVERALL: PASSED in long-receipt.txt",
+        "{} must name the strict certification fields (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1, MODE: full, OVERALL: PASSED)",
         path.display()
     );
     assert!(
@@ -1261,7 +1449,7 @@ fn build_release_script_requires_real_strict_long_receipt() {
 
 /// (e) Live structural surface: `utils/tests-long.sh --help` is the sanctioned
 /// read-only surface for AI/CI structural validation (the runner itself is
-/// human-operator-only). It must exit 0 and inventory all 5 canonical phases
+/// human-operator-only). It must exit 0 and inventory all 6 canonical phases
 /// plus the `--strict-pre-release` / `--simulate` options; an unknown option
 /// must be rejected fail-closed with exit code 2 (never silently accepted).
 #[test]
@@ -1306,234 +1494,6 @@ fn long_suite_help_surface_is_parseable_and_fail_closed() {
     );
 }
 
-/// Phase verdict of a long-suite receipt line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LongPhaseStatus {
-    Pass,
-    Fail,
-    Gap,
-    Simulated,
-}
-
-/// One `PHASEn: <status> log=... duration_ms=...` line of the long receipt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LongPhaseResult {
-    id: String,
-    status: LongPhaseStatus,
-    log: String,
-    duration_ms: Option<u64>,
-}
-
-/// Fail-closed parsed representation of `target/logs/long-receipt.txt`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LongReceipt {
-    suite: String,
-    strict: bool,
-    mode: String,
-    phases: Vec<LongPhaseResult>,
-    gaps: Vec<String>,
-    overall: String,
-}
-
-/// Parses one `PHASEn: <status> log=... duration_ms=...` line. `None` when the
-/// line is not a phase line or is structurally malformed (unknown status
-/// token, missing `log=` attribute).
-fn parse_long_phase(line: &str) -> Option<(String, LongPhaseStatus, String, Option<u64>)> {
-    let rest = line.strip_prefix("PHASE")?;
-    let (num, tail) = rest.split_once(':')?;
-    let id = format!("PHASE{num}");
-    let mut tokens = tail.split_whitespace();
-    let status = match tokens.next()? {
-        "PASS" => LongPhaseStatus::Pass,
-        "FAIL" => LongPhaseStatus::Fail,
-        "GAP" => LongPhaseStatus::Gap,
-        "SIMULATED" => LongPhaseStatus::Simulated,
-        _ => return None,
-    };
-    let mut log = String::new();
-    let mut duration_ms = None;
-    for tok in tokens {
-        if let Some(v) = tok.strip_prefix("log=") {
-            log = v.to_string();
-        } else if let Some(v) = tok.strip_prefix("duration_ms=") {
-            duration_ms = v.parse().ok();
-        }
-    }
-    Some((id, status, log, duration_ms))
-}
-
-/// Fail-closed parser for the long-suite receipt format
-/// (`target/logs/long-receipt.txt`, emitted by `utils/tests-long.sh`):
-///
-/// ```text
-/// SUITE: tests-long
-/// STRICT: 0
-/// MODE: simulate|full
-/// PHASE1: PASS|FAIL|GAP|SIMULATED log=target/logs/... [duration_ms=N]
-/// ... (PHASE2..PHASE5)
-/// GAP: <typed reason>            (zero or more)
-/// OVERALL: PASSED|FAILED|COMPLETED_WITH_GAPS|SIMULATED
-/// ```
-///
-/// Unknown line types, duplicated mandatory fields, invalid values, a missing
-/// mandatory phase or a missing `OVERALL:` verdict are all rejected — a receipt
-/// that cannot be parsed fail-closed must never certify anything.
-fn parse_long_receipt(text: &str) -> Result<LongReceipt, String> {
-    let mut suite: Option<String> = None;
-    let mut strict: Option<bool> = None;
-    let mut mode: Option<String> = None;
-    let mut phases: Vec<LongPhaseResult> = Vec::new();
-    let mut gaps: Vec<String> = Vec::new();
-    let mut overall: Option<String> = None;
-
-    for (idx, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let lineno = idx + 1;
-        if let Some(v) = line.strip_prefix("SUITE:") {
-            let v = v.trim();
-            if suite.replace(v.to_string()).is_some() {
-                return Err(format!("line {lineno}: duplicate SUITE: line"));
-            }
-        } else if let Some(v) = line.strip_prefix("STRICT:") {
-            let parsed = match v.trim() {
-                "0" => false,
-                "1" => true,
-                other => {
-                    return Err(format!(
-                        "line {lineno}: invalid STRICT: value {other:?} (expected 0 or 1)"
-                    ));
-                }
-            };
-            if strict.replace(parsed).is_some() {
-                return Err(format!("line {lineno}: duplicate STRICT: line"));
-            }
-        } else if let Some(v) = line.strip_prefix("MODE:") {
-            let v = v.trim();
-            if v != "simulate" && v != "full" {
-                return Err(format!(
-                    "line {lineno}: invalid MODE: value {v:?} (expected simulate or full)"
-                ));
-            }
-            if mode.replace(v.to_string()).is_some() {
-                return Err(format!("line {lineno}: duplicate MODE: line"));
-            }
-        } else if let Some(v) = line.strip_prefix("OVERALL:") {
-            let v = v.trim();
-            if !matches!(v, "PASSED" | "FAILED" | "COMPLETED_WITH_GAPS" | "SIMULATED") {
-                return Err(format!("line {lineno}: invalid OVERALL: verdict {v:?}"));
-            }
-            if overall.replace(v.to_string()).is_some() {
-                return Err(format!("line {lineno}: duplicate OVERALL: line"));
-            }
-        } else if let Some(v) = line.strip_prefix("GAP:") {
-            gaps.push(v.trim().to_string());
-        } else if line.starts_with("PHASE") {
-            let (id, status, log, duration_ms) = parse_long_phase(line)
-                .ok_or_else(|| format!("line {lineno}: malformed phase line: {line:?}"))?;
-            phases.push(LongPhaseResult {
-                id,
-                status,
-                log,
-                duration_ms,
-            });
-        } else {
-            return Err(format!(
-                "line {lineno}: unrecognized receipt line: {line:?}"
-            ));
-        }
-    }
-
-    let suite = suite.ok_or("missing SUITE: line")?;
-    let strict = strict.ok_or("missing STRICT: line")?;
-    let mode = mode.ok_or("missing MODE: line")?;
-    let overall = overall.ok_or("missing OVERALL: line")?;
-
-    for n in 1..=5 {
-        let id = format!("PHASE{n}");
-        if !phases.iter().any(|p| p.id == id) {
-            return Err(format!("missing mandatory phase {id} in receipt"));
-        }
-    }
-
-    Ok(LongReceipt {
-        suite,
-        strict,
-        mode,
-        phases,
-        gaps,
-        overall,
-    })
-}
-
-impl LongReceipt {
-    /// Semantic consistency audit (fail-closed): the `OVERALL:` verdict must
-    /// match the phase/gap evidence collected in the same receipt, mirroring
-    /// the runner's verdict logic — a `PASSED` receipt may not hide a GAP
-    /// phase, a `COMPLETED_WITH_GAPS` must be backed by gap evidence, and a
-    /// simulate run must close as `SIMULATED` with only simulated phases.
-    fn audit(&self) -> Result<(), String> {
-        if self.mode == "simulate" {
-            if self.overall != "SIMULATED" {
-                return Err(format!(
-                    "simulate receipt must close with OVERALL: SIMULATED, got {:?}",
-                    self.overall
-                ));
-            }
-            if !self
-                .phases
-                .iter()
-                .all(|p| p.status == LongPhaseStatus::Simulated)
-            {
-                return Err("simulate receipt must carry only SIMULATED phase statuses".into());
-            }
-            return Ok(());
-        }
-
-        let has_fail = self
-            .phases
-            .iter()
-            .any(|p| p.status == LongPhaseStatus::Fail);
-        let has_gap =
-            self.phases.iter().any(|p| p.status == LongPhaseStatus::Gap) || !self.gaps.is_empty();
-        match self.overall.as_str() {
-            "PASSED" if !has_fail && !has_gap => Ok(()),
-            "FAILED" if has_fail => Ok(()),
-            "COMPLETED_WITH_GAPS" if has_gap && !has_fail => Ok(()),
-            other => Err(format!(
-                "inconsistent receipt: OVERALL={other} (fail_phase={has_fail}, gap_evidence={has_gap})"
-            )),
-        }
-    }
-
-    /// Verifies if the receipt meets strict release certification requirements (T8.1):
-    /// `SUITE: tests-long`, `STRICT: 1`, `MODE: full`, `OVERALL: PASSED`.
-    fn verify_release_certification(&self) -> Result<(), String> {
-        self.audit()?;
-        if self.suite != "tests-long" {
-            return Err(format!("expected SUITE: tests-long, got {:?}", self.suite));
-        }
-        if !self.strict {
-            return Err("release certification requires STRICT: 1 (got STRICT: 0)".into());
-        }
-        if self.mode != "full" {
-            return Err(format!(
-                "release certification requires MODE: full (got {:?})",
-                self.mode
-            ));
-        }
-        if self.overall != "PASSED" {
-            return Err(format!(
-                "release certification requires OVERALL: PASSED (got {:?})",
-                self.overall
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// (e) Negative: `LongReceipt::verify_release_certification` must reject simulated receipts
 /// (`MODE: simulate`, `OVERALL: SIMULATED`) when evaluating release certification (T8.1).
 #[test]
@@ -1541,6 +1501,7 @@ fn long_receipt_certification_rejects_simulated_receipt() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1564,6 +1525,7 @@ fn long_receipt_certification_rejects_non_strict_receipt() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: full
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
@@ -1580,18 +1542,22 @@ OVERALL: PASSED
     );
 }
 
-/// (e) Positive: `LongReceipt::verify_release_certification` accepts real strict passed receipt (T8.1).
+/// (e) Positive: `LongReceipt::verify_release_certification` accepts real strict passed receipt (T8.1 + T5.1 + T5.3).
 #[test]
 fn long_receipt_certification_accepts_real_strict_passed_receipt() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 1
+NAM_RT_STRICT: 1
 MODE: full
+SOAK_PURPOSE: accelerated_timeline — timeline comprimida, janelas fail-closed
+ENDURANCE_PURPOSE: real_wall_clock — parede, RSS/faults/threads/FDs periódicos
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
 PHASE3: PASS log=target/logs/phase3-rt-deadline.log
 PHASE4: PASS log=target/logs/phase4-rt-jitter.log
 PHASE5: PASS log=target/logs/phase5-concurrency.log
+PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000
 OVERALL: PASSED
 ";
     let receipt = parse_long_receipt(RECEIPT).unwrap();
@@ -1605,6 +1571,7 @@ fn long_receipt_parser_accepts_simulated_receipt() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1618,6 +1585,7 @@ OVERALL: SIMULATED
         parse_long_receipt(RECEIPT).unwrap_or_else(|e| panic!("simulated receipt must parse: {e}"));
     assert_eq!(receipt.suite, "tests-long");
     assert!(!receipt.strict);
+    assert_eq!(receipt.nam_rt_strict, Some(false));
     assert_eq!(receipt.mode, "simulate");
     assert_eq!(receipt.phases.len(), 5);
     assert!(
@@ -1642,6 +1610,7 @@ fn long_receipt_parser_detects_gaps_fail_closed() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: full
 PHASE1: PASS log=target/logs/phase1-soak.log duration_ms=120000
 PHASE2: PASS log=target/logs/phase2-heap-audit.log duration_ms=90000
@@ -1676,6 +1645,7 @@ fn long_receipt_audit_rejects_passed_verdict_with_gap_evidence() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: full
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
@@ -1701,6 +1671,7 @@ fn long_receipt_parser_rejects_unknown_lines() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1724,6 +1695,7 @@ fn long_receipt_parser_rejects_missing_overall() {
     const RECEIPT: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1745,6 +1717,7 @@ fn long_receipt_parser_rejects_malformed_and_truncated_receipts() {
     const BAD_STATUS: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: MAYBE log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1762,6 +1735,7 @@ OVERALL: SIMULATED
     const TRUNCATED: &str = "\
 SUITE: tests-long
 STRICT: 0
+NAM_RT_STRICT: 0
 MODE: simulate
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -1783,6 +1757,7 @@ OVERALL: SIMULATED
 /// green ER-6 gate always implies a valid long-suite receipt was on disk.
 #[test]
 fn long_suite_receipt_audit() {
+    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
     let path = repo_root().join(LONG_RECEIPT_REL);
     if !path.is_file() {
         eprintln!(
@@ -1810,5 +1785,408 @@ fn long_suite_receipt_audit() {
         phases.join(","),
         receipt.gaps.len(),
         path.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T5.1: NAM_RT_STRICT propagation validation — the strict flag must reach
+// `tests/rt_metrics.rs` (via `utils/tests-long.sh --strict-pre-release`)
+// without ever running the long suite (rules/testing.md §2: AI/CI uses only
+// the non-executing `--simulate` surface).
+// ---------------------------------------------------------------------------
+
+/// RAII guard that restores the operator's long-audit receipt and phase logs
+/// after a `--simulate` invocation replaced them (the sanctioned CI surface).
+struct LongSimulateGuard {
+    backups: Vec<(PathBuf, PathBuf)>,
+}
+
+impl LongSimulateGuard {
+    fn new() -> Self {
+        let root = repo_root();
+        let mut files = vec![root.join(LONG_RECEIPT_REL)];
+        for name in [
+            "phase1-soak.log",
+            "phase2-heap-audit.log",
+            "phase3-rt-deadline.log",
+            "phase4-rt-jitter.log",
+            "phase5-concurrency.log",
+            "phase6-endurance.log",
+        ] {
+            files.push(root.join(format!("target/logs/{name}")));
+        }
+        let mut backups = Vec::new();
+        for f in files {
+            if f.is_file() {
+                let bk = f.with_extension("t5.1-test-backup");
+                let _ = std::fs::copy(&f, &bk);
+                backups.push((f, bk));
+            }
+        }
+        Self { backups }
+    }
+}
+
+impl Drop for LongSimulateGuard {
+    fn drop(&mut self) {
+        for (orig, bk) in &self.backups {
+            let _ = std::fs::copy(bk, orig);
+            let _ = std::fs::remove_file(bk);
+        }
+    }
+}
+
+/// Runs `utils/tests-long.sh` with `args` (the sanctioned non-executing
+/// `--simulate` surface) with `NAM_RT_STRICT` removed from the child
+/// environment, and returns the generated long-receipt text.
+fn run_tests_long_simulate(args: &[&str]) -> String {
+    let root = repo_root();
+    let out = Command::new(root.join(LONG_SUITE_REL))
+        .current_dir(&root)
+        .args(args)
+        .env_remove("NAM_RT_STRICT")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to execute {}: {e}", LONG_SUITE_REL));
+    assert!(
+        out.status.success(),
+        "{} {args:?} must exit 0 (got {:?}); stderr: {}",
+        LONG_SUITE_REL,
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let receipt_path = root.join(LONG_RECEIPT_REL);
+    std::fs::read_to_string(&receipt_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read generated receipt {}: {e}",
+            receipt_path.display()
+        )
+    })
+}
+
+/// (T5.1) Gate acceptance: `--strict-pre-release` must propagate
+/// `NAM_RT_STRICT=1` — the simulate receipt records `STRICT: 1` AND
+/// `NAM_RT_STRICT: 1` (the observable propagation evidence the release
+/// ceremony requires). No long-suite test is executed.
+#[test]
+fn strict_pre_release_propagates_nam_rt_strict() {
+    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _guard = LongSimulateGuard::new();
+
+    let text = run_tests_long_simulate(&["--simulate", "--strict-pre-release"]);
+    let receipt = parse_long_receipt(&text)
+        .unwrap_or_else(|e| panic!("--simulate --strict-pre-release receipt must parse: {e}"));
+    assert!(
+        receipt.strict,
+        "STRICT: 1 must be recorded for --strict-pre-release"
+    );
+    assert_eq!(
+        receipt.nam_rt_strict,
+        Some(true),
+        "NAM_RT_STRICT=1 must be propagated and recorded (T5.1), receipt:\n{text}"
+    );
+    assert_eq!(
+        receipt.mode, "simulate",
+        "the --simulate surface stays non-executing"
+    );
+    receipt
+        .audit()
+        .unwrap_or_else(|e| panic!("strict simulate receipt must audit cleanly: {e}"));
+}
+
+/// (T5.1) Companion: a non-strict simulate run records `NAM_RT_STRICT: 0` —
+/// the propagation is a strict-only behavior, never inherited by accident.
+#[test]
+fn non_strict_simulate_records_nam_rt_strict_zero() {
+    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _guard = LongSimulateGuard::new();
+
+    let text = run_tests_long_simulate(&["--simulate"]);
+    let receipt =
+        parse_long_receipt(&text).unwrap_or_else(|e| panic!("--simulate receipt must parse: {e}"));
+    assert!(!receipt.strict);
+    assert_eq!(
+        receipt.nam_rt_strict,
+        Some(false),
+        "a non-strict run must record NAM_RT_STRICT: 0, receipt:\n{text}"
+    );
+    receipt
+        .audit()
+        .unwrap_or_else(|e| panic!("simulate receipt must audit cleanly: {e}"));
+}
+
+/// (T5.1) Negative: an invalid `NAM_RT_STRICT:` value must be rejected
+/// fail-closed by the semantic parser.
+#[test]
+fn long_receipt_parser_rejects_invalid_nam_rt_strict_value() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 2
+MODE: simulate
+PHASE1: SIMULATED log=target/logs/phase1-soak.log
+PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
+PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
+PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
+PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
+OVERALL: SIMULATED
+";
+    let err = parse_long_receipt(RECEIPT).unwrap_err();
+    assert!(
+        err.contains("invalid NAM_RT_STRICT") && err.contains("expected 0 or 1"),
+        "invalid NAM_RT_STRICT value must be rejected, got: {err}"
+    );
+}
+
+/// (T5.1) Negative: a receipt claiming `STRICT: 1` while recording
+/// `NAM_RT_STRICT: 0` is internally inconsistent and must fail the semantic
+/// audit — a strict run without propagation evidence can never certify.
+#[test]
+fn long_receipt_audit_rejects_strict_without_propagation_evidence() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 0
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    let err = receipt.audit().unwrap_err();
+    assert!(
+        err.contains("STRICT: 1 but NAM_RT_STRICT: 0"),
+        "strict receipt without propagation evidence must fail the audit, got: {err}"
+    );
+}
+
+/// (T5.1) Negative: strict release certification requires the
+/// `NAM_RT_STRICT: 1` propagation evidence — a receipt that predates the
+/// field (or lacks the line) cannot certify a release.
+#[test]
+fn long_receipt_certification_requires_nam_rt_strict_propagation() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    let err = receipt.verify_release_certification().unwrap_err();
+    assert!(
+        err.contains("NAM_RT_STRICT: 1"),
+        "certification without NAM_RT_STRICT propagation evidence must be rejected, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T5.3 (G-PERF-004): soak/endurance purpose declarations in the receipt.
+// The accelerated timeline soak and the real wall-clock endurance are separate
+// suites; the receipt must declare each purpose and the strict certification
+// must require PHASE6 (real endurance) — never conflating harness throughput
+// with RT audio throughput.
+// ---------------------------------------------------------------------------
+
+/// (T5.3) Gate acceptance: the `--simulate` receipt (the sanctioned
+/// non-executing surface) declares both soak suite purposes — `SOAK_PURPOSE:
+/// accelerated_timeline` and `ENDURANCE_PURPOSE: real_wall_clock` — and
+/// closes the new PHASE6 (real endurance) as SIMULATED. No long-suite test is
+/// executed.
+#[test]
+fn simulate_receipt_declares_suite_purposes_and_phase6() {
+    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _guard = LongSimulateGuard::new();
+
+    let text = run_tests_long_simulate(&["--simulate"]);
+    let receipt =
+        parse_long_receipt(&text).unwrap_or_else(|e| panic!("--simulate receipt must parse: {e}"));
+    let soak = receipt.soak_purpose.as_deref().unwrap_or_default();
+    assert!(
+        soak.starts_with(SOAK_PURPOSE_TOKEN),
+        "SOAK_PURPOSE must declare accelerated_timeline, receipt:\n{text}"
+    );
+    let endurance = receipt.endurance_purpose.as_deref().unwrap_or_default();
+    assert!(
+        endurance.starts_with(ENDURANCE_PURPOSE_TOKEN),
+        "ENDURANCE_PURPOSE must declare real_wall_clock, receipt:\n{text}"
+    );
+    let phase6 = receipt
+        .phases
+        .iter()
+        .find(|p| p.id == "PHASE6")
+        .expect("PHASE6 must be declared by the runner");
+    assert_eq!(
+        phase6.status,
+        LongPhaseStatus::Simulated,
+        "simulate receipt must register PHASE6 as SIMULATED"
+    );
+    receipt
+        .audit()
+        .unwrap_or_else(|e| panic!("simulate receipt must audit cleanly: {e}"));
+}
+
+/// (T5.3) Negative: a `SOAK_PURPOSE:` / `ENDURANCE_PURPOSE:` line carrying a
+/// non-canonical purpose token must be rejected fail-closed.
+#[test]
+fn long_receipt_parser_rejects_invalid_purpose_values() {
+    const BAD_SOAK: &str = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: simulate
+SOAK_PURPOSE: real_wall_clock
+PHASE1: SIMULATED log=target/logs/phase1-soak.log
+PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
+PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
+PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
+PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
+PHASE6: SIMULATED log=target/logs/phase6-endurance.log
+OVERALL: SIMULATED
+";
+    let err = parse_long_receipt(BAD_SOAK).unwrap_err();
+    assert!(
+        err.contains("invalid SOAK_PURPOSE"),
+        "non-canonical SOAK_PURPOSE must be rejected, got: {err}"
+    );
+
+    const BAD_ENDURANCE: &str = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: simulate
+SOAK_PURPOSE: accelerated_timeline — timeline comprimida
+ENDURANCE_PURPOSE: accelerated_timeline
+PHASE1: SIMULATED log=target/logs/phase1-soak.log
+PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
+PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
+PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
+PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
+PHASE6: SIMULATED log=target/logs/phase6-endurance.log
+OVERALL: SIMULATED
+";
+    let err = parse_long_receipt(BAD_ENDURANCE).unwrap_err();
+    assert!(
+        err.contains("invalid ENDURANCE_PURPOSE"),
+        "non-canonical ENDURANCE_PURPOSE must be rejected, got: {err}"
+    );
+
+    // A crafted value that merely *starts with* the canonical token (no
+    // separator) must never certify — whole-token match is fail-closed.
+    const PREFIX_BYPASS: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 1
+MODE: full
+SOAK_PURPOSE: accelerated_timeline_fake_evidence
+ENDURANCE_PURPOSE: real_wall_clock — parede
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000
+OVERALL: PASSED
+";
+    let err = parse_long_receipt(PREFIX_BYPASS).unwrap_err();
+    assert!(
+        err.contains("invalid SOAK_PURPOSE"),
+        "token-prefix bypass must be rejected, got: {err}"
+    );
+}
+
+/// (T5.3) Negative: strict release certification requires PHASE6 (real
+/// wall-clock endurance) and both purpose declarations — a receipt that lacks
+/// them can never certify a release.
+#[test]
+fn long_receipt_certification_requires_purposes_and_phase6() {
+    const NO_PURPOSES: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 1
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(NO_PURPOSES).unwrap();
+    let err = receipt.verify_release_certification().unwrap_err();
+    assert!(
+        err.contains("PHASE6"),
+        "certification without PHASE6 must be rejected, got: {err}"
+    );
+
+    const NO_ENDURANCE_PURPOSE: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 1
+MODE: full
+SOAK_PURPOSE: accelerated_timeline — timeline comprimida
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(NO_ENDURANCE_PURPOSE).unwrap();
+    let err = receipt.verify_release_certification().unwrap_err();
+    assert!(
+        err.contains("ENDURANCE_PURPOSE"),
+        "certification without ENDURANCE_PURPOSE must be rejected, got: {err}"
+    );
+}
+
+/// (T5.3) The semantic audit covers PHASE6 like any other phase: a GAP or FAIL
+/// in the real-endurance phase can never hide behind a green `OVERALL` verdict.
+#[test]
+fn long_receipt_audit_accounts_phase6_gap_and_fail() {
+    const PHASE6_GAP: &str = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+PHASE6: GAP log=target/logs/phase6-endurance.log
+GAP: phase6:endurance_harness_missing (T5.3 pending)
+OVERALL: COMPLETED_WITH_GAPS
+";
+    let receipt = parse_long_receipt(PHASE6_GAP).unwrap();
+    receipt
+        .audit()
+        .unwrap_or_else(|e| panic!("PHASE6 GAP with gap evidence must audit cleanly: {e}"));
+
+    const PHASE6_FAIL_HIDDEN: &str = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log
+PHASE2: PASS log=target/logs/phase2-heap-audit.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log
+PHASE6: FAIL log=target/logs/phase6-endurance.log
+OVERALL: PASSED
+";
+    let receipt = parse_long_receipt(PHASE6_FAIL_HIDDEN).unwrap();
+    let err = receipt.audit().unwrap_err();
+    assert!(
+        err.contains("inconsistent receipt"),
+        "PASSED verdict hiding a PHASE6 FAIL must fail the audit, got: {err}"
     );
 }

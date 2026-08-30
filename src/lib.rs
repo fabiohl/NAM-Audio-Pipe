@@ -6,6 +6,7 @@
 //! Provides real-time PipeWire node setup, lock-free SPSC channel communication,
 //! automatic resampler and CabSim management, and asynchronous WAV recording.
 
+pub mod receipt;
 pub mod recording;
 pub mod standalone;
 

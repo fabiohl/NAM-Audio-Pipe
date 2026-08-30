@@ -86,10 +86,12 @@ mod reconnect;
 mod rt_callback;
 mod run;
 pub mod status;
+mod wakeup;
 
 pub use output_pw::PipewireHostConfig;
 pub use run::run_pipewire_host;
 pub use status::{BackendState, BackendStatusSnapshot, SharedBackendStatus, observe_stream_state};
+pub use wakeup::ControlPlaneWakeup;
 
 /// Offline RT swap-stress harness (T2.6 / ER-2) — full capture-callback drain
 /// sequence + DSP with no PipeWire daemon. Compiled only under `testing`.

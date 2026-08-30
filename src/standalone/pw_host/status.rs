@@ -15,9 +15,11 @@
 //! audio, and never reconnects unboundedly.
 
 use crate::standalone::colors::Colorize;
+use crate::standalone::pw_host::wakeup::ControlPlaneWakeup;
+use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 use pipewire as pw;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Typed lifecycle state of the PipeWire backend.
@@ -39,20 +41,42 @@ pub enum BackendState {
     /// lost connectivity and the host is waiting the backoff before the next
     /// stream re-instantiation attempt.
     Reconnecting {
-        /// 1-based number of the reconnect attempt about to be made.
+        /// 1-based attempt index of the current cycle.
         attempt: u32,
-        /// Total reconnect budget for this session (`max_attempts`).
+        /// Maximum attempts configured for the cycle.
         total_attempts: u32,
-        /// Backoff being waited before the next attempt.
+        /// Backoff duration before the next reconnect attempt.
         next_backoff: Duration,
     },
-    /// Fatal loss of connectivity on a specific stream.
+    /// A fatal error occurred on `stream` (e.g. PipeWire daemon disconnected or
+    /// fatal stream error).
     Failed {
+        /// Stream where the error originated (`capture`, `playback`, or `core`).
         stream: &'static str,
+        /// Diagnostic message emitted by PipeWire.
         reason: String,
     },
-    /// Teardown finished.
+    /// Host shut down cleanly (control loop exited).
     Terminated,
+}
+
+impl BackendState {
+    /// Invariant: returns `true` if `is_failed == true` is consistent with this
+    /// state. `Failed` must always match `is_failed == true`; all other states
+    /// require `is_failed == false`, except `Terminated` which can follow a
+    /// failed teardown.
+    pub fn matches_failed_flag(&self, failed: bool) -> bool {
+        match self {
+            BackendState::Failed { .. } => failed,
+            BackendState::Starting
+            | BackendState::Running
+            | BackendState::Degraded { .. }
+            | BackendState::Reconnecting { .. } => !failed,
+            // A terminated backend can originate from a clean shutdown or a
+            // failed teardown, so both flag values are legal.
+            BackendState::Terminated => true,
+        }
+    }
 }
 
 /// Immutable failure detail captured when the backend failed (sticky).
@@ -90,16 +114,7 @@ impl BackendStatusSnapshot {
     /// the unit regression (`status_test.rs`) and the long-suite model-check
     /// gate (`tests/rt_metrics.rs`).
     pub fn invariants_hold(&self) -> bool {
-        match &self.state {
-            BackendState::Failed { .. } => self.failed && self.failure.is_some(),
-            BackendState::Running
-            | BackendState::Degraded { .. }
-            | BackendState::Reconnecting { .. }
-            | BackendState::Starting => !self.failed && self.failure.is_none(),
-            // Terminated is terminal: it may follow either a clean run or a
-            // failed teardown, so both flag values are legal.
-            BackendState::Terminated => true,
-        }
+        self.state.matches_failed_flag(self.failed)
     }
 }
 
@@ -111,19 +126,77 @@ impl BackendStatusSnapshot {
 /// handlers run on the PipeWire `ThreadLoop` thread, never on the RT data
 /// thread), while an [`AtomicBool`] gives the main loop a lock-free fast-path
 /// [`SharedBackendStatus::is_failed`] poll every control iteration.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SharedBackendStatus {
     failed: AtomicBool,
     capture_active: AtomicBool,
     playback_active: AtomicBool,
     state: Mutex<BackendState>,
     failure_detail: Mutex<Option<BackendFailureDetail>>,
+    rt_status: Option<Arc<RtStatusFlags>>,
+    wakeup: Option<ControlPlaneWakeup>,
+}
+
+impl std::fmt::Debug for SharedBackendStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedBackendStatus")
+            .field("failed", &self.failed)
+            .field("capture_active", &self.capture_active)
+            .field("playback_active", &self.playback_active)
+            .field("state", &self.lock_state())
+            .field("has_rt_status", &self.rt_status.is_some())
+            .field("has_wakeup", &self.wakeup.is_some())
+            .finish()
+    }
 }
 
 impl SharedBackendStatus {
-    /// Creates a new status in the [`BackendState::Starting`] state.
+    /// Creates a new status in the [`BackendState::Starting`] state without an RT status latch.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new status in the [`BackendState::Starting`] state bound to an RT status latch.
+    pub fn with_rt_status(rt_status: Arc<RtStatusFlags>) -> Self {
+        // Initial state before PipeWire streams reach `Streaming` is inactive (muted).
+        crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "capture", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "playback", false);
+        Self {
+            failed: AtomicBool::new(false),
+            capture_active: AtomicBool::new(false),
+            playback_active: AtomicBool::new(false),
+            state: Mutex::new(BackendState::Starting),
+            failure_detail: Mutex::new(None),
+            rt_status: Some(rt_status),
+            wakeup: None,
+        }
+    }
+
+    /// Binds an RT status latch to an existing backend status instance.
+    pub fn bind_rt_status(&mut self, rt_status: Arc<RtStatusFlags>) {
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &rt_status,
+            "capture",
+            self.capture_active.load(Ordering::Acquire),
+        );
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &rt_status,
+            "playback",
+            self.playback_active.load(Ordering::Acquire),
+        );
+        self.rt_status = Some(rt_status);
+    }
+
+    /// Binds an event-driven wakeup mechanism for the main control plane.
+    pub fn bind_wakeup(&mut self, wakeup: ControlPlaneWakeup) {
+        self.wakeup = Some(wakeup);
+    }
+
+    /// Wakes up the waiting main control plane loop immediately.
+    pub fn notify_wakeup(&self) {
+        if let Some(ref wakeup) = self.wakeup {
+            wakeup.notify();
+        }
     }
 
     /// Lock-free fast-path poll used by the main control loop (F-RB-010 / T4.4).
@@ -182,6 +255,9 @@ impl SharedBackendStatus {
         } else if stream == "playback" {
             self.playback_active.store(active, Ordering::Release);
         }
+        if let Some(ref rt) = self.rt_status {
+            crate::standalone::pw_host::output_pw::mark_stream_active(rt, stream, active);
+        }
         let cap = self.capture_active.load(Ordering::Acquire);
         let pb = self.playback_active.load(Ordering::Acquire);
         let mut guard = self.lock_state();
@@ -194,9 +270,13 @@ impl SharedBackendStatus {
                 BackendState::Starting | BackendState::Reconnecting { .. }
             ) {
                 *guard = BackendState::Running;
+                drop(guard);
+                self.notify_wakeup();
             }
         } else if matches!(*guard, BackendState::Running) {
             *guard = BackendState::Starting;
+            drop(guard);
+            self.notify_wakeup();
         }
     }
 
@@ -210,6 +290,8 @@ impl SharedBackendStatus {
             return;
         }
         *guard = BackendState::Running;
+        drop(guard);
+        self.notify_wakeup();
     }
 
     /// Transitions to [`BackendState::Degraded`] with a diagnostic reason
@@ -222,6 +304,8 @@ impl SharedBackendStatus {
         *guard = BackendState::Degraded {
             reason: reason.into(),
         };
+        drop(guard);
+        self.notify_wakeup();
     }
 
     /// Transitions to [`BackendState::Failed`] for `stream` and records the
@@ -235,6 +319,8 @@ impl SharedBackendStatus {
         };
         *self.lock_failure_detail() = Some(BackendFailureDetail { stream, reason });
         self.failed.store(true, Ordering::Release);
+        drop(guard);
+        self.notify_wakeup();
     }
 
     /// Marks the backend [`BackendState::Terminated`] after teardown finished.
@@ -242,6 +328,11 @@ impl SharedBackendStatus {
         *self.lock_state() = BackendState::Terminated;
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
+        if let Some(ref rt) = self.rt_status {
+            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "capture", false);
+            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "playback", false);
+        }
+        self.notify_wakeup();
     }
 
     /// Enters the bounded reconnect cycle (F-RB-010 / T4.5).
@@ -250,12 +341,18 @@ impl SharedBackendStatus {
         self.failed.store(false, Ordering::Release);
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
+        if let Some(ref rt) = self.rt_status {
+            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "capture", false);
+            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "playback", false);
+        }
         *self.lock_failure_detail() = None;
         *guard = BackendState::Reconnecting {
             attempt,
             total_attempts,
             next_backoff,
         };
+        drop(guard);
+        self.notify_wakeup();
     }
 
     fn lock_state(&self) -> std::sync::MutexGuard<'_, BackendState> {

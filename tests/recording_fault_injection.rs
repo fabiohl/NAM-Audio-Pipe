@@ -36,17 +36,14 @@
 //! non-ignored tests validate the RIFF parser itself against the pure header
 //! builder, so the harness always contributes to `cargo test --all-targets`.
 
-use nam_audio_pipe::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, RING_CAPACITY, RingPayload,
-    create_audio_ring_buffer,
-};
+use nam_audio_pipe::recording::buffer::AudioMetadata;
+use nam_audio_pipe::recording::transport::RecordingSender;
 use nam_audio_pipe::recording::wav_header::build_wav_header;
 use nam_audio_pipe::recording::{
-    RecordingStatus, RecordingWorkerGuard, RecordingWorkerOutcome, spawn_recording_worker,
-    wait_for_recording_init,
+    RecordingStatus, RecordingWorkerGuard, RecordingWorkerOutcome, create_recording_transport,
+    spawn_recording_worker, wait_for_recording_init,
 };
 use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
-use rtrb::Producer;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -355,40 +352,40 @@ fn assert_samples_bit_exact(actual: &[f32], expected: &[f32], ctx: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Ring push helpers (real io_uring path)
+// Transport push helpers (real io_uring path)
 // ---------------------------------------------------------------------------
 
-/// Pushes a payload, retrying while the ring is full (the worker drains
-/// concurrently) so 100% of the injected data is guaranteed to land.
-fn push_or_retry(
-    producer: &mut Producer<RingPayload<MAX_BLOCK_SIZE>>,
-    payload: RingPayload<MAX_BLOCK_SIZE>,
-) {
+/// Pushes one payload through `push`, retrying while the transport is full
+/// (the worker drains concurrently) so 100% of the injected data is guaranteed
+/// to land. The pool's exhaustion condition (`try_acquire() == None`) is
+/// exactly the "channel full" the retry must survive.
+fn push_or_retry(sender: &mut RecordingSender, push: impl Fn(&mut RecordingSender) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut payload = payload;
     loop {
-        match producer.push(payload) {
-            Ok(()) => return,
-            Err(e) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "ring never drained — recording worker stalled"
-                );
-                payload = match e {
-                    rtrb::PushError::Full(value) => value,
-                };
-                std::thread::sleep(Duration::from_micros(100));
-            }
+        if push(sender) {
+            return;
         }
+        assert!(
+            Instant::now() < deadline,
+            "transport never drained — recording worker stalled"
+        );
+        std::thread::sleep(Duration::from_micros(100));
     }
 }
 
+/// Pushes a metadata payload with retry (see [`push_or_retry`]).
+fn push_meta_or_retry(sender: &mut RecordingSender, meta: AudioMetadata) {
+    push_or_retry(sender, |s| s.try_push_metadata(meta));
+}
+
 /// Pushes an audio block with retry (see [`push_or_retry`]).
-fn push_block_or_retry(
-    producer: &mut Producer<RingPayload<MAX_BLOCK_SIZE>>,
-    block: AlignedBlock<MAX_BLOCK_SIZE>,
-) {
-    push_or_retry(producer, RingPayload::Audio(block));
+fn push_block_or_retry(sender: &mut RecordingSender, left: &[f32], right: &[f32]) {
+    push_or_retry(sender, |s| s.try_push_audio(left, right));
+}
+
+/// Pushes the terminal `StreamStop` token with retry (see [`push_or_retry`]).
+fn push_stop_or_retry(sender: &mut RecordingSender) {
+    push_or_retry(sender, RecordingSender::try_push_stream_stop);
 }
 
 /// All `capture_*.wav` files in `dir`, sorted for deterministic ordering.
@@ -413,22 +410,16 @@ fn record_blocks(
     metadata: AudioMetadata,
     blocks: &[(Vec<f32>, Vec<f32>)],
 ) -> Vec<PathBuf> {
-    let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(64);
-    let (handle, _status, failed_flag) = spawn_ready_worker(consumer, dir);
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, dir);
 
-    producer
-        .push(RingPayload::Metadata(metadata))
-        .expect("metadata push must succeed");
+    push_meta_or_retry(&mut sender, metadata);
     for (left, right) in blocks {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(left, right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, left, right);
     }
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push must succeed");
+    push_stop_or_retry(&mut sender);
 
-    let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag));
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
     let outcome = guard.shutdown();
     assert_eq!(
         outcome,
@@ -595,6 +586,51 @@ fn wav_byte_exact_sine_noise_ramp_roundtrip() {
     assert_eq!(reader.duration() as usize, 24 * 480);
 }
 
+/// T4.1 acceptance — capacity-domain boundaries: blocks of exactly 2048
+/// frames (the old hard drop ceiling of `MAX_BLOCK_SIZE / 2`), 2049 frames
+/// (the first frame past it) and 8192 frames (`MAX_BRIDGE_BUF`, the largest
+/// legal quantum) must all be persisted **integrally** and byte-exact. No
+/// quantum accepted with `--record` may be discarded at enqueue time.
+#[test]
+#[ignore = "requires io_uring support"]
+fn wav_byte_exact_capacity_boundaries_2048_2049_8192() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let _sd = ShutdownGuard::new();
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+
+    let mut signal = noise_lr(0xB0A7_2048);
+    let mut blocks = Vec::new();
+    let mut base = 0usize;
+    for frames in [2048usize, 2049, 8192] {
+        let left: Vec<f32> = (0..frames).map(|i| signal(base + i).0).collect();
+        let right: Vec<f32> = (0..frames).map(|i| signal(base + i).1).collect();
+        base += frames;
+        blocks.push((left, right));
+    }
+    let total_frames: usize = blocks.iter().map(|(l, _)| l.len()).sum();
+
+    let files = record_blocks(&dir, META, &blocks);
+    assert_eq!(
+        files.len(),
+        1,
+        "a single stream must produce a single capture"
+    );
+
+    let bytes = std::fs::read(&files[0]).expect("failed to read recorded WAV");
+    let wav = parse_riff_wav(&bytes).expect("recorded WAV must be structurally valid");
+    assert_eq!(
+        wav.data_size as usize,
+        total_frames * 2 * 4,
+        "every boundary quantum must be persisted integrally"
+    );
+    assert_samples_bit_exact(
+        &wav_float_samples(&bytes),
+        &expected_interleaved(&blocks),
+        "2048/2049/8192-frame capacity boundaries",
+    );
+}
+
 /// A mid-stream metadata change must finalize the current capture and start a
 /// sequential `_partN` file; both parts must be byte-exact and carry the
 /// correct per-part format.
@@ -609,16 +645,12 @@ fn wav_metadata_change_splits_part2_byte_exact() {
     let part1_blocks = make_blocks(sine_lr(220.0, 48_000.0, 0.4), 480, 4);
     let part2_blocks = make_blocks(noise_lr(0x0BAD_C0DE), 480, 4);
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(64);
-    let (handle, _status, failed_flag) = spawn_ready_worker(consumer, &dir);
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
 
-    producer
-        .push(RingPayload::Metadata(META))
-        .expect("metadata push must succeed");
+    push_meta_or_retry(&mut sender, META);
     for (left, right) in &part1_blocks {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(left, right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, left, right);
     }
 
     let meta_44100 = AudioMetadata {
@@ -626,19 +658,13 @@ fn wav_metadata_change_splits_part2_byte_exact() {
         bit_depth: 32,
         channels: 2,
     };
-    producer
-        .push(RingPayload::Metadata(meta_44100))
-        .expect("metadata change push must succeed");
+    push_meta_or_retry(&mut sender, meta_44100);
     for (left, right) in &part2_blocks {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(left, right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, left, right);
     }
 
-    producer
-        .push(RingPayload::StreamStop)
-        .expect("StreamStop push must succeed");
-    let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag));
+    push_stop_or_retry(&mut sender);
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
     assert_eq!(guard.shutdown(), RecordingWorkerOutcome::Success);
 
     let files = capture_files(&dir);
@@ -741,12 +767,10 @@ fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {
         0
     );
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(64);
-    let (handle, status, failed_flag) = spawn_ready_worker(consumer, &dir);
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, status, failed_flag) = spawn_ready_worker(receiver, &dir);
 
-    producer
-        .push(RingPayload::Metadata(META))
-        .expect("metadata push must succeed");
+    push_meta_or_retry(&mut sender, META);
 
     let mut expected_payload = Vec::new();
     for block_idx in 0..(OK_BLOCKS + 1) {
@@ -760,12 +784,10 @@ fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {
                 expected_payload.extend_from_slice(&r.to_le_bytes());
             }
         }
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(&left, &right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, &left, &right);
     }
 
-    let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag.clone()));
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag.clone()));
     let outcome = guard.shutdown();
     assert!(
         matches!(outcome, RecordingWorkerOutcome::Failed { .. }),
@@ -829,27 +851,23 @@ fn sigint_shutdown_under_high_rate_never_truncates() {
     let blocks = make_blocks(noise_lr(0x5EED_2026), 480, PRE + POST);
     let expected = expected_interleaved(&blocks);
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
-    let (handle, _status, failed_flag) = spawn_ready_worker(consumer, &dir);
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
 
-    producer
-        .push(RingPayload::Metadata(META))
-        .expect("metadata push must succeed");
+    push_meta_or_retry(&mut sender, META);
 
     for (i, (left, right)) in blocks.iter().enumerate() {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(left, right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, left, right);
         if i == PRE - 1 {
             // SIGINT fires mid-stream while the RT callback is still pushing.
             SHUTDOWN.store(true, Ordering::Release);
         }
     }
 
-    // The ring may still be momentarily full (the last audio push succeeded on
-    // a freed slot); retry so the terminal token always lands.
-    push_or_retry(&mut producer, RingPayload::StreamStop);
-    let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag));
+    // The transport may still be momentarily full (the last audio publish
+    // succeeded on a freed slot); retry so the terminal token always lands.
+    push_stop_or_retry(&mut sender);
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
     assert_eq!(
         guard.shutdown(),
         RecordingWorkerOutcome::Success,
@@ -866,7 +884,7 @@ fn sigint_shutdown_under_high_rate_never_truncates() {
     );
 }
 
-/// Simulates a `SIGTERM` (recording producer vanishes without `StreamStop`).
+/// Simulates a `SIGTERM` (recording sender vanishes without `StreamStop`).
 /// The worker must terminate through the "abandoned + drained" condition and
 /// finalize every pending block into the WAV — nothing is orphaned.
 #[test]
@@ -879,20 +897,17 @@ fn sigterm_producer_drop_drains_and_finalizes_byte_exact() {
 
     let blocks = make_blocks(ramp_lr(313), 480, 1000);
 
-    let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
-    let (handle, _status, failed_flag) = spawn_ready_worker(consumer, &dir);
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
 
-    producer
-        .push(RingPayload::Metadata(META))
-        .expect("metadata push must succeed");
+    push_meta_or_retry(&mut sender, META);
     for (left, right) in &blocks {
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(left, right);
-        push_block_or_retry(&mut producer, block);
+        push_block_or_retry(&mut sender, left, right);
     }
 
-    // SIGTERM simulation: the producer is dropped without StreamStop.
-    drop(producer);
+    // SIGTERM simulation: the sender is dropped without StreamStop — the
+    // worker terminates via the abandoned+drained terminal condition.
+    drop(sender);
     let guard = RecordingWorkerGuard::new(handle, None, Some(failed_flag));
     assert_eq!(
         guard.shutdown(),
@@ -951,10 +966,10 @@ fn concurrent_workers_same_dir_atomic_creation_no_clobber() {
             let dir = dir.clone();
             let barrier = Arc::clone(&barrier);
             scope.spawn(move || {
-                let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(8);
+                let (mut sender, receiver) = create_recording_transport();
                 let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
                 let handle =
-                    spawn_recording_worker(consumer, None, init).expect("spawn recording worker");
+                    spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
 
                 // Align all instances so the atomic create attempts collide in
                 // the same instant (same-second timestamps → suffix races).
@@ -962,24 +977,16 @@ fn concurrent_workers_same_dir_atomic_creation_no_clobber() {
                 wait_for_recording_init(init_rx, Duration::from_secs(5))
                     .expect("recording worker must confirm readiness");
 
-                let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
                 let left: Vec<f32> = (0..BLOCK_SAMPLES)
                     .map(|i| (instance * 4096 + i) as f32 * 0.001)
                     .collect();
                 let right: Vec<f32> = left.iter().map(|v| -v).collect();
-                block.fill_planar(&left, &right);
 
-                producer
-                    .push(RingPayload::Metadata(META))
-                    .expect("metadata push must succeed");
-                producer
-                    .push(RingPayload::Audio(block))
-                    .expect("audio push must succeed");
-                producer
-                    .push(RingPayload::StreamStop)
-                    .expect("StreamStop push must succeed");
+                push_meta_or_retry(&mut sender, META);
+                push_block_or_retry(&mut sender, &left, &right);
+                push_stop_or_retry(&mut sender);
 
-                let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag));
+                let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
                 assert_eq!(
                     guard.shutdown(),
                     RecordingWorkerOutcome::Success,
@@ -1038,22 +1045,17 @@ fn recording_cycles_fd_thread_leak_sweep() {
     let baseline_threads = count_threads();
 
     for cycle in 0..100 {
-        let (mut producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(16);
-        let (handle, _status, failed_flag) = spawn_ready_worker(consumer, &dir);
+        let (mut sender, receiver) = create_recording_transport();
+        let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
 
-        producer
-            .push(RingPayload::Metadata(META))
-            .expect("metadata push must succeed");
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        block.fill_planar(&[0.5f32; 128], &[-0.5f32; 128]);
-        producer
-            .push(RingPayload::Audio(block))
-            .expect("audio push must succeed");
-        producer
-            .push(RingPayload::StreamStop)
-            .expect("StreamStop push must succeed");
+        push_meta_or_retry(&mut sender, META);
+        assert!(
+            sender.try_push_audio(&[0.5f32; 128], &[-0.5f32; 128]),
+            "audio push must succeed"
+        );
+        push_stop_or_retry(&mut sender);
 
-        let guard = RecordingWorkerGuard::new(handle, Some(producer), Some(failed_flag));
+        let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
         assert_eq!(
             guard.shutdown(),
             RecordingWorkerOutcome::Success,

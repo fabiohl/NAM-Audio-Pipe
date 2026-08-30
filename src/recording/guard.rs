@@ -15,10 +15,10 @@
 //! [`RecordingWorkerGuard`] fixes both problems:
 //!
 //! * **RAII custody** — the guard owns the [`JoinHandle`] *and* the recording
-//!   ring [`Producer`] (the worker's stop channel: dropping it arms the
-//!   "abandoned + drained" terminal condition, F-RB-009 / T3.4). On a
+//!   transport [`RecordingSender`] (the worker's stop channel: dropping it
+//!   arms the "abandoned + drained" terminal condition, F-RB-009 / T3.4). On a
 //!   premature drop — an error `?` return or a panic unwinding during host
-//!   initialization — the guard pushes `StreamStop`, drops the producer and
+//!   initialization — the guard pushes `StreamStop`, drops the sender and
 //!   joins the worker with a bounded timeout, so no zombie thread or open file
 //!   descriptor survives any exit path.
 //! * **Observable join** — [`RecordingWorkerGuard::shutdown`] formally
@@ -27,7 +27,7 @@
 //!   propagates into the process exit code: recording failures can no longer
 //!   masquerade as a successful run.
 
-use crate::recording::buffer::{MAX_BLOCK_SIZE, RingPayload};
+use crate::recording::transport::RecordingSender;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -105,8 +105,9 @@ impl std::fmt::Display for RecordingWorkerOutcome {
 /// * the [`JoinHandle`] of the `nam-recording-io` thread — so every exit path
 ///   (normal shutdown, early `?`, panic unwinding) formally joins it instead
 ///   of silently detaching; and
-/// * the recording ring [`Producer`] — the worker's stop channel. Pushing
-///   [`RingPayload::StreamStop`] and then dropping the producer arms the
+/// * the recording transport [`RecordingSender`] — the worker's stop channel.
+///   Pushing [`StreamStop`](crate::recording::buffer::ControlPayload::StreamStop)
+///   and then dropping the sender (which drops every producer half) arms the
 ///   worker's terminal "abandoned + drained" condition (F-RB-009 / T3.4), so a
 ///   premature drop terminates the worker in bounded time.
 ///
@@ -114,7 +115,7 @@ impl std::fmt::Display for RecordingWorkerOutcome {
 ///
 /// The guard is created by `main.rs` right after the startup handshake and
 /// moved into [`crate::standalone::pw_host::run_pipewire_host`], which borrows
-/// the producer slot (through a raw pointer for the RT callback) and calls
+/// the sender slot (through a raw pointer for the RT callback) and calls
 /// [`RecordingWorkerGuard::shutdown`] after the audio loop stopped. If the
 /// host returns early via `?` — before the shutdown path runs — the guard is
 /// dropped and `Drop` performs the same ordered teardown.
@@ -126,8 +127,9 @@ impl std::fmt::Display for RecordingWorkerOutcome {
 pub struct RecordingWorkerGuard {
     /// Worker thread handle; `None` once the join was performed.
     handle: Option<JoinHandle<anyhow::Result<()>>>,
-    /// Ring producer — the worker's stop channel. `Some` only under `--record`.
-    producer: Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    /// Recording transport sender — the worker's stop channel. `Some` only
+    /// under `--record`.
+    sender: Option<RecordingSender>,
     /// RT-observable failure flag; `Some` only under `--record`. When raised,
     /// the worker already exited and the `StreamStop` push is skipped (the
     /// ring would never drain — F-RB-009 / T3.3).
@@ -141,30 +143,33 @@ pub struct RecordingWorkerGuard {
 impl RecordingWorkerGuard {
     /// Wraps a freshly spawned recording worker.
     ///
-    /// `producer` is the recording ring producer (the stop channel) and
+    /// `sender` is the recording transport producer half (the stop channel) and
     /// `failed` the RT-observable failure flag — both `Some` only when the
     /// worker was actually spawned with `--record`.
     pub fn new(
         handle: JoinHandle<anyhow::Result<()>>,
-        producer: Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+        sender: Option<RecordingSender>,
         failed: Option<Arc<AtomicBool>>,
     ) -> Self {
         Self {
             handle: Some(handle),
-            producer,
+            sender,
             failed,
             teardown_done: false,
         }
     }
 
-    /// Stable `&mut` slot for the recording producer.
+    /// Stable `&mut` slot for the recording sender.
     ///
     /// Exposed to `run_pipewire_host` so the RT callback can push through a
     /// raw pointer (single-writer SPSC contract) while the guard keeps
     /// custody of the channel. The slot address is stable for the guard's
-    /// lifetime — the guard must not be moved while the pointer is live.
-    pub fn producer_slot(&mut self) -> &mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>> {
-        &mut self.producer
+    /// lifetime — the guard must not be moved while the pointer is live. A
+    /// guard created without a sender (recording disabled) lazily inserts a
+    /// disabled [`RecordingSender::none`] so the caller can always deref the
+    /// slot unconditionally.
+    pub fn sender_slot(&mut self) -> &mut RecordingSender {
+        self.sender.get_or_insert_with(RecordingSender::none)
     }
 
     /// RT-observable failure flag, for the RT callback path (clone before
@@ -176,18 +181,18 @@ impl RecordingWorkerGuard {
     /// Ordered teardown of the recording worker (F-RB-009 / T3.4 + T3.5):
     ///
     /// 1. **`StreamStop`** — best-effort delivery (bounded retry) of the
-    ///    terminal token. It is only sent after `thread_loop.stop()` confirmed
-    ///    the RT loop stopped, so it can never race a pending block. Skipped
-    ///    when the worker already reported a fatal error (it has exited; the
-    ///    ring will never drain).
-    /// 2. **Producer drop** — arms the worker's "abandoned **and** drained"
+    ///    terminal token through the transport's control channel. It is only
+    ///    sent after `thread_loop.stop()` confirmed the RT loop stopped, so it
+    ///    can never race a pending block. Skipped when the worker already
+    ///    reported a fatal error (it has exited; the rings will never drain).
+    /// 2. **Sender drop** — arms the worker's "abandoned **and** drained"
     ///    terminal condition, so finalization is guaranteed even if the token
-    ///    push timed out on a full ring.
+    ///    push timed out on a full channel.
     /// 3. **Bounded join with formal result inspection** — the worker's
     ///    returned `Result<()>`, a panic payload or a join timeout become the
     ///    returned [`RecordingWorkerOutcome`].
     pub fn shutdown(mut self) -> RecordingWorkerOutcome {
-        let outcome = teardown(&mut self.handle, &mut self.producer, self.failed.as_deref());
+        let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
         self.teardown_done = true;
         outcome
     }
@@ -200,11 +205,11 @@ impl Drop for RecordingWorkerGuard {
         }
         // Premature drop: an error `?` return or a panic unwinding during host
         // initialization reached this frame before the explicit shutdown path
-        // ran. Signal the worker (StreamStop → producer drop) and join with a
+        // ran. Signal the worker (StreamStop → sender drop) and join with a
         // bounded timeout so no zombie thread or open WAV descriptor outlives
         // the guard (F-RB-009 / T3.5). The join result cannot be returned from
         // `Drop`; a non-clean teardown is logged for the diagnostics trace.
-        let outcome = teardown(&mut self.handle, &mut self.producer, self.failed.as_deref());
+        let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
         self.teardown_done = true;
         if !matches!(outcome, RecordingWorkerOutcome::Success) {
             log::warn!(
@@ -220,17 +225,17 @@ impl Drop for RecordingWorkerGuard {
 /// rationale.
 fn teardown(
     handle: &mut Option<JoinHandle<anyhow::Result<()>>>,
-    producer: &mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    sender: &mut Option<RecordingSender>,
     failed: Option<&AtomicBool>,
 ) -> RecordingWorkerOutcome {
     let recording_failed_observed = failed.is_some_and(|f| f.load(Ordering::Acquire));
-    if let Some(mut producer) = producer.take() {
+    if let Some(mut sender) = sender.take() {
         if !recording_failed_observed {
-            push_stream_stop(&mut producer, STREAM_STOP_RETRY_TIMEOUT);
+            push_stream_stop(&mut sender, STREAM_STOP_RETRY_TIMEOUT);
         }
         // Explicit drop: arms the worker's abandoned+drained terminal
         // condition so finalization happens even if the token never landed.
-        drop(producer);
+        drop(sender);
     }
     join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT)
 }
@@ -238,15 +243,17 @@ fn teardown(
 /// Pushes `StreamStop` with a short retry. The audio callback is already
 /// stopped, so the I/O thread is the only remaining consumer and should drain
 /// capacity quickly. On timeout the token is dropped; the worker then
-/// terminates through the producer-drop + drained-ring condition armed by
+/// terminates through the sender-drop + drained-channels condition armed by
 /// [`teardown`] (F-RB-009 / T3.4).
-pub(crate) fn push_stream_stop(
-    producer: &mut rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>,
-    timeout: std::time::Duration,
-) {
+pub(crate) fn push_stream_stop(sender: &mut RecordingSender, timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if producer.push(RingPayload::StreamStop).is_ok() {
+        if sender.try_push_stream_stop() {
+            return;
+        }
+        if !sender.has_producer() {
+            // No channel exists (recording disabled / already taken) — nothing
+            // to deliver.
             return;
         }
         if std::time::Instant::now() >= deadline {

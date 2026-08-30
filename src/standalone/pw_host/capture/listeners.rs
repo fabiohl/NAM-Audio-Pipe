@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// post-streaming `StreamState::Unconnected` (daemon crash/restart) marks the
 /// backend `Failed`, so the main control loop tears the host down observably.
 ///
-/// Note (Sprint C-01 / H-06): This handler executes on the PipeWire `ThreadLoop` thread,
-/// NOT on the RT data processing thread that runs `process()`. Real-time thread setup
-/// (DAZ/FTZ MXCSR, SCHED_FIFO, CPU affinity) must remain in the cold-path of `process()`.
+/// Note (T3.1 / F-RES-003): Real-time thread setup (DAZ/FTZ MXCSR, SCHED_FIFO, CPU affinity)
+/// executes during the `state_changed` (Paused/Streaming) transition on this thread before
+/// stream readiness, ensuring zero setup syscalls during operational `process()` callbacks.
 pub fn state_changed_handler(
     old: pw::stream::StreamState,
     new: pw::stream::StreamState,
@@ -70,6 +70,7 @@ pub fn param_changed_handler(
                 .store(rate, Ordering::Release);
             mark_format_contract_ok(rt_status, "capture");
             check_negotiated_rate_mismatch(rt_status);
+            backend.notify_wakeup();
         }
         Err(violation) => {
             let violation_msg = violation.to_string();

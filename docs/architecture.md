@@ -339,31 +339,58 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Audio Thread (RT)                                                          │
 │    - Checks gate state (n_pw > 0)                                           │
-│    - Pushes RingPayload::Audio(AlignedBlock) into SPSC RingBuffer           │
+│    - Audio: try_acquire() slot → fill_planar in place → publish()           │
+│      (preallocated pool, 4-byte descriptor; zero alloc on RT)               │
+│    - Control: Metadata/StreamStop on a dedicated small control ring         │
 │    - Signals recording_data_available notification flag                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Recording Worker Thread ("nam-recording-io")                               │
 │    - tokio-uring async event loop (Linux io_uring)                          │
-│    - Consumes RingPayload (Metadata, Audio, StreamStop)                     │
+│    - Pops audio descriptors → writes the 64 KiB block IN PLACE → release()  │
+│    - Applies Metadata at the stream position marked by a control barrier    │
 │    - Reuses internal I/O buffer (io_buf) to eliminate heap allocations      │
-│    - Enters 10ms idle sleep when channel is drained to eliminate busy spin  │
+│    - Enters 10ms idle sleep when channels are drained to eliminate spin     │
 │    - Automatically splits files at 4 GiB RIFF size limit (_partN.wav)       │
 │    - Lifecycle decoupled from SHUTDOWN (T3.4): exits only on StreamStop or  │
-│      producer drop + drained ring                                          │
-│    - Graceful shutdown: push_stream_stop (200ms retry) → producer drop →   │
+│      sender drop + drained channels                                        │
+│    - Graceful shutdown: push_stream_stop (200ms retry) → sender drop →      │
 │      bounded join (5s)                                                      │
 │    - Rewrites WAV header with exact data byte count & issues fsync          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 7.0 Promoted Pool Transport (T4.2 verdict PROMOTE → integrated in T4.3)
+
+Production recording audio travels through a **preallocated slot pool** (`src/recording/pool.rs`,
+256 × ~64 KiB slots ≈ 16,8 MiB) instead of moving every 64 KiB block *by value* through an
+SPSC ring. The RT thread `try_acquire`s a slot (pops a `u16` index from a free-list ring),
+fills it in place (`fill_planar`) and `publish`es a 4-byte [`Descriptor`]; the I/O thread pops
+the descriptor, writes the block **in place** and `release`s the index back to the free ring.
+The payload is written once and read once — the inline ring moved it 7 × per quantum vs 3 ×
+for the pool (~57% fewer 64 B cache lines). Measured (A/B, `recording_ab_bench`, 3 runs × 5
+sizes, Ryzen 7 5700U): reproducible p99 recording-latency gain ≥ 5 % at every size
+(64 f +96 %, 256 f +93 %, 512 f +92 %, 2048 f +78–84 %, 8192 f +33–44 %); cache
+`cache-references` −86,7 %, `cache-misses` −77,3 %).
+
+The pool only carries audio. `AudioMetadata` and `StreamStop` travel on a small dedicated
+**control ring** (`CONTROL_CAPACITY = 4`); to preserve the RT thread's publication order under
+mid-stream rate changes (header must apply between the pre-change and post-change audio), every
+confirmed metadata push also deposits a **control barrier** (`slot == 0xFFFF`, an impossible
+pool index) at the exact position in the pool `work`-ring FIFO — the I/O thread applies the
+control message when it reaches the barrier, matching the inline ring's FIFO semantics exactly.
+The wiring abstraction lives in `src/recording/transport.rs` (`RecordingSender` /
+`RecordingReceiver`); the T4.1 inline ring remains fully wired behind the compile-time
+`RECORDING_POOL_TRANSPORT` switch as the rollback path.
+
 ### 7.1 Recording Guarantees & File Integrity
 
-- **Zero Blocking in RT:** The RT callback pushes to `rtrb::Producer<RingPayload>`. If the ring fills (e.g. disk stalled), `OVERRUN_COUNT` is incremented atomically; audio playback is never blocked.
-- **Startup Handshake & Fail-Fast (F-RB-009 / T3.3):** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded into the ring.
+- **Capacity Domain Closed over the Full Quantum Range (T4.1/T4.3):** The recording block is sized `MAX_BLOCK_SIZE = 16384` interleaved f32 samples (8192 stereo frames), covering the **largest legal host quantum** (`MAX_BRIDGE_BUF = 8192`). Every quantum accepted with `--record` is persisted integrally — the old hard drop ceiling (2048 frames, half of the former 4096-sample block) is gone. `POOL_CAPACITY = 256` slots × ~64 KiB = 16 MiB, the same memory footprint as the previous 1024 × 16 KiB layout with 4× deeper frame buffering. A block wider than `MAX_BLOCK_SIZE` (a spurious over-bridge quantum) is still dropped fail-closed without acquiring a slot.
+- **Overrun Accounting in Blocks and Frames (T4.1/T4.3):** When the pool is exhausted (all 256 slots in flight — the pool's analog of a full ring) or a block exceeds `MAX_BLOCK_SIZE`, `OVERRUN_COUNT` (blocks) **and** `OVERRUN_FRAMES_COUNT` (frames) are incremented atomically; audio playback is never blocked. At shutdown the worker reports `blocos perdidos: N (frames: M)`, so the invariant `frames_capturados == frames_enfileirados + frames_perdidos` can be reconciled. Enqueueing is zero-alloc/zero-dealloc on the RT thread (heap-audit gated, `get_dealloc_count() == 0`).
+- **Startup Handshake & Fail-Fast (F-RB-009 / T3.3):** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded.
 - **Runtime Failure Propagation (F-RB-009 / T3.3):** On a fatal mid-stream error (`EIO`, `ENOSPC`), the worker transitions the observable `RecordingStatus` to `Failed` and raises an atomic flag the RT callback polls to suspend enqueueing without panics; the error is logged visibly.
-- **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `RingPayload::StreamStop` (bounded retry), explicitly drops the recording producer, and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
-- **Lifecycle Decoupling & Integral Drain (F-RB-009 / T3.4):** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the ring is momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped, or (2) the ring `Producer` was dropped **and** the ring is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent.
-- **RAII Worker Custody & Observable Join (F-RB-009 / T3.5):** The worker thread, its ring producer (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see `src/recording/guard.rs`). The guard owns the `JoinHandle` and the producer, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → producer drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — the old `let _ = handle.join()` that silently swallowed worker failures is gone.
+- **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `ControlPayload::StreamStop` (bounded retry), explicitly drops the recording sender (control producer + pool producer), and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
+- **Lifecycle Decoupling & Integral Drain (F-RB-009 / T3.4):** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the channels are momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped (draining every pending pool descriptor first), or (2) the sender was dropped (both producers gone) **and** every channel is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent. No ABA / double-return: slot ownership is `FREE→RT→IN-FLIGHT→I/O→FREE` through two strict SPSC FIFOs.
+- **RAII Worker Custody & Observable Join (F-RB-009 / T3.5):** The worker thread, its transport sender (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see `src/recording/guard.rs`). The guard owns the `JoinHandle` and the sender, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → sender drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — the old `let _ = handle.join()` that silently swallowed worker failures is gone.
 
 ---
 

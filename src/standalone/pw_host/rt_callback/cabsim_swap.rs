@@ -55,7 +55,7 @@ pub fn drain_cabsims(
         if pending.generation != current_req_gen {
             // Stale deferred payload: generation changed while parked.
             discard_cabsim(
-                pending.pair,
+                pending,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -68,7 +68,7 @@ pub fn drain_cabsims(
                 // A newer command is already queued (latest-wins): the deferred
                 // payload is obsolete and cascades to GC.
                 discard_cabsim(
-                    pending.pair,
+                    pending,
                     gc_producer,
                     parking_lot,
                     parking_lot_dirty,
@@ -112,7 +112,7 @@ pub fn drain_cabsims(
         if payload.generation != current_req_gen {
             // Stale envelope: generation changed while payload was in transit.
             discard_cabsim(
-                payload.pair,
+                payload,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -122,10 +122,10 @@ pub fn drain_cabsims(
             continue;
         }
         if let Some(older) = candidate.replace(payload) {
-            // Coalescing: an intermediate command is obsolete — its pair (if
-            // any) cascades to GC (latest-wins).
+            // Coalescing: an intermediate command is obsolete — its payload
+            // cascades to GC (latest-wins).
             discard_cabsim(
-                older.pair,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -161,7 +161,7 @@ pub fn drain_cabsims(
             // — supersede the parked command and park this one (latest-wins).
             let older = deferred.take().expect("slot occupied, checked above");
             discard_cabsim(
-                older.pair,
+                older,
                 gc_producer,
                 parking_lot,
                 parking_lot_dirty,
@@ -182,12 +182,11 @@ pub fn drain_cabsims(
 }
 
 /// Installs a cab-sim command atomically: the active pair (or bypass) is
-/// replaced, the applied generation counter is updated, and the retired pair
-/// cascades to GC as a single moved `Box` (F-RB-007).
+/// swapped into the payload envelope, the applied generation counter is updated,
+/// and the retired envelope cascades to GC as a single moved `Box` (F-RB-007).
 #[inline(always)]
-#[expect(clippy::boxed_local)]
 fn install_cabsim(
-    payload: Box<CabSimSwapPayload>,
+    mut payload: Box<CabSimSwapPayload>,
     active_cabsim: &mut Option<Box<CabSimPair>>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
@@ -195,44 +194,39 @@ fn install_cabsim(
     gc_overflow_for_process: &GcOverflowBuffer,
     rt_status_for_process: &RtStatusFlags,
 ) {
-    let old_pair = std::mem::replace(active_cabsim, payload.pair);
+    std::mem::swap(&mut payload.pair, active_cabsim);
     rt_status_for_process
         .applied_cabsim_generation
         .store(payload.generation, Ordering::Release);
 
-    if let Some(old) = old_pair {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::CabSimPair(old)),
-            gc_producer,
-            parking_lot,
-            gc_overflow_for_process,
-            rt_status_for_process,
-        );
-    }
+    parking_lot_dirty.store(true, Ordering::Release);
+    gc_cascade(
+        Some(GcItem::CabSimSwap(payload)),
+        gc_producer,
+        parking_lot,
+        gc_overflow_for_process,
+        rt_status_for_process,
+    );
 }
 
-/// Discards an obsolete cab-sim command to the GC cascade (its pair, if any,
-/// is moved as a single `Box` — F-RB-007).
+/// Discards an obsolete cab-sim command to the GC cascade as a single moved `Box` (F-RB-007).
 #[inline(always)]
 fn discard_cabsim(
-    old_pair: Option<Box<CabSimPair>>,
+    payload: Box<CabSimSwapPayload>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
     rt_status_for_process: &RtStatusFlags,
 ) {
-    if let Some(old) = old_pair {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::CabSimPair(old)),
-            gc_producer,
-            parking_lot,
-            gc_overflow_for_process,
-            rt_status_for_process,
-        );
-    }
+    parking_lot_dirty.store(true, Ordering::Release);
+    gc_cascade(
+        Some(GcItem::CabSimSwap(payload)),
+        gc_producer,
+        parking_lot,
+        gc_overflow_for_process,
+        rt_status_for_process,
+    );
 }
 
 #[cfg(test)]
@@ -323,9 +317,9 @@ mod tests {
             req_gen
         );
         assert!(parking_lot_dirty.load(Ordering::Acquire));
-        // The retired pair reaches GC as a single moved Box (F-RB-007).
+        // The retired payload reaches GC as a single moved Box (F-RB-007).
         let old = gc_c.pop().unwrap();
-        assert_matches!(old, GcItem::CabSimPair(_));
+        assert_matches!(old, GcItem::CabSimSwap(_));
         assert!(gc_c.pop().is_err());
     }
 
@@ -375,9 +369,9 @@ mod tests {
             req_gen
         );
         assert!(parking_lot_dirty.load(Ordering::Acquire));
-        // Both retired pairs reach GC as single moved boxes.
-        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimPair(_));
-        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimPair(_));
+        // Both retired payloads reach GC as single moved boxes.
+        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
+        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
         assert!(gc_c.pop().is_err());
     }
 
@@ -426,8 +420,8 @@ mod tests {
         assert_eq!(installed.partition_size(), 64);
         // Applied generation is untouched (remains 1)
         assert_eq!(flags.applied_cabsim_generation.load(Ordering::Acquire), 1);
-        // Stale pair was discarded to GC
-        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimPair(_));
+        // Stale payload was discarded to GC
+        assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
     }
 
     // ── T2.5 Structural Budget & Coalescing (F-RB-011) ──────────────────────
@@ -491,10 +485,10 @@ mod tests {
         assert!(cons.is_empty());
         assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
-        // GC: 2 superseded pairs + the replaced active pair = 3 moved Boxes.
+        // GC: 2 superseded payloads + the replaced active payload = 3 moved Boxes.
         let mut pairs = 0usize;
         while let Ok(item) = gc_c.pop() {
-            assert_matches!(item, GcItem::CabSimPair(_));
+            assert_matches!(item, GcItem::CabSimSwap(_));
             pairs += 1;
         }
         assert_eq!(pairs, 3);
@@ -563,7 +557,9 @@ mod tests {
 #[cfg(all(test, feature = "heap-audit"))]
 mod heap_audit_tests {
     use super::*;
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
 
     const IR: [f32; 16] = [
         1.0, 0.5, 0.25, 0.125, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -629,7 +625,7 @@ mod heap_audit_tests {
         /// Runs one RT drain cycle under the allocation watchdog, asserts zero
         /// heap traffic, then reclaims retired pairs through the off-RT GC.
         fn run_audited_drain(&mut self, label: &str) {
-            let count = {
+            let (allocs, deallocs, reallocs) = {
                 let _guard = TrackingGuard::new();
                 drain_cabsims(
                     &mut self.cons,
@@ -642,12 +638,15 @@ mod heap_audit_tests {
                     &self.gc_overflow,
                     &self.flags,
                 );
-                get_alloc_count()
+                (get_alloc_count(), get_dealloc_count(), get_realloc_count())
             };
+            // Medido: alloc=0, dealloc=0, realloc=0 (drain_cabsims RT cycle)
             assert_eq!(
-                count, 0,
-                "heap allocations detected during {label}: count={count}"
+                allocs, 0,
+                "heap allocations detected during {label}: count={allocs}"
             );
+            assert_eq!(deallocs, 0, "dealloc no callback RT during {label}");
+            assert_eq!(reallocs, 0, "realloc no callback RT during {label}");
             // Off-RT: the retired pairs must be reclaimable via the GC drain.
             while let Ok(item) = self.gc_c.pop() {
                 drop(item);
@@ -667,7 +666,7 @@ mod heap_audit_tests {
         h.push_pair(64, 48000);
         h.run_audited_drain("initial install");
         assert!(h.active.is_some());
-        assert!(!h.parking_lot_dirty.load(Ordering::Acquire));
+        assert!(h.parking_lot_dirty.load(Ordering::Acquire));
     }
 
     #[test]
@@ -698,14 +697,14 @@ mod heap_audit_tests {
         // cascade spilling through tier 3 (overflow ring) under load.
         let mut h = DrainHarness::new(64, 1, 4, Some(Box::new(make_pair(&IR, 64, 48000))));
 
-        // Pre-fill the overflow ring with old pairs, then drain it once so the
+        // Pre-fill the overflow ring with old payloads, then drain it once so the
         // ring is empty but the audit forces tier 3 after SPSC+lot fill.
         for i in 0..4 {
-            h.gc_overflow.push(GcItem::CabSimPair(Box::new(make_pair(
-                &IR,
-                64 + i * 64,
-                48000,
-            ))));
+            h.gc_overflow
+                .push(GcItem::CabSimSwap(Box::new(CabSimSwapPayload {
+                    generation: 0,
+                    pair: Some(Box::new(make_pair(&IR, 64 + i * 64, 48000))),
+                })));
         }
         for item in h.gc_overflow.drain(&h.flags) {
             drop(item);

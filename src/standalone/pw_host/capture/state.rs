@@ -20,6 +20,7 @@ use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::math::dsp::gain_lut;
 use rtrb::{Consumer, Producer};
 use std::sync::Arc;
@@ -55,6 +56,8 @@ pub struct CaptureState {
     pub active_model_l: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
     pub active_model_r: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
     pub resampler: Box<NamResampler>,
+    /// Pre-allocated bidirectional streaming adapter providing strict host cardinality.
+    pub stream: Box<StreamingResampleBuffer>,
     pub os_l: Box<OversampleEngine>,
     pub os_r: Box<OversampleEngine>,
     /// Active stereo-decoupled cab-sim pair (`None` = bypass, zero cost).
@@ -133,6 +136,18 @@ impl CaptureState {
             NamResampler::new(48_000, 48_000, 2048).expect("bypass cannot fail")
         });
 
+        let stream =
+            StreamingResampleBuffer::new(48_000, 48_000, MAX_RESAMP_BUF).unwrap_or_else(|e| {
+                NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
+                    .message("Failed to create initial StreamingResampleBuffer (using 48k bypass).")
+                    .hint("Falling back to bypass mode.")
+                    .param("initial_rate", 48_000_u32)
+                    .param("detail", e)
+                    .emit_warning();
+                StreamingResampleBuffer::new(48_000, 48_000, MAX_RESAMP_BUF)
+                    .expect("bypass streaming buffer cannot fail")
+            });
+
         let gate_params = GateParams::default();
         let lut = gain_lut::get_gain_lut();
         let open_lin = lut.db_to_linear(gate_params.threshold_open_db);
@@ -142,6 +157,7 @@ impl CaptureState {
             active_model_l: None,
             active_model_r: None,
             resampler: Box::new(resampler),
+            stream: Box::new(stream),
             os_l: Box::new(
                 OversampleEngine::new(os, MAX_RESAMP_BUF).unwrap_or_else(|e| {
                     NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)

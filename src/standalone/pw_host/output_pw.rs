@@ -10,7 +10,8 @@ use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
-use super::rt_callback::handle_spa_pair_fail_closed;
+use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
+use crate::standalone::rt_setup;
 
 /// Holds essential PipeWire instances (`StreamBox` and `Listener`).
 ///
@@ -54,6 +55,8 @@ pub struct PipewireHostConfig {
     pub os_producer: rtrb::Producer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     /// Initial oversampling factor for the neural stage.
     pub oversample: OversampleFactor,
+    /// Optional explicit CPU core index requested via CLI (`--cpu`).
+    pub requested_cpu: Option<usize>,
     /// `--fail-fast` on the CLI: disables the bounded reconnect cycle
     /// (F-RB-010 / T4.5) — the first backend failure triggers the T4.4
     /// fail-fast teardown immediately.
@@ -67,7 +70,15 @@ pub fn playback_dsp_cycle(
     bridge: DspBridgeReader,
     last_bridge_gen: &mut u64,
     rt_status: &RtStatusFlags,
+    pb_frame_count: u32,
 ) {
+    let should_measure = (pb_frame_count & 0xF) == 0;
+    let t_pb_start = if should_measure {
+        rt_setup::rdtsc_nanos()
+    } else {
+        0
+    };
+
     // T4.3 fail-closed mute: while the negotiated format contract is broken
     // (a divergent renegotiation was rejected by the param_changed listener),
     // no processed audio may reach the hardware. Deterministic silence is
@@ -177,6 +188,24 @@ pub fn playback_dsp_cycle(
         chunk_r_mut.size = (n_out * std::mem::size_of::<f32>()) as u32;
         chunk_r_mut.stride = std::mem::size_of::<f32>() as i32;
     }
+
+    // 4. PLAYBACK TOTAL & 5. CAPTURE TO PLAYBACK (END-TO-END)
+    // Medido: overhead TSC=~15ns por amostragem (LFENCE+RDTSC), total < 0.05% do quantum de 333µs
+    if should_measure && t_pb_start > 0 {
+        let t_pb_end = rt_setup::rdtsc_nanos();
+        let pb_nanos = t_pb_end.saturating_sub(t_pb_start);
+        rt_status
+            .playback_cycle_time
+            .store(pb_nanos, Ordering::Relaxed);
+        rt_status.playback_hist.record(pb_nanos);
+
+        let cap_start = rt_status.capture_start_tsc.load(Ordering::Relaxed);
+        if cap_start > 0 && t_pb_end > cap_start {
+            let e2e_nanos = t_pb_end.saturating_sub(cap_start);
+            rt_status.e2e_cycle_time.store(e2e_nanos, Ordering::Relaxed);
+            rt_status.e2e_hist.record(e2e_nanos);
+        }
+    }
 }
 
 /// Deterministic silence delivery for bridge starvation (G-RB-001 / T4.2).
@@ -216,8 +245,21 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     chunk_r: *mut pw::spa::sys::spa_chunk,
     rt_status: &RtStatusFlags,
 ) -> Option<usize> {
+    let max_cap = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
+    let silence_bytes_l = max_l.min(max_cap);
+    let silence_bytes_r = max_r.min(max_cap);
     let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
-        ptr_l, max_l, chunk_l, 0, max_l, ptr_r, max_r, chunk_r, 0, max_r, rt_status,
+        ptr_l,
+        max_l,
+        chunk_l,
+        0,
+        silence_bytes_l,
+        ptr_r,
+        max_r,
+        chunk_r,
+        0,
+        silence_bytes_r,
+        rt_status,
     )?;
 
     // SAFETY: the harness proved per-channel alignment, bounds, frame symmetry
@@ -300,31 +342,6 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
     let _ = unsafe {
         deliver_silence_pair_fail_closed(ptr_l, max_l, chunk_l, ptr_r, max_r, chunk_r, rt_status)
     };
-}
-
-/// Silences every present SPA data region of a malformed stereo buffer.
-///
-/// Fail-closed guarantee (T4.2): a buffer handed back to the PipeWire graph
-/// must never carry audio content that was not written by this callback. When
-/// the host violates the negotiated stereo contract (`datas.len() < 2`) no
-/// stereo pair can be validated, so every region present is zeroed via raw
-/// pointer writes (no `&mut` aliasing is formed).
-#[inline(always)]
-fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
-    let align = std::mem::align_of::<f32>();
-    let stride = std::mem::size_of::<f32>();
-    let max_safe_bytes = MAX_BRIDGE_BUF * stride;
-
-    for data in datas.iter_mut() {
-        let raw = data.as_raw();
-        let ptr = raw.data as usize;
-        let maxsize = raw.maxsize as usize;
-        if ptr != 0 && ptr.is_multiple_of(align) && maxsize > 0 && maxsize.is_multiple_of(stride) {
-            let safe_len = maxsize.min(max_safe_bytes);
-            // SAFETY: `ptr` is aligned to f32, `safe_len` is cardinal and bounded by `MAX_BRIDGE_BUF * sizeof(f32)`.
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, safe_len) };
-        }
-    }
 }
 
 /// Storage buffer for SPA POD construction with a guaranteed 8-byte alignment.
@@ -555,6 +572,21 @@ pub fn mark_format_contract_ok(rt_status: &RtStatusFlags, stream_name: &str) {
     rt_status
         .format_contract_ok
         .store(if cap != 0 && pb != 0 { 1 } else { 0 }, Ordering::Relaxed);
+}
+
+/// Updates the stream active latch on `RtStatusFlags` (T1.4).
+///
+/// When a stream enters `Streaming`, `active` is `true` (latches `1`).
+/// When a stream is `Paused`, `Unconnected` or in `Error`, `active` is `false` (latches `0`),
+/// causing [`RtStatusFlags::is_audio_unmuted`] to fail-closed mute audio on the RT thread.
+#[inline]
+pub fn mark_stream_active(rt_status: &RtStatusFlags, stream_name: &str, active: bool) {
+    let val = if active { 1 } else { 0 };
+    if stream_name == "capture" {
+        rt_status.capture_active.store(val, Ordering::Release);
+    } else if stream_name == "playback" {
+        rt_status.playback_active.store(val, Ordering::Release);
+    }
 }
 
 /// Returns `Some((capture, playback))` when both streams have negotiated a
@@ -849,7 +881,7 @@ mod tests {
         assert!(
             l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
                 && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
-            "oversized playback window must silence both output channels up to max bridge bound"
+            "oversized playback window must silence both output channels fail-closed up to MAX_BRIDGE_BUF"
         );
     }
 
@@ -1085,6 +1117,72 @@ mod tests {
             "asymmetric extensions must silence both channels fail-closed"
         );
         assert_eq!(rt.playback_bridge_starvation.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
+        // F-RES-001 / T6.1: when host supplies a huge buffer (e.g. 1 MiB or > MAX_BRIDGE_BUF),
+        // silence delivery must bound zeroing to MAX_BRIDGE_BUF frames (32 KiB)
+        // and chunk.size must match the exact zeroed interval.
+        let total_samples = MAX_BRIDGE_BUF + 1024;
+        let mut l = vec![0.5f32; total_samples];
+        let mut r = vec![0.5f32; total_samples];
+        fill_bytes(&mut l, 0x5A);
+        fill_bytes(&mut r, 0xA5);
+        let mut chunk_l = chunk_of(0, 0);
+        let mut chunk_r = chunk_of(0, 0);
+        let rt = RtStatusFlags::default();
+
+        let frames = unsafe {
+            deliver_silence_pair_fail_closed(
+                l.as_ptr() as usize,
+                l.len() * 4,
+                &mut chunk_l,
+                r.as_ptr() as usize,
+                r.len() * 4,
+                &mut chunk_r,
+                &rt,
+            )
+        };
+
+        assert_eq!(frames, Some(MAX_BRIDGE_BUF));
+        assert_eq!(chunk_l.size, (MAX_BRIDGE_BUF * 4) as u32);
+        assert_eq!(chunk_r.size, (MAX_BRIDGE_BUF * 4) as u32);
+        assert_eq!(chunk_l.offset, 0);
+        assert_eq!(chunk_r.offset, 0);
+
+        // First MAX_BRIDGE_BUF samples must be zeroed
+        assert!(
+            l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+            "bounded range must be zeroed"
+        );
+        assert!(
+            r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+            "bounded range must be zeroed"
+        );
+
+        // Samples past MAX_BRIDGE_BUF must remain untouched
+        let trailing_l = unsafe {
+            std::slice::from_raw_parts(
+                (l.as_ptr() as usize + MAX_BRIDGE_BUF * 4) as *const u8,
+                1024 * 4,
+            )
+        };
+        assert!(
+            trailing_l.iter().all(|&b| b == 0x5A),
+            "trailing memory past MAX_BRIDGE_BUF must not be touched"
+        );
+
+        let trailing_r = unsafe {
+            std::slice::from_raw_parts(
+                (r.as_ptr() as usize + MAX_BRIDGE_BUF * 4) as *const u8,
+                1024 * 4,
+            )
+        };
+        assert!(
+            trailing_r.iter().all(|&b| b == 0xA5),
+            "trailing memory past MAX_BRIDGE_BUF must not be touched"
+        );
     }
 
     // ── SPA format negotiation validator (G-RB-001 / T4.3) ───────────────────

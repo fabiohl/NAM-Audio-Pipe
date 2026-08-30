@@ -243,6 +243,12 @@ try:
     doc["pgo"]["oversampling_blocks"] = r.get("oversampling_blocks")
     doc["pgo"]["cabsim_frames"] = (r.get("cabsim") or {}).get("stereo_convolved_frames")
     doc["pgo"]["no_stage_skipped"] = r.get("no_stage_skipped")
+    # T5.2: the matrix receipt declares per-topology minimum progress per DSP
+    # group (G-PERF-003) — carried into the release receipt so the certification
+    # never reduces the coverage to an aggregated global number.
+    doc["pgo"]["progress"] = r.get("progress") or {}
+    doc["pgo"]["coverage"] = r.get("coverage") or {}
+    doc["pgo"]["matrix"] = r.get("matrix") or {}
 except FileNotFoundError:
     doc["pgo"]["parse_error"] = "receipt not found"
 except Exception as e:  # noqa: BLE001 - receipt is auxiliary evidence
@@ -308,14 +314,17 @@ if [ "$RELEASE_CEREMONY" = true ]; then
 
     LONG_RECEIPT_PATH="$PROJECT_DIR/target/logs/long-receipt.txt"
     if [ -f "$LONG_RECEIPT_PATH" ]; then
-        echo -e "  → Verifying existing long suite receipt..."
-        if ! grep -qF "SUITE: tests-long" "$LONG_RECEIPT_PATH" || \
-           ! grep -qF "STRICT: 1" "$LONG_RECEIPT_PATH" || \
-           ! grep -qF "MODE: full" "$LONG_RECEIPT_PATH" || \
-           ! grep -qF "OVERALL: PASSED" "$LONG_RECEIPT_PATH"; then
-            die "Release ceremony requires a real, strict long suite receipt on disk (SUITE: tests-long, STRICT: 1, MODE: full, OVERALL: PASSED).\nReceipt at target/logs/long-receipt.txt failed verification (SIMULATED, STRICT: 0, COMPLETED_WITH_GAPS, FAILED or simulate mode are strictly rejected)."
+        echo -e "  → Verifying existing long suite receipt (semantic strict certification)..."
+        # T5.1 / T8.1: the strict receipt is verified by the shared semantic
+        # parser (src/bin/long_receipt_check.rs + nam_audio_pipe::receipt::long)
+        # — never a substring search. The gate accepts only a real strict
+        # passed run (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1, MODE:
+        # full, OVERALL: PASSED); simulate/partial/legacy receipts are rejected
+        # fail-closed.
+        if ! cargo run --quiet --locked --bin long_receipt_check -- "$LONG_RECEIPT_PATH"; then
+            die "Release ceremony requires a real, strict long suite receipt on disk (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1, MODE: full, OVERALL: PASSED).\nReceipt at target/logs/long-receipt.txt failed semantic verification (SIMULATED, STRICT: 0, COMPLETED_WITH_GAPS, FAILED, missing NAM_RT_STRICT propagation or simulate mode are strictly rejected)."
         fi
-        echo -e "  ${GREEN}✓${NC} Real strict long suite receipt verified (STRICT: 1, MODE: full, OVERALL: PASSED)."
+        echo -e "  ${GREEN}✓${NC} Real strict long suite receipt verified (STRICT: 1, NAM_RT_STRICT: 1, MODE: full, OVERALL: PASSED)."
     else
         die "Release ceremony requires a real, strict long suite receipt on disk (target/logs/long-receipt.txt is missing).\nPlease ask the human operator to execute:\n  ./utils/tests-long.sh --strict-pre-release\n(AI agents MUST NEVER execute the long suite directly)."
     fi
@@ -461,6 +470,9 @@ if [ "$USE_PGO" = true ]; then
 import json
 import sys
 
+# T5.2 matrix gate (G-PERF-003): the receipt must prove per-topology minimum
+# progress (frames) per DSP group — never an aggregated global number — and
+# every matrix dimension value must have been exercised.
 min_blocks = 1000
 path = sys.argv[1]
 try:
@@ -470,36 +482,71 @@ except Exception as e:
     print(f"[FATAL] cannot parse PGO receipt {path}: {e}", file=sys.stderr)
     sys.exit(1)
 
-topology_blocks = receipt.get("topology_blocks") or {}
+if receipt.get("schema_version") != 2:
+    print(
+        f"[FATAL] PGO receipt schema_version must be 2 (matrix), got "
+        f"{receipt.get('schema_version')}.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+progress = receipt.get("progress") or {}
+min_blocks_by_topo = progress.get("min_blocks_per_topology") or {}
+min_frames_by_topo = progress.get("min_frames_per_topology") or {}
+groups = progress.get("groups") or {}
+
 for topology in ("wavenet_a1", "wavenet_a2", "lstm"):
-    count = topology_blocks.get(topology, 0)
-    if count < min_blocks:
+    blocks = min_blocks_by_topo.get(topology, 0)
+    if blocks < min_blocks:
         print(
-            f"[FATAL] PGO receipt: topology '{topology}' has only {count} blocks "
+            f"[FATAL] PGO receipt: topology '{topology}' min blocks = {blocks} "
             f"(required >= {min_blocks}); the profile is not representative.",
             file=sys.stderr,
         )
         sys.exit(1)
+    frames = min_frames_by_topo.get(topology, 0)
+    if frames <= 0:
+        print(
+            f"[FATAL] PGO receipt: topology '{topology}' advanced 0 frames.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    for group in ("resampler", "inference", "oversample", "cabsim", "bridge", "recording"):
+        gmin = ((groups.get(group) or {}).get("min_frames_per_topology") or {}).get(topology, 0)
+        if gmin <= 0:
+            print(
+                f"[FATAL] PGO receipt: DSP group '{group}' advanced 0 frames for "
+                f"topology '{topology}'.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
-cabsim = receipt.get("cabsim") or {}
-if not (cabsim.get("stereo_convolved_frames", 0) > 0):
-    print("[FATAL] PGO receipt: stereo CabSim convolution was not executed.", file=sys.stderr)
-    sys.exit(1)
+coverage = receipt.get("coverage") or {}
+for dim, required in (
+    ("rates", ("44100", "48000", "96000")),
+    ("quantums", ("64", "256", "512")),
+    ("oversampling", ("Off", "2x", "4x")),
+    ("cabsim", ("ir", "bypass")),
+    ("recording", ("no", "yes")),
+):
+    counts = coverage.get(dim) or {}
+    for value in required:
+        if not (counts.get(value, 0) > 0):
+            print(
+                f"[FATAL] PGO receipt: matrix dimension '{dim}' value '{value}' "
+                f"was not exercised.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
 if receipt.get("no_stage_skipped") is not True:
     print("[FATAL] PGO receipt: no_stage_skipped is not true; a mandatory DSP stage was skipped.", file=sys.stderr)
     sys.exit(1)
 
-oversampling = receipt.get("oversampling_blocks") or {}
-for mode in ("Off", "2x", "4x"):
-    if not (oversampling.get(mode, 0) > 0):
-        print(f"[FATAL] PGO receipt: oversampling mode '{mode}' was not exercised.", file=sys.stderr)
-        sys.exit(1)
-
 print(
-    f"  OK PGO receipt valid: topologies={ {k: v for k, v in sorted(topology_blocks.items())} }, "
-    f"oversampling={ {k: v for k, v in sorted(oversampling.items())} }, "
-    f"cabsim_frames={cabsim.get('stereo_convolved_frames')}"
+    f"  OK PGO matrix receipt valid: min_blocks={ {k: v for k, v in sorted(min_blocks_by_topo.items())} }, "
+    f"min_frames={ {k: v for k, v in sorted(min_frames_by_topo.items())} }, "
+    f"coverage={ {d: sorted(c.items()) for d, c in sorted(coverage.items())} }"
 )
 PY
     then
@@ -1145,18 +1192,21 @@ PY
 # write_provenance_receipt
 #   Emits target/logs/release-provenance.json certifying every element that
 #   determines the distributed bytes: clean source commit + UTC timestamp,
-#   exact rustc/cargo versions, build profile/RUSTFLAGS/active optimizations,
-#   dependency traceability (Cargo.lock SHA-256 + coupled NeuralAmpModeler-rs
-#   commit) and SHA-256 + size + Build-ID of each delivery artifact (installed
-#   stripped ELF, .tar.zst, .flatpak, AppStream metainfo). Failure to emit the
-#   receipt is fatal under --release-ceremony (a release without provenance is
-#   not a release); elsewhere it degrades to a typed warning.
+#   exact rustc/cargo versions, build identity (profile `dist` vs `testing`,
+#   active features, RUSTFLAGS, optimization status, explicit opt-out of
+#   harness-measured performance claims for the final ELF — T5.1), build
+#   environment (`uname -r`, `pw-cli --version` — T5.1), dependency
+#   traceability (Cargo.lock SHA-256 + coupled NeuralAmpModeler-rs commit) and
+#   SHA-256 + size + Build-ID of each delivery artifact (installed stripped
+#   ELF, .tar.zst, .flatpak, AppStream metainfo). Failure to emit the receipt
+#   is fatal under --release-ceremony (a release without provenance is not a
+#   release); elsewhere it degrades to a typed warning.
 write_provenance_receipt() {
     mkdir -p "$PROJECT_DIR/target/logs"
     local ts commit tree_sha rustc_ver cargo_ver base_rustflags cpu_baseline \
         lock_path nam_rs_dir nam_commit bin_bid bin_path tar_path \
         flatpak_path appstream_path ceremony_status quick_receipt long_receipt \
-        pgo_receipt release_receipt
+        pgo_receipt release_receipt features_json kernel_release pw_cli_version
     ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     commit="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
     tree_sha="$(git rev-parse HEAD^{tree} 2>/dev/null || echo "unknown")"
@@ -1168,6 +1218,38 @@ write_provenance_receipt() {
         *native*) cpu_baseline="native ($(uname -m))" ;;
         *) cpu_baseline="default" ;;
     esac
+    # T5.1: active features of the release ELF = the resolved default feature
+    # set (the release build passes no --features flags). Derived from
+    # Cargo.toml so the receipt can never drift from the manifest.
+    features_json=$(python3 -c '
+import json
+
+features = []
+try:
+    import tomllib
+    with open("Cargo.toml", "rb") as f:
+        data = tomllib.load(f)
+    default = data.get("features", {}).get("default", [])
+    features = [f.split("/")[0] for f in default if isinstance(f, str)]
+except Exception:
+    import re
+    try:
+        with open("Cargo.toml", "r") as f:
+            content = f.read()
+        match = re.search(r"\[features\]\s*default\s*=\s*\[(.*?)\]", content, re.DOTALL)
+        if match:
+            features = [
+                x.strip().strip("\"").split("/")[0]
+                for x in match.group(1).split(",")
+                if x.strip()
+            ]
+    except Exception:
+        pass
+print(json.dumps(features))
+' 2>/dev/null || echo "[]")
+    # T5.1: build environment identity — kernel release + PipeWire CLI version.
+    kernel_release="$(uname -r 2>/dev/null || echo 'unknown')"
+    pw_cli_version="$(command -v pw-cli >/dev/null 2>&1 && pw-cli --version 2>/dev/null | head -n1 || true)"
     lock_path="$PROJECT_DIR/Cargo.lock"
     nam_rs_dir="$PROJECT_DIR/../NeuralAmpModeler-rs"
     if [ -d "$nam_rs_dir/.git" ]; then
@@ -1197,7 +1279,8 @@ write_provenance_receipt() {
         "$base_rustflags" "$BOLT_STATUS" "$cpu_baseline" "$lock_path" \
         "$nam_commit" "$bin_bid" "$bin_path" "$tar_path" "$flatpak_path" \
         "$appstream_path" "$ceremony_status" "$quick_receipt" "$long_receipt" \
-        "$pgo_receipt" "$release_receipt" > "$PROVENANCE_RECEIPT" <<'PY'
+        "$pgo_receipt" "$release_receipt" "$features_json" "$kernel_release" \
+        "$pw_cli_version" > "$PROVENANCE_RECEIPT" <<'PY'
 import hashlib
 import json
 import os
@@ -1215,7 +1298,15 @@ def sha256(path):
 (ts, commit, tree_sha, version, rustc_ver, cargo_ver, rustflags, opt_status,
  cpu_baseline, lock_path, nam_commit, bin_bid, bin_path, tar_path,
  flatpak_path, appstream_path, ceremony_status, quick_receipt, long_receipt,
- pgo_receipt, release_receipt) = sys.argv[1:22]
+ pgo_receipt, release_receipt, features_json, kernel_release,
+ pw_cli_version) = sys.argv[1:25]
+
+try:
+    features = json.loads(features_json) if features_json else []
+    if not isinstance(features, list):
+        features = []
+except Exception:
+    features = []
 
 lock_sha = sha256(lock_path) if os.path.isfile(lock_path) else None
 
@@ -1285,7 +1376,7 @@ if ceremony_status == "certified_release":
         )
 
 doc = {
-    "schema_version": 1,
+    "schema_version": 2,
     "tool": "build-release.sh",
     "kind": "release-provenance",
     "project": {
@@ -1298,13 +1389,22 @@ doc = {
     "toolchain": {"rustc": rustc_ver, "cargo": cargo_ver},
     "build": {
         "profile": "dist",
+        "features": features,
         "rustflags": rustflags,
         "optimizations": {
             "status": opt_status,
             "cpu_baseline": cpu_baseline,
             "pgo": opt_status in ("PGO+BOLT", "PGO-ONLY"),
             "bolt": opt_status in ("PGO+BOLT", "BOLT-ONLY"),
+            # T5.1: the optimization status is a compilation-transform claim
+            # only — no harness-measured performance metric (deadline/jitter/
+            # throughput) is ever attributed to the final PGO+BOLT ELF here.
+            "measured_performance_claims": False,
         },
+    },
+    "environment": {
+        "kernel_release": kernel_release,
+        "pw_cli_version": pw_cli_version or None,
     },
     "dependencies": {
         "cargo_lock_sha256": lock_sha,

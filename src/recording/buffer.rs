@@ -10,20 +10,27 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::AtomicU64;
 
 /// Maximum number of interleaved f32 samples per audio block, defined at compile time.
-pub const MAX_BLOCK_SIZE: usize = 4096;
+/// Sized for the maximum host quantum (8192 frames × 2 channels = 16384 samples).
+pub const MAX_BLOCK_SIZE: usize = 16384;
 
 /// Number of slots in the SPSC ring buffer.
-/// Each slot holds a `RingPayload<MAX_BLOCK_SIZE>` (~16 KiB).
-pub const RING_CAPACITY: usize = 1024;
+/// Each slot holds a `RingPayload<MAX_BLOCK_SIZE>` (~64 KiB).
+/// Total memory: 256 slots × 64 KiB = 16 MiB (same footprint as the previous
+/// 1024 × 16 KiB layout, but with 4× deeper frame buffering).
+pub const RING_CAPACITY: usize = 256;
 
 /// Atomic counter for ring buffer overruns (push failures on the DSP producer side).
 /// Reported to the user at shutdown to indicate potential audio data loss.
 pub static OVERRUN_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Serializes unit tests that mutate the process-wide [`OVERRUN_COUNT`] global.
-/// Test-only; compiled out of production builds. Guards against races between
-/// the overrun-accounting tests and the `overrun_counter_starts_at_zero` test
-/// (both live in the same `--lib` test binary).
+/// Atomic counter for total frames lost due to ring buffer overruns.
+/// Reported alongside `OVERRUN_COUNT` at shutdown for reconciliation.
+pub static OVERRUN_FRAMES_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes unit tests that mutate the process-wide [`OVERRUN_COUNT`] and
+/// [`OVERRUN_FRAMES_COUNT`] globals. Test-only; compiled out of production
+/// builds. Guards against races between the overrun-accounting tests and the
+/// `overrun_counter_starts_at_zero` test (both live in the same `--lib` test binary).
 #[cfg(test)]
 pub(crate) static OVERRUN_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -45,7 +52,7 @@ pub(crate) static OVERRUN_COUNT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 pub struct AlignedBlock<const SIZE: usize> {
     /// Planar f32 audio samples: `data[0..n]` = channel L, `data[n..2n]` = channel R.
     /// Stored as `MaybeUninit` so the RT path can fill without zero-initializing
-    /// the whole 16 KiB array (see `new_uninit`).
+    /// the whole 64 KiB array (see `new_uninit`).
     data: [MaybeUninit<f32>; SIZE],
     /// Number of valid f32 samples in `data[0..valid_len]`.
     ///
@@ -72,10 +79,10 @@ impl<const SIZE: usize> AlignedBlock<SIZE> {
     ///
     /// # Performance
     ///
-    /// Measured: avoids ~16 KiB of memset per RT quantum with
+    /// Measured: avoids ~64 KiB of memset per RT quantum with
     /// `--record` active (~12 MB/s saved at 750 callbacks/s).
     /// On a 5-second capture at 48 kHz / 128-sample quanta
-    /// (~1875 callbacks), this saves ~30 MiB of redundant writes.
+    /// (~1875 callbacks), this saves ~120 MiB of redundant writes.
     #[inline]
     pub fn new_uninit() -> Self {
         Self {
@@ -197,8 +204,46 @@ pub enum RingPayload<const SIZE: usize> {
     StreamStop,
 }
 
+/// Control messages exchanged through the **dedicated control channel** of the
+/// promoted pool transport (T4.3).
+///
+/// The preallocated pool only carries audio; [`AudioMetadata`] and the
+/// [`StreamStop`](ControlPayload::StreamStop) token travel on a small separate
+/// SPSC ring so the RT path never pushes 64 KiB metadata frames and the I/O
+/// thread can finalize a capture independently of the audio backlog.
+#[repr(align(128))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ControlPayload {
+    /// Stream metadata (sample rate, bit depth, channels) to configure the WAV
+    /// file — pushed on format initialization and on every rate change.
+    Metadata(AudioMetadata),
+    /// Stream stop signal — instructs the I/O thread to drain the remaining
+    /// pool descriptors and close the current WAV file.
+    StreamStop,
+}
+
+/// Capacity of the dedicated recording control channel (T4.3).
+///
+/// [`ControlPayload::Metadata`] is pushed only on stream-format changes
+/// (rate renegotiations, rare) and [`ControlPayload::StreamStop`] exactly once
+/// at shutdown, so 4 slots are far beyond the steady-state need while keeping
+/// the control-ring footprint negligible (~4 × 128 B).
+pub const CONTROL_CAPACITY: usize = 4;
+
+/// Creates the SPSC control ring for the promoted pool transport (T4.3):
+/// [`Metadata`](ControlPayload::Metadata) / [`StreamStop`](ControlPayload::StreamStop)
+/// only — audio goes through the preallocated pool.
+pub fn create_control_ring_buffer(
+    capacity: usize,
+) -> (Producer<ControlPayload>, Consumer<ControlPayload>) {
+    RingBuffer::new(capacity)
+}
+
 /// Creates an SPSC (single-producer/single-consumer) ring buffer strictly dimensioned
 /// for `RingPayload` structures. The `capacity` parameter defines the number of slots.
+///
+/// This is the T4.1 **inline** transport constructor — the rollback path of
+/// T4.3. Production wiring uses [`crate::recording::transport::create_recording_transport`].
 pub fn create_audio_ring_buffer<const BLOCK_SIZE: usize>(
     capacity: usize,
 ) -> (
@@ -300,6 +345,34 @@ mod tests {
     fn overrun_counter_starts_at_zero() {
         let _guard = OVERRUN_COUNT_LOCK.lock().unwrap();
         assert_eq!(OVERRUN_COUNT.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            OVERRUN_FRAMES_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    /// T4.1 memory-impact contract: the slot must hold the largest legal host
+    /// quantum (8192 frames = `MAX_BRIDGE_BUF` × 2 interleaved channels) and
+    /// the reduced `RING_CAPACITY` must keep the total footprint at the same
+    /// ~16 MiB budget as the previous 1024 × 16 KiB layout.
+    #[test]
+    fn ring_footprint_covers_max_quantum_within_budget() {
+        // 8192 = MAX_BRIDGE_BUF (largest quantum the RT callbacks accept).
+        const {
+            assert!(
+                MAX_BLOCK_SIZE / 2 >= 8192,
+                "a slot must hold every legal quantum (8192 frames)"
+            );
+        }
+        assert_eq!(MAX_BLOCK_SIZE % 2, 0);
+        let slot = std::mem::size_of::<RingPayload<MAX_BLOCK_SIZE>>();
+        let footprint = slot * RING_CAPACITY;
+        // Medido: slot=65664 B → footprint = 256 × 65664 ≈ 16,8 MiB
+        // (was 1024 × 16640 ≈ 16,3 MiB with MAX_BLOCK_SIZE=4096).
+        assert!(
+            footprint <= 18 * 1024 * 1024,
+            "ring footprint exceeded the 16 MiB budget: {footprint} bytes"
+        );
     }
 
     #[test]

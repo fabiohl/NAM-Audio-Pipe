@@ -65,13 +65,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, RingPayload,
+    AlignedBlock, AudioMetadata, ControlPayload, MAX_BLOCK_SIZE, OVERRUN_COUNT,
+    OVERRUN_FRAMES_COUNT, RingPayload,
 };
 use crate::recording::io::{WriteAt, write_all_at};
+use crate::recording::pool::{POOL_CAPACITY, PoolConsumer};
 use crate::recording::probe::{IoUringSupport, probe_io_uring};
 use crate::recording::status::{
     RecordingInit, RecordingStatus, SharedRecordingStatus, record_failure,
 };
+use crate::recording::transport::RecordingReceiver;
 use crate::recording::wav_header::{build_wav_header, capture_filename, current_capture_timestamp};
 
 /// Monotonic sequence suffix for the writability probe file.
@@ -362,7 +365,7 @@ impl WavSink for TokioUringSink<'_> {
 /// observable [`RecordingStatus`] to `Failed` and raises the RT-observable
 /// failure flag.
 pub async fn disk_writer_loop(
-    mut consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>>,
+    mut receiver: RecordingReceiver,
     recording_data_available: Option<Arc<AtomicBool>>,
     init: RecordingInit,
 ) -> Result<()> {
@@ -406,7 +409,7 @@ pub async fn disk_writer_loop(
         base_dir: &base_dir,
     };
     let result =
-        disk_writer_loop_inner(&sink, &mut consumer, recording_data_available, &status).await;
+        disk_writer_loop_inner(&sink, &mut receiver, recording_data_available, &status).await;
 
     match &result {
         Ok(()) => {
@@ -481,24 +484,190 @@ fn fail_startup(
 ///
 /// Extracted so the startup handshake and failure propagation live in
 /// [`disk_writer_loop`] while the long-running drain loop stays focused.
+/// Dispatches to the transport selected by
+/// [`crate::recording::transport::RECORDING_POOL_TRANSPORT`]:
+/// [`disk_writer_loop_pool`] (production, T4.3) or [`disk_writer_loop_inline`]
+/// (rollback, T4.1).
 ///
 /// # Lifecycle (F-RB-009 / T3.4)
 ///
 /// The loop **never** observes the process-global `SHUTDOWN` flag. It exits
-/// only when the ring producer can no longer emit audio:
+/// only when the recording producer can no longer emit audio:
 ///
-/// 1. the [`RingPayload::StreamStop`] token is consumed — the main thread
-///    pushes it exclusively after `thread_loop.stop()` confirmed the RT loop
-///    stopped; or
-/// 2. the `Producer` was dropped **and** the ring is fully drained
-///    ([`Consumer::is_abandoned`] + [`Consumer::is_empty`]) — no block can
-///    ever arrive again.
+/// 1. the [`ControlPayload::StreamStop`] token (pool transport) /
+///    [`RingPayload::StreamStop`] token (inline transport) is consumed — the
+///    main thread pushes it exclusively after `thread_loop.stop()` confirmed
+///    the RT loop stopped; or
+/// 2. every producer was dropped **and** every channel is fully drained
+///    ([`RecordingReceiver::is_fully_drained`]) — no block can ever arrive
+///    again.
 ///
 /// Both terminal paths drain every pending block first (integral drain),
 /// finalize the WAV header and `fsync` before returning, so a SIGINT arriving
 /// while the ring is momentarily empty can never orphan the blocks produced
 /// afterwards.
 async fn disk_writer_loop_inner<S: WavSink>(
+    sink: &S,
+    receiver: &mut RecordingReceiver,
+    recording_data_available: Option<Arc<AtomicBool>>,
+    status: &SharedRecordingStatus,
+) -> Result<()> {
+    match receiver {
+        RecordingReceiver::Pool { control, pool } => {
+            disk_writer_loop_pool(sink, control, pool, recording_data_available, status).await
+        }
+        RecordingReceiver::Inline(consumer) => {
+            disk_writer_loop_inline(sink, consumer, recording_data_available, status).await
+        }
+    }
+}
+
+/// Promoted T4.3 drain loop: consumes the dedicated control ring
+/// (Metadata/StreamStop) plus the preallocated audio pool, writing every pool
+/// block **in place** (the 64 KiB payload never moves out of its slot).
+///
+/// # Ordering (control barriers)
+///
+/// The pool `work` ring is polled **before** the control ring in every
+/// iteration. The RT producer gates audio publication on metadata confirmation
+/// and, for every metadata push, deposits a [control barrier](crate::recording::pool::CONTROL_BARRIER_SLOT)
+/// into the pool `work` ring **after** the control message lands in the
+/// control ring — so the barrier marks the exact position where a mid-stream
+/// rate change must be applied. The worker consumes the barrier from the audio
+/// FIFO and applies the corresponding control message at that point, preserving
+/// the RT publication order (`... A4 A5 M B1 B2 ...`) exactly like the inline
+/// ring. A control message whose barrier push failed (pool exhausted) surfaces
+/// as an orphan when the pool drains empty — audio was never published past it
+/// (unconfirmed), so the ordering still holds.
+///
+/// # Integral drain on StreamStop
+///
+/// `StreamStop` is pushed only after the RT loop stopped, so no new pool
+/// descriptors can arrive once it is consumed; the stop handler still drains
+/// every pending descriptor (audio or barrier) before finalizing — no block
+/// published before the stop can be orphaned (F-RB-009 / T3.4).
+async fn disk_writer_loop_pool<S: WavSink>(
+    sink: &S,
+    control: &mut Consumer<ControlPayload>,
+    pool: &mut PoolConsumer<POOL_CAPACITY>,
+    recording_data_available: Option<Arc<AtomicBool>>,
+    status: &SharedRecordingStatus,
+) -> Result<()> {
+    let mut wav_writer: Option<S::Writer> = None;
+    let mut part_counter: u32 = 0;
+
+    loop {
+        // 1. Audio pool first — drains in strict FIFO order.
+        if let Some(in_flight) = pool.try_pop() {
+            if in_flight.is_barrier() {
+                // A control barrier: the RT pushed a Metadata into the control
+                // ring just before this marker — apply it at this stream
+                // position. (StreamStop cannot be here: it is pushed only
+                // after the RT stopped and all barriers were already emitted.)
+                if let Ok(ControlPayload::Metadata(meta)) = control.pop() {
+                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
+                }
+            } else {
+                write_block_with_overflow_rollover(
+                    sink,
+                    &mut wav_writer,
+                    &mut part_counter,
+                    status,
+                    in_flight.block(),
+                )
+                .await?;
+            }
+            in_flight.release();
+            continue;
+        }
+
+        // 2. Pool drained: consume orphan control messages — a metadata whose
+        // barrier push failed while the pool was exhausted (audio publication
+        // was suspended until it was confirmed, so applying it now is still
+        // positionally correct), or the terminal StreamStop.
+        if let Ok(ctrl) = control.pop() {
+            match ctrl {
+                ControlPayload::Metadata(meta) => {
+                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
+                }
+                ControlPayload::StreamStop => {
+                    // Terminal condition (1): the token is consumed only after
+                    // the RT loop stopped (`thread_loop.stop()`), so no further
+                    // audio can be produced. Drain any descriptor that raced
+                    // in (audio or barrier), then finalize and exit.
+                    while let Some(in_flight) = pool.try_pop() {
+                        if in_flight.is_barrier() {
+                            if let Ok(ControlPayload::Metadata(meta)) = control.pop() {
+                                open_new_part(
+                                    sink,
+                                    &mut wav_writer,
+                                    &mut part_counter,
+                                    status,
+                                    meta,
+                                )
+                                .await?;
+                            }
+                        } else {
+                            write_block_with_overflow_rollover(
+                                sink,
+                                &mut wav_writer,
+                                &mut part_counter,
+                                status,
+                                in_flight.block(),
+                            )
+                            .await?;
+                        }
+                        in_flight.release();
+                    }
+                    if let Some(mut writer) = wav_writer.take() {
+                        writer
+                            .finalize()
+                            .await
+                            .context("Failed to finalize WAV on stream stop")?;
+                        log::info!(
+                            "⏹️  Audio source stopped. WAV file safely closed and ready for use.",
+                        );
+                    }
+                    report_overruns();
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // 3. Terminal condition (2): both producers were dropped AND both
+        // channels are completely drained — no block can ever arrive again.
+        // Drain is integral: everything pending was already written above, so
+        // finalize with the last sample and exit.
+        if control.is_abandoned()
+            && control.is_empty()
+            && pool.work_is_abandoned()
+            && pool.work_is_empty()
+        {
+            if let Some(mut writer) = wav_writer.take() {
+                writer
+                    .finalize()
+                    .await
+                    .context("Failed to finalize WAV file after recording producer was dropped")?;
+                log::info!("⏹️  Recording producer disconnected; capture finalized.");
+            }
+            report_overruns();
+            break;
+        }
+
+        // 4. Idle poll (see the inline loop for the hint-flag rationale).
+        if let Some(ref flag) = recording_data_available {
+            flag.store(false, Ordering::Relaxed);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    Ok(())
+}
+
+/// T4.1 rollback drain loop: consumes the single inline SPSC ring carrying
+/// Metadata, Audio and StreamStop in FIFO order.
+async fn disk_writer_loop_inline<S: WavSink>(
     sink: &S,
     consumer: &mut Consumer<RingPayload<MAX_BLOCK_SIZE>>,
     recording_data_available: Option<Arc<AtomicBool>>,
@@ -511,64 +680,17 @@ async fn disk_writer_loop_inner<S: WavSink>(
         if let Ok(payload) = consumer.pop() {
             match payload {
                 RingPayload::Metadata(meta) => {
-                    // Finalize the previous WAV if the format changed mid-stream.
-                    if let Some(mut existing_writer) = wav_writer.take() {
-                        existing_writer
-                            .finalize()
-                            .await
-                            .context("Failed to finalize the previous WAV file")?;
-                        log::info!("⏹️  Safely closed the previous capture.");
-                    }
-
-                    part_counter += 1;
-                    let (writer, filename) = sink.create(part_counter, meta).await?;
-
-                    log::info!("🎬 Created file: {}", filename.display());
-                    log::info!("🎧 Started writing strict PipeWire source audio...");
-
-                    // Keep the observable status pointed at the live capture file.
-                    if let Ok(mut guard) = status.lock() {
-                        *guard = RecordingStatus::Active {
-                            path: filename.clone(),
-                        };
-                    }
-
-                    wav_writer = Some(writer);
+                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
                 }
                 RingPayload::Audio(block) => {
-                    let overflow_detected = wav_writer
-                        .as_ref()
-                        .is_some_and(|w| w.would_overflow(block.valid_len()));
-                    if overflow_detected {
-                        log::warn!(
-                            "WAV file reached 4 GiB RIFF limit. Closing current segment \
-                             and starting part {}.",
-                            part_counter + 1
-                        );
-                        if let Some(mut old_writer) = wav_writer.take() {
-                            let meta = old_writer.metadata();
-                            old_writer
-                                .finalize()
-                                .await
-                                .context("Failed to finalize previous WAV segment on overflow")?;
-
-                            part_counter += 1;
-                            let (new_writer, filename) = sink.create(part_counter, meta).await?;
-                            log::info!("🎬 Continuing capture in: {}", filename.display());
-
-                            if let Ok(mut guard) = status.lock() {
-                                *guard = RecordingStatus::Active {
-                                    path: filename.clone(),
-                                };
-                            }
-
-                            wav_writer = Some(new_writer);
-                        }
-                    }
-
-                    if let Some(writer) = &mut wav_writer {
-                        writer.write_block(&block).await?;
-                    }
+                    write_block_with_overflow_rollover(
+                        sink,
+                        &mut wav_writer,
+                        &mut part_counter,
+                        status,
+                        &block,
+                    )
+                    .await?;
                 }
                 RingPayload::StreamStop => {
                     // Terminal condition (1): the token is consumed only after
@@ -620,13 +742,101 @@ async fn disk_writer_loop_inner<S: WavSink>(
     Ok(())
 }
 
-/// Logs a warning if the RT producer reported ring overruns (audio loss).
-fn report_overruns() {
-    let overruns = OVERRUN_COUNT.load(Ordering::Relaxed);
-    if overruns > 0 {
+/// Finalizes the previous capture segment (if any), opens a new sequential
+/// `_partN` file for `meta` and points the observable status at it. Shared by
+/// both transports (Metadata arm, overflow rollover and the control-barrier
+/// path of the pool transport).
+async fn open_new_part<S: WavSink>(
+    sink: &S,
+    wav_writer: &mut Option<S::Writer>,
+    part_counter: &mut u32,
+    status: &SharedRecordingStatus,
+    meta: AudioMetadata,
+) -> Result<()> {
+    // Finalize the previous WAV if the format changed mid-stream.
+    if let Some(mut existing_writer) = wav_writer.take() {
+        existing_writer
+            .finalize()
+            .await
+            .context("Failed to finalize the previous WAV file")?;
+        log::info!("⏹️  Safely closed the previous capture.");
+    }
+
+    *part_counter += 1;
+    let (writer, filename) = sink.create(*part_counter, meta).await?;
+
+    log::info!("🎬 Created file: {}", filename.display());
+    log::info!("🎧 Started writing strict PipeWire source audio...");
+
+    // Keep the observable status pointed at the live capture file.
+    if let Ok(mut guard) = status.lock() {
+        *guard = RecordingStatus::Active {
+            path: filename.clone(),
+        };
+    }
+
+    *wav_writer = Some(writer);
+    Ok(())
+}
+
+/// Writes one audio block through the shared overflow-rollover logic used by
+/// both transports: if the block would exceed the `u32` RIFF size field the
+/// current segment is finalized and a sequential `_partN` file is started
+/// (F-RB-008 / T3.2), then the block is persisted.
+async fn write_block_with_overflow_rollover<S: WavSink>(
+    sink: &S,
+    wav_writer: &mut Option<S::Writer>,
+    part_counter: &mut u32,
+    status: &SharedRecordingStatus,
+    block: &AlignedBlock<MAX_BLOCK_SIZE>,
+) -> Result<()> {
+    let overflow_detected = wav_writer
+        .as_ref()
+        .is_some_and(|w| w.would_overflow(block.valid_len()));
+    if overflow_detected {
         log::warn!(
-            "⚠️  Detected {} ring buffer overruns — possible audio data loss.",
-            overruns
+            "WAV file reached 4 GiB RIFF limit. Closing current segment \
+             and starting part {}.",
+            *part_counter + 1
+        );
+        if let Some(mut old_writer) = wav_writer.take() {
+            let meta = old_writer.metadata();
+            old_writer
+                .finalize()
+                .await
+                .context("Failed to finalize previous WAV segment on overflow")?;
+
+            *part_counter += 1;
+            let (new_writer, filename) = sink.create(*part_counter, meta).await?;
+            log::info!("🎬 Continuing capture in: {}", filename.display());
+
+            if let Ok(mut guard) = status.lock() {
+                *guard = RecordingStatus::Active {
+                    path: filename.clone(),
+                };
+            }
+
+            *wav_writer = Some(new_writer);
+        }
+    }
+
+    if let Some(writer) = &mut *wav_writer {
+        writer.write_block(block).await?;
+    }
+    Ok(())
+}
+
+/// Logs a warning if the RT producer reported ring overruns (audio loss),
+/// reporting both the lost block count and the lost frame count so the user can
+/// reconcile `frames_capturados == frames_enfileirados + frames_perdidos`.
+fn report_overruns() {
+    let blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
+    let frames = OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed);
+    if blocks > 0 || frames > 0 {
+        log::warn!(
+            "⚠️  blocos perdidos: {} (frames: {}) — possível perda de áudio.",
+            blocks,
+            frames
         );
     }
 }
@@ -639,6 +849,10 @@ fn report_overruns() {
 /// [`RecordingInit::io_uring_probe`] so the unavailable-kernel fail-fast path
 /// is unit-testable without a real kernel change.
 ///
+/// `receiver` is the consumer half of the recording transport (promoted pool +
+/// control ring, or the T4.1 inline ring) produced by
+/// [`crate::recording::transport::create_recording_transport`].
+///
 /// Returns the thread handle. The worker communicates its startup outcome
 /// through `init.handshake` (consumed by
 /// [`crate::recording::status::wait_for_recording_init`]) and, on any later
@@ -650,7 +864,7 @@ fn report_overruns() {
 /// formally and recording failures propagate into the process exit code
 /// (F-RB-009 / T3.5).
 pub fn spawn_recording_worker(
-    consumer: Consumer<RingPayload<MAX_BLOCK_SIZE>>,
+    receiver: RecordingReceiver,
     recording_data_available: Option<Arc<AtomicBool>>,
     init: RecordingInit,
 ) -> std::io::Result<std::thread::JoinHandle<anyhow::Result<()>>> {
@@ -670,7 +884,7 @@ pub fn spawn_recording_worker(
                 Err(anyhow::anyhow!(reason))
             } else {
                 tokio_uring::start(async move {
-                    let result = disk_writer_loop(consumer, recording_data_available, init).await;
+                    let result = disk_writer_loop(receiver, recording_data_available, init).await;
                     if let Err(e) = &result {
                         // `disk_writer_loop` already records the failure on the
                         // observable status and the RT failure flag; log here

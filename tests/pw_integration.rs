@@ -96,6 +96,7 @@ fn test_pipewire_integration() {
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
+                requested_cpu: None,
                 // Reconnect disabled in the deterministic integration harness:
                 // the daemon probe already guarantees it is up, so any backend
                 // failure is a defect that must surface immediately (T4.5).
@@ -240,6 +241,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
+                requested_cpu: None,
                 // Reconnect ENABLED: this is exactly what the bounce exercises.
                 fail_fast: false,
             },
@@ -531,6 +533,7 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
+                requested_cpu: None,
                 fail_fast: false,
             },
             gc_cons,

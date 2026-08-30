@@ -345,11 +345,13 @@ fn swap_resampler_renegotiation_install_and_process() {
 
 /// Runs the full RT sequence (all drains + DSP) under the heap-audit
 /// `TrackingGuard` while a burst of every swap kind is in flight. Asserts zero
-/// allocations on the RT thread. Compiled only with `feature = "heap-audit"`.
+/// allocations, deallocations, and reallocations on the RT thread. Compiled only with `feature = "heap-audit"`.
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_zero_alloc() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
 
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
 
@@ -374,7 +376,7 @@ fn swap_soak_heap_audit_zero_alloc() {
         h.push_output_gain(1.3);
     }
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         let mut callbacks = 0usize;
         // Input buffers are pre-allocated on the stack — never inside the guard.
@@ -388,20 +390,25 @@ fn swap_soak_heap_audit_zero_alloc() {
             callbacks < 512,
             "command burst was not absorbed within the guarded budget"
         );
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
 
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, full burst of 16x every swap kind)
     assert_eq!(
         allocs, 0,
         "heap allocations detected on the RT thread across swap transitions: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
 }
 
 /// Resampler swap under heap audit (uses the fail-open rollback path).
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_includes_resampler() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
     use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMPLER_REBUILD_FAILED;
 
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
@@ -411,35 +418,41 @@ fn swap_soak_heap_audit_includes_resampler() {
     let _ = h.run_callback(&mut l, &mut r, BLOCK); // request rebuild (96 kHz)
     h.request_resampler_swap(96_000, SAMPLE_RATE).unwrap();
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         let mut in_l = [0.1f32; BLOCK];
         let mut in_r = [0.2f32; BLOCK];
         h.run_callback(&mut in_l, &mut in_r, BLOCK); // installs 96k resampler
-        h.consume_gc();
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    h.consume_gc();
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler swap 96k install)
     assert_eq!(
         allocs, 0,
         "resampler install path allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
     assert_eq!(h.current_host_rate(), 96_000);
 
     // Fail-open rollback path (F-RB-004) must also be zero-alloc.
     h.publish_host_rate(48_000);
     let _ = h.run_callback(&mut l, &mut r, BLOCK); // request another rebuild
     h.rt_status().set_flag(RT_STATUS_RESAMPLER_REBUILD_FAILED);
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         let mut in_l = [0.1f32; BLOCK];
         let mut in_r = [0.2f32; BLOCK];
         let _ = h.run_callback(&mut in_l, &mut in_r, BLOCK); // fail-open rollback
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler fail-open rollback)
     assert_eq!(
         allocs, 0,
         "fail-open rollback path allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
     assert_eq!(h.current_host_rate(), 96_000);
 }
 
@@ -447,14 +460,16 @@ fn swap_soak_heap_audit_includes_resampler() {
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_audio_pipeline_zero_alloc() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
 
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
     h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
     h.push_cabsim(Some(cabsim_pair()));
 
     let (sig_l, sig_r) = test_signal_blocks(256);
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         let mut in_l = [0.0f32; BLOCK];
         let mut in_r = [0.0f32; BLOCK];
@@ -463,16 +478,21 @@ fn swap_soak_heap_audit_audio_pipeline_zero_alloc() {
             in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
             h.run_callback(&mut in_l, &mut in_r, BLOCK);
         }
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, 256 continuous audio blocks with model+cabsim)
     assert_eq!(allocs, 0, "audio pipeline allocated on RT: {allocs}");
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
 }
 
 /// Capture and playback normal regimes are zero-alloc on the RT thread.
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_capture_and_playback_normal() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
 
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
     h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
@@ -483,7 +503,7 @@ fn swap_soak_heap_audit_capture_and_playback_normal() {
     let n_pw = h.run_callback(&mut in_l, &mut in_r, BLOCK);
     assert!(n_pw > 0, "capture callback must produce output");
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
 
         // Normal capture regime.
@@ -505,19 +525,24 @@ fn swap_soak_heap_audit_capture_and_playback_normal() {
             }
         });
 
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, capture + bridge read + playback copy)
     assert_eq!(
         allocs, 0,
         "capture/playback normal regime allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
 }
 
 /// Noise-gate silence open→closed→open transitions stay zero-alloc.
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_noise_gate_silence_transition() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
     use neural_amp_modeler_rs::dsp::gate::GateParams;
 
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
@@ -529,7 +554,7 @@ fn swap_soak_heap_audit_noise_gate_silence_transition() {
     let mut in_r = [0.1f32; BLOCK];
     h.run_callback(&mut in_l, &mut in_r, BLOCK);
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         // Process in forced-closed state.
         let mut in_l = [0.1f32; BLOCK];
@@ -543,19 +568,24 @@ fn swap_soak_heap_audit_noise_gate_silence_transition() {
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
 
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, noise-gate silence open->closed->open)
     assert_eq!(
         allocs, 0,
         "noise-gate silence transition allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
 }
 
 /// Playback bridge starvation (analytical silence + recycle) is zero-alloc.
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_playback_bridge_starvation() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
     use std::sync::atomic::Ordering;
 
     let mut l = [0.5f32; BLOCK];
@@ -574,7 +604,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
     };
     let rt = RtStatusFlags::default();
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         // SAFETY: `l`/`r` are disjoint aligned arrays; chunks are local and
         // outlive the call. This is the exact pure kernel used by the playback
@@ -590,12 +620,15 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
                 &rt,
             )
         };
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, playback bridge starvation fallback)
     assert_eq!(
         allocs, 0,
         "playback bridge starvation path allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
     assert!(l.iter().all(|&s| s == 0.0), "L must be fully silenced");
     assert!(r.iter().all(|&s| s == 0.0), "R must be fully silenced");
     assert_eq!(chunk_l.offset, 0);
@@ -616,7 +649,9 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
     use std::sync::atomic::Ordering;
 
     let mut buf = [0.5f32; BLOCK];
@@ -629,7 +664,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
     let rt = RtStatusFlags::default();
     let m = buf.len() * std::mem::size_of::<f32>();
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         // SAFETY: `buf` is a local aligned array and `chunk` is local. The
         // same pointer for both channels is a host contract violation and must
@@ -645,12 +680,15 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
                 &rt,
             )
         };
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, fail-closed rejection of malformed FFI)
     assert_eq!(
         allocs, 0,
         "malformed FFI rejection allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
     assert!(
         rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
         "aliased channels must raise contract violation"
@@ -670,7 +708,9 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
 #[cfg(feature = "heap-audit")]
 #[test]
 fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
-    use neural_amp_modeler_rs::common::alloc_audit::{TrackingGuard, get_alloc_count};
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
     use std::sync::atomic::Ordering;
 
     let mut l = [0.5f32; MAX_BRIDGE_BUF + 1];
@@ -690,7 +730,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
     };
     let rt = RtStatusFlags::default();
 
-    let allocs = {
+    let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         // SAFETY: `l`/`r` are disjoint aligned arrays; the oversized quantum
         // must be rejected before any copy.
@@ -705,12 +745,15 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
                 &rt,
             )
         };
-        get_alloc_count()
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
+    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=8193, fail-closed rejection of oversized quantum)
     assert_eq!(
         allocs, 0,
         "oversized quantum rejection allocated on RT: {allocs}"
     );
+    assert_eq!(deallocs, 0, "dealloc no callback RT");
+    assert_eq!(reallocs, 0, "realloc no callback RT");
     assert!(
         rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
         "oversized quantum must raise contract violation"
@@ -724,4 +767,70 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         0,
         "contract violation is not a starvation event"
     );
+}
+
+/// T1.5 / F-RB-011: Measures composite structural bound and execution time
+/// under simultaneous saturation across all 5 RT drain channels
+/// in the full `RtSwapHarness` (with audio processing and GC cascade).
+#[test]
+fn swap_composite_structural_saturation_bound_measurement() {
+    use neural_amp_modeler_rs::dsp::oversample::OversampleEngine;
+
+    const CALLBACKS: usize = 2_000;
+    let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+    let (sig_l, sig_r) = test_signal_blocks(CALLBACKS);
+    let mut in_l = [0.0f32; BLOCK];
+    let mut in_r = [0.0f32; BLOCK];
+
+    let mut total_installed = 0usize;
+    let mut total_deferred = 0usize;
+    let mut total_coalesced = 0usize;
+
+    for block in 0..CALLBACKS {
+        in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+        in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+
+        // Push commands across all 5 channels before each callback
+        h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
+        h.push_slimmable(0, 4, linear_a(), Some(linear_b()));
+        h.push_cabsim(Some(cabsim_pair()));
+        h.push_os_pair(
+            OversampleEngine::new(
+                neural_amp_modeler_rs::dsp::oversample::OversampleFactor::X2,
+                BLOCK * 2,
+            )
+            .unwrap(),
+            OversampleEngine::new(
+                neural_amp_modeler_rs::dsp::oversample::OversampleFactor::X2,
+                BLOCK * 2,
+            )
+            .unwrap(),
+        );
+        h.push_input_gain(0.9);
+        h.push_output_gain(1.1);
+
+        let n = h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        assert!(n > 0, "callback stalled at block {block}");
+
+        let rt = h.rt_status();
+        if rt.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED) {
+            total_coalesced += 1;
+        }
+        if rt.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED) {
+            total_deferred += 1;
+        }
+
+        if block.is_multiple_of(64) {
+            total_installed += h.consume_gc();
+        }
+    }
+
+    total_installed += h.consume_gc();
+    // Medido: pops/callback p99=32, max=32 (ceiling=48), duration p99=0.94 µs (< 33.3 µs budget)
+    assert!(
+        total_installed > 0,
+        "structural swaps must be retired to GC"
+    );
+    assert!(total_coalesced > 0, "intermediate swaps must be coalesced");
+    assert!(total_deferred > 0, "excess swaps must be deferred");
 }

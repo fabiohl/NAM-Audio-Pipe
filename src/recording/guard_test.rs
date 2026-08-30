@@ -3,44 +3,65 @@
 
 //! Unit tests for the RAII recording worker guard and the observable join
 //! (F-RB-009 / T3.5): premature-drop cleanup, formal join-result inspection
-//! (worker error, panic, timeout) and the ordered StreamStop → producer drop
+//! (worker error, panic, timeout) and the ordered StreamStop → sender drop
 //! → bounded join teardown.
 
 use super::*;
-use crate::recording::buffer::{MAX_BLOCK_SIZE, RingPayload, create_audio_ring_buffer};
+use crate::recording::buffer::{AudioMetadata, ControlPayload, RingPayload};
+use crate::recording::transport::{RecordingReceiver, RecordingSender, create_recording_transport};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-fn dummy_meta() -> RingPayload<MAX_BLOCK_SIZE> {
-    RingPayload::Metadata(crate::recording::buffer::AudioMetadata {
+fn dummy_meta() -> AudioMetadata {
+    AudioMetadata {
         sample_rate: 48000.0,
         bit_depth: 32,
         channels: 2,
-    })
+    }
 }
 
 #[test]
 fn push_stream_stop_succeeds_when_capacity_frees() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(1);
-    prod.push(dummy_meta()).unwrap();
+    // A single-slot control channel pre-filled with a Metadata: the retry loop
+    // must land the StreamStop as soon as the consumer frees the slot.
+    let (control_p, mut control_c) = crate::recording::buffer::create_control_ring_buffer(1);
+    let mut sender = RecordingSender::Pool {
+        control: Some(control_p),
+        pool: None,
+    };
+    sender
+        .control_producer_mut()
+        .unwrap()
+        .push(ControlPayload::Metadata(dummy_meta()))
+        .unwrap();
 
     let handle = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
-        let _ = cons.pop();
+        let _ = control_c.pop();
     });
 
-    push_stream_stop(&mut prod, Duration::from_millis(200));
+    push_stream_stop(&mut sender, Duration::from_millis(200));
     handle.join().unwrap();
 }
 
 #[test]
 fn push_stream_stop_times_out_when_ring_stays_full() {
-    let (mut prod, _cons) = rtrb::RingBuffer::new(1);
-    prod.push(dummy_meta()).unwrap();
+    // A single-slot control channel with no consumer: the bounded retry must
+    // give up at the timeout — never spin forever.
+    let (control_p, _control_c) = crate::recording::buffer::create_control_ring_buffer(1);
+    let mut sender = RecordingSender::Pool {
+        control: Some(control_p),
+        pool: None,
+    };
+    sender
+        .control_producer_mut()
+        .unwrap()
+        .push(ControlPayload::Metadata(dummy_meta()))
+        .unwrap();
 
     let start = std::time::Instant::now();
-    push_stream_stop(&mut prod, Duration::from_millis(30));
+    push_stream_stop(&mut sender, Duration::from_millis(30));
     let elapsed = start.elapsed();
     assert!(
         elapsed >= Duration::from_millis(30),
@@ -129,36 +150,62 @@ fn join_recording_io_times_out_and_never_reports_success() {
 }
 
 /// Spawns a mock "disk worker" that records how it terminated: `1` on the
-/// `StreamStop` token, `2` on producer drop + drained ring, `0` on deadline.
+/// `StreamStop` token, `2` on sender drop + drained channels, `0` on deadline.
 /// Returns `Ok(())` on every exit path so only the termination *reason* is
 /// observable.
 fn spawn_mock_recording_worker(
-    mut consumer: rtrb::Consumer<RingPayload<MAX_BLOCK_SIZE>>,
+    mut receiver: RecordingReceiver,
     exit_reason: Arc<AtomicU8>,
 ) -> std::thread::JoinHandle<anyhow::Result<()>> {
     std::thread::Builder::new()
         .name("guard-mock-recording-io".into())
         .spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                match consumer.pop() {
-                    Ok(RingPayload::StreamStop) => {
-                        exit_reason.store(1, Ordering::Release);
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(_) if consumer.is_abandoned() => {
-                        exit_reason.store(2, Ordering::Release);
-                        break;
-                    }
-                    Err(_) => {
-                        if std::time::Instant::now() >= deadline {
-                            exit_reason.store(0, Ordering::Release);
+            match &mut receiver {
+                RecordingReceiver::Pool { control, pool } => loop {
+                    match control.pop() {
+                        Ok(ControlPayload::StreamStop) => {
+                            exit_reason.store(1, Ordering::Release);
                             break;
                         }
-                        std::thread::yield_now();
+                        Ok(_) => {}
+                        Err(_)
+                            if control.is_abandoned()
+                                && pool.work_is_abandoned()
+                                && pool.work_is_empty() =>
+                        {
+                            exit_reason.store(2, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => {
+                            if std::time::Instant::now() >= deadline {
+                                exit_reason.store(0, Ordering::Release);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
                     }
-                }
+                },
+                RecordingReceiver::Inline(consumer) => loop {
+                    match consumer.pop() {
+                        Ok(RingPayload::StreamStop) => {
+                            exit_reason.store(1, Ordering::Release);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) if consumer.is_abandoned() => {
+                            exit_reason.store(2, Ordering::Release);
+                            break;
+                        }
+                        Err(_) => {
+                            if std::time::Instant::now() >= deadline {
+                                exit_reason.store(0, Ordering::Release);
+                                break;
+                            }
+                            std::thread::yield_now();
+                        }
+                    }
+                },
             }
             Ok(())
         })
@@ -167,15 +214,16 @@ fn spawn_mock_recording_worker(
 
 #[test]
 fn shutdown_pushes_stream_stop_then_drops_producer_and_joins() {
-    let (producer, consumer) = rtrb::RingBuffer::<RingPayload<MAX_BLOCK_SIZE>>::new(8);
+    let (sender, receiver) = create_recording_transport();
     let exit_reason = Arc::new(AtomicU8::new(0));
 
-    // Ordering contract (F-RB-009 / T3.4): StreamStop first, producer drop
-    // second, bounded join last. On an empty ring the token lands immediately,
-    // so the worker must terminate on it (reason 1) and the join must return
-    // promptly — a join-before-drop bug would block the mock forever.
-    let worker = spawn_mock_recording_worker(consumer, Arc::clone(&exit_reason));
-    let guard = RecordingWorkerGuard::new(worker, Some(producer), None);
+    // Ordering contract (F-RB-009 / T3.4): StreamStop first, sender drop
+    // second, bounded join last. On an empty control channel the token lands
+    // immediately, so the worker must terminate on it (reason 1) and the join
+    // must return promptly — a join-before-drop bug would block the mock
+    // forever.
+    let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
+    let guard = RecordingWorkerGuard::new(worker, Some(sender), None);
     let start = std::time::Instant::now();
     let outcome = guard.shutdown();
     assert!(
@@ -193,15 +241,15 @@ fn shutdown_pushes_stream_stop_then_drops_producer_and_joins() {
 
 #[test]
 fn shutdown_skips_stream_stop_after_failure_but_still_drops_producer() {
-    let (producer, consumer) = rtrb::RingBuffer::<RingPayload<MAX_BLOCK_SIZE>>::new(8);
+    let (sender, receiver) = create_recording_transport();
     let failed = Arc::new(AtomicBool::new(true));
     let exit_reason = Arc::new(AtomicU8::new(0));
 
     // With a failed worker there is no consumer left: StreamStop must be
-    // skipped (a full ring would never drain) but the producer must still be
+    // skipped (a full channel would never drain) but the sender must still be
     // dropped, arming the abandoned+drained terminal condition.
-    let worker = spawn_mock_recording_worker(consumer, Arc::clone(&exit_reason));
-    let guard = RecordingWorkerGuard::new(worker, Some(producer), Some(failed));
+    let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
+    let guard = RecordingWorkerGuard::new(worker, Some(sender), Some(failed));
     let start = std::time::Instant::now();
     let outcome = guard.shutdown();
     assert!(
@@ -213,7 +261,7 @@ fn shutdown_skips_stream_stop_after_failure_but_still_drops_producer() {
     assert_eq!(
         exit_reason.load(Ordering::Acquire),
         2,
-        "worker must terminate via the producer drop + drained ring"
+        "worker must terminate via the sender drop + drained channels"
     );
 }
 
@@ -224,13 +272,13 @@ fn shutdown_skips_stream_stop_after_failure_but_still_drops_producer() {
 /// zombie thread behind.
 #[test]
 fn premature_drop_signals_termination_and_joins_cleanly() {
-    let (producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(8);
+    let (sender, receiver) = create_recording_transport();
     let exit_reason = Arc::new(AtomicU8::new(0));
 
-    let worker = spawn_mock_recording_worker(consumer, Arc::clone(&exit_reason));
+    let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
     let start = std::time::Instant::now();
     {
-        let guard = RecordingWorkerGuard::new(worker, Some(producer), None);
+        let guard = RecordingWorkerGuard::new(worker, Some(sender), None);
         // Premature drop — simulates the host failing before the shutdown path.
         drop(guard);
     }
@@ -247,28 +295,28 @@ fn premature_drop_signals_termination_and_joins_cleanly() {
 
 #[test]
 fn premature_drop_with_failed_worker_still_terminates_via_producer_drop() {
-    let (producer, consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(8);
+    let (sender, receiver) = create_recording_transport();
     let failed = Arc::new(AtomicBool::new(true));
     let exit_reason = Arc::new(AtomicU8::new(0));
 
-    let worker = spawn_mock_recording_worker(consumer, Arc::clone(&exit_reason));
+    let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
     {
-        let guard = RecordingWorkerGuard::new(worker, Some(producer), Some(failed));
+        let guard = RecordingWorkerGuard::new(worker, Some(sender), Some(failed));
         drop(guard);
     }
     assert_eq!(
         exit_reason.load(Ordering::Acquire),
         2,
-        "a failed worker must still be terminated by the producer drop"
+        "a failed worker must still be terminated by the sender drop"
     );
 }
 
-/// Proves the run.rs plumbing contract: the guard exposes a stable producer
+/// Proves the run.rs plumbing contract: the guard exposes a stable sender
 /// slot that the RT callback (simulated here as the test) can push into, and
 /// the same guard still owns the channel for the shutdown path.
 #[test]
-fn producer_slot_is_a_stable_mut_slot() {
-    let (producer, mut consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(8);
+fn sender_slot_is_a_stable_mut_slot() {
+    let (sender, mut receiver) = create_recording_transport();
     let worker = std::thread::spawn(|| {
         // Stand-in for the real worker: outlives the push below and exits
         // cleanly on its own — only the slot plumbing is under test here.
@@ -276,16 +324,19 @@ fn producer_slot_is_a_stable_mut_slot() {
         anyhow::Result::<()>::Ok(())
     });
 
-    let mut guard = RecordingWorkerGuard::new(worker, Some(producer), None);
-    let slot = guard.producer_slot();
-    slot.as_mut()
-        .expect("recording producer must be inside the guard")
-        .push(dummy_meta())
-        .expect("push through the guard's slot must succeed");
+    let mut guard = RecordingWorkerGuard::new(worker, Some(sender), None);
+    let slot = guard.sender_slot();
+    assert!(
+        slot.try_push_metadata(dummy_meta()),
+        "push through the guard's sender slot must succeed"
+    );
 
-    match consumer.pop() {
-        Ok(RingPayload::Metadata(_)) => {}
-        other => panic!("expected the pushed metadata, got {other:?}"),
+    match &mut receiver {
+        RecordingReceiver::Pool { control, .. } => match control.pop() {
+            Ok(ControlPayload::Metadata(_)) => {}
+            other => panic!("expected the pushed metadata, got {other:?}"),
+        },
+        RecordingReceiver::Inline(_) => panic!("pool transport expected"),
     }
 }
 
