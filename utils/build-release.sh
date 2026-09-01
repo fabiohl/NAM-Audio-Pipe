@@ -45,7 +45,7 @@ Options:
   --strict-release       Fail the release whenever the declared optimization cannot be proven:
                          BOLT failure/unavailability becomes fatal (no silent PGO-ONLY fallback)
                          and the release receipt must certify the applied optimization status.
-  --release-ceremony     Official release ceremony mode (F-RB-014 / T5.5): requires a pristine
+  --release-ceremony     Official release ceremony mode: requires a pristine
                          git worktree (no modified/untracked files, Cargo.lock identical to HEAD,
                          coupled NeuralAmpModeler-rs tree clean), mandates --locked Cargo
                          resolution and requires the cryptographic provenance receipt
@@ -137,10 +137,10 @@ PROFRAW_DIR="$PGO_DIR/profraw"
 MERGED_PROFILE="$PGO_DIR/merged.profdata"
 ORIG_RUSTFLAGS="${RUSTFLAGS:-}"
 
-# Structured receipts (F-RB-013 / T5.3): PGO workload coverage + release optimization status.
+# Structured receipts: PGO workload coverage + release optimization status.
 PGO_RECEIPT="$PROJECT_DIR/target/logs/pgo-workload-receipt.json"
 RELEASE_RECEIPT="$PROJECT_DIR/target/logs/release-receipt.json"
-# Cryptographic chain of custody (F-RB-014 / T5.5): release provenance receipt.
+# Cryptographic chain of custody: release provenance receipt.
 PROVENANCE_RECEIPT="$PROJECT_DIR/target/logs/release-provenance.json"
 
 # Isolated target directory to avoid polluting standard build artifacts
@@ -176,7 +176,7 @@ cleanup() {
 }
 
 # ---------------------------------------------------------------------------
-# Release ceremony gate (F-RB-014 / T5.5): pristine-worktree requirement
+# Release ceremony gate: pristine-worktree requirement
 # ---------------------------------------------------------------------------
 # verify_clean_worktree
 #   Official release ceremony check: the release must be built from a pristine
@@ -212,7 +212,7 @@ verify_clean_worktree() {
 trap cleanup EXIT INT TERM HUP
 
 # ---------------------------------------------------------------------------
-# Release optimization receipt (F-RB-013 / T5.3)
+# Release optimization receipt
 # ---------------------------------------------------------------------------
 # write_release_receipt <status> <cause>
 #   Emits target/logs/release-receipt.json certifying the optimization applied
@@ -458,7 +458,7 @@ if [ "$USE_PGO" = true ]; then
         exit 1
     }
 
-    # Fail-closed PGO coverage gate (F-RB-013 / T5.3): the workload receipt must
+    # Fail-closed PGO coverage gate: the workload receipt must
     # prove every mandatory DSP topology reached >= 1000 total blocks and >= 4 blocks per cell,
     # all oversampling modes ran, the stereo CabSim convolution executed and no stage was skipped.
     if [ ! -f "$PGO_RECEIPT" ]; then
@@ -597,7 +597,7 @@ echo -e "  Using RUSTFLAGS: ${BOLD}$RUSTFLAGS${NC}"
 
 echo -e "  Building standalone executable..."
 # -C strip=none retains symbol tables for LLVM BOLT. Stripping is applied in Phase 5.
-# RELEASE_RUSTFLAGS is captured verbatim for the provenance receipt (F-RB-014 / T5.5).
+# RELEASE_RUSTFLAGS is captured verbatim for the provenance receipt.
 RELEASE_RUSTFLAGS="$RUSTFLAGS -C strip=none -Clink-arg=-Wl,-q"
 RUSTFLAGS="$RELEASE_RUSTFLAGS" cargo build --locked --profile dist
 
@@ -954,7 +954,7 @@ else
     fi
 fi
 
-# Degradation policy (F-RB-013 / T5.3): BOLT absence must be typed and explicit,
+# Degradation policy: BOLT absence must be typed and explicit,
 # never silently masked as "PGO + BOLT applied". Under --strict-release, any
 # unproven BOLT aborts the release.
 if [ "$BOLT_APPLIED" = true ]; then
@@ -1009,7 +1009,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 5 helpers (F-RB-014 / T5.4): functional smoke test of the stripped ELF
+# Phase 5 helpers: functional smoke test of the stripped ELF
 # ---------------------------------------------------------------------------
 # run_live_smoke <staging_bin> <model_abs> <smoke_dir> <out_file>
 #   Runs the stripped staging binary against a real fixture model with
@@ -1127,7 +1127,7 @@ PY
 
     # The recording pipeline must have produced a real, finalized WAV with a
     # coherent header (data size > 0) — proof the model loaded, DSP ran and the
-    # recording worker shut down cleanly (F-RB-009 / T3.5 join outcome).
+    # recording worker shut down cleanly.
     wav="$(find "$dir" -maxdepth 1 -name 'capture_*.wav' -print -quit 2>/dev/null || true)"
     if [ -z "$wav" ] || [ ! -s "$wav" ]; then
         SMOKE_CAUSE="SMOKE_FAILED: no recording WAV was produced during the live smoke run (DSP/recording pipeline did not execute)."
@@ -1166,7 +1166,7 @@ PY
 
 # write_smoke_receipt <status> <cause>
 #   Enriches the release receipt (target/logs/release-receipt.json) with the
-#   functional smoke-test certification (F-RB-014 / T5.4): status LIVE or
+#   functional smoke-test certification: status LIVE or
 #   DIAGNOSE_ONLY, plus the detailed cause when degraded/failed. The base
 #   optimization receipt written after Phase 4 is preserved.
 write_smoke_receipt() {
@@ -1198,7 +1198,7 @@ PY
 }
 
 # ---------------------------------------------------------------------------
-# Provenance receipt (F-RB-014 / T5.5): cryptographic chain of custody
+# Provenance receipt: cryptographic chain of custody
 # ---------------------------------------------------------------------------
 # write_provenance_receipt
 #   Emits target/logs/release-provenance.json certifying every element that
@@ -1349,7 +1349,7 @@ for name, path in (
 # The agile suite (tests-quick.sh) regenerates quick-phase*.log and
 # quick-receipt.txt on every pass. Pinning them in an UNCERTIFIED chain
 # would make the very next quick run invalidate the provenance — the
-# F-RB-014 integrity gate could never go green while a release exists.
+# integrity gate could never go green while a release exists.
 # The certified ceremony path still requires them; uncertified chains keep
 # only the stable evidence (long-audit logs, PGO/release receipts).
 phase_logs = {}
@@ -1456,7 +1456,7 @@ PY
 }
 
 # -----------------------------------------------------------------------------
-# PHASE 5: Staging, Functional Smoke Test & Atomic Installation (F-RB-014 / T5.4)
+# PHASE 5: Staging, Functional Smoke Test & Atomic Installation
 # -----------------------------------------------------------------------------
 echo -e "\n${BLUE}${BOLD}[Phase 5/7] Staging, functionally smoke-testing and atomically installing the artifact...${NC}"
 
@@ -1573,7 +1573,7 @@ write_smoke_receipt "$SMOKE_STATUS" "$SMOKE_CAUSE"
 
 # 4. STRICTLY ATOMIC INSTALLATION: only after the staging smoke test approved
 #    the artifact. The previous installation is preserved until the new stripped
-#    ELF is fully in place (F-RB-014 / T5.4 rollback).
+#    ELF is fully in place rollback).
 if [ -e "$BIN_TARGET" ] || [ -L "$BIN_TARGET" ]; then
     if ! mv -f "$BIN_TARGET" "$BIN_TARGET.old"; then
         rm -rf "$STAGING_DIR"
@@ -1607,7 +1607,7 @@ FLATPAK_BUNDLE="$HOME/${ARCHIVE_NAME}.flatpak"
 if [ "$BUILD_TARBALL" = true ]; then
     echo -e "\n${BLUE}${BOLD}[Phase 6/7] Generating deterministic distribution tarball...${NC}"
 
-    # Reproducible builds (F-RB-014 / T5.5): anchor every packaged mtime to the
+    # Reproducible builds: anchor every packaged mtime to the
     # source commit timestamp so the archive is byte-identical across rebuilds
     # of the exact same tree.
     SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
@@ -1646,7 +1646,7 @@ EOF
 
     echo -e "  ${GREEN}✓${NC} Distribution package generated at: ${BOLD}$TARBALL${NC}"
 
-    # Post-packaging validation (F-RB-014 / T5.5): extract into a temporary
+    # Post-packaging validation: extract into a temporary
     # dir, prove the packaged ELF is byte-for-byte the installed artifact and
     # functionally healthy (--diagnose) — the distributed bytes are exactly
     # the tested bytes.
@@ -1762,16 +1762,34 @@ if [ "$BUILD_FLATPAK" = true ]; then
     APP_INFO_XMLS="$APP_INFO_DIR/xmls"
     APP_INFO_ICONS="$APP_INFO_DIR/icons"
     mkdir -p "$APP_INFO_XMLS"
-    sed 's#<component type="desktop-application">#<component type="desktop-application" origin="nam-audio-pipe">#' \
-        "$METAINFO_SRC" | gzip -9 > "$APP_INFO_XMLS/io.github.fabiohl.NAMAudioPipe.xml.gz"
+    python3 - "$METAINFO_SRC" "$APP_INFO_XMLS/io.github.fabiohl.NAMAudioPipe.xml.gz" <<'PY'
+import gzip
+import sys
+
+src_path, dst_path = sys.argv[1], sys.argv[2]
+with open(src_path, "r", encoding="utf-8") as f:
+    xml_data = f.read()
+
+body = xml_data.split("?>", 1)[-1].strip()
+collection_xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<components version="1.0">
+{body}
+</components>
+"""
+with gzip.open(dst_path, "wt", encoding="utf-8") as f:
+    f.write(collection_xml)
+PY
+
     if [ -d "$ICONS_SRC" ]; then
         for size_dir in "$ICONS_SRC"/*; do
             if [ -d "$size_dir" ]; then
                 size_name=$(basename "$size_dir")
-                target_icon_dir="$APP_INFO_ICONS/hicolor/$size_name/apps"
-                mkdir -p "$target_icon_dir"
-                if [ -d "$size_dir/apps" ]; then
-                    cp "$size_dir/apps"/* "$target_icon_dir/" 2>/dev/null || true
+                if [ "$size_name" != "scalable" ]; then
+                    target_appstream_icon_dir="$APP_INFO_ICONS/flatpak/$size_name"
+                    mkdir -p "$target_appstream_icon_dir"
+                    if [ -d "$size_dir/apps" ]; then
+                        cp "$size_dir/apps"/* "$target_appstream_icon_dir/" 2>/dev/null || true
+                    fi
                 fi
             fi
         done
@@ -1833,11 +1851,14 @@ if [ "$BUILD_FLATPAK" = true ]; then
         "$FLATPAK_SMOKE_REPO/tmp" "$FLATPAK_SMOKE_REPO/state"
     printf '[core]\nrepo_version=1\nmode=archive-z2\n' > "$FLATPAK_SMOKE_REPO/config"
 
-    if ! flatpak build-import-bundle "$FLATPAK_SMOKE_REPO" "$FLATPAK_BUNDLE" >/dev/null 2>&1; then
+    if ! flatpak build-import-bundle --update-appstream "$FLATPAK_SMOKE_REPO" "$FLATPAK_BUNDLE" >/dev/null 2>&1; then
         die "Flatpak bundle integrity check failed: could not import $FLATPAK_BUNDLE into the smoke-test repository."
     fi
     if ! flatpak repo "$FLATPAK_SMOKE_REPO" --branches 2>/dev/null | grep -q "$FLATPAK_APP_REF"; then
         die "Flatpak bundle smoke test failed: app ref $FLATPAK_APP_REF not found after bundle import."
+    fi
+    if ! flatpak repo "$FLATPAK_SMOKE_REPO" --branches 2>/dev/null | grep -Eq '^appstream[0-9]*/'; then
+        die "Flatpak bundle smoke test failed: AppStream catalog branch not found after bundle import."
     fi
     if ! flatpak repo "$FLATPAK_SMOKE_REPO" --metadata="$FLATPAK_APP_REF" 2>/dev/null \
         | grep -q '^command=nam-audio-pipe$'; then
@@ -1872,7 +1893,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# PROVENANCE: cryptographic chain of custody (F-RB-014 / T5.5)
+# PROVENANCE: cryptographic chain of custody
 # -----------------------------------------------------------------------------
 # Generated after every delivery artifact exists so the receipt can bind the
 # installed stripped ELF, tarball, Flatpak bundle and AppStream metadata to the

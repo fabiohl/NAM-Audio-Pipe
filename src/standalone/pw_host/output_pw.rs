@@ -6,7 +6,7 @@
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
-use neural_amp_modeler_rs::dsp::pipeline::DspBridgeReader;
+use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
@@ -208,14 +208,23 @@ pub fn playback_dsp_cycle(
     }
 }
 
-/// Deterministic silence delivery for bridge starvation (G-RB-001 / T4.2).
+/// Deterministic silence delivery for bridge starvation (G-RB-001 / T4.2,
+/// S5 / E2304).
 ///
 /// Pure SPA-descriptor kernel (raw integers/pointers, no live PipeWire stream
 /// required — mockable by the harness tests). Validates the stereo pair
-/// fail-closed with the full-extension window `(0, maxsize)` per channel,
-/// zero-fills 100% of both output regions, stamps `offset = 0`,
-/// `size = frames × 4`, `stride = 4` on both chunks and registers the
-/// starvation occurrence on `rt_status`.
+/// fail-closed with the *silence window* `(0, silence_bytes)` per channel —
+/// **not** the full allocated `maxsize` (which may be 64 KiB and exceeds the
+/// `MAX_BRIDGE_BUF × 4` safety cap, causing false `E2304` on pause) —,
+/// zero-fills exactly `silence_bytes / 4` frames of both output regions,
+/// stamps `offset = 0`, `size = silence_bytes`, `stride = 4` on both chunks
+/// and registers the starvation occurrence on `rt_status`.
+///
+/// The caller ([`deliver_silence_block`]) quantizes `silence_bytes` from the
+/// active stream quantum (`last_n_samples`/`requested_buffer_frames`, 128-frame
+/// fallback), bounded by both channel capacities and `MAX_BRIDGE_BUF × 4`, so
+/// pausing the input or starting before the first block never raises
+/// `RT_STATUS_HOST_CONTRACT_VIOLATION` (`E2304`).
 ///
 /// Public so the ER-4 service-resilience harness (`tests/service_resilience.rs`)
 /// can prove the analytical-silence + buffer-recycle contract deterministically
@@ -231,11 +240,17 @@ pub fn playback_dsp_cycle(
 /// The caller must prove — for both channels — that `ptr_l`/`ptr_r` point to
 /// writable, `f32`-aligned, non-overlapping regions of `max_l`/`max_r` bytes
 /// each, and that `chunk_l`/`chunk_r` are non-null and remain valid (owned by
-/// the SPA buffer) for the duration of the call. The kernel validates the
-/// regions via [`handle_spa_pair_fail_closed`] and only dereferences the chunk
-/// pointers after proving them non-null, but the safety contract of the raw
-/// pointer arguments is the caller's.
+/// the SPA buffer) for the duration of the call. `silence_bytes` must be a
+/// multiple of `sizeof(f32)`, not exceed either channel's `maxsize` nor
+/// `MAX_BRIDGE_BUF × sizeof(f32)`. The kernel validates the regions via
+/// [`handle_spa_pair_fail_closed`] and only dereferences the chunk pointers
+/// after proving them non-null, but the safety contract of the raw pointer
+/// arguments is the caller's.
 #[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Raw SPA descriptor fields plus the bounded silence window; signature is stable and shared verbatim by the RT callback and the harness tests"
+)]
 pub unsafe fn deliver_silence_pair_fail_closed(
     ptr_l: usize,
     max_l: usize,
@@ -243,10 +258,21 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     ptr_r: usize,
     max_r: usize,
     chunk_r: *mut pw::spa::sys::spa_chunk,
+    silence_bytes: usize,
     rt_status: &RtStatusFlags,
 ) -> Option<usize> {
     let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
-        ptr_l, max_l, chunk_l, 0, max_l, ptr_r, max_r, chunk_r, 0, max_r, rt_status,
+        ptr_l,
+        max_l,
+        chunk_l,
+        0,
+        silence_bytes,
+        ptr_r,
+        max_r,
+        chunk_r,
+        0,
+        silence_bytes,
+        rt_status,
     )?;
 
     // SAFETY: the harness proved per-channel alignment, bounds, frame symmetry
@@ -280,7 +306,14 @@ pub unsafe fn deliver_silence_pair_fail_closed(
 }
 
 /// Dequeues the playback output buffer and, under bridge starvation, fills it
-/// with analytical silence and recycles it (G-RB-001 / T4.2).
+/// with analytical silence and recycles it (G-RB-001 / T4.2, S5 / E2304).
+///
+/// The silence window is **quantized by the active stream quantum** — the last
+/// processed frame count (`last_n_samples`, fallback to
+/// `requested_buffer_frames`, then a 128-frame default) — bounded by both
+/// channel capacities and `MAX_BRIDGE_BUF × 4`. It never uses the raw shared
+/// memory `maxsize` (e.g. 64 KiB), which would trip the fail-closed SPA window
+/// check (`E2304`) hundreds of times per second when the input is paused.
 ///
 /// The buffer is returned to the PipeWire graph by dropping the dequeued
 /// `Buffer` at the end of this function — every callback path (success,
@@ -318,6 +351,29 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
     );
     let (chunk_l, chunk_r) = (data_l.as_raw().chunk, data_r.as_raw().chunk);
 
+    // S5 / E2304: silence quantum = last active frame count (or requested
+    // quantum, or 128-frame default), expressed in bytes and bounded by both
+    // channel capacities and MAX_BRIDGE_BUF × 4. Delivering the shared-memory
+    // `maxsize` here would exceed the fail-closed window cap on a 64 KiB
+    // buffer and raise a false E2304 on every pause.
+    let active_frames = {
+        let last = rt_status.last_n_samples.load(Ordering::Relaxed);
+        if last != 0 {
+            last
+        } else {
+            rt_status.requested_buffer_frames.load(Ordering::Relaxed)
+        }
+    };
+    let silence_frames = if active_frames == 0 {
+        128
+    } else {
+        active_frames
+    };
+    let silence_bytes = (silence_frames as usize * std::mem::size_of::<f32>())
+        .min(max_l)
+        .min(max_r)
+        .min(MAX_BRIDGE_BUF * std::mem::size_of::<f32>());
+
     // Validate, silence and recycle. On a malformed descriptor the harness
     // raises `RT_STATUS_HOST_CONTRACT_VIOLATION`, silences both channels and
     // the buffer still returns to the graph via drop.
@@ -327,7 +383,16 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
     // the kernel itself rejects null/aligned-overlapping descriptors fail-closed
     // before dereferencing any of them.
     let _ = unsafe {
-        deliver_silence_pair_fail_closed(ptr_l, max_l, chunk_l, ptr_r, max_r, chunk_r, rt_status)
+        deliver_silence_pair_fail_closed(
+            ptr_l,
+            max_l,
+            chunk_l,
+            ptr_r,
+            max_r,
+            chunk_r,
+            silence_bytes,
+            rt_status,
+        )
     };
 }
 
@@ -1014,6 +1079,7 @@ mod tests {
                 r.as_ptr() as usize,
                 r.len() * 4,
                 &mut chunk_r,
+                l.len() * 4,
                 &rt,
             )
         };
@@ -1058,7 +1124,7 @@ mod tests {
         // SAFETY: `buf` is a local, aligned, writable `[f32; 32]` and `chunk`
         // is a local non-null struct; the kernel rejects the aliasing fail-closed.
         let frames =
-            unsafe { deliver_silence_pair_fail_closed(p, m, &mut chunk, p, m, &mut chunk, &rt) };
+            unsafe { deliver_silence_pair_fail_closed(p, m, &mut chunk, p, m, &mut chunk, m, &rt) };
 
         assert_eq!(frames, None);
         assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
@@ -1083,8 +1149,8 @@ mod tests {
         let rt = RtStatusFlags::default();
 
         // SAFETY: `l`/`r` are local aligned writable arrays and `chunk` is a
-        // local non-null struct; the kernel rejects the asymmetric extensions
-        // fail-closed.
+        // local non-null struct; a silence window exceeding the smaller
+        // channel's capacity must be rejected fail-closed.
         let frames = unsafe {
             deliver_silence_pair_fail_closed(
                 l.as_ptr() as usize,
@@ -1093,6 +1159,7 @@ mod tests {
                 r.as_ptr() as usize,
                 r.len() * 4,
                 &mut chunk,
+                l.len() * 4,
                 &rt,
             )
         };
@@ -1108,9 +1175,11 @@ mod tests {
 
     #[test]
     fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
-        // F-RES-001 / T6.1: when host supplies a huge buffer (e.g. 1 MiB or > MAX_BRIDGE_BUF),
-        // silence delivery must bound zeroing to MAX_BRIDGE_BUF frames (32 KiB)
-        // and chunk.size must match the exact zeroed interval.
+        // S5 / E2304 + F-RES-001 / T6.1: when host supplies a huge buffer
+        // (e.g. 1 MiB or > MAX_BRIDGE_BUF), the *caller* quantizes the silence
+        // window to MAX_BRIDGE_BUF frames (32 KiB), so the kernel delivers
+        // exactly that bounded interval: no false E2304 on pause, chunk.size
+        // matches the zeroed interval and trailing memory stays untouched.
         let total_samples = MAX_BRIDGE_BUF + 1024;
         let mut l = vec![0.5f32; total_samples];
         let mut r = vec![0.5f32; total_samples];
@@ -1120,6 +1189,7 @@ mod tests {
         let mut chunk_r = chunk_of(0, 0);
         let rt = RtStatusFlags::default();
 
+        let silence_bytes = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
         let frames = unsafe {
             deliver_silence_pair_fail_closed(
                 l.as_ptr() as usize,
@@ -1128,15 +1198,23 @@ mod tests {
                 r.as_ptr() as usize,
                 r.len() * 4,
                 &mut chunk_r,
+                silence_bytes,
                 &rt,
             )
         };
 
-        assert_eq!(frames, None);
-        assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
-        assert_eq!(rt.playback_bridge_starvation.load(Ordering::Relaxed), 0);
+        assert_eq!(frames, Some(MAX_BRIDGE_BUF));
+        assert!(!rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+        assert_eq!(
+            rt.playback_bridge_starvation.load(Ordering::Relaxed),
+            1,
+            "bounded silence delivery is a starvation event"
+        );
+        assert_eq!(chunk_l.size, silence_bytes as u32);
+        assert_eq!(chunk_l.stride, 4);
+        assert_eq!(chunk_r.size, silence_bytes as u32);
 
-        // First MAX_BRIDGE_BUF samples must be zeroed
+        // Exactly MAX_BRIDGE_BUF samples must be zeroed
         assert!(
             l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
             "bounded range must be zeroed"
@@ -1167,6 +1245,44 @@ mod tests {
         assert!(
             trailing_r.iter().all(|&b| b == 0xA5),
             "trailing memory past MAX_BRIDGE_BUF must not be touched"
+        );
+    }
+
+    #[test]
+    fn playback_bridge_starvation_rejects_oversized_silence_window() {
+        // S5 / E2304: a caller-requested silence window larger than
+        // MAX_BRIDGE_BUF × 4 is still rejected fail-closed — the kernel never
+        // zeroes beyond the safety cap even when the host buffer could hold it.
+        let total_samples = MAX_BRIDGE_BUF + 1;
+        let mut l = vec![0.5f32; total_samples];
+        let mut r = vec![0.5f32; total_samples];
+        fill_bytes(&mut l, 0x5A);
+        fill_bytes(&mut r, 0xA5);
+        let mut chunk_l = chunk_of(0, 0);
+        let mut chunk_r = chunk_of(0, 0);
+        let rt = RtStatusFlags::default();
+
+        let oversized = (MAX_BRIDGE_BUF + 1) * std::mem::size_of::<f32>();
+        let frames = unsafe {
+            deliver_silence_pair_fail_closed(
+                l.as_ptr() as usize,
+                l.len() * 4,
+                &mut chunk_l,
+                r.as_ptr() as usize,
+                r.len() * 4,
+                &mut chunk_r,
+                oversized,
+                &rt,
+            )
+        };
+
+        assert_eq!(frames, None);
+        assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+        assert_eq!(rt.playback_bridge_starvation.load(Ordering::Relaxed), 0);
+        assert!(
+            l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
+                && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+            "oversized window must silence both channels up to MAX_BRIDGE_BUF"
         );
     }
 

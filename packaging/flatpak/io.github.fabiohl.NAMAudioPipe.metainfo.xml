@@ -29,9 +29,16 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     </ul>
   </description>
   <launchable type="desktop-id">io.github.fabiohl.NAMAudioPipe.desktop</launchable>
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/fabiohl/NAM-Audio-Pipe/main/docs/assets/screenshot-main.png</image>
+      <caption>NAM Audio Pipe interactive terminal status display and PipeWire host monitor</caption>
+    </screenshot>
+  </screenshots>
   <url type="homepage">https://github.com/fabiohl/NAM-Audio-Pipe</url>
   <url type="bugtracker">https://github.com/fabiohl/NAM-Audio-Pipe/issues</url>
   <url type="vcs-browser">https://github.com/fabiohl/NAM-Audio-Pipe</url>
+  <url type="help">https://github.com/fabiohl/NAM-Audio-Pipe#readme</url>
   <categories>
     <category>AudioVideo</category>
     <category>Audio</category>
@@ -48,6 +55,12 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <keyword>lstm</keyword>
     <keyword>dsp</keyword>
   </keywords>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <display_length side="longest" compare="ge">1024</display_length>
+    <display_length side="shortest" compare="ge">600</display_length>
+  </supports>
   <content_rating type="oars-1.1" />
   <provides>
     <binary>nam-audio-pipe</binary>

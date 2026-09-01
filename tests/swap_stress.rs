@@ -617,6 +617,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
                 r.as_mut_ptr() as usize,
                 r.len() * std::mem::size_of::<f32>(),
                 &mut chunk_r,
+                BLOCK * std::mem::size_of::<f32>(),
                 &rt,
             )
         };
@@ -677,6 +678,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
                 buf.as_mut_ptr() as usize,
                 m,
                 &mut chunk,
+                m,
                 &rt,
             )
         };
@@ -742,6 +744,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
                 r.as_mut_ptr() as usize,
                 size,
                 &mut chunk_r,
+                size,
                 &rt,
             )
         };

@@ -284,12 +284,12 @@ For multi-profile `.namb` containers (`--slim auto`), an internal state machine 
 
 The DSP pipeline has **hard, static buffer ceilings** that every input — CLI, PipeWire graph or SPA descriptor — is validated against before it can influence allocation:
 
-| Limit | Value | Origin / Enforcement |
-|:----- |:----- |:-------------------- |
-| `MAX_BRIDGE_BUF` | 8192 samples | `neural_amp_modeler_rs::dsp::pipeline` — the `DspBridge` double-buffer width; the RT callbacks reject any quantum with `n_samples > MAX_BRIDGE_BUF` **fail-closed** (see §2.1) |
-| `MAX_RESAMP_BUF` | 8192 samples | Same module — bounds every resampler and oversampling engine construction |
-| CabSim partition | clamped to `[16, MAX_RESAMP_BUF]` | Off-RT rebuild handler (`handlers.rs`): a spurious requested partition is clamped before any `ConvEngine` instantiation, so no oversized UPOLS FFT can be built |
-| `--buffer-size` domain | `{0} ∪ {2^k | 16 ≤ 2^k ≤ 8192}` | `src/standalone/cli.rs::validate_buffer_size` — pure, typed, runs before any PipeWire connection or allocation |
+| Limit                  | Value                             | Origin / Enforcement                                                                                                                                                           |
+|:---------------------- |:--------------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MAX_BRIDGE_BUF`       | 8192 samples                      | `neural_amp_modeler_rs::dsp::pipeline` — the `DspBridge` double-buffer width; the RT callbacks reject any quantum with `n_samples > MAX_BRIDGE_BUF` **fail-closed** (see §2.1) |
+| `MAX_RESAMP_BUF`       | 8192 samples                      | Same module — bounds every resampler and oversampling engine construction                                                                                                      |
+| CabSim partition       | clamped to `[16, MAX_RESAMP_BUF]` | Off-RT rebuild handler (`handlers.rs`): a spurious requested partition is clamped before any `ConvEngine` instantiation, so no oversized UPOLS FFT can be built                |
+| `--buffer-size` domain | `{0} ∪ {2^k                       | 16 ≤ 2^k ≤ 8192}`                                                                                                                                                              |
 
 **Negotiation flow** (CLI → PipeWire → RT bounds → CabSim):
 
@@ -406,17 +406,31 @@ nam-audio-pipe --diagnose
 nam-audio-pipe --diagnose-full
 ```
 
+**Runtime telemetry is deliberately bundle-free.** The interactive control loop
+([`src/standalone/rt_setup/telemetry.rs`](../src/standalone/rt_setup/telemetry.rs) and
+[`src/standalone/pw_host/handlers.rs`](../src/standalone/pw_host/handlers.rs)) reports warnings
+and errors as concise `log::*` lines carrying the typed `[Exxxx | MNEMONIC]` code, the cause, and a
+recovery hint — it never re-prints the retrospective `──── Recent Log Trace ────` support block.
+Recurrent signals (GC overflow, queue backlog, playback starvation, CPU overload, clipping, SPA
+contract violations, deadline overruns) are **latched per episode** (`TelemetryLatches`), so a
+continuous condition warns at most once per episode instead of once per control-loop iteration.
+The full `DiagnosticBundle::render()` output (including the `Recent Log Trace`) is reserved for
+explicit user-triggered dumps (`--diagnose` / `--diagnose-full`), the teardown `BACKEND_FAILURE`
+report, and crash/panic reports (`~/.cache/nam-rs/crash-*.txt`). All runtime `log::*` lines still
+populate the `NamLogger` ring buffer, so they remain part of future support bundles and crash
+reports.
+
 ### 8.1 Error Catalog Summary (`NamErrorCode`)
 
 Typed diagnostic error codes (`NamErrorCode`) provide structured error categorization:
 
-| Range   | Category            | Representative Error Codes                                                                                          |
-|:------- |:------------------- |:------------------------------------------------------------------------------------------------------------------- |
-| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE |
+| Range   | Category            | Representative Error Codes                                                                                                                           |
+|:------- |:------------------- |:---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                  |
 | `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2200` RESAMPLER_BUILD_FAILED, `E2300` SCHED_FIFO_DENIED, `E2302` BACKEND_FAILURE, `E2304` SPA_FORMAT_CONTRACT_VIOLATION |
-| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                                               |
-| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` IR_LOAD_FAILED                                                                  |
-| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                               |
+| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                                                                                |
+| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` IR_LOAD_FAILED                                                                                                   |
+| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                |
 
 ---
 

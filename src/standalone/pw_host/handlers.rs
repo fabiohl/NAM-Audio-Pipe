@@ -7,7 +7,7 @@
 //! slimmable WaveNet slicing, and oversampling engine reconfiguration.
 
 use crate::standalone::colors::Colorize;
-use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
+use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
     self, CabSimSwapPayload, ResamplerSwapPayload, RtStatusFlags, SlimModelPair,
 };
@@ -33,7 +33,7 @@ use std::sync::atomic::Ordering;
 /// control-loop iteration rebuilds for the most recent request (F-RB-004).
 pub(super) fn handle_resampler_rebuild(
     rt_status: &RtStatusFlags,
-    sys: &SystemSnapshot,
+    _sys: &SystemSnapshot,
     resampler_producer: &mut rtrb::Producer<Box<ResamplerSwapPayload>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD) {
@@ -73,33 +73,26 @@ pub(super) fn handle_resampler_rebuild(
                     // NEEDS here (or setting REBUILD_FAILED) would either strand
                     // RESAMP_SWAP_PENDING (permanent mute) or unmute with the
                     // stale resampler (wrong rate).
-                    NamDiagnostic::new(NamErrorCode::ResamplerChannelFull, sys)
-                        .message("Resampler channel full. Rebuild will be retried.")
-                        .hint(
-                            "The audio engine is overloaded. \
-                             The resampler swap is retried automatically until delivery succeeds.",
-                        )
-                        .param("target_host_rate", target_host_rate)
-                        .param("target_nam_rate", target_nam_rate)
-                        .emit_warning();
+                    // Sprint 6 / T6.1: concise runtime warning, no support block.
+                    log::warn!(
+                        "[E2201 | RESAMPLER_CHANNEL_FULL] Resampler channel full — rebuild will \
+                         be retried; the audio engine is overloaded (PW={} Hz, NAM={} Hz). \
+                         The swap is retried automatically until delivery succeeds.",
+                        target_host_rate,
+                        target_nam_rate
+                    );
                     return;
                 }
                 rearm_rebuild_if_superseded(rt_status, generation);
             }
             (Err(e), _) => {
-                NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
-                    .message(format!(
-                        "Failed to rebuild resampler for PW={} Hz and NAM={} Hz.",
-                        target_host_rate, target_nam_rate
-                    ))
-                    .hint(
-                        "Audio will continue with the previous resampler. \
-                         If the sample rate is incorrect, restart NAM-Audio-Pipe.",
-                    )
-                    .param("target_host_rate", target_host_rate)
-                    .param("target_nam_rate", target_nam_rate)
-                    .param("detail", e)
-                    .emit();
+                log::error!(
+                    "[E2200 | RESAMPLER_BUILD_FAILED] Failed to rebuild resampler for PW={} Hz \
+                     and NAM={} Hz ({e}) — audio will continue with the previous resampler; if \
+                     the sample rate is incorrect, restart NAM-Audio-Pipe.",
+                    target_host_rate,
+                    target_nam_rate
+                );
 
                 rt_status
                     .resampler_failed_generation
@@ -107,19 +100,13 @@ pub(super) fn handle_resampler_rebuild(
                 rt_status.clear_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD);
             }
             (_, Err(e)) => {
-                NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
-                    .message(format!(
-                        "Failed to create streaming resample buffer for PW={} Hz and NAM={} Hz.",
-                        target_host_rate, target_nam_rate
-                    ))
-                    .hint(
-                        "Audio will continue with the previous resampler. \
-                         If the sample rate is incorrect, restart NAM-Audio-Pipe.",
-                    )
-                    .param("target_host_rate", target_host_rate)
-                    .param("target_nam_rate", target_nam_rate)
-                    .param("detail", format!("{:?}", e))
-                    .emit();
+                log::error!(
+                    "[E2200 | RESAMPLER_BUILD_FAILED] Failed to create streaming resample buffer \
+                     for PW={} Hz and NAM={} Hz ({e:?}) — audio will continue with the previous \
+                     resampler; if the sample rate is incorrect, restart NAM-Audio-Pipe.",
+                    target_host_rate,
+                    target_nam_rate
+                );
 
                 rt_status
                     .resampler_failed_generation
@@ -193,7 +180,7 @@ pub(super) fn handle_cabsim_rebuild(
     rt_status: &RtStatusFlags,
     ir_raw_samples: Option<&[f32]>,
     ir_source_rate: u32,
-    sys: &SystemSnapshot,
+    _sys: &SystemSnapshot,
     cabsim_producer: &mut rtrb::Producer<Box<CabSimSwapPayload>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD) {
@@ -251,15 +238,14 @@ pub(super) fn handle_cabsim_rebuild(
                 // Fail-closed: keep NEEDS_CABSIM_REBUILD so the next
                 // main-loop iteration retries. Clearing NEEDS here
                 // would lock the RT on the stale partition/rate.
-                NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                    .message("Cab-sim rebuild channel full. Rebuild will be retried.")
-                    .hint(
-                        "The audio engine is overloaded. \
-                         The cab-sim swap is retried automatically until delivery succeeds.",
-                    )
-                    .param("partition_size", partition_size)
-                    .param("target_host_rate", target_host_rate)
-                    .emit_warning();
+                // Sprint 6 / T6.1: concise runtime warning, no support block.
+                log::warn!(
+                    "[E3100 | PARAM_CHANNEL_FULL] Cab-sim rebuild channel full — rebuild will \
+                     be retried; the audio engine is overloaded (partition={}, PW={} Hz). \
+                     The swap is retried automatically until delivery succeeds.",
+                    partition_size,
+                    target_host_rate
+                );
                 return;
             }
             rearm_cabsim_if_superseded(rt_status, generation);
@@ -276,15 +262,11 @@ pub(super) fn handle_cabsim_rebuild(
                 pair: None,
             });
             if cabsim_producer.push(payload).is_err() {
-                NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                    .message("Cab-sim bypass channel full. Rebuild will be retried.")
-                    .hint(
-                        "The audio engine is overloaded. \
-                         The cab-sim swap is retried automatically until delivery succeeds.",
-                    )
-                    .param("partition_size", partition_size)
-                    .param("target_host_rate", target_host_rate)
-                    .emit_warning();
+                log::warn!(
+                    "[E3100 | PARAM_CHANNEL_FULL] Cab-sim bypass channel full — rebuild will \
+                     be retried; the audio engine is overloaded. The swap is retried \
+                     automatically until delivery succeeds."
+                );
                 return;
             }
             rearm_cabsim_if_superseded(rt_status, generation);
@@ -365,7 +347,7 @@ pub(super) fn handle_slimmable_rebuild(
     full_wavenet_model_l: Option<&StaticModel>,
     full_wavenet_model_r: Option<&StaticModel>,
     has_model_r: bool,
-    sys: &SystemSnapshot,
+    _sys: &SystemSnapshot,
     slimmable_producer: &mut rtrb::Producer<Box<SlimModelPair>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD) {
@@ -432,14 +414,12 @@ pub(super) fn handle_slimmable_rebuild(
         // Fail-closed (F-RB-005): neither channel is delivered; keep NEEDS so
         // the next cycle retries the whole pair instead of delivering a
         // half-swap that would desynchronize L/R generations.
-        NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-            .message("Slimmable model channel full. Rebuild will be retried.")
-            .hint(
-                "The audio engine is overloaded. \
-                 The slimmable swap is retried automatically until delivery succeeds.",
-            )
-            .param("target_ch", target_ch)
-            .emit_warning();
+        // Sprint 6 / T6.1: concise runtime warning, no support block.
+        log::warn!(
+            "[E3100 | PARAM_CHANNEL_FULL] Slimmable model channel full — rebuild will be \
+             retried; the audio engine is overloaded (target_ch={target_ch}). The swap is \
+             retried automatically until delivery succeeds."
+        );
         return;
     }
     rearm_slimmable_if_superseded(rt_status, generation);
@@ -467,7 +447,7 @@ fn rearm_slimmable_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
 /// Handles oversampling engine dynamic rebuild.
 pub(super) fn handle_oversample_rebuild(
     rt_status: &RtStatusFlags,
-    sys: &SystemSnapshot,
+    _sys: &SystemSnapshot,
     os_producer: &mut rtrb::Producer<Box<OsEnginePair>>,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_OS_REBUILD) {
@@ -492,23 +472,21 @@ pub(super) fn handle_oversample_rebuild(
                 factor,
             );
             if os_producer.push(pair).is_err() {
-                NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-                    .message("OS engine channel full. Rebuild will be retried.")
-                    .hint(
-                        "The audio engine is overloaded. \
-                         The oversampling swap is retried automatically until delivery succeeds.",
-                    )
-                    .emit_warning();
+                // Sprint 6 / T6.1: concise runtime warning, no support block.
+                log::warn!(
+                    "[E3100 | PARAM_CHANNEL_FULL] OS engine channel full — rebuild will be \
+                     retried; the audio engine is overloaded. The oversampling swap is \
+                     retried automatically until delivery succeeds."
+                );
                 return;
             }
             rearm_os_if_superseded(rt_status, generation);
         }
         (Err(e), _) | (_, Err(e)) => {
-            NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
-                .message("Failed to rebuild oversample engine (OOM).")
-                .hint("Audio will continue with the previous oversampling state.")
-                .param("detail", e)
-                .emit();
+            log::error!(
+                "[E5000 | OUT_OF_MEMORY] Failed to rebuild oversample engine ({e}) — audio \
+                 will continue with the previous oversampling state."
+            );
         }
     }
 }

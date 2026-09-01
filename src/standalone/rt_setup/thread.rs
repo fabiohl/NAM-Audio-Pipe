@@ -156,11 +156,16 @@ impl ThreadConfigurator for SystemThreadConfigurator {
 
     fn set_sched_param(
         &self,
-        thread_id: libc::pthread_t,
+        _thread_id: libc::pthread_t,
         policy: i32,
         param: &libc::sched_param,
     ) -> i32 {
-        unsafe { libc::pthread_setschedparam(thread_id, policy, param) }
+        let ret = unsafe { libc::sched_setscheduler(0, policy, param) };
+        if ret == -1 {
+            unsafe { *libc::__errno_location() }
+        } else {
+            0
+        }
     }
 
     fn get_current_cpu(&self) -> i32 {
@@ -208,65 +213,49 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     rt_status.rt_cpu.store(actual_cpu, Ordering::Relaxed);
     rt_status.rt_tid.store(thread_id as i64, Ordering::Relaxed);
 
-    match cfg.get_sched_param(thread_id) {
-        Ok((actual_policy, mut actual_param)) => {
-            let mut base_policy = actual_policy & !0x40000000i32;
-
-            if base_policy == libc::SCHED_FIFO {
-                rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-                rt_status
-                    .rt_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status
-                    .confirmed_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status
-                    .rt_policy
-                    .store(libc::SCHED_FIFO, Ordering::Relaxed);
-            } else if base_policy == libc::SCHED_RR {
-                // Legitimate PipeWire / RTKit real-time policy.
-                // Do NOT convert RR to FIFO 90: report honestly.
-                rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-                rt_status
-                    .rt_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status
-                    .confirmed_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status.rt_policy.store(libc::SCHED_RR, Ordering::Relaxed);
+    let (actual_policy, actual_param) = match cfg.get_sched_param(thread_id) {
+        Ok((p, param)) => {
+            let base_policy = p & !0x40000000i32;
+            if base_policy == libc::SCHED_FIFO || base_policy == libc::SCHED_RR {
+                (base_policy, param)
             } else {
-                // Non-RT policy (e.g. SCHED_OTHER): attempt elevation to SCHED_FIFO 90.
-                let param = libc::sched_param { sched_priority: 90 };
-                let ret_sched = cfg.set_sched_param(thread_id, libc::SCHED_FIFO, &param);
-
-                if ret_sched == 0 {
-                    base_policy = libc::SCHED_FIFO;
-                    actual_param.sched_priority = 90;
-                    rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                // Thread is in SCHED_OTHER (or other non-RT). Attempt direct RT elevation to SCHED_FIFO 88.
+                let target_param = libc::sched_param { sched_priority: 88 };
+                let ret_set = cfg.set_sched_param(thread_id, libc::SCHED_FIFO, &target_param);
+                if ret_set == 0 {
+                    (libc::SCHED_FIFO, target_param)
                 } else {
-                    rt_status.rt_sched_err.store(ret_sched, Ordering::Relaxed);
-                    rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+                    rt_status.rt_sched_err.store(ret_set, Ordering::Relaxed);
+                    (base_policy, param)
                 }
-
-                rt_status
-                    .rt_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status
-                    .confirmed_priority
-                    .store(actual_param.sched_priority, Ordering::Relaxed);
-                rt_status.rt_policy.store(base_policy, Ordering::Relaxed);
             }
         }
         Err(ret_getsched) => {
-            rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-            rt_status.rt_priority.store(0, Ordering::Relaxed);
-            rt_status.confirmed_priority.store(-1, Ordering::Relaxed);
-            rt_status.rt_policy.store(-1, Ordering::Relaxed);
             rt_status
                 .rt_getsched_err
                 .store(ret_getsched, Ordering::Relaxed);
+            (-1, libc::sched_param { sched_priority: -1 })
         }
+    };
+
+    if actual_policy == libc::SCHED_FIFO {
+        rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+    } else {
+        rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
     }
+
+    rt_status.rt_priority.store(
+        if actual_policy == -1 {
+            0
+        } else {
+            actual_param.sched_priority
+        },
+        Ordering::Relaxed,
+    );
+    rt_status
+        .confirmed_priority
+        .store(actual_param.sched_priority, Ordering::Relaxed);
+    rt_status.rt_policy.store(actual_policy, Ordering::Relaxed);
 }
 
 /// Configures the current DSP thread for real-time operation using the default `SystemThreadConfigurator`.

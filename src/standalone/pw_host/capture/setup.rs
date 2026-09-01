@@ -106,7 +106,6 @@ pub fn setup_capture_stream<'c>(
     )?;
 
     let rate_for_process = rate_for_param.clone();
-    let rt_status_for_state = rt_status.clone();
     let rt_status_for_listener = rt_status.clone();
     let rt_status_for_process = rt_status.clone();
     let backend_for_state = backend_status.clone();
@@ -117,20 +116,6 @@ pub fn setup_capture_stream<'c>(
     let capture_listener = capture_stream
         .add_local_listener::<()>()
         .state_changed(move |_stream, _user_data, old, new| {
-            if matches!(
-                new,
-                pw::stream::StreamState::Paused | pw::stream::StreamState::Streaming
-            ) {
-                // SAFETY: state_ptr points to the `Box<CaptureState>` owned by run_pipewire_host.
-                // This state transition runs on the data-loop thread before stream readiness,
-                // ensuring RT setup (DAZ/FTZ, thread naming, affinity, scheduler inspection)
-                // executes off the hot-path audio callback.
-                let state = unsafe { &mut *state_ptr };
-                if !state.thread_configured {
-                    rt_setup::configure_realtime_thread(target_cpu, rt_status_for_state.clone());
-                    state.thread_configured = true;
-                }
-            }
             super::listeners::state_changed_handler(old, new, &backend_for_state)
         })
         .param_changed(move |stream, user_data, id, param| {
@@ -178,12 +163,10 @@ pub fn setup_capture_stream<'c>(
             // this slot — that would race with the RT flush below.
             let parking_lot = unsafe { &mut *parking_lot_ptr };
             let parking_lot_dirty = unsafe { &*parking_lot_dirty_ptr };
-            // Harness RT setup fallback: in operational execution, RT thread setup is performed
-            // ahead-of-time during `state_changed` on the data-loop thread before stream readiness,
-            // guaranteeing zero setup syscalls in operational audio blocks (T3.1 / F-RES-003).
-            // This branch runs exclusively in test harnesses that invoke `process` directly
-            // without prior state transitions.
-            #[cfg(test)]
+
+            // RT thread setup: performed on the first invocation of `process` on the
+            // actual PipeWire data-loop thread. Sets DAZ/FTZ, thread naming, core affinity,
+            // and scheduler inspection directly on the audio thread.
             if !state.thread_configured {
                 rt_setup::configure_realtime_thread(target_cpu, rt_status_for_process.clone());
                 state.thread_configured = true;

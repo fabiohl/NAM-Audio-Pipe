@@ -119,7 +119,7 @@ pub fn print_help() {
     println!("      --cpu INDEX          Pin RT audio thread to explicit CPU core index");
     println!("      --record             Record raw PipeWire input to a WAV file");
     println!(
-        "      --fail-fast          Disable the bounded backend reconnect cycle (F-RB-010 / T4.5): \
+        "      --fail-fast          Disable the bounded backend reconnect cycle: \
          exit with an error on the first PipeWire stream failure"
     );
     println!("  -h, --help              Show this help message and exit");

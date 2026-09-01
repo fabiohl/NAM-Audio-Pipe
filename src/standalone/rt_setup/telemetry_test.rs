@@ -6,9 +6,9 @@ use crate::standalone::rt_setup::affinity::{CpuSelectionReason, CpuSelectionRece
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_GC_CORRUPTED, RT_STATUS_GC_OVERFLOW, RT_STATUS_GC_TIER3, RT_STATUS_HAS_CLIPPED,
-    RT_STATUS_HUGEPAGE_OK, RT_STATUS_IS_FADING, RT_STATUS_IS_SILENT,
-    RT_STATUS_SLIMMABLE_RESET_FAILED, RT_STATUS_SLIMMABLE_SLICE_FAILED, RT_STATUS_THP_ACTIVE,
-    RtStatusFlags,
+    RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_HUGEPAGE_OK, RT_STATUS_IS_FADING,
+    RT_STATUS_IS_SILENT, RT_STATUS_PARAM_QUEUE_BACKLOG, RT_STATUS_SLIMMABLE_RESET_FAILED,
+    RT_STATUS_SLIMMABLE_SLICE_FAILED, RT_STATUS_THP_ACTIVE, RtStatusFlags,
 };
 use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, DspBridge};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -40,6 +40,35 @@ fn test_poll_state_default_and_independent_instances() {
     state2.telemetry_throttle = state2.telemetry_throttle.wrapping_add(1);
     assert_eq!(state2.telemetry_throttle, 43);
     assert_eq!(state1.telemetry_throttle, 0);
+
+    // Sprint 6 / T6.2: latches default to inactive and stay independent.
+    assert_eq!(state1.latches, TelemetryLatches::default());
+    assert_eq!(state2.latches, TelemetryLatches::default());
+    state2.latches.clipping.observe(true);
+    assert!(state2.latches.clipping.active);
+    assert!(!state1.latches.clipping.active);
+}
+
+#[test]
+fn test_latched_signal_observe_semantics() {
+    let mut latch = LatchedSignal::default();
+    assert!(!latch.active);
+    assert!(
+        latch.observe(true),
+        "first observation of an episode must emit"
+    );
+    assert!(!latch.observe(true), "sustained condition must not re-emit");
+    assert!(!latch.observe(true));
+    assert!(
+        !latch.observe(false),
+        "a clear observation releases the latch silently"
+    );
+    assert!(
+        latch.observe(true),
+        "a new episode after the clear must emit"
+    );
+    assert!(!latch.observe(false));
+    assert!(!latch.observe(false));
 }
 
 #[test]
@@ -142,6 +171,178 @@ fn test_poll_rt_status_clears_diagnostic_flags() {
     assert!(!rt_status.check_flag(RT_STATUS_HAS_CLIPPED));
     assert!(!rt_status.check_flag(RT_STATUS_HUGEPAGE_OK));
     assert!(!rt_status.check_flag(RT_STATUS_THP_ACTIVE));
+}
+
+#[test]
+fn test_latched_flag_emits_once_per_episode() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    let e3101_count = || {
+        let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+            .expect("LogBuffer must be initialized");
+        log_buf
+            .snapshot()
+            .iter()
+            .filter(|r| r.message.contains("[E3101 | GC_OVERFLOW]"))
+            .count()
+    };
+
+    let base = e3101_count();
+
+    // Episode 1: the RT producer keeps re-arming the flag across polls.
+    rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        e3101_count() - base,
+        1,
+        "first poll of the episode must emit"
+    );
+
+    rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        e3101_count() - base,
+        1,
+        "sustained flag must not re-emit (2nd poll)"
+    );
+
+    rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        e3101_count() - base,
+        1,
+        "sustained flag must not re-emit (3rd poll)"
+    );
+
+    // Producer stops re-arming: the latch releases without emitting.
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(e3101_count() - base, 1, "no flag set -> nothing emitted");
+
+    // Episode 2: a new episode after the clear emits exactly once.
+    rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        e3101_count() - base,
+        2,
+        "a new episode after the clear must emit once"
+    );
+}
+
+#[test]
+fn test_latched_counter_emits_once_per_episode() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    let overload_count = || {
+        let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+            .expect("LogBuffer must be initialized");
+        log_buf
+            .snapshot()
+            .iter()
+            .filter(|r| r.message.contains("CPU overload"))
+            .count()
+    };
+
+    let base = overload_count();
+
+    rt_status.dsp_overloads.store(3, Ordering::Relaxed);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(overload_count() - base, 1, "first overload poll must emit");
+
+    rt_status.dsp_overloads.store(2, Ordering::Relaxed);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        overload_count() - base,
+        1,
+        "sustained overload must not re-emit"
+    );
+
+    rt_status.dsp_overloads.store(0, Ordering::Relaxed);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        overload_count() - base,
+        1,
+        "overload clear -> nothing emitted"
+    );
+
+    rt_status.dsp_overloads.store(5, Ordering::Relaxed);
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        overload_count() - base,
+        2,
+        "a new overload episode must emit once"
+    );
+}
+
+#[test]
+fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
+    rt_status.set_flag(RT_STATUS_GC_CORRUPTED);
+    rt_status.set_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
+    rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+    rt_status.set_flag(RT_STATUS_HAS_CLIPPED);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+
+    // Sprint 6 / T6.1: runtime warnings/errors are concise `log::*` lines
+    // carrying the typed code + mnemonic — never the full support bundle.
+    assert!(
+        records
+            .iter()
+            .any(|r| r.message.contains("[E3101 | GC_OVERFLOW]")),
+        "GC overflow must surface as a concise [E3101 | GC_OVERFLOW] line"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.message.contains("[E3102 | GC_CORRUPTED]")),
+        "GC corruption must surface as a concise [E3102 | GC_CORRUPTED] line"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.message.contains("[E3100 | PARAM_CHANNEL_FULL]")),
+        "param backlog must surface as a concise [E3100 | PARAM_CHANNEL_FULL] line"
+    );
+    assert!(
+        records.iter().any(|r| r
+            .message
+            .contains("[E2304 | SPA_FORMAT_CONTRACT_VIOLATION]")),
+        "contract violation must surface as a concise [E2304 | SPA_FORMAT_CONTRACT_VIOLATION] line"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|r| r.message.contains("Clipping detected")),
+        "clipping must keep its concise warning"
+    );
+
+    // Sprint 6 / T6.1: the retrospective `Recent Log Trace` support block is
+    // reserved for `--diagnose`/`--diagnose-full` and crash reports — runtime
+    // telemetry must never re-print it.
+    assert!(
+        !records
+            .iter()
+            .any(|r| r.message.contains("Recent Log Trace")),
+        "runtime telemetry must not re-print the Recent Log Trace block"
+    );
 }
 
 #[test]
@@ -252,13 +453,14 @@ fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
         .expect("LogBuffer must be initialized");
     let records = log_buf.snapshot();
     let has_dedicated_log = records.iter().any(|r| {
-        r.message.contains("Dedicated core")
-            && r.message.contains("Real-Time priority (FIFO")
+        r.message.contains("Real-Time Priority: Active")
+            && r.message.contains("Dedicated Core")
+            && r.message.contains("FIFO")
             && r.message.contains("TID=12345")
     });
     assert!(
         has_dedicated_log,
-        "LogBuffer must contain 'Dedicated core' log for proven isolated core"
+        "LogBuffer must contain 'Dedicated Core' log for proven isolated core"
     );
 }
 
@@ -302,8 +504,8 @@ fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
         .expect("LogBuffer must be initialized");
     let records = log_buf.snapshot();
     let has_heuristic_log = records.iter().any(|r| {
-        r.message.contains("Conservative heuristic core")
-            && r.message.contains("Real-Time priority (FIFO")
+        r.message.contains("Real-Time Priority: Active")
+            && r.message.contains("FIFO")
             && r.message.contains("TID=12346")
             && r.message.contains(
                 "Highest capacity with lowest IRQ load and SMT primary preference (non-isolated)",
@@ -311,7 +513,7 @@ fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
     });
     assert!(
         has_heuristic_log,
-        "LogBuffer must contain 'Conservative heuristic core' with typed reason for non-isolated core"
+        "LogBuffer must contain 'Real-Time Priority: Active' with typed reason for non-isolated core"
     );
 }
 
@@ -334,14 +536,143 @@ fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
         .expect("LogBuffer must be initialized");
     let records = log_buf.snapshot();
     let has_heuristic_log = records.iter().any(|r| {
-        r.message.contains("Conservative heuristic core")
-            && r.message.contains("Real-Time priority (RR")
+        r.message.contains("Real-Time Priority: Active")
+            && r.message.contains("RR")
             && r.message.contains("TID=12347")
             && r.message
                 .contains("Conservative heuristic / unverified topology")
     });
     assert!(
         has_heuristic_log,
-        "LogBuffer must contain 'Conservative heuristic core' fallback when receipt is None"
+        "LogBuffer must contain 'Real-Time Priority: Active' fallback when receipt is None"
+    );
+}
+
+#[test]
+fn test_poll_rt_status_sched_rr_is_rt_and_suppresses_denied() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let mut state = PollState::default();
+    // RTKit/PipeWire grant: SCHED_RR with the typical priority 20, FIFO flag absent.
+    rt_status.rt_priority.store(20, Ordering::Relaxed);
+    rt_status.rt_policy.store(libc::SCHED_RR, Ordering::Relaxed);
+    rt_status.rt_cpu.store(1, Ordering::Relaxed);
+    rt_status.rt_tid.store(12348, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_rr_info = records.iter().any(|r| {
+        r.level == "INFO"
+            && r.message.contains("Real-Time Priority: Active")
+            && r.message.contains("RR")
+            && r.message.contains("TID=12348")
+    });
+    assert!(
+        has_rr_info,
+        "SCHED_RR must be confirmed as valid real-time scheduling via an INFO message"
+    );
+    let has_false_denied = records.iter().any(|r| {
+        (r.message.contains("RT_PRIORITY_DENIED") || r.message.contains("E2300"))
+            && r.message.contains("TID=12348")
+    });
+    assert!(
+        !has_false_denied,
+        "E2300 / RT_PRIORITY_DENIED must never fire when SCHED_RR is the granted policy"
+    );
+}
+
+#[test]
+fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let mut state = PollState::default();
+    rt_status.rt_priority.store(0, Ordering::Relaxed);
+    rt_status
+        .rt_policy
+        .store(libc::SCHED_OTHER, Ordering::Relaxed);
+    rt_status.rt_cpu.store(1, Ordering::Relaxed);
+    rt_status.rt_tid.store(12349, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_non_rt_warn = records.iter().any(|r| {
+        r.level == "WARN"
+            && r.message.contains("E2300")
+            && r.message.contains("RT_PRIORITY_DENIED")
+            && r.message.contains("policy = OTHER")
+            && r.message.contains("TID=12349")
+    });
+    assert!(
+        has_non_rt_warn,
+        "Non-RT policy (SCHED_OTHER) must be reported as a clear WARN note advising the operator, got: {:?}",
+        records
+            .iter()
+            .map(|r| (r.level.as_str(), r.message.as_str()))
+            .collect::<Vec<_>>()
+    );
+    let has_sched_error = records
+        .iter()
+        .any(|r| r.message.contains("E2302") && r.message.contains("TID=12349"));
+    assert!(
+        !has_sched_error,
+        "SCHED_OTHER must not produce false E2302 elevation errors"
+    );
+}
+
+#[test]
+fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
+    init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+
+    let mut state = PollState::default();
+    // A genuine setsched failure must still surface as an error.
+    rt_status
+        .rt_sched_err
+        .store(libc::EINVAL, Ordering::Relaxed);
+    rt_status.rt_priority.store(0, Ordering::Relaxed);
+    rt_status
+        .rt_policy
+        .store(libc::SCHED_OTHER, Ordering::Relaxed);
+    rt_status.rt_cpu.store(1, Ordering::Relaxed);
+    rt_status.rt_tid.store(12350, Ordering::Relaxed);
+
+    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+
+    let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .expect("LogBuffer must be initialized");
+    let records = log_buf.snapshot();
+    let has_hard_error = records.iter().any(|r| {
+        r.level == "ERROR"
+            && r.message.contains("E2302")
+            && r.message.contains("errno=22")
+            && r.message.contains("TID=12350")
+    });
+    assert!(
+        has_hard_error,
+        "setsched failure must keep the E2302 error report"
+    );
+    let has_denied_diagnostic = records.iter().any(|r| {
+        r.level == "WARN"
+            && (r.message.contains("RT_PRIORITY_DENIED") || r.message.contains("E2300"))
+            && r.message.contains("TID=12350")
+    });
+    assert!(
+        has_denied_diagnostic,
+        "a failure landing on SCHED_OTHER must surface the \
+         E2300 / RT_PRIORITY_DENIED concise warning"
     );
 }

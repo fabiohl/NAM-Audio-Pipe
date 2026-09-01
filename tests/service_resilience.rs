@@ -540,15 +540,18 @@ fn spa_chunk(offset: u32, size: u32, stride: i32) -> pw::spa::sys::spa_chunk {
 /// Under **zero bridge generation** (G-RB-001 starvation) the playback path
 /// (`playback_dsp_cycle` → [`deliver_silence_pair_fail_closed`]) must:
 ///
-/// * emit `0.0f32` analytical-silence sequences over 100% of both output
-///   extensions (no stale audio residue from the previous buffer);
+/// * emit `0.0f32` analytical-silence sequences over the **quantum-sized
+///   window** (S5 / E2304: `silence_bytes` bounded by the active frame count,
+///   not the shared-memory `maxsize`);
 /// * stamp the SPA chunks deterministically (`offset = 0`, `size = frames × 4`,
 ///   `stride = 4`) — the buffer is recycled back to the graph coherently;
 /// * never stall: thousands of consecutive starvation quantums complete
 ///   deterministically; and
 /// * keep telemetry honest: each starvation quantum is counted on
 ///   `playback_bridge_starvation`, no `output_buffer_miss` is fabricated and no
-///   host-contract violation flag is raised.
+///   host-contract violation flag is raised — including when the host hands us
+///   a **large `maxsize` buffer (64 KiB)** that exceeds `MAX_BRIDGE_BUF × 4`
+///   (the false-`E2304` regression this sprint fixes).
 ///
 /// Daemon-independent — runs in every quick pass.
 #[test]
@@ -567,7 +570,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     let started = Instant::now();
     for cycle in 0..CYCLES {
         // Re-fill with stale non-zero garbage each cycle: the silence path must
-        // deterministically zero 100% of both extensions, never carry residue.
+        // deterministically zero the quantum window, never carry residue.
         l.fill(0.5f32);
         r.fill(0.5f32);
 
@@ -583,6 +586,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
                 r.as_ptr() as usize,
                 r.len() * 4,
                 &mut chunk_r,
+                FRAMES * 4,
                 &rt,
             )
         };
@@ -641,6 +645,91 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     assert!(
         elapsed < Duration::from_secs(5),
         "starvation soak must not stall: {CYCLES} quantums took {elapsed:?}"
+    );
+
+    // S5 / E2304 regression: a large maxsize buffer (64 KiB per channel, well
+    // beyond MAX_BRIDGE_BUF × 4 = 32 KiB) must NOT raise the fail-closed
+    // contract flag during sustained starvation. The kernel delivers exactly
+    // the quantum-sized window (FRAMES × 4 bytes) and never touches the
+    // trailing stale samples.
+    const BIG_FRAMES: usize = 16_384; // 64 KiB per channel
+    let mut big_l = vec![0.5f32; BIG_FRAMES];
+    let mut big_r = vec![0.5f32; BIG_FRAMES];
+    let mut big_chunk_l = spa_chunk(7, 4, 0);
+    let mut big_chunk_r = spa_chunk(3, 8, 2);
+    let rt_big = RtStatusFlags::default();
+
+    for cycle in 0..CYCLES {
+        big_l.fill(0.5f32);
+        big_r.fill(0.5f32);
+
+        // SAFETY: disjoint aligned writable 64 KiB vectors with local chunks.
+        let frames = unsafe {
+            deliver_silence_pair_fail_closed(
+                big_l.as_ptr() as usize,
+                big_l.len() * 4,
+                &mut big_chunk_l,
+                big_r.as_ptr() as usize,
+                big_r.len() * 4,
+                &mut big_chunk_r,
+                FRAMES * 4,
+                &rt_big,
+            )
+        };
+        assert_eq!(
+            frames,
+            Some(FRAMES),
+            "big cycle {cycle}: quantum-sized silence must be delivered"
+        );
+        assert!(
+            big_l[..FRAMES]
+                .iter()
+                .all(|s| s.to_bits() == 0.0f32.to_bits()),
+            "big cycle {cycle}: L quantum window must be bit-exact silence"
+        );
+        assert!(
+            big_r[..FRAMES]
+                .iter()
+                .all(|s| s.to_bits() == 0.0f32.to_bits()),
+            "big cycle {cycle}: R quantum window must be bit-exact silence"
+        );
+        assert!(
+            big_l[FRAMES..]
+                .iter()
+                .all(|s| s.to_bits() == 0.5f32.to_bits()),
+            "big cycle {cycle}: L trailing memory past the quantum must be untouched"
+        );
+        assert!(
+            big_r[FRAMES..]
+                .iter()
+                .all(|s| s.to_bits() == 0.5f32.to_bits()),
+            "big cycle {cycle}: R trailing memory past the quantum must be untouched"
+        );
+        assert_eq!(
+            big_chunk_l.size,
+            (FRAMES * 4) as u32,
+            "big cycle {cycle}: L chunk size"
+        );
+        assert_eq!(
+            big_chunk_r.size,
+            (FRAMES * 4) as u32,
+            "big cycle {cycle}: R chunk size"
+        );
+    }
+
+    assert_eq!(
+        rt_big.playback_bridge_starvation.load(Ordering::Relaxed),
+        CYCLES as u32,
+        "every large-buffer starvation quantum must be telemetrized"
+    );
+    assert_eq!(
+        rt_big.output_buffer_miss.load(Ordering::Relaxed),
+        0,
+        "large-buffer recycle is not a miss"
+    );
+    assert!(
+        !rt_big.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
+        "64 KiB maxsize must NOT raise E2304 during sustained starvation (S5 regression)"
     );
 }
 

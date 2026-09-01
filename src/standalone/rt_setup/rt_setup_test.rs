@@ -358,6 +358,14 @@ fn test_mock_thread_configurator_sched_rr() {
     );
     // RT_STATUS_RT_IS_FIFO must be false since it is SCHED_RR
     assert!(!flags.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO));
+    // SCHED_RR is accepted as-is: no elevation attempt and no sched error
+    assert_eq!(
+        flags
+            .rt_sched_err
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "SCHED_RR must never attempt FIFO elevation nor record a scheduling error"
+    );
     assert_eq!(
         flags.rt_tid.load(std::sync::atomic::Ordering::Relaxed),
         9999
@@ -383,26 +391,18 @@ fn test_mock_thread_configurator_sched_other_elevation_success() {
         1
     );
     assert_eq!(
-        mock.set_policy.load(std::sync::atomic::Ordering::Relaxed),
-        libc::SCHED_FIFO
-    );
-    assert_eq!(
-        mock.set_priority.load(std::sync::atomic::Ordering::Relaxed),
-        90
-    );
-    assert_eq!(
         flags.rt_policy.load(std::sync::atomic::Ordering::Relaxed),
         libc::SCHED_FIFO
     );
     assert_eq!(
         flags.rt_priority.load(std::sync::atomic::Ordering::Relaxed),
-        90
+        88
     );
     assert_eq!(
         flags
             .confirmed_priority
             .load(std::sync::atomic::Ordering::Relaxed),
-        90
+        88
     );
     assert!(flags.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO));
     assert_eq!(
@@ -414,7 +414,7 @@ fn test_mock_thread_configurator_sched_other_elevation_success() {
 }
 
 #[test]
-fn test_mock_thread_configurator_sched_other_elevation_failure() {
+fn test_mock_thread_configurator_sched_other_elevation_eperm_fallback() {
     let mock = MockThreadConfigurator {
         getsched_result: Ok((libc::SCHED_OTHER, libc::sched_param { sched_priority: 0 })),
         setsched_result: libc::EPERM,

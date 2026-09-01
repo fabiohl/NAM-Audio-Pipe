@@ -30,6 +30,7 @@ use super::capture;
 use super::identity;
 use super::playback;
 use crate::standalone::colors::Colorize;
+use pipewire as pw;
 
 /// Initializes the PipeWire dual-stream topology (Capture + Playback).
 ///
@@ -238,7 +239,10 @@ pub fn run_pipewire_host(
         let thread_loop = unsafe {
             pipewire::thread_loop::ThreadLoopBox::new(Some(identity::PW_THREAD_LOOP_NAME), None)
         }?;
-        let context = pipewire::context::ContextBox::new(thread_loop.loop_(), None)?;
+        let context_props = pw::properties::properties! {
+            "config.name" => "client.conf",
+        };
+        let context = pipewire::context::ContextBox::new(thread_loop.loop_(), Some(context_props))?;
         // The daemon is only reachable here. A failed `connect` during the
         // bounded reconnect phase means the daemon is still down — consume the
         // next retry slot instead of aborting. The very first connect (startup)

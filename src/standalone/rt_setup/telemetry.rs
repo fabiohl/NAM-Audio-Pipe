@@ -5,12 +5,85 @@
 //!
 //! Translates atomic signals from the DSP thread into diagnostic logs for
 //! the main loop, acting as the "dashboard" of NAM-Audio-Pipe.
+//!
+//! Sprint 6 / T6.1: runtime telemetry emits concise `log::*` lines
+//! (`[Exxxx | MNEMONIC]` code + cause + recovery hint) **without** the
+//! `DiagnosticBundle` support block — the `──── Recent Log Trace ────`
+//! render is reserved for explicit `--diagnose`/`--diagnose-full` dumps and
+//! crash/panic reports. Sprint 6 / T6.2: every recurrent signal is latched
+//! ([`TelemetryLatches`]) so a continuous condition warns at most once per
+//! episode instead of once per control-loop iteration.
 
 use crate::standalone::colors::Colorize;
-use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode, SystemSnapshot};
+use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// Per-signal episode latch (Sprint 6 / T6.2).
+///
+/// A condition observed continuously by the control loop (starvation, queue
+/// saturation, rate churn, clipping, …) emits **at most once per episode**:
+/// the first poll that observes it after it has cleared. The latch re-arms
+/// only when a poll observes the condition absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LatchedSignal {
+    active: bool,
+}
+
+impl LatchedSignal {
+    /// Records one poll observation of a signal. Returns `true` exactly on
+    /// the first observation of each episode — callers emit the log line
+    /// only when `true`.
+    #[inline]
+    pub fn observe(&mut self, active_now: bool) -> bool {
+        if active_now {
+            let first = !self.active;
+            self.active = true;
+            first
+        } else {
+            self.active = false;
+            false
+        }
+    }
+}
+
+/// Latching state for every recurrent signal translated by `poll_rt_status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryLatches {
+    /// GC channel overflow (`RT_STATUS_GC_OVERFLOW`).
+    pub gc_overflow: LatchedSignal,
+    /// GC cascade Tier 3 (`RT_STATUS_GC_TIER3`).
+    pub gc_tier3: LatchedSignal,
+    /// GC overflow buffer corruption (`RT_STATUS_GC_CORRUPTED`).
+    pub gc_corrupted: LatchedSignal,
+    /// Scalar parameter queue backlog (`RT_STATUS_PARAM_QUEUE_BACKLOG`).
+    pub param_backlog: LatchedSignal,
+    /// Structural command deferred (`RT_STATUS_STRUCTURAL_DEFERRED`).
+    pub structural_deferred: LatchedSignal,
+    /// Deferred structural command superseded (`RT_STATUS_STRUCTURAL_SUPERSEDED`).
+    pub structural_superseded: LatchedSignal,
+    /// WaveNet slimmable slice rebuild failure (`RT_STATUS_SLIMMABLE_SLICE_FAILED`).
+    pub slimmable_slice_failed: LatchedSignal,
+    /// ContainerModel submodel reset failure (`RT_STATUS_SLIMMABLE_RESET_FAILED`).
+    pub slimmable_reset_failed: LatchedSignal,
+    /// Digital clipping (`RT_STATUS_HAS_CLIPPED`).
+    pub clipping: LatchedSignal,
+    /// SPA format contract violation (`RT_STATUS_HOST_CONTRACT_VIOLATION`).
+    pub contract_violation: LatchedSignal,
+    /// DSP CPU overload counter (`dsp_overloads`).
+    pub cpu_overload: LatchedSignal,
+    /// PipeWire capture buffer miss counter (`input_buffer_miss`).
+    pub input_buffer_miss: LatchedSignal,
+    /// PipeWire playback buffer miss counter (`output_buffer_miss`).
+    pub output_buffer_miss: LatchedSignal,
+    /// Playback bridge starvation counter (`playback_bridge_starvation`).
+    pub playback_starvation: LatchedSignal,
+    /// Clock-drift dropped-frames counter (`DspBridge::dropped_frames`).
+    pub drift_drops: LatchedSignal,
+    /// Audio deadline exceeded (`dsp_cycle_time > quantum budget`).
+    pub deadline_exceeded: LatchedSignal,
+}
 
 /// Mutable state for `poll_rt_status`, replacing function-scoped statics
 /// to make the function testable and re-entrant.
@@ -19,6 +92,8 @@ pub struct PollState {
     pub hugepage_synced: bool,
     pub telemetry_throttle: u32,
     pub cpu_receipt: Option<super::affinity::CpuSelectionReceipt>,
+    /// Per-signal episode latches (Sprint 6 / T6.2).
+    pub latches: TelemetryLatches,
 }
 
 impl PollState {
@@ -33,6 +108,7 @@ impl PollState {
             hugepage_synced: false,
             telemetry_throttle: 0,
             cpu_receipt: receipt,
+            latches: TelemetryLatches::default(),
         }
     }
 }
@@ -44,9 +120,12 @@ impl PollState {
 /// into understandable messages, performance warnings, and latency telemetry.
 ///
 /// Returns a tuple (current_silent, current_fading) for state control in the main loop.
+///
+/// `_sys` is retained for API stability (callers/tests pass the startup snapshot);
+/// runtime telemetry is intentionally bundle-free (Sprint 6 / T6.1).
 pub fn poll_rt_status(
     rt_status: &RtStatusFlags,
-    sys: &SystemSnapshot,
+    _sys: &SystemSnapshot,
     was_silent: bool,
     was_fading: bool,
     bridge: &neural_amp_modeler_rs::dsp::pipeline::DspBridge,
@@ -61,81 +140,95 @@ pub fn poll_rt_status(
     // If the cleanup channel is full, it means we are swapping neural models
     // faster than the system can discard old ones. We prioritize audio
     // "leaking" memory temporarily to avoid clicks (drops) in the sound.
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_OVERFLOW) {
-        NamDiagnostic::new(NamErrorCode::GcOverflow, sys)
-            .message("Garbage Collection (GC) channel overflow detected.")
-            .hint(
-                "The audio thread had to leak memory to avoid dropouts in the hot-path. \
-                   This can occur during rapid model swaps. \
-                   NAM-Audio-Pipe will drain the buffer aggressively now.",
-            )
-            .emit_warning();
+    // (T6.2) sustained pressure is latched: one concise warning per episode.
+    let gc_overflow =
+        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_OVERFLOW);
+    if state.latches.gc_overflow.observe(gc_overflow) {
+        log::warn!(
+            "[E3101 | GC_OVERFLOW] Garbage Collection (GC) channel overflow detected — \
+             the audio thread had to leak memory to avoid dropouts in the hot-path; \
+             NAM-Audio-Pipe will drain the buffer aggressively now."
+        );
     }
 
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_TIER3) {
-        NamDiagnostic::new(NamErrorCode::GcOverflow, sys)
-            .message("Garbage Collection (GC) cascade reached Tier 3 (overflow buffer).")
-            .hint(
-                "The SPSC channel and parking lot are both full — items are being parked \
-                   in the overflow buffer. This indicates sustained GC pressure. \
-                   NAM-Audio-Pipe will drain the overflow buffer aggressively now.",
-            )
-            .emit_warning();
+    let gc_tier3 =
+        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_TIER3);
+    if state.latches.gc_tier3.observe(gc_tier3) {
+        log::warn!(
+            "[E3101 | GC_OVERFLOW] GC cascade reached Tier 3 (SPSC channel and parking lot \
+             both full) — items are being parked in the overflow buffer; \
+             NAM-Audio-Pipe will drain the overflow buffer aggressively now."
+        );
     }
 
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_CORRUPTED) {
-        NamDiagnostic::new(NamErrorCode::GcCorrupted, sys)
-            .message("Garbage Collection overflow buffer corruption detected.")
-            .hint(
-                "A GC slot had inconsistent type/pointer data. The pointer was leaked \
-                   to avoid undefined behavior (Box::from_raw with wrong type). \
-                   This should never happen — report it.",
-            )
-            .emit();
+    let gc_corrupted =
+        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_CORRUPTED);
+    if state.latches.gc_corrupted.observe(gc_corrupted) {
+        log::error!(
+            "[E3102 | GC_CORRUPTED] Garbage Collection overflow buffer corruption detected — \
+             a GC slot had inconsistent type/pointer data; the pointer was leaked to avoid \
+             undefined behavior. This should never happen — report it."
+        );
     }
 
     // Command Budgeting telemetry (F-RB-011 / T2.5): the RT callback drains
     // under fixed per-quantum budgets. These flags make saturation explicit —
     // no command is ever lost; the excess is deferred to the next callback.
-    if rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_PARAM_QUEUE_BACKLOG)
-    {
-        NamDiagnostic::new(NamErrorCode::ParamChannelFull, sys)
-            .message("Command queue backlog: the scalar parameter drain budget was exhausted.")
-            .hint(
-                "A producer (CLI/UI/automation) filled the command queue faster than the \
-                 per-callback budget (16) can drain. The remainder is processed by the \
-                 next callback — audio deadline preserved.",
-            )
-            .emit_warning();
+    let param_backlog = rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_PARAM_QUEUE_BACKLOG);
+    if state.latches.param_backlog.observe(param_backlog) {
+        log::warn!(
+            "[E3100 | PARAM_CHANNEL_FULL] Command queue backlog: the scalar parameter drain \
+             budget (16/callback) was exhausted — a producer (CLI/UI/automation) filled the \
+             queue faster than it can drain; the remainder is processed by the next callback, \
+             preserving the audio deadline."
+        );
     }
 
-    if rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED)
+    let structural_deferred = rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED);
+    if state
+        .latches
+        .structural_deferred
+        .observe(structural_deferred)
     {
         log::info!(
             "Structural command deferred to the next callback (structural budget 1/callback) — FIFO order preserved."
         );
     }
 
-    if rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED)
+    let structural_superseded = rt_status
+        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED);
+    if state
+        .latches
+        .structural_superseded
+        .observe(structural_superseded)
     {
         log::info!(
             "Deferred structural command superseded by a newer same-kind command; obsolete resources discarded off-RT (coalescing)."
         );
     }
 
-    if rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED)
+    let slimmable_slice_failed = rt_status.check_and_clear_flag(
+        neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED,
+    );
+    if state
+        .latches
+        .slimmable_slice_failed
+        .observe(slimmable_slice_failed)
     {
         log::error!(
             "WaveNet slimmable slice_channels rebuild failed — model may run in reduced state."
         );
     }
 
-    if rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_RESET_FAILED)
+    let slimmable_reset_failed = rt_status.check_and_clear_flag(
+        neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_RESET_FAILED,
+    );
+    if state
+        .latches
+        .slimmable_reset_failed
+        .observe(slimmable_reset_failed)
     {
         log::error!("ContainerModel submodel reset failed — model may run in previous state.");
     }
@@ -154,8 +247,11 @@ pub fn poll_rt_status(
 
     // 3. DIGITAL DISTORTION (Clipping):
     // The equivalent of the "red LED" on mixing consoles. Indicates that the signal volume
-    // exceeded the maximum limit of digital processing.
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HAS_CLIPPED) {
+    // exceeded the maximum limit of digital processing. Latched: a continuously hot signal
+    // warns once per episode instead of on every control-loop iteration.
+    let has_clipped =
+        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HAS_CLIPPED);
+    if state.latches.clipping.observe(has_clipped) {
         log::warn!(
             "{} Clipping detected! Consider reducing the input and/or output gain.",
             "🔥".bright_red().bold()
@@ -191,6 +287,7 @@ pub fn poll_rt_status(
     let sched_err = rt_status.rt_sched_err.swap(0, Ordering::Relaxed);
     let getsched_err = rt_status.rt_getsched_err.swap(0, Ordering::Relaxed);
     let target_cpu = rt_status.rt_target_cpu.swap(-1, Ordering::Relaxed);
+    let tid = rt_status.rt_tid.load(Ordering::Relaxed);
 
     if aff_err == -1 {
         log::error!(
@@ -214,7 +311,7 @@ pub fn poll_rt_status(
 
     if sched_err > 0 {
         log::error!(
-            "⚠️ pthread_setschedparam(SCHED_FIFO, 90) failed (errno={}).\n\
+            "⚠️ pthread_setschedparam failed (errno={}, TID={tid}).\n\
              [E2302 | RT_SCHED_FAILED] Check ulimit -r and rtkit permissions.\n",
             sched_err
         );
@@ -232,7 +329,6 @@ pub fn poll_rt_status(
         let is_fifo =
             rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
         let policy = rt_status.rt_policy.load(Ordering::Relaxed);
-        let tid = rt_status.rt_tid.load(Ordering::Relaxed);
         let cpu = rt_status.rt_cpu.load(Ordering::Relaxed);
 
         rt_status.rt_priority.store(-1, Ordering::Relaxed);
@@ -252,11 +348,11 @@ pub fn poll_rt_status(
 
             if is_dedicated {
                 log::info!(
-                    "{} Thread Optimization: Dedicated core {} with Real-Time priority ({}, Prio={}, TID={})",
-                    "🔍".blue(),
-                    cpu.to_string().cyan(),
+                    "{} Real-Time Priority: Active ({}, Prio={}, Dedicated Core {}, TID={})",
+                    "⚡".yellow(),
                     policy_name,
                     prio.to_string().green(),
+                    cpu.to_string().cyan(),
                     tid
                 );
             } else {
@@ -278,11 +374,11 @@ pub fn poll_rt_status(
                     .unwrap_or("Conservative heuristic / unverified topology");
 
                 log::info!(
-                    "{} Thread Optimization: Conservative heuristic core {} with Real-Time priority ({}, Prio={}, TID={}) [Reason: {}]",
-                    "🔍".blue(),
-                    cpu.to_string().cyan(),
+                    "{} Real-Time Priority: Active ({}, Prio={}, Core {}, TID={}) [Affinity: {}]",
+                    "⚡".yellow(),
                     policy_name,
                     prio.to_string().green(),
+                    cpu.to_string().cyan(),
                     tid,
                     reason_str
                 );
@@ -294,26 +390,23 @@ pub fn poll_rt_status(
                 libc::SCHED_IDLE => "IDLE",
                 _ => "NON-RT",
             };
-            NamDiagnostic::new(NamErrorCode::RtPriorityDenied, sys)
-                .message(format!(
-                    "DSP thread is NOT in a Real-Time scheduling policy (policy = {}, priority = {}, TID = {}). \
-                     Audio may experience jitter and xruns.",
-                    policy_str, prio, tid
-                ))
-                .hint(
-                    "Check if your user has RT permission (ulimit -r) \
-                     or if the system has rtkit/PipeWire configured correctly.",
-                )
-                .emit_warning();
+            log::warn!(
+                "[E2300 | RT_PRIORITY_DENIED] DSP thread is NOT in a Real-Time scheduling \
+                 policy (policy = {policy_str}, priority = {prio}, TID={tid}) — audio may \
+                 experience jitter and xruns under CPU load. Ensure PipeWire RT module or rtkit is configured."
+            );
         }
     }
 
     // 5. PROCESSING OVERLOAD (Overloads):
     // Warns if the processor (CPU) is not fast enough to compute
     // the neural network before the next audio block is needed.
+    // (T6.2) latched: a sustained overload episode warns once.
     let overloads = rt_status.dsp_overloads.swap(0, Ordering::Relaxed);
     if overloads > 0 {
         rt_status.xruns.fetch_add(overloads, Ordering::Relaxed);
+    }
+    if state.latches.cpu_overload.observe(overloads > 0) {
         log::warn!(
             "{} CPU overload ({} buffers). Consider using a lighter model or a faster processor.",
             "🚨".red(),
@@ -324,7 +417,11 @@ pub fn poll_rt_status(
     // 5.5 BUFFER MISS (PipeWire):
     // PipeWire failed to provide a buffer — either on the capture or playback side.
     let input_buffer_miss = rt_status.input_buffer_miss.swap(0, Ordering::Relaxed);
-    if input_buffer_miss > 0 {
+    if state
+        .latches
+        .input_buffer_miss
+        .observe(input_buffer_miss > 0)
+    {
         log::warn!(
             "{} PipeWire capture buffer miss ({} xruns). Check system load or buffer size.",
             "📻".yellow(),
@@ -332,7 +429,11 @@ pub fn poll_rt_status(
         );
     }
     let output_buffer_miss = rt_status.output_buffer_miss.swap(0, Ordering::Relaxed);
-    if output_buffer_miss > 0 {
+    if state
+        .latches
+        .output_buffer_miss
+        .observe(output_buffer_miss > 0)
+    {
         log::warn!(
             "{} PipeWire playback buffer miss ({} xruns). Check system load or buffer size.",
             "📢".yellow(),
@@ -344,18 +445,17 @@ pub fn poll_rt_status(
     // The audio host handed buffers or negotiated a format diverging from the
     // strict F32P planar stereo contract (raised by the RT harness or by the
     // param_changed listeners). The backend state machine acknowledges the
-    // degraded/error state here with a structured diagnostic.
-    if rt_status.check_and_clear_flag(RT_STATUS_HOST_CONTRACT_VIOLATION) {
-        NamDiagnostic::new(NamErrorCode::SpaFormatContractViolation, sys)
-            .message(
-                "Audio host violated the strict SPA format contract (F32P planar stereo, \
-                 2 channels FL/FR).",
-            )
-            .hint(
-                "Check that the PipeWire graph is not forcing a mono, interleaved, S16 or \
-                 surround negotiation onto the NAM streams (e.g. via WirePlumber rules).",
-            )
-            .emit();
+    // degraded/error state here with a concise error. The source-side listeners
+    // already name the offending stream/violation (see output_pw.rs); this
+    // loop covers the RT-raised path and is latched to warn once per episode.
+    let contract_violation = rt_status.check_and_clear_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+    if state.latches.contract_violation.observe(contract_violation) {
+        log::error!(
+            "[E2304 | SPA_FORMAT_CONTRACT_VIOLATION] Audio host violated the strict SPA format \
+             contract (F32P planar stereo, 2 channels FL/FR) — check that the PipeWire graph is \
+             not forcing a mono, interleaved, S16 or surround negotiation onto the NAM streams \
+             (e.g. via WirePlumber rules)."
+        );
     }
 
     // 5.6 PLAYBACK BRIDGE STARVATION (T4.2 / G-RB-001):
@@ -363,10 +463,16 @@ pub fn poll_rt_status(
     // pending, clock drift or quantum miss). The playback callback delivered a
     // recycled buffer filled with deterministic silence instead of repeating
     // stale audio — expected behavior, surfaced as info telemetry.
+    // (T6.2) latched: sustained starvation (e.g. paused capture) informs once
+    // per episode instead of every control-loop iteration.
     let playback_bridge_starvation = rt_status
         .playback_bridge_starvation
         .swap(0, Ordering::Relaxed);
-    if playback_bridge_starvation > 0 {
+    if state
+        .latches
+        .playback_starvation
+        .observe(playback_bridge_starvation > 0)
+    {
         log::info!(
             "{} Playback delivered {} silence block(s) under bridge starvation (no stale audio repeated).",
             "🔇".blue(),
@@ -378,8 +484,9 @@ pub fn poll_rt_status(
     // Occurs when you use different devices for input and output (e.g. USB Microphone
     // and P2 Headphones). If one is slightly faster than the other, the system needs to discard
     // some small audio chunks to maintain synchronization.
+    // (T6.2) latched: a sustained drift episode warns once.
     let drops = bridge.drain_dropped_frames();
-    if drops > 0 {
+    if state.latches.drift_drops.observe(drops > 0) {
         log::warn!(
             "{} Drifting detected: {} audio blocks discarded (capture > playback).",
             "⚠️".yellow(),
@@ -529,15 +636,21 @@ pub fn poll_rt_status(
             let budget_us = (samples_val as f64 / rate_val as f64) * 1_000_000.0;
             let elapsed_us = duration.as_micros() as f64;
 
-            if elapsed_us > budget_us {
-                NamDiagnostic::new(NamErrorCode::ProcessingOverload, sys)
-                    .message("Audio deadline exceeded (Possible Xrun detected)")
-                    .hint("Verify model topology or reduce system load.")
-                    .param("exec_time_us", elapsed_us as u64)
-                    .param("budget_us", budget_us as u64)
-                    .param("n_samples", samples_val)
-                    .param("rate", rate_val)
-                    .emit();
+            // (T6.2) latched: sustained deadline overruns report once per
+            // episode instead of once per telemetry window. The observation
+            // runs on every throttle window so the latch releases as soon as
+            // the DSP stays within budget.
+            let deadline_exceeded = elapsed_us > budget_us;
+            if state.latches.deadline_exceeded.observe(deadline_exceeded) {
+                log::error!(
+                    "[E2001 | PROCESSING_OVERLOAD] Audio deadline exceeded (possible xrun): \
+                     exec_time_us={} budget_us={} n_samples={} rate={} — verify model \
+                     topology or reduce system load.",
+                    elapsed_us as u64,
+                    budget_us as u64,
+                    samples_val,
+                    rate_val
+                );
             }
         }
     }
