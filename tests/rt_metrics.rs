@@ -26,7 +26,11 @@
 //! - `concurrent_state_interleaving_stress_16_threads` (filter `concurrent`,
 //!   Phase 5): 16-thread stress over swap requests, stream-state transitions
 //!   (`observe_stream_state`), simulated reconnect cycles, sample-rate
-//!   renegotiation and the cooperative `SHUTDOWN` trigger. A watcher thread
+//!   renegotiation and the cooperative `SHUTDOWN` trigger. The rate workers
+//!   follow the production renegotiation causality (T1.1): publish → `sync_rate`
+//!   observes → constructor dispatches the generation-stamped envelope, so
+//!   `drain_resamplers` installs it, clears `RESAMP_SWAP_PENDING` and the RT
+//!   driver keeps incrementing `frame_count`. A watcher thread
 //!   samples coherent [`BackendStatusSnapshot`]s and asserts the hardened
 //!   `SharedBackendStatus` machine never leaks failure state; the RT driver
 //!   asserts sample-rate reads stay within the published set; the joined
@@ -61,7 +65,7 @@ use common::swap::*;
 use nam_audio_pipe::standalone::pw_host::{
     RtSwapHarness, SharedBackendStatus, observe_stream_state,
 };
-use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
+use neural_amp_modeler_rs::common::spsc::{RT_STATUS_NEEDS_RESAMPLER_REBUILD, SHUTDOWN};
 use pipewire::stream::StreamState;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,6 +91,22 @@ const MODEL_CHECK_THREADS: usize = 16;
 /// Host rates the rate-renegotiation workers may publish; the RT driver
 /// asserts `current_host_rate()` never leaves this set.
 const VALID_RATES: [u32; 4] = [32_000, 44_100, 48_000, 96_000];
+
+/// Rate-renegotiation publish period (T1.1): each rate worker publishes a new
+/// host rate every N loop iterations. The publish strictly precedes any
+/// resampler delivery — the RT callback must observe it in `sync_rate` first.
+const RATE_PUBLISH_PERIOD: u64 = 8;
+
+/// Rate-renegotiation publish budget (T1.1): after this many loop iterations a
+/// rate worker stops publishing and only plays the constructor role — keeping
+/// the resampler build/GC churn bounded while still delivering an envelope for
+/// every request the RT callback already observed (including the final one).
+const RATE_PUBLISH_BUDGET: u64 = 200;
+
+/// Calibrated micro-yield sleep for the stress workers (T1.2): 10–50 µs so the
+/// RT driver always wins a scheduling slot on a saturated host instead of
+/// starving on the harness lock against the 15 writer threads.
+const WORKER_YIELD_US: u64 = 20;
 // ── Nanosecond timing (CLOCK_MONOTONIC_RAW, NTP-immune) ─────────────────────
 
 /// Reads a monotonic clock's current time in nanoseconds.
@@ -579,6 +599,11 @@ fn concurrent_state_interleaving_stress_16_threads() {
 
     let mut handles = Vec::with_capacity(MODEL_CHECK_THREADS);
 
+    // Shared RT status flags: lock-free observation face for the rate workers'
+    // constructor role (the generation/NEEDS checks below never contend on the
+    // harness mutex while the callback is unmuted).
+    let rt_status_flags = harness.lock().expect("harness lock").rt_status_arc();
+
     // 4 swap workers: bounded bursts of model/cabsim/gain requests through
     // the producer face (serialized exactly like the production main thread).
     // Payloads are built *outside* the harness lock so the RT driver keeps a
@@ -678,28 +703,79 @@ fn concurrent_state_interleaving_stress_16_threads() {
         }));
     }
 
-    // 4 rate workers: publish host-rate changes and request resampler
-    // rebuilds. Bounded burst, throttled, with yields so the SPSC stays
-    // absorbable by the RT driver.
+    // 4 rate workers: publisher + constructor roles following the production
+    // rate-renegotiation protocol (F-RB-004 / T1.1). The causal chain is:
+    //
+    //   1. `publish_host_rate(rate)`   — publisher role: publish the desired rate.
+    //   2. `sync_rate` (RT callback)   — detects the discrepancy, bumps
+    //      `requested_rate_generation` and arms
+    //      `RT_STATUS_NEEDS_RESAMPLER_REBUILD`.
+    //   3. `request_resampler_swap`    — constructor role: dispatched *only*
+    //      after the RT observed the publish, capturing the updated generation
+    //      under the harness lock (the same "photograph"
+    //      `handle_resampler_rebuild` takes before building).
+    //   4. `drain_resamplers` (RT)     — installs the envelope, clears
+    //      `RT_STATUS_RESAMP_SWAP_PENDING` and the callback processes DSP.
+    //
+    // Dispatching the swap *before* the RT observes the publish is the Phase-5
+    // starvation bug: the envelope carries a stale generation, is discarded by
+    // `drain_resamplers` without unmuting, and `RESAMP_SWAP_PENDING` stays
+    // armed — the fail-open rollback guard skips every callback and
+    // `frame_count` never advances. The publish budget bounds the publisher
+    // role; the constructor role keeps polling until `stop`, so the final
+    // published rate always receives its envelope (T1.2: both loops
+    // yield/sleep so the RT driver wins the harness lock).
     for w in 0..4 {
         let harness = Arc::clone(&harness);
+        let rt_status = Arc::clone(&rt_status_flags);
         let stop = Arc::clone(&stop);
         let swaps_requested = Arc::clone(&swaps_requested);
         handles.push(std::thread::spawn(move || {
             let mut iter = 0u64;
-            while iter < 200 && !stop.load(Ordering::Acquire) {
-                if iter.is_multiple_of(8) {
+            let mut last_delivered_gen = 0u64;
+            while !stop.load(Ordering::Acquire) {
+                // Publisher role (bounded): publish the desired host rate and
+                // release the lock immediately — the RT callback observes the
+                // publish in its own `sync_rate` run.
+                if iter < RATE_PUBLISH_BUDGET && iter.is_multiple_of(RATE_PUBLISH_PERIOD) {
                     let rate =
                         VALID_RATES[(w + (iter as usize % VALID_RATES.len())) % VALID_RATES.len()];
                     let mut h = harness.lock().expect("harness lock");
                     h.publish_host_rate(rate);
-                    if h.request_resampler_swap(rate, SAMPLE_RATE).is_ok() {
+                }
+                // Constructor role: only when the RT observed a request for a
+                // generation this worker has not delivered yet (lock-free fast
+                // path — zero mutex contention while the callback is unmuted).
+                let req_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
+                if req_gen != last_delivered_gen
+                    && rt_status.check_flag_acquire(RT_STATUS_NEEDS_RESAMPLER_REBUILD)
+                {
+                    let mut h = harness.lock().expect("harness lock");
+                    // Re-verify under the lock (atomic vs the RT callback) and
+                    // capture the updated generation + requested rates — the
+                    // production `handle_resampler_rebuild` photograph. The
+                    // envelope is stamped with `requested_rate_generation`,
+                    // which cannot advance while the lock is held.
+                    let req_gen = h
+                        .rt_status()
+                        .requested_rate_generation
+                        .load(Ordering::Acquire);
+                    let host = h.rt_status().requested_host_rate.load(Ordering::Relaxed);
+                    let nam = h.rt_status().requested_nam_rate.load(Ordering::Relaxed);
+                    if req_gen != last_delivered_gen
+                        && host != 0
+                        && nam != 0
+                        && h.request_resampler_swap(host, nam).is_ok()
+                    {
+                        last_delivered_gen = req_gen;
                         swaps_requested.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 iter += 1;
+                // T1.2 calibrated micro-yield: the RT driver always wins a
+                // scheduling slot even on a saturated host.
                 if iter.is_multiple_of(16) {
-                    std::thread::sleep(Duration::from_micros(20));
+                    std::thread::sleep(Duration::from_micros(WORKER_YIELD_US));
                 } else {
                     std::thread::yield_now();
                 }

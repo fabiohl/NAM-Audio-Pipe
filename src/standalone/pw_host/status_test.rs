@@ -25,6 +25,23 @@ impl Drop for ShutdownRestore {
     }
 }
 
+/// Initializes the global `NamLogger` once per test binary (idempotent) so the
+/// Sprint 2 / T2.1 tests can assert the log level of the disconnect records.
+fn init_log_capture() {
+    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+    let _ = NamLogger::init(LoggerConfig {
+        level_filter: log::LevelFilter::Trace,
+        emit_stderr: false,
+    });
+}
+
+/// Returns the buffered log records (after [`init_log_capture`]), if the
+/// global logger is available.
+fn captured_logs() -> Option<Vec<neural_amp_modeler_rs::common::diagnostics::logger::LogRecord>> {
+    neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        .map(|buffer| buffer.snapshot())
+}
+
 #[test]
 fn new_defaults_to_starting_and_healthy() {
     let backend = SharedBackendStatus::new();
@@ -162,6 +179,13 @@ fn observe_error_transitions_to_failed() {
 
 #[test]
 fn observe_unconnected_after_streaming_marks_failed() {
+    // Sprint 2 / T2.1 strict path: without `SHUTDOWN` the post-streaming
+    // disconnect is an unexpected drop — it must fail the backend and be
+    // logged at `ERROR` (daemon restart/crash alarm).
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(false, Ordering::Release);
+    init_log_capture();
+
     let backend = SharedBackendStatus::new();
     observe_stream_state(
         "playback",
@@ -177,10 +201,103 @@ fn observe_unconnected_after_streaming_marks_failed() {
             "stream disconnected from the audio backend".to_string()
         ))
     );
+
+    if let Some(records) = captured_logs() {
+        let strict = records
+            .iter()
+            .find(|r| r.message.contains("disconnected from the audio backend"));
+        assert!(
+            strict.is_some(),
+            "unexpected drop must produce an ERROR log record"
+        );
+        assert_eq!(
+            strict.unwrap().level,
+            "ERROR",
+            "unexpected drop must be logged at ERROR"
+        );
+    }
+}
+
+#[test]
+fn observe_unconnected_during_shutdown_is_cooperative_and_not_fatal() {
+    // Sprint 2 / T2.1 cooperative path: on a graceful termination (SIGINT /
+    // SIGTERM raising `SHUTDOWN`), the streams destroyed by
+    // `thread_loop.stop()` emit a post-streaming `Unconnected`. That disconnect
+    // is expected — it must NOT transition the backend to the sticky `Failed`
+    // state (no false "daemon crash" alarm) and must be logged below `ERROR`.
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(true, Ordering::Release);
+    init_log_capture();
+
+    let backend = SharedBackendStatus::new();
+    backend.mark_running();
+    observe_stream_state(
+        "capture",
+        StreamState::Streaming,
+        StreamState::Unconnected,
+        &backend,
+    );
+
+    assert!(
+        !backend.is_failed(),
+        "cooperative disconnect must not fail the backend"
+    );
+    assert!(
+        !matches!(backend.state(), BackendState::Failed { .. }),
+        "state must not become Failed during cooperative shutdown"
+    );
+    assert_eq!(backend.failure(), None);
+    assert_eq!(
+        backend.state(),
+        BackendState::Starting,
+        "the deactivated stream returns the backend to Starting during teardown"
+    );
+
+    if let Some(records) = captured_logs() {
+        let coop = records.iter().find(|r| {
+            r.message
+                .contains("disconnected cooperatively during shutdown")
+        });
+        assert!(
+            coop.is_some(),
+            "cooperative disconnect must produce a log record"
+        );
+        let level = coop.unwrap().level.as_str();
+        assert!(
+            level == "INFO" || level == "DEBUG",
+            "cooperative disconnect must be logged at INFO/DEBUG, got {level}"
+        );
+    }
+}
+
+#[test]
+fn observe_error_stays_fatal_even_during_shutdown() {
+    // Sprint 2 / T2.1 scope guard: `SHUTDOWN` only downgrades the cooperative
+    // disconnect (`Unconnected`). A genuine `StreamState::Error` remains fatal
+    // even while shutting down — a failing stream is never masked as expected.
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(true, Ordering::Release);
+
+    let backend = SharedBackendStatus::new();
+    observe_stream_state(
+        "capture",
+        StreamState::Streaming,
+        StreamState::Error("node failure".into()),
+        &backend,
+    );
+    assert!(backend.is_failed());
+    assert_eq!(
+        backend.failure(),
+        Some(("capture", "node failure".to_string()))
+    );
 }
 
 #[test]
 fn observe_unconnected_after_paused_marks_failed() {
+    // Sprint 2 / T2.1 strict path (Paused origin): unexpected drop, not
+    // shutdown — must remain fatal.
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(false, Ordering::Release);
     let backend = SharedBackendStatus::new();
     observe_stream_state(
         "capture",

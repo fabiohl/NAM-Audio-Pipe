@@ -26,6 +26,7 @@ pub fn detect_hardware_sink() -> Option<String> {
         .spawn()
         .ok()?;
 
+    let pid = child.id() as libc::pid_t;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
@@ -35,6 +36,10 @@ pub fn detect_hardware_sink() -> Option<String> {
         Ok(Ok(out)) => out,
         Ok(Err(_)) => return None,
         Err(_) => {
+            // SAFETY: terminating unresponsive child by PID unblocks the joiner thread.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
             log::warn!(
                 "detect_hardware_sink: pw-metadata did not respond within {}ms — \
                  skipping default sink detection (WirePlumber will decide routing).",

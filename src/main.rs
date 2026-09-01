@@ -346,7 +346,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
     log::info!("{} NAM-Audio-Pipe encerrado. 🎸", "✅".green());
-    Ok(())
+    std::process::exit(0);
 }
 
 fn pw_library_version() -> String {

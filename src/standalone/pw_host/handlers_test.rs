@@ -43,7 +43,7 @@ fn fake_pair(generation: u64, ch: usize) -> Box<SlimModelPair> {
 /// returns a full-model storage clone suitable for `handle_slimmable_rebuild`.
 fn load_slimmable_full_model() -> Option<Box<StaticModel>> {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("../NeuralAmpModeler-rs/tests/fixtures/models/wavenet_dyn_free.nam");
+    path.push("tests/fixtures/models/wavenet_dyn_free.nam");
     let sys = SystemSnapshot::capture();
     let loaded = loader::load_and_build_model(&path, &sys, true, loader::LoadOptions::default())
         .expect("slimmable fixture must load");

@@ -48,23 +48,19 @@ pub const LINEAR_B_JSON: &str = r#"{
     "sample_rate": 48000
 }"#;
 
-/// WaveNet Nano fixture: tiny topology for fast processing in long soak.
-pub const WAVENET_JSON: &str =
-    include_str!("../../../NeuralAmpModeler-rs/tests/fixtures/models/BossWN-nano.nam");
+/// WaveNet Nano / standard fixture: representative topology for soak / test harnesses.
+pub const WAVENET_JSON: &str = include_str!("../fixtures/models/wavenet_a1_standard.nam");
 
 /// Full WaveNet A1 fixture (`wavenet_a1_standard.nam`): representative
 /// production-grade WaveNet topology for the RT deadline/jitter gates (T6.5).
-pub const WAVENET_A1_JSON: &str =
-    include_str!("../../../NeuralAmpModeler-rs/tests/fixtures/models/wavenet_a1_standard.nam");
+pub const WAVENET_A1_JSON: &str = include_str!("../fixtures/models/wavenet_a1_standard.nam");
 
-/// Full WaveNet A2 fixture (`wavenet_a2_full.nam`): production-grade A2
+/// Full WaveNet A2 fixture (`a2_example.nam`): production-grade A2
 /// topology for the RT deadline/jitter gates (T6.5).
-pub const WAVENET_A2_JSON: &str =
-    include_str!("../../../NeuralAmpModeler-rs/tests/fixtures/models/wavenet_a2_full.nam");
+pub const WAVENET_A2_JSON: &str = include_str!("../fixtures/models/a2_example.nam");
 
-/// LSTM 1×10 fixture: minimal recurrent model for soak coverage.
-pub const LSTM_JSON: &str =
-    include_str!("../../../NeuralAmpModeler-rs/tests/fixtures/models/lstm_1x10.nam");
+/// LSTM fixture: recurrent model for soak coverage.
+pub const LSTM_JSON: &str = include_str!("../fixtures/models/lstm.nam");
 
 fn linear_data(json: &str) -> NamModelData {
     parse_nam_json(json).expect("parse linear model")

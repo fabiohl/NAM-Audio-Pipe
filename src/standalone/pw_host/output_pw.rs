@@ -6,7 +6,7 @@
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
-use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
+use neural_amp_modeler_rs::dsp::pipeline::DspBridgeReader;
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
@@ -245,21 +245,8 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     chunk_r: *mut pw::spa::sys::spa_chunk,
     rt_status: &RtStatusFlags,
 ) -> Option<usize> {
-    let max_cap = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
-    let silence_bytes_l = max_l.min(max_cap);
-    let silence_bytes_r = max_r.min(max_cap);
     let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
-        ptr_l,
-        max_l,
-        chunk_l,
-        0,
-        silence_bytes_l,
-        ptr_r,
-        max_r,
-        chunk_r,
-        0,
-        silence_bytes_r,
-        rt_status,
+        ptr_l, max_l, chunk_l, 0, max_l, ptr_r, max_r, chunk_r, 0, max_r, rt_status,
     )?;
 
     // SAFETY: the harness proved per-channel alignment, bounds, frame symmetry
@@ -1145,11 +1132,9 @@ mod tests {
             )
         };
 
-        assert_eq!(frames, Some(MAX_BRIDGE_BUF));
-        assert_eq!(chunk_l.size, (MAX_BRIDGE_BUF * 4) as u32);
-        assert_eq!(chunk_r.size, (MAX_BRIDGE_BUF * 4) as u32);
-        assert_eq!(chunk_l.offset, 0);
-        assert_eq!(chunk_r.offset, 0);
+        assert_eq!(frames, None);
+        assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+        assert_eq!(rt.playback_bridge_starvation.load(Ordering::Relaxed), 0);
 
         // First MAX_BRIDGE_BUF samples must be zeroed
         assert!(

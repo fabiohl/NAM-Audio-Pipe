@@ -759,8 +759,17 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         "oversized quantum must raise contract violation"
     );
     assert!(
-        l.iter().all(|&s| s == 0.0) && r.iter().all(|&s| s == 0.0),
-        "oversized quantum must silence both channels"
+        l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
+            && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+        "oversized quantum must silence both channels up to MAX_BRIDGE_BUF"
+    );
+    assert_eq!(
+        l[MAX_BRIDGE_BUF], 0.5f32,
+        "memory past MAX_BRIDGE_BUF must not be touched"
+    );
+    assert_eq!(
+        r[MAX_BRIDGE_BUF], 0.5f32,
+        "memory past MAX_BRIDGE_BUF must not be touched"
     );
     assert_eq!(
         rt.playback_bridge_starvation.load(Ordering::Relaxed),

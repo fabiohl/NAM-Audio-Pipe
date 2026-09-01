@@ -13,10 +13,16 @@
 //! observably (RT loop stop, GC drain, recording teardown) and returns an
 //! error — the process never survives as a functionally-dead zombie with no
 //! audio, and never reconnects unboundedly.
+//!
+//! Sprint 2 / T2.1 exception: a post-streaming `Unconnected` observed while the
+//! process-global `SHUTDOWN` flag is raised (SIGINT/SIGTERM) is the expected
+//! teardown of the streams by `thread_loop.stop()`, not a daemon crash. It is
+//! logged at `info!` and does **not** transition the backend to `Failed`, so a
+//! graceful termination never raises a false "daemon crash" alarm.
 
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::wakeup::ControlPlaneWakeup;
-use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
+use neural_amp_modeler_rs::common::spsc::{RtStatusFlags, SHUTDOWN};
 use pipewire as pw;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -385,13 +391,26 @@ pub fn observe_stream_state(
             backend.mark_failed(stream, err);
         }
         pw::stream::StreamState::Unconnected if was_connected(&old) => {
-            log::error!(
-                "{} PipeWire {stream} stream disconnected from the audio backend \
-                 (daemon restart or crash) — bounded reconnect or fail-fast teardown follows.",
-                "🔌".red(),
-            );
             backend.set_stream_active(stream, false);
-            backend.mark_failed(stream, "stream disconnected from the audio backend");
+            // Sprint 2 / T2.1: a post-streaming disconnect while the process is
+            // shutting down cooperatively (SIGINT/SIGTERM raised `SHUTDOWN`) is
+            // the streams being torn down by `thread_loop.stop()` — expected,
+            // so it is logged below `ERROR` and the sticky `Failed` transition
+            // is skipped. Without `SHUTDOWN` the strict behavior is kept: an
+            // `error!` signaling an unexpected drop or a daemon restart/crash.
+            if SHUTDOWN.load(Ordering::Acquire) {
+                log::info!(
+                    "{} PipeWire {stream} stream disconnected cooperatively during shutdown.",
+                    "🔌".yellow(),
+                );
+            } else {
+                log::error!(
+                    "{} PipeWire {stream} stream disconnected from the audio backend \
+                     (daemon restart or crash) — bounded reconnect or fail-fast teardown follows.",
+                    "🔌".red(),
+                );
+                backend.mark_failed(stream, "stream disconnected from the audio backend");
+            }
         }
         pw::stream::StreamState::Paused => {
             backend.set_stream_active(stream, false);

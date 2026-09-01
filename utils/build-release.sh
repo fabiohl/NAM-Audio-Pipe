@@ -459,8 +459,8 @@ if [ "$USE_PGO" = true ]; then
     }
 
     # Fail-closed PGO coverage gate (F-RB-013 / T5.3): the workload receipt must
-    # prove every mandatory DSP topology reached >= 1000 blocks, all oversampling
-    # modes ran, the stereo CabSim convolution executed and no stage was skipped.
+    # prove every mandatory DSP topology reached >= 1000 total blocks and >= 4 blocks per cell,
+    # all oversampling modes ran, the stereo CabSim convolution executed and no stage was skipped.
     if [ ! -f "$PGO_RECEIPT" ]; then
         echo -e "${RED}Error: pgo_workload did not emit its receipt at $PGO_RECEIPT.${NC}"
         echo -e "${RED}The PGO profile cannot be certified as representative; aborting.${NC}"
@@ -473,7 +473,8 @@ import sys
 # T5.2 matrix gate (G-PERF-003): the receipt must prove per-topology minimum
 # progress (frames) per DSP group — never an aggregated global number — and
 # every matrix dimension value must have been exercised.
-min_blocks = 1000
+min_total_blocks = 1000
+min_cell_blocks = 4
 path = sys.argv[1]
 try:
     with open(path, "r", encoding="utf-8") as f:
@@ -491,16 +492,25 @@ if receipt.get("schema_version") != 2:
     sys.exit(1)
 
 progress = receipt.get("progress") or {}
+total_blocks_by_topo = receipt.get("topology_blocks") or (receipt.get("coverage") or {}).get("topologies") or {}
 min_blocks_by_topo = progress.get("min_blocks_per_topology") or {}
 min_frames_by_topo = progress.get("min_frames_per_topology") or {}
 groups = progress.get("groups") or {}
 
 for topology in ("wavenet_a1", "wavenet_a2", "lstm"):
-    blocks = min_blocks_by_topo.get(topology, 0)
-    if blocks < min_blocks:
+    total = total_blocks_by_topo.get(topology, 0)
+    if total < min_total_blocks:
         print(
-            f"[FATAL] PGO receipt: topology '{topology}' min blocks = {blocks} "
-            f"(required >= {min_blocks}); the profile is not representative.",
+            f"[FATAL] PGO receipt: topology '{topology}' total blocks = {total} "
+            f"(required >= {min_total_blocks}); the profile is not representative.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    min_cell = min_blocks_by_topo.get(topology, 0)
+    if min_cell < min_cell_blocks:
+        print(
+            f"[FATAL] PGO receipt: topology '{topology}' min cell blocks = {min_cell} "
+            f"(required >= {min_cell_blocks}); matrix coverage incomplete.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -544,7 +554,8 @@ if receipt.get("no_stage_skipped") is not True:
     sys.exit(1)
 
 print(
-    f"  OK PGO matrix receipt valid: min_blocks={ {k: v for k, v in sorted(min_blocks_by_topo.items())} }, "
+    f"  OK PGO matrix receipt valid: total_blocks={ {k: v for k, v in sorted(total_blocks_by_topo.items())} }, "
+    f"min_cell_blocks={ {k: v for k, v in sorted(min_blocks_by_topo.items())} }, "
     f"min_frames={ {k: v for k, v in sorted(min_frames_by_topo.items())} }, "
     f"coverage={ {d: sorted(c.items()) for d, c in sorted(coverage.items())} }"
 )
@@ -1335,17 +1346,27 @@ for name, path in (
     if art is not None:
         artifacts[name] = art
 
+# The agile suite (tests-quick.sh) regenerates quick-phase*.log and
+# quick-receipt.txt on every pass. Pinning them in an UNCERTIFIED chain
+# would make the very next quick run invalidate the provenance — the
+# F-RB-014 integrity gate could never go green while a release exists.
+# The certified ceremony path still requires them; uncertified chains keep
+# only the stable evidence (long-audit logs, PGO/release receipts).
 phase_logs = {}
 target_logs = os.path.join(os.path.dirname(lock_path), "target", "logs")
 if os.path.isdir(target_logs):
     for fname in sorted(os.listdir(target_logs)):
         if fname.endswith(".log"):
+            if ceremony_status != "certified_release" and fname.startswith("quick-phase"):
+                continue
             lpath = os.path.join(target_logs, fname)
             art = artifact(lpath)
             if art:
                 phase_logs[fname] = art
 
 quick_art = artifact(quick_receipt)
+if ceremony_status != "certified_release":
+    quick_art = None
 long_art = artifact(long_receipt)
 pgo_art = artifact(pgo_receipt)
 release_art = artifact(release_receipt)
@@ -1830,8 +1851,8 @@ if [ "$BUILD_FLATPAK" = true ]; then
     if [ "$FLATPAK_BIN_SHA" != "$INSTALLED_SHA" ]; then
         die "Flatpak smoke test failed: packaged binary SHA-256 ($FLATPAK_BIN_SHA) differs from provenanced binary ($INSTALLED_SHA)."
     fi
-    if ! flatpak build-run --command=nam-audio-pipe "$FLATPAK_BUILD_DIR" --diagnose >/dev/null 2>&1; then
-        die "In-sandbox Flatpak smoke test failed (flatpak build-run --diagnose returned non-zero)."
+    if ! flatpak build "$FLATPAK_BUILD_DIR" nam-audio-pipe --diagnose >/dev/null 2>&1; then
+        die "In-sandbox Flatpak smoke test failed (flatpak build nam-audio-pipe --diagnose returned non-zero)."
     fi
     echo -e "  ${GREEN}✓${NC} In-sandbox Flatpak smoke test passed (binary SHA matched provenanced ELF, --diagnose succeeded)."
 

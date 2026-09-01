@@ -37,7 +37,7 @@ use std::thread::JoinHandle;
 /// Shared by the explicit [`RecordingWorkerGuard::shutdown`] path and the
 /// guard's `Drop` (premature-return cleanup). On timeout the outcome is
 /// [`RecordingWorkerOutcome::TimedOut`] — never a silent success.
-pub const RECORDING_IO_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const RECORDING_IO_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Bound for retrying `StreamStop` after the audio loop has already stopped.
 pub const STREAM_STOP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);

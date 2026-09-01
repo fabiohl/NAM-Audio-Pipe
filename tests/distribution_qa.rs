@@ -1237,6 +1237,12 @@ fn provenance_validator_rejects_certified_release_without_strict_quick_or_long_r
 /// the release immediately).
 #[test]
 fn provenance_receipt_integrity() {
+    // The ceremony chain references target/logs/long-receipt.txt and the six
+    // phase logs — exactly the files the T5.1 propagation tests replace (and
+    // restore) via `utils/tests-long.sh --simulate`. Serialize against those
+    // destructive replacements so a concurrent read never hashes a half- or
+    // temporarily-replaced artifact (same rationale as long_suite_receipt_audit).
+    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
     let path = repo_root().join(PROVENANCE_REL);
     if !path.is_file() {
         eprintln!(
