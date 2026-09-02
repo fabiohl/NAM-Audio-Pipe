@@ -26,7 +26,7 @@ impl Drop for ShutdownRestore {
 }
 
 /// Initializes the global `NamLogger` once per test binary (idempotent) so the
-/// Sprint 2 / T2.1 tests can assert the log level of the disconnect records.
+/// disconnect tests can assert the log level of the disconnect records.
 fn init_log_capture() {
     use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
     let _ = NamLogger::init(LoggerConfig {
@@ -97,7 +97,7 @@ fn mark_failed_is_sticky_and_exposes_detail() {
 #[test]
 #[cfg(feature = "testing")]
 fn observe_rt_panic_transitions_backend_to_failed() {
-    // F-RB-020 / T3.2: a panic contained inside an RT callback (the capture
+    // A panic contained inside an RT callback (the capture
     // and playback `process` closures run under `run_rt_callback_body`) raises
     // the fatal `RT_STATUS_PANIC_CAPTURED` latch; the main control loop's
     // `observe_rt_panic` poll must transition the backend to `Failed` so the
@@ -154,9 +154,9 @@ fn mark_terminated_closes_lifecycle() {
 
 #[test]
 fn begin_reconnect_clears_failure_and_publishes_reconnecting() {
-    // F-RB-010 / T4.5: entering the bounded reconnect cycle must clear the
-    // sticky failure so the fresh instance's `mark_running` is not a no-op,
-    // and must publish the observable `Reconnecting` transition.
+    // Entering the bounded reconnect cycle must clear the sticky failure so
+    // the fresh instance's `mark_running` is not a no-op, and must publish the
+    // observable `Reconnecting` transition.
     let backend = SharedBackendStatus::new();
     backend.mark_failed("capture", "daemon restart");
     assert!(backend.is_failed());
@@ -212,7 +212,7 @@ fn failure_after_successful_reconnect_is_observable_again() {
 }
 
 #[test]
-fn observe_error_transitions_to_failed() {
+fn observe_error_transitions_backend_to_failed() {
     let backend = SharedBackendStatus::new();
     observe_stream_state(
         "capture",
@@ -229,7 +229,7 @@ fn observe_error_transitions_to_failed() {
 
 #[test]
 fn observe_unconnected_after_streaming_marks_failed() {
-    // Sprint 2 / T2.1 strict path: without `SHUTDOWN` the post-streaming
+    // Strict path: without `SHUTDOWN` the post-streaming
     // disconnect is an unexpected drop — it must fail the backend and be
     // logged at `ERROR` (daemon restart/crash alarm).
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
@@ -273,7 +273,7 @@ fn observe_unconnected_after_streaming_marks_failed() {
 
 #[test]
 fn observe_unconnected_during_shutdown_is_cooperative_and_not_fatal() {
-    // Sprint 2 / T2.1 cooperative path: on a graceful termination (SIGINT /
+    // Cooperative path: on a graceful termination (SIGINT /
     // SIGTERM raising `SHUTDOWN`), the streams destroyed by
     // `thread_loop.stop()` emit a post-streaming `Unconnected`. That disconnect
     // is expected — it must NOT transition the backend to the sticky `Failed`
@@ -328,7 +328,7 @@ fn observe_unconnected_during_shutdown_is_cooperative_and_not_fatal() {
 
 #[test]
 fn observe_error_stays_fatal_even_during_shutdown() {
-    // Sprint 2 / T2.1 scope guard: `SHUTDOWN` only downgrades the cooperative
+    // Scope guard: `SHUTDOWN` only downgrades the cooperative
     // disconnect (`Unconnected`). A genuine `StreamState::Error` remains fatal
     // even while shutting down — a failing stream is never masked as expected.
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
@@ -353,7 +353,7 @@ fn observe_error_stays_fatal_even_during_shutdown() {
 
 #[test]
 fn observe_unconnected_after_paused_marks_failed() {
-    // Sprint 2 / T2.1 strict path (Paused origin): unexpected drop, not
+    // Strict path (Paused origin): unexpected drop, not
     // shutdown — must remain fatal.
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
         .lock()
@@ -419,7 +419,7 @@ fn observe_pause_transition_is_transient() {
 
 #[test]
 fn failure_detection_terminates_control_loop_within_sla() {
-    // Acceptance (F-RB-010 / T4.4): a fatal backend failure must be observed by
+    // A fatal backend failure must be observed by
     // the control loop and lead to teardown + error return within < 200 ms —
     // zero zombie processes. This mirrors the exact poll pattern of the main
     // control loop in `run.rs` (SHUTDOWN condition + `is_failed` fast-path).
@@ -459,12 +459,12 @@ fn failure_detection_terminates_control_loop_within_sla() {
 
 #[test]
 fn concurrent_transitions_never_leak_incoherent_snapshots() {
-    // T6.5 model-check regression: concurrent `mark_failed` /
+    // Concurrent `mark_failed` /
     // `mark_running` / `mark_degraded` / `begin_reconnect` writers must never
-    // produce an internally inconsistent snapshot. Before the T6.5 hardening
-    // this test caught the check-then-act race where an in-flight
-    // `mark_running` could overwrite a `Failed` state while the failure flag
-    // was already published (`failed == true` with `state == Running`).
+    // produce an internally inconsistent snapshot. This test catches the
+    // check-then-act race where an in-flight `mark_running` could overwrite a
+    // `Failed` state while the failure flag was already published
+    // (`failed == true` with `state == Running`).
     let backend = Arc::new(SharedBackendStatus::new());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let violation = Arc::new(std::sync::atomic::AtomicBool::new(false));

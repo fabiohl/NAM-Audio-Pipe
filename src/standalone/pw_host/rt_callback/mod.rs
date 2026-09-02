@@ -16,10 +16,10 @@ mod process;
 mod rate_sync;
 mod resampler_swap;
 
-/// Offline RT swap-stress harness (T2.6 / ER-2), available only under the
-/// `testing` feature. Reproduces the full capture-callback drain sequence with
-/// no PipeWire daemon so integration tests can soak concurrent swaps and run
-/// the zero-allocation heap audit.
+/// Offline RT swap-stress harness, available only under the `testing` feature.
+/// Reproduces the full capture-callback drain sequence with no PipeWire daemon
+/// so integration tests can soak concurrent swaps and run the zero-allocation
+/// heap audit.
 #[cfg(feature = "testing")]
 pub mod harness;
 
@@ -32,8 +32,7 @@ pub(crate) use process::{handle_spa_pair_fail_closed, silence_available_datas};
 pub use rate_sync::sync_rate;
 pub use resampler_swap::drain_resamplers;
 
-/// RT fatal flag raised when a panic is captured inside an RT callback closure
-/// (F-RB-020 / T3.2).
+/// RT fatal flag raised when a panic is captured inside an RT callback closure.
 ///
 /// Bit 31 is **not** defined by `NeuralAmpModeler-rs`'s `RtStatusFlags` (bits
 /// `0..=30` are in use); this local constant aliases the free bit in the shared
@@ -44,8 +43,7 @@ pub use resampler_swap::drain_resamplers;
 pub(crate) const RT_STATUS_PANIC_CAPTURED: u64 = 1 << 31;
 
 /// Executes the body of an RT callback closure under `catch_unwind`, containing
-/// any panic before it reaches the `pipewire` crate's `extern "C"` trampoline
-/// (F-RB-020 / T3.2).
+/// any panic before it reaches the `pipewire` crate's `extern "C"` trampoline.
 ///
 /// On a captured panic the fatal [`RT_STATUS_PANIC_CAPTURED`] flag is raised
 /// and `false` is returned — the closure returns without processed audio and
@@ -80,10 +78,10 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn rt_panic_captured_sets_fatal_flag_no_abort() {
-        // F-RB-020 / T3.2: a panic inside an RT callback body is contained by
-        // `catch_unwind` — it never propagates to the `pipewire` C trampoline
-        // (no `abort`) and raises the fatal `RT_STATUS_PANIC_CAPTURED` latch
-        // for the control loop to run the ordered teardown.
+        // A panic inside an RT callback body is contained by `catch_unwind` — it
+        // never propagates to the `pipewire` C trampoline (no `abort`) and
+        // raises the fatal `RT_STATUS_PANIC_CAPTURED` latch for the control
+        // loop to run the ordered teardown.
         let rt = RtStatusFlags::default();
         let ok = run_rt_callback_body(
             &rt,

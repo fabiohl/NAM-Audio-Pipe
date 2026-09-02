@@ -2,8 +2,8 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 //! Unit tests for `AsyncWavWriter` against the fault-injecting I/O mock
-//! (F-RB-008 / T3.1) and for the atomic `create_new` + TOCTOU-free collision
-//! resolution and checked RIFF limits (F-RB-008 / T3.2).
+//! and for the atomic `create_new` + TOCTOU-free collision resolution and
+//! checked RIFF limits.
 //!
 //! Proves that with short writes of arbitrary sizes the WAV file reconstructed
 //! on the simulated disk is bit-identical to the expected header + interleaved
@@ -13,10 +13,10 @@
 //! concurrent writers, and that the 4 GiB RIFF limit is enforced with
 //! mathematical precision (exact boundary vs. `+1 sample`).
 //!
-//! Also proves the F-RB-009 / T3.4 lifecycle decoupling with a deterministic
-//! barrier test: `SHUTDOWN` arriving while the ring is momentarily empty can
-//! never truncate the blocks produced afterwards — the worker ignores the
-//! global flag and drains 100% of the samples into the finalized WAV.
+//! Also proves the lifecycle decoupling with a deterministic barrier test:
+//! `SHUTDOWN` arriving while the ring is momentarily empty can never truncate
+//! the blocks produced afterwards — the worker ignores the global flag and
+//! drains 100% of the samples into the finalized WAV.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -206,7 +206,7 @@ async fn block_failure_propagates_and_keeps_accounting_consistent() {
 }
 
 // ---------------------------------------------------------------------------
-// T3.2 — atomic create_new + anti-TOCTOU collision resolution
+// Atomic create_new + anti-TOCTOU collision resolution
 // ---------------------------------------------------------------------------
 
 const FIXED_TS: &str = "20260826_000000";
@@ -355,7 +355,7 @@ async fn create_new_capture_propagates_non_collision_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// T3.2 — checked RIFF limits: exact 4 GiB boundary and +1 sample
+// Checked RIFF limits: exact 4 GiB boundary and +1 sample
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -425,7 +425,7 @@ async fn would_overflow_accounts_for_riff_envelope() {
 }
 
 // ---------------------------------------------------------------------------
-// T3.3 — startup handshake, fail-fast directory validation and RT failure flag
+// Startup handshake, fail-fast directory validation and RT failure flag
 // ---------------------------------------------------------------------------
 
 /// Builds a handshake/status bundle for a test recording worker.
@@ -520,7 +520,7 @@ fn spawn_recording_worker_fails_fast_when_io_uring_unavailable() {
     );
 
     // The worker must exit on its own (no io_uring runtime was entered) and
-    // the join must surface the io_uring verdict as an error (F-RB-009 / T3.5).
+    // the join must surface the io_uring verdict as an error.
     handle
         .join()
         .expect("worker thread must finish cleanly")
@@ -528,7 +528,7 @@ fn spawn_recording_worker_fails_fast_when_io_uring_unavailable() {
 }
 
 // ---------------------------------------------------------------------------
-// T3.4 — lifecycle decoupling: SHUTDOWN must never truncate the drain
+// Lifecycle decoupling: SHUTDOWN must never truncate the drain
 // ---------------------------------------------------------------------------
 
 /// RAII guard that restores the previous `SHUTDOWN` value after the test.
@@ -599,15 +599,13 @@ impl WavSink for MockWavSink {
     }
 }
 
-/// T3.4 acceptance — deterministic barrier test.
+/// Acceptance — deterministic barrier test.
 ///
-/// The F-RB-009 failure: SIGINT (`SHUTDOWN`) fires while the ring is
-/// momentarily empty; the old worker observed the flag during its idle poll,
-/// finalized and exited, orphaning every block the RT callback produced in
-/// the following main-loop iteration. Here the test parks the worker with
-/// empty channels (barrier), then emits blocks **after** `SHUTDOWN` through the
-/// promoted pool transport (T4.3) — the worker must ignore the flag, drain
-/// 100% of the samples and finalize a bit-exact WAV with exactly one `fsync`.
+/// Scenario: SIGINT (`SHUTDOWN`) fires while the ring is momentarily empty;
+/// the test parks the worker with empty channels (barrier), then emits blocks
+/// **after** `SHUTDOWN` through the promoted pool transport — the worker must
+/// ignore the flag, drain 100% of the samples and finalize a bit-exact WAV
+/// with exactly one `fsync`.
 // REASON (T-C1): serializing SHUTDOWN-touching tests requires holding the
 // std MutexGuard across `.await`; this is Send-safe because the runtime is
 // `current_thread` (LocalSet), so the guard never crosses threads.
@@ -665,10 +663,10 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
                 }
             }
 
-            // F-RB-009 scenario: SHUTDOWN fires with empty channels. Keep the
-            // worker idle for several 10 ms poll cycles, so the OLD code —
-            // which exited on SHUTDOWN — would have finalized and quit before
-            // the blocks below land.
+            // Scenario: SHUTDOWN fires with empty channels. Keep the worker
+            // idle for several 10 ms poll cycles, so any shutdown-on-empty
+            // race condition would have finalized and quit before the blocks
+            // below land.
             let _shutdown_guard = ShutdownGuard::new();
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 

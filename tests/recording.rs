@@ -69,7 +69,7 @@ fn disk_writer_loop_creates_valid_wav() {
     let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
-    // before we push any payload — F-RB-009 / T3.3.
+    // before we push any payload.
     let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     let meta = AudioMetadata {
@@ -102,7 +102,7 @@ fn disk_writer_loop_creates_valid_wav() {
         "StreamStop push should succeed"
     );
 
-    // StreamStop is now the sole termination token (F-RB-009 / T3.4): the
+    // StreamStop is the sole termination token: the
     // worker finalizes the WAV and exits on it. SHUTDOWN is set afterwards on
     // purpose as a regression guard — the worker must ignore the global flag
     // (a SIGINT during a momentary empty ring must never truncate the tail).
@@ -146,7 +146,7 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
     let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
-    // before we push any payload — F-RB-009 / T3.3.
+    // before we push any payload.
     let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     let meta = AudioMetadata {
@@ -164,7 +164,7 @@ fn disk_writer_loop_metadata_then_stream_stop_creates_empty_wav() {
         "StreamStop push should succeed"
     );
 
-    // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
+    // StreamStop alone must terminate the worker; SHUTDOWN is set as a
     // regression guard proving the global flag is no longer consulted.
     SHUTDOWN.store(true, Ordering::SeqCst);
 
@@ -202,7 +202,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     let (mut sender, receiver) = create_recording_transport();
 
     // The worker must complete the startup handshake (io_uring + writable dir)
-    // before we push any payload — F-RB-009 / T3.3.
+    // before we push any payload.
     let (handle, _, _) = spawn_ready_worker(receiver, &dir);
 
     // Push Audio BEFORE Metadata — should be discarded silently
@@ -231,7 +231,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
         "StreamStop push should succeed"
     );
 
-    // T3.4: StreamStop alone must terminate the worker; SHUTDOWN is set as a
+    // StreamStop alone must terminate the worker; SHUTDOWN is set as a
     // regression guard proving the global flag is no longer consulted.
     SHUTDOWN.store(true, Ordering::SeqCst);
 
@@ -314,7 +314,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let gc_overflow_clone = gc_overflow.clone();
     let sys = SystemSnapshot::capture();
 
-    // F-RB-009 / T3.5: the worker thread, its transport sender and the failure
+    // The worker thread, its transport sender and the failure
     // flag travel together in the RAII guard, so the host's early `?` returns
     // and the normal shutdown both terminate and formally join the worker.
     let recording_worker =
@@ -427,7 +427,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
 }
 
 // ---------------------------------------------------------------------------
-// F-RB-009 / T3.3 — fail-fast startup handshake under unusable output dirs
+// Fail-fast startup handshake under unusable output dirs
 // ---------------------------------------------------------------------------
 
 /// The worker must reject a missing output directory at startup: the handshake
@@ -462,7 +462,7 @@ fn disk_writer_loop_fails_fast_on_missing_output_dir() {
     );
 
     // The worker must exit on its own and must never create anything. The join
-    // also surfaces the startup error (F-RB-009 / T3.5).
+    // also surfaces the startup error.
     handle
         .join()
         .expect("worker must finish cleanly")

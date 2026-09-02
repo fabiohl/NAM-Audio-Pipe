@@ -144,12 +144,12 @@ The PipeWire host lifecycle is governed by a thread-safe backend state machine (
 - **`BackendState`** transitions: `Starting → Running → Degraded/Failed → Terminated`, plus the recoverable `Reconnecting { attempt, total_attempts, next_backoff }` state. `Failed` is **sticky** (a late `Running`/`Degraded` event never erases it) and is published through an `AtomicBool` fast-path so the main control loop observes it within its ≤ 100 ms poll (fail-fast SLA < 500 ms).
 - **Stream observers** on both capture and playback map `StreamState::Error` and post-streaming `StreamState::Unconnected` (daemon crash/restart) to `Failed`.
 
-On a fatal connectivity loss the control loop enters the **bounded reconnect cycle** (F-RB-010 / T4.5, `src/standalone/pw_host/reconnect.rs`):
+On a fatal connectivity loss the control loop enters the **bounded reconnect cycle** (`src/standalone/pw_host/reconnect.rs`):
 
 1. The **DSP state** (`CaptureState`: models, resampler, cab-sim, gains, gate configuration) and the **RT-side SPSC channels** (`RtHostChannels`) live in heap `Box`es reached via raw pointers — never moved into the stream closures. Re-instantiating the streams after a daemon restart **preserves every piece of internal state** (models, IRs, recording worker).
 2. A `ReconnectCycle` (production policy: 3 attempts, progressive 250 → 500 → 1000 ms exponential backoff, total ceiling 1.75 s) hands out at most `max_attempts` backoffs and then `None` forever — the retry phase is **strictly bounded in number and time** by construction; no infinite reconnect loop can exist.
 3. Each attempt re-creates a fresh `ThreadLoop`/`Context`/`Core` and both streams (the old instance is torn down first: `thread_loop.stop()`, R-04 final GC drain, `thread_configured` reset so RT setup re-runs on the new data thread).
-4. On success the streams renegotiate the format and rate; the existing rebuild handlers re-sync sample rates and audio resumes. On budget exhaustion the host falls back to the **T4.4 fail-fast path**: integral teardown (RT stop, GC drain, recording `StreamStop` + bounded join) and a non-zero process exit.
+4. On success the streams renegotiate the format and rate; the existing rebuild handlers re-sync sample rates and audio resumes. On budget exhaustion the host falls back to the **fail-fast path**: integral teardown (RT stop, GC drain, recording `StreamStop` + bounded join) and a non-zero process exit.
 5. `--fail-fast` disables the cycle entirely (first failure → immediate teardown). The backoff sleep is interruptible in 25 ms slices so SIGINT/SIGTERM is honored even while waiting for the daemon.
 
 ---
@@ -223,74 +223,60 @@ RT Thread (Replaced Asset)
 ```
 
 1. **Tier 1 (SPSC GC Queue):** Pushed to `gc_tx` (32 slots). Main thread drains and deallocates items during its 100 ms control loop via `drain_gc_channels`.
-2. **Tier 2 (RT Parking Lot):** Fixed array `[Option<GcItem>; 16]` allocated in main thread stack and accessed via raw pointer by the RT callback. An atomic dirty tracking flag (`rt_parking_lot_dirty: AtomicBool`) is updated with `Ordering::Release` whenever an asset cascades to GC and cleared once all 16 slots are drained. This avoids iterating over the 16 slots during steady-state audio callbacks when no resource swaps have occurred. During shutdown, `thread_loop.stop()` halts the audio thread and hands `rt_parking_lot` by mutable reference to the final main-thread drain.
-3. **Tier 3 (Atomic Ring Buffer):** `GcOverflowBuffer` prevents unbounded allocation leaks under severe overload while ensuring the RT audio deadline is never breached.
+2. **Tier 2 (RT Parking Lot):** If `gc_tx` is full, the item is parked in a fixed RT-thread array (`PARKING_LOT_CAPACITY = 16` slots). On subsequent audio callbacks, the RT callback attempts to drain the parking lot to `gc_tx`.
+3. **Tier 3 (GC Overflow Buffer):** If the parking lot is also full, the asset is deposited into an atomic ring buffer with controlled leak semantics, raising the `RT_STATUS_GC_OVERFLOW` telemetry flag.
 
 ---
 
-## 6. DSP Audio Processing Signal Chain
+## 6. DSP Pipeline Architecture (`CaptureState` & `ProcessDsp`)
 
-The audio callback (`src/standalone/pw_host/rt_callback/process.rs`) executes the neural signal processing pipeline on every incoming audio buffer:
+The core digital signal processing pipeline integrates directly with `NeuralAmpModeler-rs`:
 
-```mermaid
-graph TD
-    PWInput[/"PipeWire Capture Buffer"/] --> SubnormalCheck["Enable FTZ & DAZ\n(SSE Control Register)"]
-    SubnormalCheck --> SPSCDrain["Drain SPSC Channels\n(Gains, Model, CabSim, OS)"]
-    SPSCDrain --> InGain["Input Gain Stage\n(SIMD Vectorized + ParamSmoother)"]
-    InGain --> Dither["Anti-Subnormal Dither\n(-220 dBFS)"]
-
-    Dither --> GateFSM{"Silence Gate\n(--gate on: FSM / off: Open)"}
-    GateFSM -->|"Gate Closed (Silence, --gate on)"| MuteOutput["Zero Working Buffer"]
-    GateFSM -->|"Gate Open / --gate off"| RateCheck{"Sample Rate == 48kHz?"}
-
-    RateCheck -->|"No"| ResampleUp["NamResampler\n(Host Rate -> 48kHz Native)"]
-    RateCheck -->|"Yes"| Inference
-    ResampleUp --> Inference["Neural Inference Stage (NamModel::process)\n- WaveNet A1/A2, LSTM, ConvNet, Linear\n- Half-Band Oversampling (2x / 4x)\n- Activation Precision (Standard vs Fast)"]
-
-    Inference --> RateDownCheck{"Sample Rate == 48kHz?"}
-    RateDownCheck -->|"No"| ResampleDown["NamResampler\n(48kHz Native -> Host Rate)"]
-    RateDownCheck -->|"Yes"| OutputStage
-    ResampleDown --> OutputStage
-
-    MuteOutput --> OutputStage["Output Stage\n- Dither Compensation\n- Linear Gate Fade Ramp\n- Adaptive Compute Monitoring"]
-
-    OutputStage --> CabCheck{"Cabinet IR Loaded?"}
-    CabCheck -->|"Yes"| CabConv["UPOLS CabSim Convolution\n(ConvEngine::process)"]
-    CabCheck -->|"No"| OutGain
-    CabConv --> OutGain["Output Gain Stage + Hard Clip\n(SIMD Vectorized + ParamSmoother)"]
-
-    OutGain --> BridgeWrite["Write Processed Audio to DspBridge\n(Double-Buffered Float32)"]
-    OutGain --> RecCheck{"--record Enabled?"}
-    RecCheck -->|"Yes (n_pw > 0 or --gate off)"| RecEnqueue["Enqueue to SPSC Recording Ring\n(Silence Trimmed when Gate Active)"]
-    RecCheck -->|"No / Silence"| Telemetry
-    RecEnqueue --> Telemetry["Update Atomic Telemetry\n(RtStatusFlags, CPU Cycles, Peaks)"]
+```text
+Input (PipeWire)
+  │
+  ▼
+[Capture Ring / Channel Split] ──► [Input Gain Stage]
+                                          │
+                                          ▼
+                                   [Noise Gate / Envelope]
+                                          │
+                                          ▼
+                                   [Neural Model (NAM Core)]
+                                          │
+                                          ▼
+                                   [CabSim (UPOLS Partitioned FFT)]
+                                          │
+                                          ▼
+                                   [Output Gain Stage]
+                                          │
+                                          ▼
+                                 [Playback SPSC Buffer] ──► Output (PipeWire)
 ```
 
-### 6.1 Silence Gate & Silence Trimming
+- **Lock-Free Parameter & Model Swapping:** Model topologies, Impulse Responses (IRs), and control parameters are updated live via single-producer single-consumer (`rtrb`) lock-free rings. Audio processing is never blocked while loading heavy assets.
+- **Zero-Allocation Audio Loop:** All memory required for processing buffers, oversampling filters, and intermediate DSP states is preallocated during initialization. The real-time callback executes zero heap allocations (`malloc`/`free`).
+- **UPOLS Partitioned Convolution:** Stereo cabinet impulse responses are convolved using Uniformly Partitioned Overlap-Save (UPOLS) FFT algorithms, keeping latency bounded and deterministic.
 
-The Noise Gate FSM is configurable via the `--gate on|off` CLI option (default: `on`) and operates across all operational modes (with or without neural models or cabinet IRs). When enabled, it continuously tracks the RMS signal envelope and applies smooth linear gain ramps:
+---
 
-- **Zero Playing Residual Noise:** Silences amp model idle hiss and electromagnetic pickup hum when the musician pauses.
-- **Recording Silence Trimming:** When active (`--gate on`, default), only audio blocks processed while the gate is open (`n_pw > 0`) are forwarded to the recording queue. Background pauses are trimmed automatically without RT thread overhead.
-- **Pass-Through Mode (`--gate off`):** When explicitly disabled via `--gate off`, the gate remains permanently open (`gate_enabled = false`), passing full dynamic content and un-trimmed silence through to both real-time monitoring and WAV recording.
+## 7. Real-Time Watchdog & Dynamic Downgrade
 
-### 6.2 Adaptive Compute (Auto-Slimming Watchdog)
-
-For multi-profile `.namb` containers (`--slim auto`), an internal state machine monitors CPU cycle consumption per quantum:
+To protect real-time guarantees under excessive CPU contention or thermal throttling, NAM-Audio-Pipe includes a lightweight RT watchdog mechanism:
 
 - If processing time exceeds 80% of the quantum deadline, the engine transitions to degraded state (`DEGRADE`), dynamically swapping to a lighter submodel without audio dropouts.
 - When CPU pressure stabilizes, the watchdog restores the full neural model profile.
 
-### 6.3 Pipeline Limits & Buffer/Quantum Negotiation (G-RB-003)
+### 7.1 Pipeline Limits & Buffer/Quantum Negotiation
 
 The DSP pipeline has **hard, static buffer ceilings** that every input — CLI, PipeWire graph or SPA descriptor — is validated against before it can influence allocation:
 
-| Limit                  | Value                             | Origin / Enforcement                                                                                                                                                           |
-|:---------------------- |:--------------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `MAX_BRIDGE_BUF`       | 8192 samples                      | `neural_amp_modeler_rs::dsp::pipeline` — the `DspBridge` double-buffer width; the RT callbacks reject any quantum with `n_samples > MAX_BRIDGE_BUF` **fail-closed** (see §2.1) |
-| `MAX_RESAMP_BUF`       | 8192 samples                      | Same module — bounds every resampler and oversampling engine construction                                                                                                      |
-| CabSim partition       | clamped to `[16, MAX_RESAMP_BUF]` | Off-RT rebuild handler (`handlers.rs`): a spurious requested partition is clamped before any `ConvEngine` instantiation, so no oversized UPOLS FFT can be built                |
-| `--buffer-size` domain | `{0} ∪ {2^k                       | 16 ≤ 2^k ≤ 8192}`                                                                                                                                                              |
+| Limit                  | Value                                  | Origin / Enforcement                                                                                                                                                           |
+|:---------------------- |:-------------------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `MAX_BRIDGE_BUF`       | 8192 samples                           | `neural_amp_modeler_rs::dsp::pipeline` — the `DspBridge` double-buffer width; the RT callbacks reject any quantum with `n_samples > MAX_BRIDGE_BUF` **fail-closed**            |
+| `MAX_RESAMP_BUF`       | 8192 samples                           | Same module — bounds every resampler and oversampling engine construction                                                                                                      |
+| CabSim partition       | clamped to `[16, MAX_RESAMP_BUF]`      | Off-RT rebuild handler (`handlers.rs`): a spurious requested partition is clamped before any `ConvEngine` instantiation, so no oversized UPOLS FFT can be built                |
+| `--buffer-size` domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`       | `validate_buffer_size`: rejected before PipeWire connection (`BufferSizeError`)                                                                                                |
 
 **Negotiation flow** (CLI → PipeWire → RT bounds → CabSim):
 
@@ -312,7 +298,7 @@ RT callback (process_dsp) — hard bounds check
   │  n_samples ≤ 8192                   → process DSP within the quantum budget
   ▼
 Telemetry & renegotiation logging
-  │  requested_buffer_frames / previous_buffer_frames (RtStatusFlags)
+  │  requested_buffer_frames / previous_buffer_frames
   ▼
 handle_quantum_log (handlers.rs)
   │  new_quantum != old_quantum → "PipeWire quantum renegotiated: N -> M samples"
@@ -323,14 +309,14 @@ Off-RT rebuild handlers (quantum/rate change)
 ```
 
 The domain ceiling ties directly to the deadlines: at 48 kHz a `MAX_BRIDGE_BUF` (8192) quantum
-is the 170,7 ms worst case, while the smallest certified size (16) is 0,33 ms — and a
-64-sample quantum (the low-latency target) carries a 1,33 ms budget that the RT Deadline
+is the 170.7 ms worst case, while the smallest certified size (16) is 0.33 ms — and a
+64-sample quantum (the low-latency target) carries a 1.33 ms budget that the RT Deadline
 gate (`tests/rt_metrics.rs`, `utils/tests-long.sh` Phase 3) requires the pipeline to beat
 with an 85% safety margin.
 
 ---
 
-## 7. Asynchronous WAV Recording Subsystem (`src/recording/`)
+## 8. Asynchronous WAV Recording Subsystem (`src/recording/`)
 
 When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit float stereo WAV files directly to disk without impacting real-time audio thread determinism:
 
@@ -352,7 +338,7 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 │    - Reuses internal I/O buffer (io_buf) to eliminate heap allocations      │
 │    - Enters 10ms idle sleep when channels are drained to eliminate spin     │
 │    - Automatically splits files at 4 GiB RIFF size limit (_partN.wav)       │
-│    - Lifecycle decoupled from SHUTDOWN (T3.4): exits only on StreamStop or  │
+│    - Lifecycle decoupled from SHUTDOWN: exits only on StreamStop or         │
 │      sender drop + drained channels                                        │
 │    - Graceful shutdown: push_stream_stop (200ms retry) → sender drop →      │
 │      bounded join (5s)                                                      │
@@ -360,10 +346,10 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.0 Promoted Pool Transport (T4.2 verdict PROMOTE → integrated in T4.3)
+### 8.1 Promoted Pool Transport
 
 Production recording audio travels through a **preallocated slot pool** (`src/recording/pool.rs`,
-256 × ~64 KiB slots ≈ 16,8 MiB) instead of moving every 64 KiB block *by value* through an
+256 × ~64 KiB slots ≈ 16.8 MiB) instead of moving every 64 KiB block *by value* through an
 SPSC ring. The RT thread `try_acquire`s a slot (pops a `u16` index from a free-list ring),
 fills it in place (`fill_planar`) and `publish`es a 4-byte [`Descriptor`]; the I/O thread pops
 the descriptor, writes the block **in place** and `release`s the index back to the free ring.
@@ -371,7 +357,7 @@ The payload is written once and read once — the inline ring moved it 7 × per 
 for the pool (~57% fewer 64 B cache lines). Measured (A/B, `recording_ab_bench`, 3 runs × 5
 sizes, Ryzen 7 5700U): reproducible p99 recording-latency gain ≥ 5 % at every size
 (64 f +96 %, 256 f +93 %, 512 f +92 %, 2048 f +78–84 %, 8192 f +33–44 %); cache
-`cache-references` −86,7 %, `cache-misses` −77,3 %).
+`cache-references` −86.7 %, `cache-misses` −77.3 %).
 
 The pool only carries audio. `AudioMetadata` and `StreamStop` travel on a small dedicated
 **control ring** (`CONTROL_CAPACITY = 4`); to preserve the RT thread's publication order under
@@ -380,22 +366,22 @@ confirmed metadata push also deposits a **control barrier** (`slot == 0xFFFF`, a
 pool index) at the exact position in the pool `work`-ring FIFO — the I/O thread applies the
 control message when it reaches the barrier, matching the inline ring's FIFO semantics exactly.
 The wiring abstraction lives in `src/recording/transport.rs` (`RecordingSender` /
-`RecordingReceiver`); the T4.1 inline ring remains fully wired behind the compile-time
+`RecordingReceiver`); the inline ring remains fully wired behind the compile-time
 `RECORDING_POOL_TRANSPORT` switch as the rollback path.
 
-### 7.1 Recording Guarantees & File Integrity
+### 8.2 Recording Guarantees & File Integrity
 
-- **Capacity Domain Closed over the Full Quantum Range (T4.1/T4.3):** The recording block is sized `MAX_BLOCK_SIZE = 16384` interleaved f32 samples (8192 stereo frames), covering the **largest legal host quantum** (`MAX_BRIDGE_BUF = 8192`). Every quantum accepted with `--record` is persisted integrally — the old hard drop ceiling (2048 frames, half of the former 4096-sample block) is gone. `POOL_CAPACITY = 256` slots × ~64 KiB = 16 MiB, the same memory footprint as the previous 1024 × 16 KiB layout with 4× deeper frame buffering. A block wider than `MAX_BLOCK_SIZE` (a spurious over-bridge quantum) is still dropped fail-closed without acquiring a slot.
-- **Overrun Accounting in Blocks and Frames (T4.1/T4.3):** When the pool is exhausted (all 256 slots in flight — the pool's analog of a full ring) or a block exceeds `MAX_BLOCK_SIZE`, `OVERRUN_COUNT` (blocks) **and** `OVERRUN_FRAMES_COUNT` (frames) are incremented atomically; audio playback is never blocked. At shutdown the worker reports `blocos perdidos: N (frames: M)`, so the invariant `frames_capturados == frames_enfileirados + frames_perdidos` can be reconciled. Enqueueing is zero-alloc/zero-dealloc on the RT thread (heap-audit gated, `get_dealloc_count() == 0`).
-- **Startup Handshake & Fail-Fast (F-RB-009 / T3.3):** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded.
-- **Runtime Failure Propagation (F-RB-009 / T3.3):** On a fatal mid-stream error (`EIO`, `ENOSPC`), the worker transitions the observable `RecordingStatus` to `Failed` and raises an atomic flag the RT callback polls to suspend enqueueing without panics; the error is logged visibly.
+- **Capacity Domain Closed over the Full Quantum Range:** The recording block is sized `MAX_BLOCK_SIZE = 16384` interleaved f32 samples (8192 stereo frames), covering the **largest legal host quantum** (`MAX_BRIDGE_BUF = 8192`). Every quantum accepted with `--record` is persisted integrally — the old hard drop ceiling (2048 frames, half of the former 4096-sample block) is gone. `POOL_CAPACITY = 256` slots × ~64 KiB = 16 MiB, the same memory footprint as the previous 1024 × 16 KiB layout with 4× deeper frame buffering. A block wider than `MAX_BLOCK_SIZE` (a spurious over-bridge quantum) is still dropped fail-closed without acquiring a slot.
+- **Overrun Accounting in Blocks and Frames:** When the pool is exhausted (all 256 slots in flight — the pool's analog of a full ring) or a block exceeds `MAX_BLOCK_SIZE`, `OVERRUN_COUNT` (blocks) **and** `OVERRUN_FRAMES_COUNT` (frames) are incremented atomically; audio playback is never blocked. At shutdown the worker reports `lost blocks: N (frames: M)`, so the invariant `captured_frames == enqueued_frames + lost_frames` can be reconciled. Enqueueing is zero-alloc/zero-dealloc on the RT thread (heap-audit gated, `get_dealloc_count() == 0`).
+- **Startup Handshake & Fail-Fast:** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded.
+- **Runtime Failure Propagation:** On a fatal mid-stream error (`EIO`, `ENOSPC`), the worker transitions the observable `RecordingStatus` to `Failed` and raises an atomic flag the RT callback polls to suspend enqueueing without panics; the error is logged visibly.
 - **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `ControlPayload::StreamStop` (bounded retry), explicitly drops the recording sender (control producer + pool producer), and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
-- **Lifecycle Decoupling & Integral Drain (F-RB-009 / T3.4):** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the channels are momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped (draining every pending pool descriptor first), or (2) the sender was dropped (both producers gone) **and** every channel is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent. No ABA / double-return: slot ownership is `FREE→RT→IN-FLIGHT→I/O→FREE` through two strict SPSC FIFOs.
-- **RAII Worker Custody & Observable Join (F-RB-009 / T3.5):** The worker thread, its transport sender (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see `src/recording/guard.rs`). The guard owns the `JoinHandle` and the sender, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → sender drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — the old `let _ = handle.join()` that silently swallowed worker failures is gone. **Loss observability (F-RB-024 / T5.1, D1):** a clean join with ring overruns counted on the capture path (`OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT`) is promoted to `RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }` and also exits **non-zero** with an explicit message — `frames_capturados == frames_enfileirados + frames_perdidos` stays reconcilable and is never silent (`RecordingWorkerOutcome::exit_code()`: `Success` → 0, every other variant → 1).
+- **Lifecycle Decoupling & Integral Drain:** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the channels are momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped (draining every pending pool descriptor first), or (2) the sender was dropped (both producers gone) **and** every channel is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent. No ABA / double-return: slot ownership is `FREE→RT→IN-FLIGHT→I/O→FREE` through two strict SPSC FIFOs.
+- **RAII Worker Custody & Observable Join:** The worker thread, its transport sender (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see `src/recording/guard.rs`). The guard owns the `JoinHandle` and the sender, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → sender drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — silent failure suppression is eliminated. **Loss observability:** a clean join with ring overruns counted on the capture path (`OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT`) is promoted to `RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }` and also exits **non-zero** with an explicit message — `captured_frames == enqueued_frames + lost_frames` stays reconcilable and is never silent (`RecordingWorkerOutcome::exit_code()`: `Success` → 0, every other variant → 1).
 
 ---
 
-## 8. Diagnostic Bundle & Error Catalog
+## 9. Diagnostic Bundle & Error Catalog
 
 NAM-Audio-Pipe integrates with the `NamLogger` ring buffer and `DiagnosticBundle` diagnostics engine:
 
@@ -421,7 +407,7 @@ report, and crash/panic reports (`~/.cache/nam-rs/crash-*.txt`). All runtime `lo
 populate the `NamLogger` ring buffer, so they remain part of future support bundles and crash
 reports.
 
-### 8.1 Error Catalog Summary (`NamErrorCode`)
+### 9.1 Error Catalog Summary (`NamErrorCode`)
 
 Typed diagnostic error codes (`NamErrorCode`) provide structured error categorization:
 
@@ -435,11 +421,11 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 
 ---
 
-## 9. Flatpak Packaging & Sandbox Architecture
+## 10. Flatpak Packaging & Sandbox Architecture
 
 NAM-Audio-Pipe supports standalone distribution as an isolated, high-performance Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//26.08`:
 
-### 9.1 Sandbox Topology & Low-Latency Audio IPC
+### 10.1 Sandbox Topology & Low-Latency Audio IPC
 
 Executing real-time DSP applications inside an unprivileged Linux container sandbox requires deterministic, low-latency communication channels with the host kernel and PipeWire daemon:
 
@@ -470,7 +456,7 @@ Executing real-time DSP applications inside an unprivileged Linux container sand
 - **Read-Only Model Storage (`--filesystem=home:ro`):** Allows resolving and loading `.nam`/`.namb` neural amp models and `.wav` impulse responses from anywhere in the user's `$HOME` directory without write exposure.
 - **Display & Fallback Sockets (`--socket=wayland`, `--socket=fallback-x11`, `--socket=pulseaudio`):** Ensures interoperability with desktop environments and fallback sound servers.
 
-### 9.2 Desktop Integration & AppStream Metadata
+### 10.2 Desktop Integration & AppStream Metadata
 
 The packaging directory (`packaging/flatpak/`) provides standard XDG desktop integration assets:
 
@@ -478,7 +464,7 @@ The packaging directory (`packaging/flatpak/`) provides standard XDG desktop int
 - **AppStream Metainfo (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`):** Provides catalog metadata for graphical package managers (GNOME Software, KDE Discover), documenting capabilities, URLs, release tags, and developer identity (`io.github.fabiohl`).
 - **Hicolor Icon Hierarchy (`icons/hicolor/`):** Full icon suite including scalable vector (`scalable/apps/io.github.fabiohl.NAMAudioPipe.svg`) and high-resolution rasterized assets (`64x64`, `128x128`, `256x256`, `512x512` PNGs generated via `render-icons.py`).
 
-### 9.3 Flatpak Manifest Specification (`io.github.fabiohl.NAMAudioPipe.yml`)
+### 10.3 Flatpak Manifest Specification (`io.github.fabiohl.NAMAudioPipe.yml`)
 
 The Flatpak manifest defines the standalone application package targeting `org.freedesktop.Platform//26.08`:
 
@@ -511,7 +497,7 @@ modules:
       - install -Dm644 icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png ${FLATPAK_DEST}/share/icons/hicolor/512x512/apps/io.github.fabiohl.NAMAudioPipe.png
 ```
 
-### 9.4 Integrated Release Pipeline (`build-release.sh`)
+### 10.4 Integrated Release Pipeline (`build-release.sh`)
 
 Flatpak packaging is embedded directly into Phase 7 of `utils/build-release.sh`:
 
@@ -524,7 +510,7 @@ Flatpak packaging is embedded directly into Phase 7 of `utils/build-release.sh`:
 7. **Bundle Export & Smoke Test:** Runs `flatpak build-bundle` outputting `~/nam-audio-pipe-v<VERSION>-linux-x86_64-v3.flatpak`, then imports the bundle into a fresh temporary OSTree repository to verify its integrity and manifest (`command=nam-audio-pipe`).
 8. **Automated User Installation:** If `--install` is supplied, registers and installs the package locally (`flatpak install --user --reinstall -y`) and runs an in-sandbox `flatpak run --command=nam-audio-pipe ... --diagnose` smoke test.
 
-### 9.5 Developer Build & Sandbox Inspection Commands
+### 10.5 Developer Build & Sandbox Inspection Commands
 
 ```bash
 # 1. Automated build of optimized binary and Flatpak bundle:
@@ -552,7 +538,7 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 
 ---
 
-## 10. References
+## 11. References
 
 - [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) — Core neural amplifier DSP inference engine.
 - [PipeWire Documentation](https://docs.pipewire.org/) — PipeWire low-latency multimedia routing daemon.

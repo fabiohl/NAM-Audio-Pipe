@@ -6,9 +6,9 @@
 //! Keeps the deterministic Linear tags, fixture-backed WaveNet/LSTM builders,
 //! synthetic IR factory and stereo test signal in one place so
 //! `tests/swap_stress.rs`, `tests/soak_extended.rs` and `tests/endurance.rs`
-//! never drift apart. Since T5.3 (G-PERF-004) it also owns the shared swap-batch
-//! cadence and the fail-closed Linear validation window used by both the
-//! accelerated-timeline soak and the real wall-clock endurance.
+//! never drift apart. Also owns the shared swap-batch cadence and the
+//! fail-closed Linear validation window used by both the accelerated-timeline
+//! soak and the real wall-clock endurance.
 
 #[cfg(feature = "testing")]
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
@@ -52,11 +52,11 @@ pub const LINEAR_B_JSON: &str = r#"{
 pub const WAVENET_JSON: &str = include_str!("../fixtures/models/wavenet_a1_standard.nam");
 
 /// Full WaveNet A1 fixture (`wavenet_a1_standard.nam`): representative
-/// production-grade WaveNet topology for the RT deadline/jitter gates (T6.5).
+/// production-grade WaveNet topology for the RT deadline/jitter gates.
 pub const WAVENET_A1_JSON: &str = include_str!("../fixtures/models/wavenet_a1_standard.nam");
 
 /// Full WaveNet A2 fixture (`a2_example.nam`): production-grade A2
-/// topology for the RT deadline/jitter gates (T6.5).
+/// topology for the RT deadline/jitter gates.
 pub const WAVENET_A2_JSON: &str = include_str!("../fixtures/models/a2_example.nam");
 
 /// LSTM fixture: recurrent model for soak coverage.
@@ -178,7 +178,7 @@ pub const SWAP_INTERVAL: usize = 20;
 
 /// Applies a mixed swap batch: model, CabSim, oversampling and gain.
 ///
-/// Shared cadence between the accelerated soak and the real endurance (T5.3):
+/// Shared cadence between the accelerated soak and the real endurance:
 /// a soak cadence/kind change lands here exactly once.
 #[cfg(feature = "testing")]
 pub fn apply_swap_batch(h: &mut RtSwapHarness, block: usize) {

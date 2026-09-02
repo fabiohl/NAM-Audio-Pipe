@@ -3,22 +3,22 @@
 
 //! Backend state machine and thread-safe shared status for the PipeWire host.
 //!
-//! F-RB-010 / T4.4: every fatal loss of backend connectivity (stream
-//! `StreamState::Error`, post-streaming `StreamState::Unconnected`) transitions
-//! the shared [`SharedBackendStatus`] to `Failed` through the stream-state
-//! observers installed on the capture and playback streams. The main control
-//! loop in `run.rs` polls [`SharedBackendStatus::is_failed`] every iteration
-//! and, on failure, either enters the bounded reconnect cycle (F-RB-010 / T4.5,
-//! via [`SharedBackendStatus::begin_reconnect`]) or tears the host down
+//! Every fatal loss of backend connectivity (stream `StreamState::Error`,
+//! post-streaming `StreamState::Unconnected`) transitions the shared
+//! [`SharedBackendStatus`] to `Failed` through the stream-state observers
+//! installed on the capture and playback streams. The main control loop in
+//! `run.rs` polls [`SharedBackendStatus::is_failed`] every iteration and, on
+//! failure, either enters the bounded reconnect cycle (via
+//! [`SharedBackendStatus::begin_reconnect`]) or tears the host down
 //! observably (RT loop stop, GC drain, recording teardown) and returns an
 //! error — the process never survives as a functionally-dead zombie with no
 //! audio, and never reconnects unboundedly.
 //!
-//! Sprint 2 / T2.1 exception: a post-streaming `Unconnected` observed while the
-//! process-global `SHUTDOWN` flag is raised (SIGINT/SIGTERM) is the expected
-//! teardown of the streams by `thread_loop.stop()`, not a daemon crash. It is
-//! logged at `info!` and does **not** transition the backend to `Failed`, so a
-//! graceful termination never raises a false "daemon crash" alarm.
+//! Exception: a post-streaming `Unconnected` observed while the process-global
+//! `SHUTDOWN` flag is raised (SIGINT/SIGTERM) is the expected teardown of the
+//! streams by `thread_loop.stop()`, not a daemon crash. It is logged at `info!`
+//! and does **not** transition the backend to `Failed`, so a graceful termination
+//! never raises a false "daemon crash" alarm.
 
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::wakeup::ControlPlaneWakeup;
@@ -32,8 +32,7 @@ use std::time::Duration;
 ///
 /// `Failed` is **sticky**: once the backend failed, no subsequent transition
 /// (`Running` / `Degraded`) can overwrite the failure — the control loop must
-/// observe it and either enter the bounded reconnect cycle (F-RB-010 / T4.5)
-/// or terminate the host.
+/// observe it and either enter the bounded reconnect cycle or terminate the host.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BackendState {
     /// Host initialized but no stream reached an operational state yet.
@@ -43,9 +42,8 @@ pub enum BackendState {
     Running,
     /// Backend alive but degraded (e.g. SPA format contract violated — audio muted).
     Degraded { reason: String },
-    /// A bounded reconnect cycle is in progress (F-RB-010 / T4.5): the backend
-    /// lost connectivity and the host is waiting the backoff before the next
-    /// stream re-instantiation attempt.
+    /// A bounded reconnect cycle is in progress: the backend lost connectivity
+    /// and the host is waiting the backoff before the next stream re-instantiation attempt.
     Reconnecting {
         /// 1-based attempt index of the current cycle.
         attempt: u32,
@@ -92,7 +90,7 @@ struct BackendFailureDetail {
     reason: String,
 }
 
-/// A coherent snapshot of the backend status (T6.5 / model checking).
+/// A coherent snapshot of the backend status (model checking).
 ///
 /// Read under a single acquisition of the state lock, so `failed`, `state`
 /// and `failure` can never describe different instants — the model-check
@@ -111,7 +109,7 @@ pub struct BackendStatusSnapshot {
 
 impl BackendStatusSnapshot {
     /// Whether the snapshot satisfies the coherent-snapshot invariants of the
-    /// backend machine (T6.5 model checking).
+    /// backend machine (model checking).
     ///
     /// `Failed` must be accompanied by the published failure flag and detail;
     /// every pre-terminal state (`Starting`, `Running`, `Degraded`,
@@ -168,13 +166,8 @@ impl SharedBackendStatus {
         crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "capture", false);
         crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "playback", false);
         Self {
-            failed: AtomicBool::new(false),
-            capture_active: AtomicBool::new(false),
-            playback_active: AtomicBool::new(false),
-            state: Mutex::new(BackendState::Starting),
-            failure_detail: Mutex::new(None),
             rt_status: Some(rt_status),
-            wakeup: None,
+            ..Self::default()
         }
     }
 
@@ -205,7 +198,7 @@ impl SharedBackendStatus {
         }
     }
 
-    /// Lock-free fast-path poll used by the main control loop (F-RB-010 / T4.4).
+    /// Lock-free fast-path poll used by the main control loop.
     ///
     /// `Acquire` pairs with the `Release` store in [`Self::mark_failed`]: a
     /// consumer that observes `true` is guaranteed to also observe the fully
@@ -231,7 +224,7 @@ impl SharedBackendStatus {
     }
 
     /// Coherent status snapshot for diagnostics and the concurrency
-    /// model-check gate (T6.5).
+    /// model-check gate.
     ///
     /// All three fields are read under one acquisition of the state lock, so
     /// the snapshot is internally consistent even while transition writers
@@ -315,7 +308,7 @@ impl SharedBackendStatus {
     }
 
     /// Transitions to [`BackendState::Failed`] for `stream` and records the
-    /// sticky failure detail (F-RB-010 / T4.4).
+    /// sticky failure detail.
     pub fn mark_failed(&self, stream: &'static str, reason: impl Into<String>) {
         let reason = reason.into();
         let mut guard = self.lock_state();
@@ -341,7 +334,7 @@ impl SharedBackendStatus {
         self.notify_wakeup();
     }
 
-    /// Enters the bounded reconnect cycle (F-RB-010 / T4.5).
+    /// Enters the bounded reconnect cycle.
     pub fn begin_reconnect(&self, attempt: u32, total_attempts: u32, next_backoff: Duration) {
         let mut guard = self.lock_state();
         self.failed.store(false, Ordering::Release);
@@ -392,7 +385,7 @@ pub fn observe_stream_state(
         }
         pw::stream::StreamState::Unconnected if was_connected(&old) => {
             backend.set_stream_active(stream, false);
-            // Sprint 2 / T2.1: a post-streaming disconnect while the process is
+            // Exception: a post-streaming disconnect while the process is
             // shutting down cooperatively (SIGINT/SIGTERM raised `SHUTDOWN`) is
             // the streams being torn down by `thread_loop.stop()` — expected,
             // so it is logged below `ERROR` and the sticky `Failed` transition
@@ -434,7 +427,7 @@ pub fn observe_stream_state(
     }
 }
 
-/// Observes the RT panic-captured latch (F-RB-020 / T3.2) and transitions the
+/// Observes the RT panic-captured latch and transitions the
 /// backend to [`BackendState::Failed`] when a panic was contained inside an RT
 /// callback closure.
 ///

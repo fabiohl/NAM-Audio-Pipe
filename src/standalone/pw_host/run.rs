@@ -3,7 +3,7 @@
 
 //! PipeWire host execution — dual-stream topology setup, DSP bridge allocation,
 //! CPU affinity locking, main control loop, bounded backend reconnection
-//! (F-RB-010 / T4.5) and graceful shutdown.
+//! and graceful shutdown.
 
 use super::SharedBackendStatus;
 use super::capture::state::{CaptureState, RtHostChannels};
@@ -50,13 +50,12 @@ use pipewire as pw;
 ///   builds `NamResampler::new().expect("construction should succeed for test-sized buffers")` here (allocation outside RT) and sends to the callback.
 /// - `rt_status`: Atomic flags for silent RT→Main communication.
 /// - `recording_worker`: RAII custody of the recording I/O thread and its ring
-///   producer (F-RB-009 / T3.5). The guard keeps the worker alive across every
-///   early `?` return (its `Drop` signals termination and joins bounded) and,
-///   on the normal shutdown path, `RecordingWorkerGuard::shutdown` returns the
-///   observable join outcome so recording failures propagate to the process
-///   exit code.
+///   producer. The guard keeps the worker alive across every early `?` return
+///   (its `Drop` signals termination and joins bounded) and, on the normal
+///   shutdown path, `RecordingWorkerGuard::shutdown` returns the observable join
+///   outcome so recording failures propagate to the process exit code.
 ///
-/// ## Bounded reconnect (F-RB-010 / T4.5)
+/// ## Bounded reconnect
 ///
 /// The PipeWire daemon may be restarted by the package manager, by the user or
 /// by a USB interface reconnect. Instead of aborting immediately, the host
@@ -67,7 +66,7 @@ use pipewire as pw;
 /// RT-side SPSC channels ([`RtHostChannels`]) live in heap `Box`es reached via
 /// raw pointers, so **no internal state is lost** across a re-instantiation —
 /// audio resumes with the same models/IRs/recorder. When the budget is
-/// exhausted the host falls back to the T4.4 fail-fast teardown (RT loop stop,
+/// exhausted the host falls back to the fail-fast teardown (RT loop stop,
 /// GC drain, recording shutdown, non-zero exit).
 ///
 /// Returns the recording worker outcome when `--record` was used (`None`
@@ -111,9 +110,9 @@ pub fn run_pipewire_host(
         gate_enabled,
     } = config;
 
-    // F-RB-010 / T4.5: bounded reconnect policy. `--fail-fast` disables the
-    // recovery cycle entirely; the production default allows 3 attempts with
-    // progressive backoff.
+    // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
+    // entirely; the production default allows 3 attempts with progressive
+    // backoff.
     let reconnect_policy = if fail_fast {
         ReconnectPolicy::fail_fast()
     } else {
@@ -124,11 +123,10 @@ pub fn run_pipewire_host(
     // 1. PERSISTENT HOST RESOURCES (survive reconnect attempts)
     // =========================================================
     // DSP state and RT-side channels live in heap Boxes reached through raw
-    // pointers, so a bounded reconnect (F-RB-010 / T4.5) can re-instantiate
-    // the streams without losing the models, IRs, resampler, gains or the
-    // SPSC wiring. The main thread never aliases the pointed-to objects while
-    // the RT callback runs — it touches them only before `thread_loop.start()`
-    // and after `thread_loop.stop()`.
+    // pointers, so a bounded reconnect can re-instantiate the streams without
+    // losing the models, IRs, resampler, gains or the SPSC wiring. The main
+    // thread never aliases the pointed-to objects while the RT callback runs —
+    // it touches them only before `thread_loop.start()` and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_enabled));
@@ -155,14 +153,14 @@ pub fn run_pipewire_host(
     let full_wavenet_model_l = full_wavenet_model_l;
     let full_wavenet_model_r = full_wavenet_model_r;
 
-    // Place the recording sender (owned by the worker guard — RAII custody,
-    // F-RB-009 / T3.5) on a stack slot so the RT closure can access it via a
-    // raw pointer without locking. The sender bundles the pool producer and
-    // the control-channel producer of the promoted transport (T4.3); it is not
-    // cloneable, so a raw pointer avoids shared-ownership plumbing while
-    // respecting the SPSC contract (single writer at a time). When recording
-    // is disabled the pointer targets a never-written dummy sender — the RT
-    // callback dereferences it unconditionally.
+    // Place the recording sender (owned by the worker guard — RAII custody)
+    // on a stack slot so the RT closure can access it via a raw pointer
+    // without locking. The sender bundles the pool producer and the
+    // control-channel producer of the promoted transport; it is not cloneable,
+    // so a raw pointer avoids shared-ownership plumbing while respecting the
+    // SPSC contract (single writer at a time). When recording is disabled the
+    // pointer targets a never-written dummy sender — the RT callback
+    // dereferences it unconditionally.
     let mut dummy_recording_sender = RecordingSender::none();
     let rec_ptr: *mut RecordingSender = match &mut recording_worker {
         Some(guard) => &raw mut *guard.sender_slot(),
@@ -194,15 +192,15 @@ pub fn run_pipewire_host(
     // =========================================================
     // 3. PROTECTED CONFIGURATION SCOPE (RAII)
     // =========================================================
-    // Shared backend state machine (F-RB-010 / T4.4): the capture and playback
-    // stream state listeners mark it `Failed` on a fatal connectivity loss and
-    // the main control loop below polls it every iteration — the process never
-    // survives as a functionally-dead zombie. F-RB-010 / T4.5: a failure with
-    // reconnect budget left transitions to `Reconnecting` and re-instantiates
-    // the streams; only a budget exhaustion triggers the fail-fast exit.
+    // Shared backend state machine: the capture and playback stream state
+    // listeners mark it `Failed` on a fatal connectivity loss and the main
+    // control loop below polls it every iteration — the process never survives
+    // as a functionally-dead zombie. A failure with reconnect budget left
+    // transitions to `Reconnecting` and re-instantiates the streams; only a
+    // budget exhaustion triggers the fail-fast exit.
     //
-    // Event-driven control plane wakeup (T2.2): condition variable notification
-    // wakes the control loop immediately on rate renegotiations and stream state
+    // Event-driven control plane wakeup: condition variable notification wakes
+    // the control loop immediately on rate renegotiations and stream state
     // changes without waiting for the 100 ms health poll timer.
     let wakeup = ControlPlaneWakeup::new();
     let mut backend_init = SharedBackendStatus::with_rt_status(rt_status.clone());
@@ -211,25 +209,24 @@ pub fn run_pipewire_host(
     let backend_for_capture = backend_status.clone();
     let backend_for_playback = backend_status.clone();
     // The RT-observable failure flag lives in the worker guard; clone it here
-    // for the capture stream callback (F-RB-009 / T3.3).
+    // for the capture stream callback.
     let recording_failed = recording_worker
         .as_ref()
         .and_then(RecordingWorkerGuard::failed_flag)
         .cloned();
 
-    // Bounded reconnect cycle (F-RB-010 / T4.5). One cycle per session: the
-    // budget is never reset, so the recovery phase is strictly bounded in
-    // number of attempts and total time by construction.
+    // Bounded reconnect cycle. One cycle per session: the budget is never reset,
+    // so the recovery phase is strictly bounded in number of attempts and total
+    // time by construction.
     let mut reconnect = ReconnectCycle::new(reconnect_policy);
     // Set when the control loop observes a fatal backend failure AND the
     // reconnect budget is exhausted. Drives the fail-fast teardown + `Err`
     // return below.
     let mut backend_failure: Option<(&'static str, String)> = None;
 
-    // F-RB-017 / F-RB-018: main-thread latches for failed oversample and
-    // slimmable rebuild generations. Lives here (outside the 'host loop) so a
-    // reconnect never re-opens the retry storm for a generation that already
-    // failed.
+    // Main-thread latches for failed oversample and slimmable rebuild
+    // generations. Lives here (outside the 'host loop) so a reconnect never
+    // re-opens the retry storm for a generation that already failed.
     let mut rebuild_failures = handlers::RebuildFailureTracker::default();
 
     // =========================================================
@@ -238,7 +235,7 @@ pub fn run_pipewire_host(
     'host: loop {
         // Each instance spawns a fresh PipeWire RT data thread: real-time
         // setup (DAZ/FTZ, SCHED_FIFO, CPU affinity) must re-run during its
-        // `state_changed` transition before stream readiness (T3.1 / F-RES-003).
+        // `state_changed` transition before stream readiness.
         // The previous instance (if any) already stopped its loop, so the main
         // thread is the sole owner of the DSP state here.
         rt_state.thread_configured = false;
@@ -379,31 +376,30 @@ pub fn run_pipewire_host(
         let mut was_silent = false;
         let mut was_fading = false;
         let mut poll_state = rt_setup::PollState::with_cpu_receipt(cpu_receipt.clone());
-        // F-RB-010 / T4.4: set when the control loop observes a fatal backend
-        // failure for this instance. Drives either the bounded reconnect
-        // (T4.5) or the fail-fast teardown + `Err` return below.
+        // Set when the control loop observes a fatal backend failure for this
+        // instance. Drives either the bounded reconnect or the fail-fast
+        // teardown + `Err` return below.
         let mut instance_failure: Option<(&'static str, String)> = None;
-        // F-RB-020 (review round): a contained RT panic is not a recoverable
-        // connectivity loss — the callback code that panicked will panic again
-        // on any reconnected instance and the `RT_STATUS_PANIC_CAPTURED` latch
-        // persists. Marking it terminal skips the bounded reconnect cycle
-        // (which would burn all attempts guaranteed-futile) and fails fast.
+        // A contained RT panic is not a recoverable connectivity loss — the
+        // callback code that panicked will panic again on any reconnected
+        // instance and the `RT_STATUS_PANIC_CAPTURED` latch persists. Marking
+        // it terminal skips the bounded reconnect cycle (which would burn all
+        // attempts guaranteed-futile) and fails fast.
         let mut panic_is_terminal = false;
         while !SHUTDOWN.load(Ordering::Acquire) {
-            // F-RB-010 / T4.4: a fatal loss of backend connectivity (daemon
-            // crash/restart, stream `Error`, post-streaming `Unconnected`)
-            // must never leave the process idling forever without sound. It is
-            // polled every iteration before any off-RT handler work; the loop
-            // sleeps ≤ 100 ms per iteration, keeping detection inside the
-            // < 500 ms acceptance SLA. The reconnect decision happens below
-            // after the instance teardown.
+            // A fatal loss of backend connectivity (daemon crash/restart,
+            // stream `Error`, post-streaming `Unconnected`) must never leave the
+            // process idling forever without sound. It is polled every
+            // iteration before any off-RT handler work; the loop sleeps ≤ 100 ms
+            // per iteration, keeping detection inside the < 500 ms acceptance SLA.
+            // The reconnect decision happens below after the instance teardown.
             if let Some((stream, reason)) = backend_status.failure() {
                 instance_failure = Some((stream, reason));
                 break;
             }
 
-            // F-RB-020 / T3.2: a panic contained inside an RT callback (capture
-            // or playback `process` closure) is never an abort — the fatal
+            // A panic contained inside an RT callback (capture or playback
+            // `process` closure) is never an abort — the fatal
             // `RT_STATUS_PANIC_CAPTURED` latch is observed on this poll
             // (< 100 ms), the backend transitions to `Failed` and the ordered
             // teardown runs (thread-loop stop, GC drain,
@@ -475,18 +471,18 @@ pub fn run_pipewire_host(
                 .drains
                 .fetch_add(drained as u32, Ordering::Relaxed);
 
-            // T2.2: Event-driven wakeup — wakes up immediately on rate changes or
+            // Event-driven wakeup — wakes up immediately on rate changes or
             // stream state transitions, with 100 ms as health-poll fallback to ensure
             // liveness and prevent busy-spin.
             wakeup.wait_timeout(std::time::Duration::from_millis(100));
         }
 
-        // F-RB-020 (review round): the panic latch is only observed inside the
-        // control loop above. A panic captured in the same window as a SIGINT
-        // (the loop exits via the `SHUTDOWN` condition before the next poll)
-        // would otherwise be swallowed by a clean exit 0 with the captured
-        // audio silently lost. Re-check the latch once after the loop so a
-        // contained panic always surfaces as a failure, never as a `Success`.
+        // The panic latch is only observed inside the control loop above.
+        // A panic captured in the same window as a SIGINT (the loop exits via
+        // the `SHUTDOWN` condition before the next poll) would otherwise be
+        // swallowed by a clean exit 0 with the captured audio silently lost.
+        // Re-check the latch once after the loop so a contained panic always
+        // surfaces as a failure, never as a `Success`.
         if instance_failure.is_none()
             && rt_status
                 .check_flag(crate::standalone::pw_host::rt_callback::RT_STATUS_PANIC_CAPTURED)
@@ -510,7 +506,7 @@ pub fn run_pipewire_host(
         thread_loop.stop();
 
         // Invalidates/advances the DSP bridge to zero so a reconnected instance
-        // begins strictly in silence (T7.3 / G-RB-001).
+        // begins strictly in silence.
         unsafe { &*bridge_ptr.as_ptr() }.reset_to_silence();
 
         // R-04: single-owner handoff — the loop thread has stopped, so the RT
@@ -532,16 +528,16 @@ pub fn run_pipewire_host(
             );
         }
 
-        // 6.1 Reconnect decision (F-RB-010 / T4.5)
+        // 6.1 Reconnect decision
         match instance_failure {
             // Clean shutdown (SIGINT/SIGTERM): the last instance is torn down
             // and the final teardown below finalizes the recording.
             None => break 'host,
             Some((stream, reason)) => {
-                // F-RB-020 (review round): a contained RT panic is terminal —
-                // reconnecting re-runs the same callback code and the latch
-                // persists, so every attempt would fail on the first poll.
-                // Skip the bounded reconnect cycle and fail fast instead.
+                // A contained RT panic is terminal — reconnecting re-runs the
+                // same callback code and the latch persists, so every attempt
+                // would fail on the first poll. Skip the bounded reconnect
+                // cycle and fail fast instead.
                 if panic_is_terminal {
                     backend_failure = Some((stream, reason));
                     break 'host;
@@ -569,8 +565,8 @@ pub fn run_pipewire_host(
                     }
                     continue 'host;
                 }
-                // Budget exhausted (or --fail-fast): fall back to the T4.4
-                // fail-fast path below.
+                // Budget exhausted (or --fail-fast): fall back to the fail-fast
+                // path below.
                 backend_failure = Some((stream, reason));
                 break 'host;
             }
@@ -583,15 +579,14 @@ pub fn run_pipewire_host(
     // The main thread now exclusively owns the recording producer slot (the RT
     // callback released its `&mut` after `thread_loop.stop()`). Hand the whole
     // worker custody to the guard's explicit shutdown: StreamStop → producer
-    // drop → bounded join with formal result inspection (F-RB-009 / T3.5).
+    // drop → bounded join with formal result inspection.
     // The returned outcome propagates recording failures (worker error, panic,
     // join timeout) back to `main()`, which turns them into a non-zero exit.
     //
-    // If the recording worker already reported a fatal error (F-RB-009 / T3.3)
-    // it has exited and its consumer is gone: the ring will never drain, so
-    // the guard skips the `StreamStop` push (which would only burn the retry
-    // timeout and log a misleading warning) and terminates via the producer
-    // drop.
+    // If the recording worker already reported a fatal error it has exited and
+    // its consumer is gone: the ring will never drain, so the guard skips the
+    // `StreamStop` push (which would only burn the retry timeout and log a
+    // misleading warning) and terminates via the producer drop.
     let recording_outcome = recording_worker.take().map(RecordingWorkerGuard::shutdown);
 
     log::debug!(
@@ -599,11 +594,11 @@ pub fn run_pipewire_host(
         backend_status.state()
     );
 
-    // F-RB-010 / T4.4: if the reconnect budget was exhausted (or disabled),
-    // the teardown above is the integral resource drain (RT loop stop, GC,
-    // recording worker) and the host now returns an error instead of a clean
-    // `Ok` — `main()` propagates it into a non-zero process exit, so a dead
-    // backend is never mistaken for a successful run.
+    // If the reconnect budget was exhausted (or disabled), the teardown above
+    // is the integral resource drain (RT loop stop, GC, recording worker) and
+    // the host now returns an error instead of a clean `Ok` — `main()` propagates
+    // it into a non-zero process exit, so a dead backend is never mistaken for
+    // a successful run.
     if let Some((stream, reason)) = &backend_failure {
         NamDiagnostic::new(NamErrorCode::BackendFailure, &sys)
             .message(format!(

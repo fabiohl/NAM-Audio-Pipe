@@ -79,7 +79,7 @@ fn validate_built_pod_accepts_valid_header_within_storage() {
     assert_eq!(pod.size(), 16);
 }
 
-// ── Malformed FFI/SPA playback harness (F-RB-003 Part 3 / T1.5) ──────────
+// ── Malformed FFI/SPA playback harness ──────────────────────────────────────
 //
 // `playback_dsp_cycle` funnels every dequeued output buffer through
 // `handle_spa_pair_fail_closed` with the playback window `(0, n_bytes)`.
@@ -231,9 +231,9 @@ fn playback_harness_rejects_odd_output_size() {
 
 #[test]
 fn playback_harness_rejects_quantum_exceeding_max_bridge_buf() {
-    // G-RB-003 / T6.2: a playback window of (MAX_BRIDGE_BUF + 1) frames
-    // (32,772 bytes) must be rejected fail-closed — flag raised and both
-    // output channels silenced — before any copy into the DSP buffers.
+    // A playback window of (MAX_BRIDGE_BUF + 1) frames (32,772 bytes) must be
+    // rejected fail-closed — flag raised and both output channels silenced —
+    // before any copy into the DSP buffers.
     let mut l = [0.0f32; MAX_BRIDGE_BUF + 1];
     let mut r = [0.0f32; MAX_BRIDGE_BUF + 1];
     fill_bytes(&mut l, 0x5A);
@@ -260,9 +260,56 @@ fn playback_harness_rejects_quantum_exceeding_max_bridge_buf() {
     );
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
     assert!(
-        l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
-            && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
-        "oversized playback window must silence both output channels fail-closed up to MAX_BRIDGE_BUF"
+        l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+        "L must be zeroed up to MAX_BRIDGE_BUF on reject"
+    );
+    assert!(
+        r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
+        "R must be zeroed up to MAX_BRIDGE_BUF on reject"
+    );
+}
+
+#[test]
+fn playback_harness_zeroes_buffers_on_rejection() {
+    let mut l = [1.0f32; 8];
+    let mut r = [1.0f32; 8];
+    let chunk = chunk_of(0, 64);
+    let rt = RtStatusFlags::default();
+    // Pass non-canonical base pointers with insufficient room for the window.
+    let res = handle_spa_pair_fail_closed(
+        l.as_mut_ptr() as usize,
+        32,
+        &chunk,
+        0,
+        64,
+        r.as_mut_ptr() as usize,
+        32,
+        &chunk,
+        0,
+        64,
+        &rt,
+    );
+    assert_eq!(res, None);
+    assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+    assert!(
+        l.iter().all(|&s| s == 0.0) && r.iter().all(|&s| s == 0.0),
+        "playback fail-closed path must silence the output channels"
+    );
+}
+
+#[test]
+fn playback_harness_zeroes_aliased_buffer_on_rejection() {
+    let mut buf = [1.0f32; 32];
+    let chunk = chunk_of(0, 128);
+    let rt = RtStatusFlags::default();
+    let p = buf.as_mut_ptr() as usize;
+    let m = buf.len() * 4;
+    let res = handle_spa_pair_fail_closed(p, m, &chunk, 0, 128, p, m, &chunk, 0, 128, &rt);
+    assert_eq!(res, None);
+    assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+    assert!(
+        buf.iter().all(|&s| s == 0.0),
+        "playback fail-closed path must silence the output channels"
     );
 }
 
@@ -365,7 +412,7 @@ fn playback_harness_silences_channels_on_violation() {
     );
 }
 
-// ── Bridge-starvation silence policy (G-RB-001 / T4.2) ────────────────────
+// ── Bridge-starvation silence policy ─────────────────────────────────────────
 //
 // When `bridge.read_block` yields no new DSP block, `playback_dsp_cycle`
 // must still dequeue, validate, silence-fill and recycle the output buffer.
@@ -504,11 +551,10 @@ fn playback_bridge_starvation_rejects_asymmetric_extensions() {
 
 #[test]
 fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
-    // S5 / E2304 + F-RES-001 / T6.1: when host supplies a huge buffer
-    // (e.g. 1 MiB or > MAX_BRIDGE_BUF), the *caller* quantizes the silence
-    // window to MAX_BRIDGE_BUF frames (32 KiB), so the kernel delivers
-    // exactly that bounded interval: no false E2304 on pause, chunk.size
-    // matches the zeroed interval and trailing memory stays untouched.
+    // When host supplies a huge buffer (e.g. 1 MiB or > MAX_BRIDGE_BUF), the
+    // caller quantizes the silence window to MAX_BRIDGE_BUF frames (32 KiB),
+    // so the kernel delivers exactly that bounded interval: chunk.size matches
+    // the zeroed interval and trailing memory stays untouched.
     let total_samples = MAX_BRIDGE_BUF + 1024;
     let mut l = vec![0.5f32; total_samples];
     let mut r = vec![0.5f32; total_samples];
@@ -579,9 +625,9 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
 
 #[test]
 fn playback_bridge_starvation_rejects_oversized_silence_window() {
-    // S5 / E2304: a caller-requested silence window larger than
-    // MAX_BRIDGE_BUF × 4 is still rejected fail-closed — the kernel never
-    // zeroes beyond the safety cap even when the host buffer could hold it.
+    // A caller-requested silence window larger than MAX_BRIDGE_BUF × 4 is still
+    // rejected fail-closed — the kernel never zeroes beyond the safety cap even
+    // when the host buffer could hold it.
     let total_samples = MAX_BRIDGE_BUF + 1;
     let mut l = vec![0.5f32; total_samples];
     let mut r = vec![0.5f32; total_samples];
@@ -615,7 +661,7 @@ fn playback_bridge_starvation_rejects_oversized_silence_window() {
     );
 }
 
-// ── SPA format negotiation validator (G-RB-001 / T4.3) ───────────────────
+// ── SPA format negotiation validator ────────────────────────────────────────
 //
 // `validate_audio_raw_format` is the canonical fail-closed gate applied by
 // both the capture and playback `param_changed` listeners. These tests

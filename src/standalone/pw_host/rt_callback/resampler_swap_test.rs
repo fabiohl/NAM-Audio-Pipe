@@ -192,7 +192,7 @@ fn swap_cascades_old_resampler_to_gc() {
     }
 }
 
-/// Deterministic lost-wakeup interleaving (F-RB-004 / T2.1 acceptance):
+/// Deterministic lost-wakeup interleaving:
 ///
 /// 1. RT requests A (generation 1) → `RESAMP_SWAP_PENDING` set.
 /// 2. Main starts building A.
@@ -323,7 +323,7 @@ fn unversioned_payload_never_applied_when_request_exists() {
     }
 }
 
-// ── T2.5 Structural Budget & Coalescing (F-RB-011) ──────────────────────
+// ── Structural Budget & Coalescing ──────────────────────────────────────────
 
 /// With multiple current-generation envelopes queued, exactly one swap
 /// applies per callback and the obsolete intermediate envelopes are

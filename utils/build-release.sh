@@ -243,8 +243,8 @@ try:
     doc["pgo"]["oversampling_blocks"] = r.get("oversampling_blocks")
     doc["pgo"]["cabsim_frames"] = (r.get("cabsim") or {}).get("stereo_convolved_frames")
     doc["pgo"]["no_stage_skipped"] = r.get("no_stage_skipped")
-    # T5.2: the matrix receipt declares per-topology minimum progress per DSP
-    # group (G-PERF-003) — carried into the release receipt so the certification
+    # The matrix receipt declares per-topology minimum progress per DSP
+    # group — carried into the release receipt so the certification
     # never reduces the coverage to an aggregated global number.
     doc["pgo"]["progress"] = r.get("progress") or {}
     doc["pgo"]["coverage"] = r.get("coverage") or {}
@@ -315,9 +315,9 @@ if [ "$RELEASE_CEREMONY" = true ]; then
     LONG_RECEIPT_PATH="$PROJECT_DIR/target/logs/long-receipt.txt"
     if [ -f "$LONG_RECEIPT_PATH" ]; then
         echo -e "  → Verifying existing long suite receipt (semantic strict certification)..."
-        # T5.1 / T8.1: the strict receipt is verified by the shared semantic
-        # parser (src/bin/long_receipt_check.rs + nam_audio_pipe::receipt::long)
-        # — never a substring search. The gate accepts only a real strict
+        # The strict receipt is verified by the shared semantic parser
+        # (src/bin/long_receipt_check.rs + nam_audio_pipe::receipt::long) —
+        # never a substring search. The gate accepts only a real strict
         # passed run (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1, MODE:
         # full, OVERALL: PASSED); simulate/partial/legacy receipts are rejected
         # fail-closed.
@@ -470,7 +470,7 @@ if [ "$USE_PGO" = true ]; then
 import json
 import sys
 
-# T5.2 matrix gate (G-PERF-003): the receipt must prove per-topology minimum
+# Matrix gate: the receipt must prove per-topology minimum
 # progress (frames) per DSP group — never an aggregated global number — and
 # every matrix dimension value must have been exercised.
 min_total_blocks = 1000
@@ -1023,7 +1023,7 @@ fi
 # ---------------------------------------------------------------------------
 # run_live_smoke <staging_bin> <model_abs> <smoke_dir> <out_file>
 #   Runs the stripped staging binary against a real fixture model with
-#   `--record` (distribution profile; panic = "unwind" so the F-RB-020
+#   `--record` (distribution profile; panic = "unwind" so the
 #   catch_unwind containment is effective in the shipped artifact), drives the
 #   PipeWire graph with a silent tone so the capture node consumes real audio
 #   quantums, requests graceful shutdown via SIGTERM and validates the final
@@ -1216,8 +1216,8 @@ PY
 #   determines the distributed bytes: clean source commit + UTC timestamp,
 #   exact rustc/cargo versions, build identity (profile `dist` vs `testing`,
 #   active features, RUSTFLAGS, optimization status, explicit opt-out of
-#   harness-measured performance claims for the final ELF — T5.1), build
-#   environment (`uname -r`, `pw-cli --version` — T5.1), dependency
+#   harness-measured performance claims for the final ELF), build
+#   environment (`uname -r`, `pw-cli --version`), dependency
 #   traceability (Cargo.lock SHA-256 + coupled NeuralAmpModeler-rs commit) and
 #   SHA-256 + size + Build-ID of each delivery artifact (installed stripped
 #   ELF, .tar.zst, .flatpak, AppStream metainfo). Failure to emit the receipt
@@ -1240,7 +1240,7 @@ write_provenance_receipt() {
         *native*) cpu_baseline="native ($(uname -m))" ;;
         *) cpu_baseline="default" ;;
     esac
-    # T5.1: active features of the release ELF = the resolved default feature
+    # Active features of the release ELF = the resolved default feature
     # set (the release build passes no --features flags). Derived from
     # Cargo.toml so the receipt can never drift from the manifest.
     features_json=$(python3 -c '
@@ -1269,9 +1269,9 @@ except Exception:
         pass
 print(json.dumps(features))
 ' 2>/dev/null || echo "[]")
-    # T5.1: build environment identity — kernel release + PipeWire CLI version.
+    # Build environment identity — kernel release + PipeWire CLI version.
     kernel_release="$(uname -r 2>/dev/null || echo 'unknown')"
-    # T5.1: build environment identity — PipeWire version.
+    # Build environment identity — PipeWire version.
     # NOTE: `pw-cli --version` emits only the binary name ("pw-cli") with no
     # version number on this PipeWire build. Use the package manager as the
     # authoritative source; fall back gracefully when running outside a deb/rpm
@@ -1305,15 +1305,15 @@ print(json.dumps(features))
         ceremony_status="certified_release"
     fi
 
-    # F-RB-027 / T5.2: a certified release requires exact binary identity. If
-    # readelf is absent or the ELF carries no GNU build-id note, bin_bid is
-    # empty and the ceremony must fail fail-closed — a "certified_release"
-    # receipt with `build_id: null` is rejected by tests/distribution_qa.rs
-    # anyway, so refusing here prevents emitting an uncertifiable receipt.
+    # A certified release requires exact binary identity. If readelf is absent
+    # or the ELF carries no GNU build-id note, bin_bid is empty and the
+    # ceremony must fail fail-closed — a "certified_release" receipt with
+    # `build_id: null` is rejected by tests/distribution_qa.rs anyway, so
+    # refusing here prevents emitting an uncertifiable receipt.
     if [ "$RELEASE_CEREMONY" = true ] && [ -z "$bin_bid" ]; then
         die "Release ceremony requires a non-empty ELF Build-ID on $BIN_TARGET \
 (readelf -n found no GNU build-id note, or readelf is unavailable). A \
-certified release without exact binary identity is not a release (F-RB-027)."
+certified release without exact binary identity is not a release."
     fi
 
     quick_receipt="$PROJECT_DIR/target/logs/quick-receipt.txt"
@@ -1452,7 +1452,7 @@ doc = {
             "cpu_baseline": cpu_baseline,
             "pgo": opt_status in ("PGO+BOLT", "PGO-ONLY"),
             "bolt": opt_status in ("PGO+BOLT", "BOLT-ONLY"),
-            # T5.1: the optimization status is a compilation-transform claim
+            # The optimization status is a compilation-transform claim
             # only — no harness-measured performance metric (deadline/jitter/
             # throughput) is ever attributed to the final PGO+BOLT ELF here.
             "measured_performance_claims": False,

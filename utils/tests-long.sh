@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #
-# Nightly / pre-release long audit suite of NAM-Audio-Pipe (G-RB-002, T6.3).
+# Nightly / pre-release long audit suite of NAM-Audio-Pipe.
 #
 # Certifies the claims that the agile `utils/tests-quick.sh` deliberately
 # leaves out: prolonged soak + swap concurrency, strict zero-allocation on the
@@ -10,35 +10,33 @@
 # dispersion and concurrent state-model checking. Every phase below
 # cross-references its planned harness so scope drift is visible at a glance:
 #
-#   PHASE1 — Soak acelerado (timeline comprimida)           phase1-soak.log
-#            tests/swap_stress.rs (--ignored soak battery; T6.4 registers the
-#            extended soak cases) + tests/soak_extended.rs (T6.4, T5.3:
-#            320k blocks / ~426s of compressed timeline, fail-closed windows).
+#   PHASE1 — Accelerated soak (compressed timeline)        phase1-soak.log
+#            tests/swap_stress.rs (--ignored soak battery; extended soak cases)
+#            + tests/soak_extended.rs (320k blocks / ~426s of compressed timeline,
+#            fail-closed windows).
 #   PHASE2 — RT-Safety heap-audit (zero-alloc)            phase2-heap-audit.log
 #            `--features "testing heap-audit"`: lib unit gates
 #            (cabsim_swap::heap_audit_tests) + swap_stress heap-audit battery.
 #   PHASE3 — RT Deadline gate (ns budget)                 phase3-rt-deadline.log
-#            tests/rt_metrics.rs deadline filter (T6.5, planned harness).
+#            tests/rt_metrics.rs deadline filter.
 #   PHASE4 — RT Jitter gate (inter-callback dispersion)   phase4-rt-jitter.log
-#            tests/rt_metrics.rs jitter filter (T6.5, planned harness).
+#            tests/rt_metrics.rs jitter filter.
 #   PHASE5 — Concurrency model checking & throughput      phase5-concurrency.log
-#            tests/rt_metrics.rs concurrent filter (T6.5): the 16-thread
+#            tests/rt_metrics.rs concurrent filter: the 16-thread
 #            interleaving stress + the production-SPSC throughput gate
-#            (T5.3 / G-PERF-004 — no global mutex on the measured path).
+#            (no global mutex on the measured path).
 #   PHASE6 — Endurance real & state-machine throughput    phase6-endurance.log
-#            tests/endurance.rs (T5.3 / G-PERF-004): real wall-clock
-#            endurance, fail-closed validation windows, periodic raw
-#            RSS/faults/threads/FD telemetry.
+#            tests/endurance.rs: real wall-clock endurance, fail-closed
+#            validation windows, periodic raw RSS/faults/threads/FD telemetry.
 #
-#   T5.3 (G-PERF-004): the receipt declares each soak suite's purpose — the
-#   accelerated timeline soak (`SOAK_PURPOSE:`) and the real wall-clock
-#   endurance (`ENDURANCE_PURPOSE:`) are separate suites with distinct
-#   purposes, and the throughput marker never labels harness throughput as
-#   "audio callbacks".
+#   The receipt declares each soak suite's purpose — the accelerated timeline soak
+#   (`SOAK_PURPOSE:`) and the real wall-clock endurance (`ENDURANCE_PURPOSE:`)
+#   are separate suites with distinct purposes, and the throughput marker
+#   never labels harness throughput as "audio callbacks".
 #
 #   Under --strict-pre-release, NAM_RT_STRICT=1 is exported so Phases 3/4/5
 #   (tests/rt_metrics.rs) fail hard on an uncalibrated environment instead of
-#   emitting a silent pass (T5.1); the receipt records `NAM_RT_STRICT:` as the
+#   emitting a silent pass; the receipt records `NAM_RT_STRICT:` as the
 #   propagation evidence.
 #
 # Failure isolation: every phase runs independently through `run_phase` so a
@@ -50,7 +48,7 @@
 # (PASSED / COMPLETED_WITH_GAPS / FAILED).
 #
 # ────────────────────────────────────────────────────────────────────────────
-# AI GOVERNANCE WARNING (mandatory compliance — rules/testing.md §2, G-RB-002)
+# AI GOVERNANCE WARNING (mandatory compliance — rules/testing.md §2)
 #
 #   This script is the NIGHTLY / PRE-RELEASE long audit suite of
 #   NAM-Audio-Pipe. Its full runtime is approximately 30–60 minutes and it
@@ -87,24 +85,24 @@ for arg in "$@"; do
             echo "Options:"
             echo "  --strict-pre-release   Promote every GAP to a hard failure (release gate)."
             echo "                         Certifies the audit only on a calibrated RT machine."
-            echo "                         Propagates NAM_RT_STRICT=1 to tests/rt_metrics.rs (T5.1)."
+            echo "                         Propagates NAM_RT_STRICT=1 to tests/rt_metrics.rs."
             echo "  --simulate, --dry-run  Dry run: register the 6 planned phases and the"
             echo "                         structured receipt in target/logs/ without executing"
             echo "                         any test. Safe for AI/CI structural validation."
             echo "  -h, --help             Show this help and exit."
             echo
             echo "Phases (logs in target/logs/):"
-            echo "  PHASE1 — Soak acelerado (timeline comprimida)   phase1-soak.log"
+            echo "  PHASE1 — Accelerated soak (compressed timeline) phase1-soak.log"
             echo "  PHASE2 — RT-Safety heap-audit (zero-alloc)      phase2-heap-audit.log"
             echo "  PHASE3 — RT Deadline gate (ns budget)           phase3-rt-deadline.log"
             echo "  PHASE4 — RT Jitter gate (dispersion)            phase4-rt-jitter.log"
             echo "  PHASE5 — Concurrency model checking             phase5-concurrency.log"
-            echo "  PHASE6 — Endurance real & state-machine throughput (T5.3)"
+            echo "  PHASE6 — Endurance real & state-machine throughput"
             echo "                                                  phase6-endurance.log"
             echo
-            echo "T5.3 (G-PERF-004): the receipt declares each suite's purpose —"
-            echo "  SOAK_PURPOSE:      accelerated_timeline (timeline comprimida)"
-            echo "  ENDURANCE_PURPOSE: real_wall_clock (parede, NAM_ENDURANCE_SECONDS)"
+            echo "The receipt declares each suite's purpose —"
+            echo "  SOAK_PURPOSE:      accelerated_timeline (compressed timeline)"
+            echo "  ENDURANCE_PURPOSE: real_wall_clock (wall-clock, NAM_ENDURANCE_SECONDS)"
             echo
             echo "Receipt: target/logs/long-receipt.txt"
             exit 0
@@ -117,7 +115,7 @@ for arg in "$@"; do
     esac
 done
 
-# T5.1: --strict-pre-release propagates NAM_RT_STRICT=1 to the RT metric
+# --strict-pre-release propagates NAM_RT_STRICT=1 to the RT metric
 # harness (tests/rt_metrics.rs Phases 3/4/5). Exported before any phase so the
 # child cargo processes inherit it; the value is also recorded in the receipt
 # as `NAM_RT_STRICT:` (the propagation evidence the release ceremony verifies
@@ -136,7 +134,7 @@ source "$SCRIPT_DIR/_lib.sh"
 # CPU core pinning for the RT measurement phases (Deadline, Jitter). Override
 # with NAM_BENCH_CORE; defaults to the middle physical core. The Rust harness
 # itself preflights the environment and emits typed GAP markers when it cannot
-# certify (see tests/rt_metrics.rs, T6.5) — the shell never reclassifies.
+# certify (see tests/rt_metrics.rs) — the shell never reclassifies.
 NUM_CORES=$(nproc 2>/dev/null || echo 1)
 DEFAULT_CORE=$(( ${NUM_CORES:-1} / 2 ))
 BENCH_CORE="${NAM_BENCH_CORE:-$DEFAULT_CORE}"
@@ -167,7 +165,7 @@ rm -f target/logs/phase1-soak.log \
 
 echo -e "${BLUE}${BOLD}=============================================================${NC}"
 echo -e "${BLUE}${BOLD}  NAM-Audio-Pipe Long-Duration Stress & Audit Suite           ${NC}"
-echo -e "${BLUE}${BOLD}  (~30-60 min · human operator only · G-RB-002/T6.3)          ${NC}"
+echo -e "${BLUE}${BOLD}  (~30-60 min · human operator only)                          ${NC}"
 echo -e "${BLUE}${BOLD}=============================================================${NC}"
 
 if [ "$SIMULATE" = "1" ]; then
@@ -178,11 +176,11 @@ emit_to "$LONG_RECEIPT" "SUITE: tests-long"
 emit_to "$LONG_RECEIPT" "STRICT: ${STRICT_PRE_RELEASE:-0}"
 emit_to "$LONG_RECEIPT" "NAM_RT_STRICT: ${NAM_RT_STRICT:-0}"
 emit_to "$LONG_RECEIPT" "MODE: $([ "$SIMULATE" = "1" ] && echo simulate || echo full)"
-# T5.3 (G-PERF-004): each soak suite declares its purpose in the receipt so the
+# Each soak suite declares its purpose in the receipt so the
 # accelerated timeline soak and the real wall-clock endurance are never
 # conflated.
-emit_to "$LONG_RECEIPT" "SOAK_PURPOSE: accelerated_timeline — timeline comprimida (320k blocos ≈426s nominais), janelas de validação fail-closed, swaps periódicos"
-emit_to "$LONG_RECEIPT" "ENDURANCE_PURPOSE: real_wall_clock — parede (NAM_ENDURANCE_SECONDS), janelas fail-closed, RSS bruto/faults/threads/FDs periódicos"
+emit_to "$LONG_RECEIPT" "SOAK_PURPOSE: accelerated_timeline — compressed timeline (320k blocks ≈426s nominal), fail-closed validation windows, periodic swaps"
+emit_to "$LONG_RECEIPT" "ENDURANCE_PURPOSE: real_wall_clock — wall-clock (NAM_ENDURANCE_SECONDS), fail-closed windows, periodic raw RSS/faults/threads/FDs"
 
 # ── Global phase trackers ──────────────────────────────────────────────────
 declare -a GAPS=()
@@ -278,8 +276,8 @@ finish_phase() {
 # empty_target_execution <log_file> <target>
 #   Returns 0 when <target> ran (its "Running <target> " banner exists) but
 #   its summary reports 0 executed tests. Distinguishes a planned-but-empty
-#   soak battery (typed GAP — T6.4/T6.5 pending) from a removed/renamed
-#   mandatory target (no banner — hard FAIL).
+#   soak battery (typed GAP) from a removed/renamed mandatory target
+#   (no banner — hard FAIL).
 empty_target_execution() {
     local log_file="$1"
     local target="$2"
@@ -320,21 +318,21 @@ gated_target_status() {
 # returns 0 (PASS) / 1 (FAIL) / 2 (GAP).
 # ═══════════════════════════════════════════════════════════════════════════
 
-# --- Phase 1: Soak acelerado & concorrência de swaps (release, --ignored) ---
+# --- Phase 1: Accelerated soak & swap concurrency (release, --ignored) ---
 # tests-quick.sh runs the fast swap_stress pass (debug + release, non-ignored);
 # every #[ignore]'d soak/endurance case lives here exclusively (rules/testing.md
-# §1: soak MUST be #[ignore]d and run only in tests-long.sh). T6.4 registers the
-# extended soak battery (soak_extended.rs + ignored swap_stress cases); T5.3
-# (G-PERF-004) declares this phase's purpose as the accelerated timeline soak.
+# §1: soak MUST be #[ignore]d and run only in tests-long.sh). The extended
+# soak battery consists of soak_extended.rs + ignored swap_stress cases,
+# and declares this phase's purpose as the accelerated timeline soak.
 run_soak_phase() {
     local rc=0
     local gaps_before=${#GAPS[@]}
     if [ -f tests/soak_extended.rs ]; then
-        echo "  → tests/soak_extended.rs — extended multi-model soak (T6.4)"
+        echo "  → tests/soak_extended.rs — extended multi-model soak"
         cargo test --features testing --release --no-fail-fast \
             --test soak_extended -- --ignored --nocapture --test-threads=1 || rc=1
     else
-        record_gap "phase1:soak_extended_harness_missing (T6.4 pending)"
+        record_gap "phase1:soak_extended_harness_missing"
     fi
     echo "  → tests/swap_stress.rs — ignored soak battery"
     cargo test --features testing --release --no-fail-fast \
@@ -342,11 +340,11 @@ run_soak_phase() {
     if [ "$rc" -eq 0 ]; then
         if [ -f tests/soak_extended.rs ]; then
             gated_target_status "target/logs/phase1-soak.log" "tests/soak_extended.rs" 1 \
-                "phase1:soak_extended_no_ignored_tests (T6.4 pending)" || rc=$?
+                "phase1:soak_extended_no_ignored_tests" || rc=$?
         fi
         if [ "$rc" -eq 0 ]; then
             gated_target_status "target/logs/phase1-soak.log" "tests/swap_stress.rs" 1 \
-                "phase1:swap_soak_no_ignored_tests (T6.4 pending)" || rc=$?
+                "phase1:swap_soak_no_ignored_tests" || rc=$?
         fi
     fi
     if [ "$rc" -eq 0 ] && [ "${#GAPS[@]}" -gt "$gaps_before" ]; then
@@ -397,14 +395,14 @@ run_heap_audit_phase() {
 }
 
 # --- Phase 3: RT Deadline Gate (deterministic, nanosecond budget) ---
-# tests/rt_metrics.rs (T6.5) executes 10k quantums of real DSP load and emits
+# tests/rt_metrics.rs executes 10k quantums of real DSP load and emits
 # typed markers: TEST_RESULT[rt_deadline]=PASS max_ns=... budget_ns=... or
 # TEST_RESULT[rt_deadline]=GAP:uncalibrated_environment. The shell only maps
 # markers; it never reclassifies logs.
 run_rt_deadline_phase() {
     if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing — planned by T6.5"
-        record_gap "phase3:rt_metrics_harness_missing (T6.5 pending)"
+        echo "  → tests/rt_metrics.rs missing"
+        record_gap "phase3:rt_metrics_harness_missing"
         return 2
     fi
     local rc=0
@@ -418,7 +416,7 @@ run_rt_deadline_phase() {
     fi
     # A real cargo failure is a hard FAIL and must never be masked by a typed
     # GAP marker lingering in the same log. Marker classification is
-    # fail-closed (T6.5): the harness emits exactly one
+    # fail-closed: the harness emits exactly one
     # TEST_RESULT[rt_deadline]=... marker per run — a GAP marker means the
     # measurement was bypassed/inconclusive and is never promoted to PASS.
     if [ "$rc" -ne 0 ]; then
@@ -437,12 +435,12 @@ run_rt_deadline_phase() {
 
 # --- Phase 4: RT Jitter Gate (inter-callback dispersion under contention) ---
 # Diagnostic telemetry: statistical dispersion of inter-callback intervals.
-# tests/rt_metrics.rs (T6.5) emits TEST_RESULT[rt_jitter]=PASS max_jitter_us=...
+# tests/rt_metrics.rs emits TEST_RESULT[rt_jitter]=PASS max_jitter_us=...
 # or a typed GAP when environment preconditions are not met.
 run_rt_jitter_phase() {
     if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing — planned by T6.5"
-        record_gap "phase4:rt_metrics_harness_missing (T6.5 pending)"
+        echo "  → tests/rt_metrics.rs missing"
+        record_gap "phase4:rt_metrics_harness_missing"
         return 2
     fi
     local rc=0
@@ -472,22 +470,22 @@ run_rt_jitter_phase() {
 
 # --- Phase 5: Concurrency interleaving stress, state resilience & throughput ---
 # 16-thread stress over swap requests, stream-state transitions, simulated
-# reconnect cycles and cooperative SHUTDOWN (T6.5) — zero deadlocks, no
-# inconsistent sample-rate reads, no leaked failure state. Plus (T5.3 /
-# G-PERF-004) the production-SPSC state-machine throughput gate
+# reconnect cycles and cooperative SHUTDOWN — zero deadlocks, no
+# inconsistent sample-rate reads, no leaked failure state. Plus the
+# production-SPSC state-machine throughput gate
 # (concurrent_spsc_throughput_swap_accounting): no global mutex on the measured
 # path; complete attempted/enqueued/applied/dropped swap accounting. Emits
 # typed markers TEST_RESULT[concurrency_stress]=PASS and
 # TEST_RESULT[spsc_throughput]=PASS/GAP:...
 run_concurrency_phase() {
     if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing — planned by T6.5"
-        record_gap "phase5:rt_metrics_harness_missing (T6.5 pending)"
+        echo "  → tests/rt_metrics.rs missing"
+        record_gap "phase5:rt_metrics_harness_missing"
         return 2
     fi
     local rc=0
     echo "  → rt_metrics concurrent state interleaving stress (16 threads)"
-    echo "  → rt_metrics SPSC state-machine throughput (T5.3, no global mutex)"
+    echo "  → rt_metrics SPSC state-machine throughput (no global mutex)"
     cargo test --features testing --release --no-fail-fast \
         --test rt_metrics -- concurrent --ignored --nocapture --test-threads=1 || rc=1
     # Same fail-closed precedence as the deadline gate: a real cargo failure
@@ -507,7 +505,7 @@ run_concurrency_phase() {
 }
 
 # --- Phase 6: Endurance real & state-machine throughput (release, --ignored) ---
-# tests/endurance.rs (T5.3 / G-PERF-004): real wall-clock endurance distinct
+# tests/endurance.rs: real wall-clock endurance distinct
 # from the accelerated soak — fail-closed validation windows, periodic raw
 # RSS/faults/threads/FD telemetry. The phase purpose is declared in the receipt
 # as `ENDURANCE_PURPOSE: real_wall_clock`. Override the window with
@@ -516,17 +514,17 @@ run_endurance_phase() {
     local rc=0
     local gaps_before=${#GAPS[@]}
     if [ -f tests/endurance.rs ]; then
-        echo "  → tests/endurance.rs — real wall-clock endurance (T5.3 / G-PERF-004)"
+        echo "  → tests/endurance.rs — real wall-clock endurance"
         echo "  → NAM_ENDURANCE_SECONDS=${NAM_ENDURANCE_SECONDS:-30} (default 30s wall clock)"
         cargo test --features testing --release --no-fail-fast \
             --test endurance -- --ignored --nocapture --test-threads=1 || rc=1
     else
-        record_gap "phase6:endurance_harness_missing (T5.3 pending)"
+        record_gap "phase6:endurance_harness_missing"
         return 2
     fi
     if [ "$rc" -eq 0 ]; then
         gated_target_status "target/logs/phase6-endurance.log" "tests/endurance.rs" 1 \
-            "phase6:endurance_no_ignored_tests (T5.3 pending)" || rc=$?
+            "phase6:endurance_no_ignored_tests" || rc=$?
     fi
     if [ "$rc" -eq 0 ] && [ "${#GAPS[@]}" -gt "$gaps_before" ]; then
         return 2

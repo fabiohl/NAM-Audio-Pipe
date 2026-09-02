@@ -4,7 +4,7 @@
 //! 5.1.2. COMMAND RECEPTION (SPSC Channel)
 //! Processes commands from the command-line interface or control system (volume, model, noise gate).
 //!
-//! # Command Budgeting (F-RB-011 / T2.5 / T1.5)
+//! # Command Budgeting
 //!
 //! The callback drains under fixed per-quantum budgets so a continuously
 //! refilling producer can never monopolize the audio thread:
@@ -20,11 +20,11 @@
 //!   `RT_STATUS_PARAM_QUEUE_BACKLOG` flag records the occurrence for the main
 //!   thread (telemetry only; no command is ever lost).
 //!
-//! ## Empirical Composite Bound (T1.5)
+//! ## Empirical Composite Bound
 //!
 //! Measured under continuous simultaneous saturation across all 5 RT drains
 //! (resampler, cabsim, parameters, slimmable, OS):
-//! // Medido: pops/callback p99=32, max=32 (teto nominal 48), duracao p99=0.94 us (0.28% do deadline de 333 us)
+//! // Measured: pops/callback p99=32, max=32 (nominal ceiling 48), duration p99=0.94 us (0.28% of 333 us deadline)
 //! As the p99 drain execution time (0.94 µs) is far below 10% of the 333 µs deadline
 //! at quantum=16 (33.3 µs threshold), the nominal ceiling of ~48 pops per callback
 //! is safe without requiring an additional global shared drain budget.
@@ -44,35 +44,33 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Maximum number of structural swaps applied per audio callback, shared across
-/// every RT swap drain (resampler, cab-sim, model pair, oversampling) —
-/// F-RB-011 / T2.5. Heavy state movement is bounded to one transaction per
-/// audio quantum.
+/// every RT swap drain (resampler, cab-sim, model pair, oversampling). Heavy
+/// state movement is bounded to one transaction per audio quantum.
 pub const STRUCTURAL_SWAPS_PER_CALLBACK: usize = 1;
 
 /// Maximum number of payloads popped from a single structural SPSC channel per
 /// audio callback (coalescing window). Bounds the drain loop even when the
-/// producer refills the ring continuously (F-RB-011). The channels have
-/// capacity 4, so this window covers the full queue plus producer refills.
+/// producer refills the ring continuously. The channels have capacity 4, so
+/// this window covers the full queue plus producer refills.
 pub const STRUCTURAL_POPS_PER_CALLBACK: usize = 8;
 
 /// Maximum number of `ParamPayload` commands consumed per audio callback —
-/// the scalar parameter budget (F-RB-011 / T2.5). Scalar commands inside the
-/// budget are coalesced latest-wins; the excess is left in the ring for the
-/// next callback and flagged via `RT_STATUS_PARAM_QUEUE_BACKLOG`.
+/// the scalar parameter budget. Scalar commands inside the budget are
+/// coalesced latest-wins; the excess is left in the ring for the next callback
+/// and flagged via `RT_STATUS_PARAM_QUEUE_BACKLOG`.
 pub const MAX_PARAM_BUDGET: usize = 16;
 
 /// 5.1.2. COMMAND RECEPTION (SPSC Channel)
 /// Processes commands from the command-line interface or control system (volume, model, noise gate).
 ///
-/// Runs under the [`MAX_PARAM_BUDGET`] drain budget (F-RB-011 / T2.5):
-/// scalar parameters are coalesced latest-wins inside the budget, `LoadModel`
-/// structural swaps obey the shared [`STRUCTURAL_SWAPS_PER_CALLBACK`] budget
-/// and park in `deferred` when exhausted, and a non-empty channel after the
-/// budget raises `RT_STATUS_PARAM_QUEUE_BACKLOG`.
+/// Runs under the [`MAX_PARAM_BUDGET`] drain budget: scalar parameters are
+/// coalesced latest-wins inside the budget, `LoadModel` structural swaps obey
+/// the shared [`STRUCTURAL_SWAPS_PER_CALLBACK`] budget and park in `deferred`
+/// when exhausted, and a non-empty channel after the budget raises
+/// `RT_STATUS_PARAM_QUEUE_BACKLOG`.
 ///
 /// Returns `(param_changed, pops)` — the coalesced-parameter signal plus the
-/// exact number of `ParamPayload` payloads consumed in this callback (T5.3
-/// swap accounting).
+/// exact number of `ParamPayload` payloads consumed in this callback.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -259,8 +257,8 @@ pub fn receive_commands(
         }
     }
 
-    // Backlog telemetry (F-RB-011 / T2.5): the channel still held commands
-    // after the fixed budget — the remainder is drained by the next callback.
+    // Backlog telemetry: the channel still held commands after the fixed
+    // budget — the remainder is drained by the next callback.
     if !consumer.is_empty() {
         rt_status_for_process.set_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
     }
@@ -381,8 +379,8 @@ fn discard_load_model(
 /// The audio thread ONLY sets the atomic flag, target channel count, and the
 /// rebuild generation. All allocation, prewarm, and mmap happen on the main
 /// thread. The generation is bumped with `Release` before the flag is armed so
-/// the main thread's `Acquire` capture observes the full request (F-RB-004
-/// ordering pattern) and the RT drain can discard stale in-flight pairs.
+/// the main thread's `Acquire` capture observes the full request ordering pattern
+/// and the RT drain can discard stale in-flight pairs.
 #[inline(always)]
 pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatusFlags) {
     let Some(target_ch) = adaptive.take_slimmable_rebuild() else {
@@ -398,8 +396,7 @@ pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatu
         .set_flag_release(neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
 }
 
-/// Drains slimmable-rebuilt model pairs delivered by the main thread via SPSC
-/// (F-RB-005).
+/// Drains slimmable-rebuilt model pairs delivered by the main thread via SPSC.
 ///
 /// Each [`SlimModelPair`] is consumed with a single `pop()` and both channels
 /// are swapped in the same logical block — an all-or-nothing transaction.
@@ -407,7 +404,7 @@ pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatu
 /// cascade without touching the active models, so L/R can never belong to
 /// different generations or channel counts.
 ///
-/// Budgeting (F-RB-011 / T2.5): at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
+/// Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
 /// structural swap applies per callback (shared budget); current-generation
 /// pairs in the coalescing window collapse to the latest one (intermediate
 /// pairs discarded to GC) and the excess is parked in `deferred` for the next
@@ -440,7 +437,7 @@ pub fn drain_slimmable_models(
             .load(Ordering::Acquire);
         let head_is_current = rx.peek().is_ok_and(|head| head.generation == current_gen);
         if pending.generation != current_gen {
-            // Stale while parked: discard whole to GC — never installed (F-RB-005).
+            // Stale while parked: discard whole to GC — never installed.
             discard_pair_whole(
                 pending,
                 gc_producer,
@@ -485,7 +482,7 @@ pub fn drain_slimmable_models(
         }
     }
 
-    // Phase 1 — bounded drain with coalescing (F-RB-011 / T2.5).
+    // Phase 1 — bounded drain with coalescing.
     let current_gen = rt_status
         .requested_slimmable_generation
         .load(Ordering::Acquire);
@@ -602,7 +599,7 @@ fn install_pair(
 }
 
 /// Discards a whole pair to the GC cascade as a single moved `Box<SlimModelPair>`
-/// — never applied (F-RB-005).
+/// — never applied.
 #[inline(always)]
 fn discard_pair_whole(
     pair: Box<SlimModelPair>,
@@ -625,7 +622,7 @@ fn discard_pair_whole(
 /// Drains oversampling engines delivered by the main thread via SPSC.
 /// Swaps both L and R engines and sends the obsolete envelope to the GC cascade.
 ///
-/// Budgeting (F-RB-011 / T2.5): at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
+/// Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
 /// structural swap applies per callback (shared budget); engine pairs in the
 /// coalescing window collapse to the latest one and the excess is parked in
 /// `deferred` for the next callback.
@@ -656,7 +653,7 @@ pub fn drain_os_engines(
     if let Some(pending) = deferred.take() {
         if pending.generation != current_gen {
             // Superseded while parked in the deferred slot: discard to GC cascade
-            // without applying or clearing the pending bit (F-RB-005).
+            // without applying or clearing the pending bit.
             discard_os_pair(
                 pending,
                 gc_producer,
@@ -702,7 +699,7 @@ pub fn drain_os_engines(
         }
     }
 
-    // Phase 1 — bounded drain with coalescing and stale-generation filtering (F-RB-011 / T2.5).
+    // Phase 1 — bounded drain with coalescing and stale-generation filtering.
     let mut candidate: Option<Box<OsEnginePair>> = None;
     let mut pops = 0usize;
     while pops < STRUCTURAL_POPS_PER_CALLBACK {
@@ -711,9 +708,9 @@ pub fn drain_os_engines(
         };
         pops += 1;
         if pair.generation != current_gen {
-            // Stale rebuild guard (F-RB-005 / T2.3): a newer oversample change
-            // superseded this pair before delivery. Cascade the entire envelope
-            // directly to GC without touching the active engines.
+            // Stale rebuild guard: a newer oversample change superseded this
+            // pair before delivery. Cascade the entire envelope directly to GC
+            // without touching the active engines.
             discard_os_pair(
                 pair,
                 gc_producer,

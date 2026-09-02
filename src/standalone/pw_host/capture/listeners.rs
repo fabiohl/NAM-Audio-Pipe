@@ -15,15 +15,14 @@ use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 use pipewire as pw;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Handles capture stream state changes — feeds the backend state machine
-/// (F-RB-010 / T4.4).
+/// Handles capture stream state changes — feeds the backend state machine.
 ///
 /// Transitions the shared [`SharedBackendStatus`] through the canonical
 /// [`observe_stream_state`] mapping: a fatal `StreamState::Error` or a
 /// post-streaming `StreamState::Unconnected` (daemon crash/restart) marks the
 /// backend `Failed`, so the main control loop tears the host down observably.
 ///
-/// Note (T3.1 / F-RES-003): Real-time thread setup (DAZ/FTZ MXCSR, SCHED_FIFO, CPU affinity)
+/// Note: Real-time thread setup (DAZ/FTZ MXCSR, SCHED_FIFO, CPU affinity)
 /// executes during the `state_changed` (Paused/Streaming) transition on this thread before
 /// stream readiness, ensuring zero setup syscalls during operational `process()` callbacks.
 pub fn state_changed_handler(
@@ -36,11 +35,11 @@ pub fn state_changed_handler(
 
 /// Handles capture stream `param_changed` events (format negotiation).
 ///
-/// Enforces the strict SPA format contract (G-RB-001 / T4.3) through the
-/// canonical [`validate_audio_raw_format`] gate: only `F32P` planar stereo is
-/// accepted. A diverging renegotiation (mono, interleaved, S16, surround) is
-/// rejected fail-closed — `RT_STATUS_HOST_CONTRACT_VIOLATION` is raised on
-/// `rt_status`, the structured diagnostic is emitted, the backend is marked
+/// Enforces the strict SPA format contract through the canonical
+/// [`validate_audio_raw_format`] gate: only `F32P` planar stereo is accepted.
+/// A diverging renegotiation (mono, interleaved, S16, surround) is rejected
+/// fail-closed — `RT_STATUS_HOST_CONTRACT_VIOLATION` is raised on `rt_status`,
+/// the structured diagnostic is emitted, the backend is marked
 /// `BackendState::Degraded` (audio muted), and the one-shot rate cell is left
 /// untouched so the DSP keeps the previously applied rate. A subsequent valid
 /// renegotiation restores the backend to `Running`.

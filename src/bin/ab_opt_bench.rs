@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! T5.2 A/B optimization benchmark — measures the DSP hot-path envelope of the
+//! A/B optimization benchmark — measures the DSP hot-path envelope of the
 //! **current binary** so `plain → PGO → PGO+BOLT` builds can be compared.
 //!
 //! # What it measures
@@ -11,7 +11,7 @@
 //!
 //! * **Per-block cycles** (serialized `RDTSC`) — min/mean/p50/p99/p999/max in
 //!   cycles and nanoseconds. The **p99 and max** are the tail latency the
-//!   T5.2 promotion rule is judged on.
+//!   promotion rule is judged on.
 //! * **PMU counters** (via `perf_event_open`, when the kernel/paranoid level
 //!   permits): `cycles`, `instructions`, **iTLB misses** and **I-cache
 //!   misses**, accumulated over the whole measured window. Typed
@@ -21,7 +21,7 @@
 //! The harness itself is compiled three ways by
 //! [`utils/ab-opt-ceremony.sh`](../utils/ab-opt-ceremony.sh) (plain, PGO,
 //! PGO+BOLT) and each emits a per-variant receipt; the ceremony compares them
-//! and declares whether BOLT **proves** a gain over PGO (the T5.2 rollback:
+//! and declares whether BOLT **proves** a gain over PGO (rollback:
 //! PGO-ONLY is the explicit fallback when BOLT does not).
 //!
 //! # Running
@@ -922,8 +922,8 @@ fn main() -> ExitCode {
     let mut jsonl_lines: Vec<JsonValue> = Vec::new();
     let mut txt = String::new();
     txt.push_str(&format!(
-        "NAM-Audio-Pipe A/B optimization bench — T5.2\n\
-         =============================================\n\
+        "NAM-Audio-Pipe A/B optimization bench\n\
+         =====================================\n\
          variant={} runs={} blocks={} quantum={} rate={} os={} cabsim={}\n",
         cfg.variant,
         cfg.runs,
@@ -1048,7 +1048,6 @@ fn main() -> ExitCode {
     let mut header = vec![
         kv("event", JsonValue::Str("header".into())),
         kv("suite", JsonValue::Str("ab-opt".into())),
-        kv("task", JsonValue::Str("T5.2".into())),
         kv("variant", JsonValue::Str(cfg.variant.clone())),
         kv("runs", JsonValue::Int(cfg.runs as u64)),
         kv("blocks", JsonValue::Int(cfg.blocks)),

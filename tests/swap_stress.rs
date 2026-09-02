@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! ER-2 concurrency & swap-soak harness (T2.6 / T6.4).
+//! Concurrency & swap-soak test harness.
 //!
 //! Drives the full RT capture-callback drain sequence
 //! ([`RtSwapHarness`]) under **concurrent** swap load: thousands of Slimmable
@@ -21,7 +21,7 @@
 //! - **Zero allocations on the RT thread** (heap audit, `feature = "heap-audit"`)
 //!   across every swap transition path, the noise-gate silence transition, the
 //!   playback bridge starvation/recycle path and the fail-closed FFI descriptor
-//!   rejection (G-RB-002 / T6.4).
+//!   rejection.
 
 mod common;
 
@@ -435,7 +435,7 @@ fn swap_soak_heap_audit_includes_resampler() {
     assert_eq!(reallocs, 0, "realloc no callback RT");
     assert_eq!(h.current_host_rate(), 96_000);
 
-    // Fail-open rollback path (F-RB-004) must also be zero-alloc.
+    // Fail-open rollback path must also be zero-alloc.
     h.publish_host_rate(48_000);
     let _ = h.run_callback(&mut l, &mut r, BLOCK); // request another rebuild
     h.rt_status().set_flag(RT_STATUS_RESAMPLER_REBUILD_FAILED);
@@ -446,7 +446,7 @@ fn swap_soak_heap_audit_includes_resampler() {
         let _ = h.run_callback(&mut in_l, &mut in_r, BLOCK); // fail-open rollback
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler fail-open rollback)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler fail-open rollback)
     assert_eq!(
         allocs, 0,
         "fail-open rollback path allocated on RT: {allocs}"
@@ -608,7 +608,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
         let _guard = TrackingGuard::new();
         // SAFETY: `l`/`r` are disjoint aligned arrays; chunks are local and
         // outlive the call. This is the exact pure kernel used by the playback
-        // callback under bridge starvation (G-RB-001 / T4.2).
+        // callback under bridge starvation.
         let _ = unsafe {
             deliver_silence_pair_fail_closed(
                 l.as_mut_ptr() as usize,
@@ -781,7 +781,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
     );
 }
 
-/// T1.5 / F-RB-011: Measures composite structural bound and execution time
+/// Measures composite structural bound and execution time
 /// under simultaneous saturation across all 5 RT drain channels
 /// in the full `RtSwapHarness` (with audio processing and GC cascade).
 #[test]

@@ -39,8 +39,7 @@ pub struct PipewireHostConfig {
     /// Raw IR samples for adaptive partition rebuild (None if no IR loaded).
     pub ir_raw_samples: Option<Vec<f32>>,
     /// Sample rate of `ir_raw_samples` (the IR file's native rate). Rebuilds
-    /// resample the preserved original IR for the applied host output rate
-    /// (F-RB-006 rate calibration).
+    /// resample the preserved original IR for the applied host output rate.
     pub ir_source_rate: u32,
     /// Full WaveNet model (L channel) stored for main-thread slimmable rebuild.
     pub full_wavenet_model_l: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
@@ -57,9 +56,8 @@ pub struct PipewireHostConfig {
     pub oversample: OversampleFactor,
     /// Optional explicit CPU core index requested via CLI (`--cpu`).
     pub requested_cpu: Option<usize>,
-    /// `--fail-fast` on the CLI: disables the bounded reconnect cycle
-    /// (F-RB-010 / T4.5) — the first backend failure triggers the T4.4
-    /// fail-fast teardown immediately.
+    /// `--fail-fast` on the CLI: disables the bounded reconnect cycle —
+    /// the first backend failure triggers observable teardown immediately.
     pub fail_fast: bool,
     /// Noise gate enabled flag from CLI (`--gate on|off`).
     pub gate_enabled: bool,
@@ -81,7 +79,7 @@ pub fn playback_dsp_cycle(
         0
     };
 
-    // T4.3 fail-closed mute: while the negotiated format contract is broken
+    // Fail-closed mute: while the negotiated format contract is broken
     // (a divergent renegotiation was rejected by the param_changed listener),
     // no processed audio may reach the hardware. Deterministic silence is
     // delivered instead, reusing the starvation silence policy — the DAC never
@@ -106,7 +104,7 @@ pub fn playback_dsp_cycle(
             std::mem::size_of_val(buf_r),
         )
     }) else {
-        // Bridge starvation (G-RB-001 / T4.2): the capture stream produced no
+        // Bridge starvation: the capture stream produced no
         // new block this quantum (paused input, pending resampler rebuild,
         // clock drift or capture quantum miss). Deterministic silence policy:
         // still dequeue, validate fail-closed, fill 100% of the output
@@ -207,8 +205,7 @@ pub fn playback_dsp_cycle(
     }
 }
 
-/// Deterministic silence delivery for bridge starvation (G-RB-001 / T4.2,
-/// S5 / E2304).
+/// Deterministic silence delivery for bridge starvation.
 ///
 /// Pure SPA-descriptor kernel (raw integers/pointers, no live PipeWire stream
 /// required — mockable by the harness tests). Validates the stereo pair
@@ -225,7 +222,7 @@ pub fn playback_dsp_cycle(
 /// pausing the input or starting before the first block never raises
 /// `RT_STATUS_HOST_CONTRACT_VIOLATION` (`E2304`).
 ///
-/// Public so the ER-4 service-resilience harness (`tests/service_resilience.rs`)
+/// Public so the resilience harness (`tests/service_resilience.rs`)
 /// can prove the analytical-silence + buffer-recycle contract deterministically
 /// (zero bridge generation → `0.0f32` sequences, no stalls) without a live
 /// PipeWire graph.
@@ -305,7 +302,7 @@ pub unsafe fn deliver_silence_pair_fail_closed(
 }
 
 /// Dequeues the playback output buffer and, under bridge starvation, fills it
-/// with analytical silence and recycles it (G-RB-001 / T4.2, S5 / E2304).
+/// with analytical silence and recycles it.
 ///
 /// The silence window is **quantized by the active stream quantum** — the last
 /// processed frame count (`last_n_samples`, fallback to
@@ -489,8 +486,7 @@ pub unsafe fn build_spa_format_pod<'a>(
     }
 }
 
-/// Typed violation of the strict negotiated SPA audio format contract
-/// (G-RB-001 / T4.3).
+/// Typed violation of the strict negotiated SPA audio format contract.
 ///
 /// Produced by [`validate_audio_raw_format`] when the audio server renegotiates
 /// a format diverging from the invariant that both streams operate under
@@ -534,7 +530,7 @@ impl core::fmt::Display for ContractViolation {
     }
 }
 
-/// Canonical validator of a negotiated SPA audio format (G-RB-001 / T4.3).
+/// Canonical validator of a negotiated SPA audio format.
 ///
 /// Enforces the strict host contract on both streams (capture and playback):
 /// `MediaType::Audio`, `MediaSubtype::Raw`, sample format `F32P` (planar
@@ -578,8 +574,7 @@ pub fn validate_audio_raw_format(param: &pw::spa::pod::Pod) -> Result<u32, Contr
     Ok(format.rate())
 }
 
-/// Fail-closed runtime reaction to a diverging SPA format negotiation
-/// (G-RB-001 / T4.3).
+/// Fail-closed runtime reaction to a diverging SPA format negotiation.
 ///
 /// Called from the `param_changed` listeners (PipeWire ThreadLoop thread,
 /// non-RT): raises `RT_STATUS_HOST_CONTRACT_VIOLATION` on `rt_status` so the
@@ -607,7 +602,7 @@ pub fn reject_negotiated_format_violation(
 }
 
 /// Restores the SPA format contract latch after a valid `F32P` planar stereo
-/// renegotiation (G-RB-001 / T4.3).
+/// renegotiation.
 ///
 /// Called by the `param_changed` listeners on the successful path; re-arms the
 /// RT mute guard so audio processing resumes automatically.
@@ -625,7 +620,7 @@ pub fn mark_format_contract_ok(rt_status: &RtStatusFlags, stream_name: &str) {
         .store(if cap != 0 && pb != 0 { 1 } else { 0 }, Ordering::Relaxed);
 }
 
-/// Updates the stream active latch on `RtStatusFlags` (T1.4).
+/// Updates the stream active latch on `RtStatusFlags`.
 ///
 /// When a stream enters `Streaming`, `active` is `true` (latches `1`).
 /// When a stream is `Paused`, `Unconnected` or in `Error`, `active` is `false` (latches `0`),
@@ -641,7 +636,7 @@ pub fn mark_stream_active(rt_status: &RtStatusFlags, stream_name: &str, active: 
 }
 
 /// Returns `Some((capture, playback))` when both streams have negotiated a
-/// sample rate and the rates are discrepant (G-RB-001 / T4.3).
+/// sample rate and the rates are discrepant.
 ///
 /// Both cells are written by the respective `param_changed` listeners (cold
 /// path). A `None` result means at least one stream never negotiated or the
@@ -654,7 +649,7 @@ pub fn negotiated_rate_mismatch(rt_status: &RtStatusFlags) -> Option<(u32, u32)>
 }
 
 /// Warns when the capture and playback streams operate on discrepant
-/// negotiated sample rates (G-RB-001 / T4.3, "Sincronização de Sample Rate").
+/// negotiated sample rates.
 ///
 /// Whenever one stream renegotiates a rate that diverges from the other's
 /// currently negotiated rate, the mismatch is surfaced as a warning so the

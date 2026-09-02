@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the RAII recording worker guard and the observable join
-//! (F-RB-009 / T3.5): premature-drop cleanup, formal join-result inspection
-//! (worker error, panic, timeout) and the ordered StreamStop → sender drop
-//! → bounded join teardown.
+//! Unit tests for the RAII recording worker guard and the observable join:
+//! premature-drop cleanup, formal join-result inspection (worker error, panic,
+//! timeout) and the ordered StreamStop → sender drop → bounded join teardown.
 
 use super::*;
 use crate::recording::buffer::{
@@ -19,8 +18,7 @@ use std::time::Duration;
 /// Runs `f` with the process-wide overrun counters pinned to zero (under the
 /// test-only `OVERRUN_COUNT_LOCK` that serializes mutation of the globals), so
 /// assertions on `Success` vs `SuccessWithLoss` are deterministic regardless of
-/// parallel overrun-accounting tests in the same `--lib` binary (F-RB-024 /
-/// T5.1).
+/// parallel overrun-accounting tests in the same `--lib` binary.
 fn with_zeroed_overruns<R>(f: impl FnOnce() -> R) -> R {
     let _guard = OVERRUN_COUNT_LOCK.lock().unwrap();
     OVERRUN_COUNT.store(0, Ordering::Relaxed);
@@ -236,11 +234,10 @@ fn shutdown_pushes_stream_stop_then_drops_producer_and_joins() {
         let (sender, receiver) = create_recording_transport();
         let exit_reason = Arc::new(AtomicU8::new(0));
 
-        // Ordering contract (F-RB-009 / T3.4): StreamStop first, sender drop
-        // second, bounded join last. On an empty control channel the token lands
-        // immediately, so the worker must terminate on it (reason 1) and the join
-        // must return promptly — a join-before-drop bug would block the mock
-        // forever.
+        // Ordering contract: StreamStop first, sender drop second, bounded
+        // join last. On an empty control channel the token lands immediately,
+        // so the worker must terminate on it (reason 1) and the join must
+        // return promptly — a join-before-drop bug would block the mock forever.
         let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
         let guard = RecordingWorkerGuard::new(worker, Some(sender), None);
         let start = std::time::Instant::now();
@@ -287,9 +284,9 @@ fn shutdown_skips_stream_stop_after_failure_but_still_drops_producer() {
     });
 }
 
-/// T5.1 (F-RB-024, D1): a clean join with ring overruns counted on the capture
-/// path must surface as `SuccessWithLoss` with the exact block/frame counts —
-/// never as a pristine `Success` — and the D1 exit code must be non-zero.
+/// A clean join with ring overruns counted on the capture path must surface
+/// as `SuccessWithLoss` with the exact block/frame counts — never as a
+/// pristine `Success` — and the exit code must be non-zero.
 #[test]
 fn shutdown_reports_success_with_loss_when_overruns_were_counted() {
     with_zeroed_overruns(|| {
@@ -316,7 +313,7 @@ fn shutdown_reports_success_with_loss_when_overruns_were_counted() {
         assert_eq!(
             outcome.exit_code(),
             1,
-            "SuccessWithLoss must map to a non-zero exit (D1)"
+            "SuccessWithLoss must map to a non-zero exit"
         );
         assert_eq!(
             exit_reason.load(Ordering::Acquire),
@@ -326,8 +323,8 @@ fn shutdown_reports_success_with_loss_when_overruns_were_counted() {
     });
 }
 
-/// T5.1 (F-RB-024, D1): a clean join with zero overruns keeps `Success` — the
-/// baseline policy is unchanged and the exit code stays 0.
+/// A clean join with zero overruns keeps `Success` — the baseline policy is
+/// unchanged and the exit code stays 0.
 #[test]
 fn shutdown_with_zero_overruns_stays_success() {
     with_zeroed_overruns(|| {
@@ -346,12 +343,12 @@ fn shutdown_with_zero_overruns_stays_success() {
         assert_eq!(
             outcome.exit_code(),
             0,
-            "a lossless recording keeps exit code 0 (D1)"
+            "a lossless recording keeps exit code 0"
         );
     });
 }
 
-/// T3.5 acceptance — induced abort during host initialization must produce a
+/// Acceptance — induced abort during host initialization must produce a
 /// clean shutdown: a premature `Drop` (the equivalent of an early `?` return
 /// or a panic unwinding in `run_pipewire_host` before the explicit shutdown
 /// path) signals the worker and joins it with a bounded timeout, leaving no

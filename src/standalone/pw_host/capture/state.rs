@@ -30,12 +30,12 @@ use std::sync::atomic::AtomicU32;
 ///
 /// Owned (heap-allocated) by `run_pipewire_host` and reached from the RT
 /// callback through a raw pointer — never moved into the stream closures — so
-/// the channels survive a bounded reconnect cycle (F-RB-010 / T4.5). The
-/// `slimmable` and `oversample` consumers live in [`CaptureState`] instead
-/// (`slimmable_rx` / `os_rx`); the main thread only touches its own separate
-/// `gc_overflow` handle (an [`Arc`] clone) during the control loop, so there
-/// is never concurrent aliasing of this struct between the RT callback
-/// (exclusive `&mut`) and the main thread.
+/// the channels survive a bounded reconnect cycle. The `slimmable` and
+/// `oversample` consumers live in [`CaptureState`] instead (`slimmable_rx` /
+/// `os_rx`); the main thread only touches its own separate `gc_overflow`
+/// handle (an [`Arc`] clone) during the control loop, so there is never
+/// concurrent aliasing of this struct between the RT callback (exclusive
+/// `&mut`) and the main thread.
 pub struct RtHostChannels {
     /// CLI→DSP parameter channel consumer (gain, model, etc.).
     pub param_consumer: Consumer<ParamPayload>,
@@ -62,7 +62,7 @@ pub struct CaptureState {
     pub os_r: Box<OversampleEngine>,
     /// Active stereo-decoupled cab-sim pair (`None` = bypass, zero cost).
     /// Transported `Box`ed end-to-end (state, SPSC channel, GC) so swaps move
-    /// the same allocation without RT heap traffic (F-RB-007).
+    /// the same allocation without RT heap traffic.
     pub active_cabsim: Option<Box<CabSimPair>>,
     pub current_nam_rate: u32,
     pub resamp_mid_l: Box<[f32; MAX_RESAMP_BUF]>,
@@ -101,11 +101,11 @@ pub struct CaptureState {
     pub ir_raw_samples: Option<Vec<f32>>,
     /// Sample rate of `ir_raw_samples` (the IR file's native rate). The
     /// main-thread rebuild resamples the preserved original IR specifically
-    /// for the applied host output rate (F-RB-006 rate calibration).
+    /// for the applied host output rate.
     pub ir_source_rate: u32,
     pub slimmable_rx: Option<Consumer<Box<neural_amp_modeler_rs::common::spsc::SlimModelPair>>>,
     pub os_rx: Option<Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>>,
-    /// Deferred structural command slots (F-RB-011 / T2.5 command budgeting).
+    /// Deferred structural command slots.
     ///
     /// Each slot parks at most one structural command whose per-callback
     /// structural budget (`STRUCTURAL_SWAPS_PER_CALLBACK`, shared across all

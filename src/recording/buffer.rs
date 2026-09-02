@@ -205,7 +205,7 @@ pub enum RingPayload<const SIZE: usize> {
 }
 
 /// Control messages exchanged through the **dedicated control channel** of the
-/// promoted pool transport (T4.3).
+/// recording pool transport.
 ///
 /// The preallocated pool only carries audio; [`AudioMetadata`] and the
 /// [`StreamStop`](ControlPayload::StreamStop) token travel on a small separate
@@ -222,7 +222,7 @@ pub enum ControlPayload {
     StreamStop,
 }
 
-/// Capacity of the dedicated recording control channel (T4.3).
+/// Capacity of the dedicated recording control channel.
 ///
 /// [`ControlPayload::Metadata`] is pushed only on stream-format changes
 /// (rate renegotiations, rare) and [`ControlPayload::StreamStop`] exactly once
@@ -230,7 +230,7 @@ pub enum ControlPayload {
 /// the control-ring footprint negligible (~4 × 128 B).
 pub const CONTROL_CAPACITY: usize = 4;
 
-/// Creates the SPSC control ring for the promoted pool transport (T4.3):
+/// Creates the SPSC control ring for the pool transport:
 /// [`Metadata`](ControlPayload::Metadata) / [`StreamStop`](ControlPayload::StreamStop)
 /// only — audio goes through the preallocated pool.
 pub fn create_control_ring_buffer(
@@ -242,8 +242,8 @@ pub fn create_control_ring_buffer(
 /// Creates an SPSC (single-producer/single-consumer) ring buffer strictly dimensioned
 /// for `RingPayload` structures. The `capacity` parameter defines the number of slots.
 ///
-/// This is the T4.1 **inline** transport constructor — the rollback path of
-/// T4.3. Production wiring uses [`crate::recording::transport::create_recording_transport`].
+/// This is the legacy inline ring transport constructor maintained as an alternative
+/// rollback path. Production wiring uses [`crate::recording::transport::create_recording_transport`].
 pub fn create_audio_ring_buffer<const BLOCK_SIZE: usize>(
     capacity: usize,
 ) -> (
@@ -351,7 +351,7 @@ mod tests {
         );
     }
 
-    /// T4.1 memory-impact contract: the slot must hold the largest legal host
+    /// Memory-impact contract: the slot must hold the largest legal host
     /// quantum (8192 frames = `MAX_BRIDGE_BUF` × 2 interleaved channels) and
     /// the reduced `RING_CAPACITY` must keep the total footprint at the same
     /// ~16 MiB budget as the previous 1024 × 16 KiB layout.
@@ -367,8 +367,8 @@ mod tests {
         assert_eq!(MAX_BLOCK_SIZE % 2, 0);
         let slot = std::mem::size_of::<RingPayload<MAX_BLOCK_SIZE>>();
         let footprint = slot * RING_CAPACITY;
-        // Medido: slot=65664 B → footprint = 256 × 65664 ≈ 16,8 MiB
-        // (was 1024 × 16640 ≈ 16,3 MiB with MAX_BLOCK_SIZE=4096).
+        // Measured: slot=65664 B → footprint = 256 × 65664 ≈ 16.8 MiB
+        // (was 1024 × 16640 ≈ 16.3 MiB with MAX_BLOCK_SIZE=4096).
         assert!(
             footprint <= 18 * 1024 * 1024,
             "ring footprint exceeded the 16 MiB budget: {footprint} bytes"
@@ -398,7 +398,7 @@ mod tests {
         /// Property: for any input slices `left`/`right`, `fill_planar` publishes
         /// exactly `n = min(len(L), len(R), SIZE/2)` stereo frames, keeping
         /// `valid_len` even, bounded by `SIZE`, and bit-identical to the copied
-        /// inputs — the F-RB-001 soundness invariant.
+        /// inputs — preserving planar sound consistency.
         #[test]
         fn fill_planar_preserves_invariants(
             left in proptest::collection::vec(any::<f32>(), 0..(MAX_BLOCK_SIZE / 2 + 16)),

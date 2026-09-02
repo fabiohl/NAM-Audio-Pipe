@@ -4,7 +4,7 @@
 //! 5.1.1. Resampler Draining (Zero-Alloc Swap)
 //! Replaces resamplers without using memory allocation in the critical path.
 //!
-//! Budgeting (F-RB-011 / T2.5): at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
+//! Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
 //! structural swap applies per callback (budget shared across every RT swap
 //! drain); current-generation envelopes in the coalescing window collapse to
 //! the latest one (intermediate envelopes discarded to GC) and the excess is
@@ -24,8 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 5.1.1. Resampler Draining (Zero-Alloc Swap)
 /// Replaces resamplers without using memory allocation in the critical path.
 ///
-/// Versioned delivery (F-RB-004): each envelope carries the request generation
-/// it was built for. An envelope whose generation still equals
+/// Versioned delivery: each envelope carries the request generation it was
+/// built for. An envelope whose generation still equals
 /// `requested_rate_generation` is current and is installed (the previous
 /// resampler cascades to GC). An envelope whose generation is older has been
 /// superseded by a newer host renegotiation — it goes straight to the GC
@@ -58,8 +58,8 @@ pub fn drain_resamplers(
             .peek()
             .is_ok_and(|head| head.generation == current_req_gen);
         if pending.generation != current_req_gen {
-            // Stale while parked (F-RB-004): discard to GC without unmuting and
-            // without clearing RESAMP_SWAP_PENDING.
+            // Stale while parked: discard to GC without unmuting and without
+            // clearing RESAMP_SWAP_PENDING.
             discard_resampler(
                 pending,
                 gc_producer,
@@ -104,7 +104,7 @@ pub fn drain_resamplers(
         }
     }
 
-    // Phase 1 — bounded drain with coalescing (F-RB-011 / T2.5).
+    // Phase 1 — bounded drain with coalescing.
     let current_req_gen = rt_status_for_process
         .requested_rate_generation
         .load(Ordering::Acquire);
@@ -116,9 +116,9 @@ pub fn drain_resamplers(
         };
         pops += 1;
         if payload.generation != current_req_gen {
-            // Stale envelope (F-RB-004): the host renegotiated the clock while
-            // this resampler was being built. Discard it for GC without
-            // unmuting and without clearing RESAMP_SWAP_PENDING.
+            // Stale envelope: the host renegotiated the clock while this
+            // resampler was being built. Discard it for GC without unmuting and
+            // without clearing RESAMP_SWAP_PENDING.
             discard_resampler(
                 payload,
                 gc_producer,

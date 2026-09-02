@@ -95,10 +95,7 @@ fn test_parse_args_fail_fast_defaults_to_disabled() {
     let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
-    assert!(
-        !cli_args.fail_fast,
-        "reconnect must be enabled by default (F-RB-010 / T4.5)"
-    );
+    assert!(!cli_args.fail_fast, "reconnect must be enabled by default");
 }
 
 #[test]
@@ -170,7 +167,7 @@ fn test_parse_args_gate_invalid_value_exits() {
     assert_eq!(parse_gate_mode("oFf"), Ok(GateMode::Off));
 }
 
-// --buffer-size domain contract (G-RB-003 / T6.1) -------------------------
+// --buffer-size domain contract -------------------------------------------
 
 #[test]
 fn buffer_size_domain_constants_document_the_contract() {

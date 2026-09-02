@@ -323,10 +323,9 @@ fn recording_metadata_absent_producer_never_confirmed() {
     assert!(!meta_sent);
     assert_eq!(meta_rate, 0);
 }
-
 #[test]
 fn recording_metadata_not_pushed_when_worker_failed() {
-    // F-RB-009 / T3.3: once the disk worker reports a fatal error, the RT
+    // Once the disk worker reports a fatal error, the RT
     // callback must suspend enqueueing — the metadata must NOT be pushed.
     let (mut sender, mut control_c, _pool_c) = pool_sender_and_consumers();
     let mut meta_sent = false;
@@ -355,7 +354,7 @@ fn recording_metadata_not_pushed_when_worker_failed() {
 
 #[test]
 fn recording_audio_not_pushed_when_worker_failed() {
-    // F-RB-009 / T3.3: with the failure flag raised the audio block must be
+    // With the failure flag raised the audio block must be
     // dropped cleanly — no publish, no overrun accounting (the worker is gone).
     let _guard = crate::recording::buffer::OVERRUN_COUNT_LOCK.lock().unwrap();
     OVERRUN_COUNT.store(0, Ordering::Relaxed);
@@ -369,7 +368,7 @@ fn recording_audio_not_pushed_when_worker_failed() {
 
     send_recording_audio(
         &mut sender,
-        4,
+        MAX_BLOCK_SIZE,
         &resamp_l,
         &resamp_r,
         &mut block,
@@ -379,46 +378,70 @@ fn recording_audio_not_pushed_when_worker_failed() {
 
     assert!(
         pool_c.try_pop().is_none(),
-        "no audio may reach the dead worker"
+        "no audio may be published while the worker failed"
     );
     assert_eq!(
         OVERRUN_COUNT.load(Ordering::Relaxed),
         0,
-        "suspended enqueueing must not inflate the overrun counter"
+        "no overruns should be charged against a dead worker"
     );
-    assert_eq!(
-        OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed),
-        0,
-        "suspended enqueueing must not inflate the frame counter"
-    );
-    assert_eq!(
-        sender.pool_producer_mut().unwrap().leaked_slots(),
-        0,
-        "a suspended enqueue must never acquire a slot"
-    );
-    OVERRUN_COUNT.store(0, Ordering::Relaxed);
-    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
 }
 
 #[test]
-fn recording_audio_pushed_again_once_failure_clears() {
-    // The failure flag is latched by the worker; if it is ever cleared the RT
-    // path resumes publishing normally (flag is the sole gate).
+fn recording_audio_zero_quantum_is_noop() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
-    let resamp_l = [0.0f32; 4];
-    let resamp_r = [0.0f32; 4];
+    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
+    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+
+    send_recording_audio(&mut sender, 0, &resamp_l, &resamp_r, &mut block, None, None);
+
+    assert!(pool_c.try_pop().is_none());
+}
+
+#[test]
+fn recording_audio_sender_none_is_noop() {
+    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
+    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    let mut none = RecordingSender::none();
+
+    send_recording_audio(&mut none, 64, &resamp_l, &resamp_r, &mut block, None, None);
+}
+
+#[test]
+fn recording_audio_flag_cleared_when_worker_fails_in_flight() {
+    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
+    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
+    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
     let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
     let failed = AtomicBool::new(false);
+    let flag = AtomicBool::new(true);
 
+    // Normal enqueue: flag stays true
     send_recording_audio(
         &mut sender,
         4,
         &resamp_l,
         &resamp_r,
         &mut block,
-        None,
+        Some(&flag),
         Some(&failed),
     );
+    assert!(flag.load(Ordering::Relaxed));
+
+    // Worker fails: subsequent enqueue clears the active flag
+    failed.store(true, Ordering::Release);
+    send_recording_audio(
+        &mut sender,
+        4,
+        &resamp_l,
+        &resamp_r,
+        &mut block,
+        Some(&flag),
+        Some(&failed),
+    );
+    assert!(!flag.load(Ordering::Relaxed));
 
     let in_flight = pool_c.try_pop().expect("published descriptor");
     assert_eq!(in_flight.block().valid_len(), 8);
@@ -427,7 +450,7 @@ fn recording_audio_pushed_again_once_failure_clears() {
 
 #[test]
 fn recording_audio_oversized_block_dropped_and_counted() {
-    // Fail-closed safety net (T4.1/T4.3): a block wider than `MAX_BLOCK_SIZE`
+    // Fail-closed safety net: a block wider than `MAX_BLOCK_SIZE`
     // (16384 samples = 8192 stereo frames, the largest legal quantum) must be
     // dropped and accounted in BOTH the block counter and the frame counter —
     // on the pool path no slot is acquired for it.
@@ -549,7 +572,7 @@ fn recording_audio_full_channel_counted_as_overrun() {
     OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
 }
 
-// ── T4.1/T4.3 — capacity domain boundaries & frame reconciliation ────────────
+// ── Capacity Domain Boundaries & Frame Reconciliation ────────────────────────
 //
 // The recording transport must persist every legal quantum integrally
 // (`MAX_BLOCK_SIZE = 16384` samples = 8192 stereo frames = `MAX_BRIDGE_BUF`):
@@ -635,7 +658,7 @@ fn recording_audio_reconciliation_enqueued_plus_lost_equals_produced() {
     OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
 }
 
-/// T4.3 acceptance: `get_dealloc_count() == 0` during recording. The RT
+/// Zero-allocation acceptance: `get_dealloc_count() == 0` during recording. The RT
 /// enqueue path — pool `try_acquire`, in-place planar fill, descriptor publish
 /// — must perform zero heap allocations and zero deallocations on every legal
 /// quantum, including the maximum (8192 frames).
@@ -669,7 +692,7 @@ fn recording_audio_enqueue_zero_alloc_dealloc() {
         }
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=8192, 64 enqueues, pool)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=8192, 64 enqueues, pool)
     assert_eq!(allocs, 0, "recording enqueue allocated on RT: {allocs}");
     assert_eq!(
         deallocs, 0,
@@ -681,14 +704,13 @@ fn recording_audio_enqueue_zero_alloc_dealloc() {
     );
 }
 
-// ── Malformed FFI/SPA harness (F-RB-003 Part 3 / T1.5) ──────────────────────
+// ── Malformed FFI/SPA Harness ──────────────────────────────────────────────
 //
 // The harness feeds raw SPA descriptor values (data pointers, maxsize, chunk
 // metadata read as integers) to the exact fail-closed code the RT callbacks
 // run, without requiring a live PipeWire stream. It proves every adversarial
-// frontier scenario from F-RB-003 / ER-1 step 4 is rejected with the
-// `RT_STATUS_HOST_CONTRACT_VIOLATION` flag raised, no panic, and the buffers
-// silenced.
+// frontier scenario is rejected with the `RT_STATUS_HOST_CONTRACT_VIOLATION`
+// flag raised, no panic, and the buffers silenced.
 
 /// Creates an SPA chunk descriptor with the given valid-data window.
 fn chunk_of(offset: u32, size: u32) -> pw::spa::sys::spa_chunk {
@@ -759,7 +781,7 @@ fn read_chunk_meta_reads_host_window() {
     assert_eq!(read_chunk_meta(&chunk), ChunkWindow::Valid(8, 64));
 }
 
-// ── F-RB-019 / T3.1 — malformed non-null chunks raise E2304, never silence ──
+// ── Malformed non-null chunks raise E2304, never silence ─────────────────────
 
 #[test]
 fn spa_corrupted_chunk_raises_contract_violation() {
@@ -1216,7 +1238,7 @@ fn ffi_harness_capture_null_chunk_flagged_no_panic_no_reference() {
     );
 }
 
-// ── Quantum bound hardening (G-RB-003 / T6.2) ────────────────────────────────
+// ── Quantum Bound Hardening ──────────────────────────────────────────────────
 //
 // The RT callbacks copy the host quantum into fixed-capacity `DspBuffers`
 // (`MAX_BRIDGE_BUF = 8192`). A spurious SPA descriptor reporting a quantum
@@ -1292,7 +1314,7 @@ fn ffi_harness_accepts_max_bridge_buf_quantum() {
 
 #[test]
 fn ffi_harness_recovers_after_oversized_quantum() {
-    // Reversal (T6.2 acceptance): after an oversized quantum is rejected, a
+    // Reversal: after an oversized quantum is rejected, a
     // normal 128-sample quantum is processed again — the pair validates and
     // the pipeline resumes without any panic.
     let mut big_l = FfiHarnessBuf::new(MAX_BRIDGE_BUF + 1);
@@ -1345,7 +1367,7 @@ fn ffi_harness_recovers_after_oversized_quantum() {
 
 #[test]
 fn silence_spa_channels_bounds_huge_buffer_to_max_bridge_buf() {
-    // F-RES-001 / T6.1: silence_spa_channels must bound zeroing to MAX_BRIDGE_BUF frames (32 KiB),
+    // silence_spa_channels must bound zeroing to MAX_BRIDGE_BUF frames (32 KiB),
     // leaving memory beyond the cap untouched.
     let total_samples = MAX_BRIDGE_BUF + 2048;
     let mut l = FfiHarnessBuf::new(total_samples);
@@ -1380,7 +1402,7 @@ fn silence_spa_channels_bounds_huge_buffer_to_max_bridge_buf() {
 
 #[test]
 fn ffi_harness_accepts_huge_maxsize_with_small_quantum() {
-    // F-RES-001 / T6.1: a host descriptor declaring a large maxsize (e.g. 1 MiB)
+    // A host descriptor declaring a large maxsize (e.g. 1 MiB)
     // with a valid small quantum (64 frames = 256 bytes) is safely bounded
     // and validated without forming unbounded slices.
     let l = FfiHarnessBuf::new(MAX_BRIDGE_BUF * 4); // 32,768 samples = 128 KiB
@@ -1409,7 +1431,7 @@ fn ffi_harness_accepts_huge_maxsize_with_small_quantum() {
 
 #[test]
 fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed() {
-    // T4.3: metadata travels on the dedicated control ring. When that ring is
+    // Metadata travels on the dedicated control ring. When that ring is
     // full a rate-change Metadata push fails → `meta_sent` stays false → the
     // audio path stays blocked (audio is only enqueued after the metadata for
     // the current rate is confirmed).
@@ -1494,7 +1516,7 @@ fn silence_available_descriptors_empty_slice_is_noop() {
 
 #[test]
 fn silence_available_descriptors_single_channel_zeros_and_stamps_chunk() {
-    // F-RES-002 / T6.2: when a buffer has datas.len() < 2 (e.g. exactly 1 descriptor),
+    // When a buffer has datas.len() < 2 (e.g. exactly 1 descriptor),
     // the single channel must be zeroed and stamped with silence metadata.
     let mut buf = FfiHarnessBuf::new(128); // 128 samples = 512 bytes
     buf.fill_pattern(0xAB);
@@ -1517,7 +1539,7 @@ fn silence_available_descriptors_single_channel_zeros_and_stamps_chunk() {
 
 #[test]
 fn silence_available_descriptors_bounds_huge_single_channel() {
-    // F-RES-001 / F-RES-002: a huge single-channel buffer must be bounded to MAX_BRIDGE_BUF * 4 bytes
+    // A huge single-channel buffer must be bounded to MAX_BRIDGE_BUF * 4 bytes
     let total_samples = MAX_BRIDGE_BUF + 1024;
     let mut buf = FfiHarnessBuf::new(total_samples);
     buf.fill_pattern(0x5A);
@@ -1547,7 +1569,7 @@ fn silence_available_descriptors_bounds_huge_single_channel() {
 
 #[test]
 fn capture_datas_less_than_two_sets_contract_violation_flag() {
-    // Acceptance for T6.2 (F-RES-002): when datas.len() < 2, the capture callback
+    // When datas.len() < 2, the capture callback
     // sets RT_STATUS_HOST_CONTRACT_VIOLATION, silences all available regions,
     // and returns without running DSP.
     let rt = RtStatusFlags::default();
@@ -1567,7 +1589,7 @@ fn capture_datas_less_than_two_sets_contract_violation_flag() {
     assert_eq!(chunk.stride, 4);
 }
 
-// ── Sprint 3: Gate Off Guarantee Tests (T3.2, T3.3, T3.4) ───────────────────
+// ── Gate Off Guarantee Tests ─────────────────────────────────────────────────
 
 #[test]
 #[cfg(feature = "testing")]

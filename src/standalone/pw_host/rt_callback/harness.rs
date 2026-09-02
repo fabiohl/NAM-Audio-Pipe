@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(target_arch = "x86_64")]
 
-//! Offline RT swap-stress harness (T2.6 / ER-2).
+//! Offline RT swap-stress harness.
 //!
 //! `RtSwapHarness` reproduces, with no PipeWire daemon, the exact drain
 //! sequence the capture `process()` callback executes (mirror of
@@ -25,8 +25,8 @@
 //! thread does in production; `run_callback` then drains them inside a single
 //! audio quantum, exactly as the RT thread does.
 //!
-//! Since T5.3 (G-PERF-004) the harness is **splittable** into its two
-//! production faces via [`RtSwapHarness::into_parts`]:
+//! The harness is **splittable** into its two production faces via
+//! [`RtSwapHarness::into_parts`]:
 //!
 //! - [`SwapProducer`] — the main-thread producer face (the SPSC writers plus
 //!   the shared rate signal). It counts every push (`attempted`/`enqueued`/
@@ -36,10 +36,9 @@
 //!   bridge). Its `run_callback_accounted` returns the per-quantum swap
 //!   accounting (`applied`/`pops`/`commands_remaining`).
 //!
-//! This is the substrate for the T2.6 concurrency/soak and zero-allocation
-//! heap-audit gates (ER-2) and for the T5.3 production-SPSC throughput
-//! measurement (no global mutex on the measured path). It is compiled only
-//! under `feature = "testing"`.
+//! This is the substrate for concurrency/soak and zero-allocation heap-audit
+//! gates and for production-SPSC throughput measurement (no global mutex on the
+//! measured path). It is compiled only under `feature = "testing"`.
 
 use crate::standalone::pw_host::capture::state::CaptureState;
 use crate::standalone::pw_host::rt_callback::{
@@ -73,18 +72,18 @@ const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
 
 /// Per-quantum swap accounting returned by [`SwapRtSide::run_callback_accounted`].
 ///
-/// T5.3 (G-PERF-004): the concurrency-throughput harness records, per callback,
-/// how many structural swaps were actually applied, how many payloads the
-/// drains consumed (param vs structural channels) and how many commands are
-/// still queued/parked after the quantum — the "contabilidade completa de
-/// swaps" the acceptance requires. The producer-side attempt counters
-/// (`attempted`/`enqueued`/`dropped`) live in [`SwapProducer`].
+/// The concurrency-throughput harness records, per callback, how many
+/// structural swaps were actually applied, how many payloads the drains
+/// consumed (param vs structural channels) and how many commands are still
+/// queued/parked after the quantum — the full swap accounting required by the
+/// contract. The producer-side attempt counters (`attempted`/`enqueued`/`dropped`)
+/// live in [`SwapProducer`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CallbackAccounting {
     /// Valid output frames produced by the DSP pipeline (`0` when the quantum
     /// was skipped, e.g. a resampler swap is pending).
     pub n_pw: usize,
-    /// Structural swaps installed during this quantum (shared F-RB-011 budget).
+    /// Structural swaps installed during this quantum (shared structural budget).
     pub structural_applied: usize,
     /// `ParamPayload` payloads popped from the param SPSC this quantum.
     pub param_pops: usize,
@@ -99,7 +98,7 @@ pub struct CallbackAccounting {
 
 /// Main-thread producer face of the swap harness (production SPSC writers).
 ///
-/// T5.3: this handle is movable to a separate producer thread with **no global
+/// This handle is movable to a separate producer thread with **no global
 /// mutex** — it mirrors the production single-writer main thread, pushing
 /// commands through the same bounded ring buffers the real `process()`
 /// callback drains. Every push is counted (`attempted`/`enqueued`/`dropped`)
@@ -167,7 +166,7 @@ impl SwapProducer {
         self.count_push(result);
     }
 
-    /// Pushes an atomic slimmable L/R pair (F-RB-005).
+    /// Pushes an atomic slimmable L/R pair.
     pub fn push_slimmable(
         &mut self,
         generation: u64,
@@ -175,17 +174,22 @@ impl SwapProducer {
         l: Box<StaticModel>,
         r: Option<Box<StaticModel>>,
     ) {
-        let result = self.slimmable_producer.push(Box::new(SlimModelPair {
+        let pair = Box::new(SlimModelPair {
             generation,
             channels,
             l: Some(l),
             r,
-        }));
-        self.count_push(result);
+        });
+        self.attempted.fetch_add(1, Ordering::Relaxed);
+        if self.slimmable_producer.push(pair).is_ok() {
+            self.enqueued.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Pushes a cab-sim pair with current requested_cabsim_generation; `None`
-    /// clears/bypasses the cab-sim (F-RB-007).
+    /// clears/bypasses the cab-sim.
     pub fn push_cabsim(&mut self, pair: Option<Box<CabSimPair>>) {
         let generation = self
             .rt_status
@@ -302,7 +306,7 @@ impl SwapRtSide {
     ///
     /// This is the plain quantum used by the RT measurement gates (deadline,
     /// jitter, soak, endurance): the instruction profile mirrors the real
-    /// callback exactly — no accounting reads (T5.3). Use
+    /// callback exactly — no accounting reads. Use
     /// [`Self::run_callback_accounted`] only where the per-quantum swap
     /// accounting is actually consumed.
     ///
@@ -326,7 +330,7 @@ impl SwapRtSide {
             }
         }
 
-        // 2. Command budgeting (F-RB-011 / T2.5): shared structural budget.
+        // 2. Command budgeting: shared structural budget.
         let mut structural_applied = 0usize;
 
         // 3. Budgeted drains in production order.
@@ -427,7 +431,7 @@ impl SwapRtSide {
             );
         }
 
-        // 6. Fail-open rollback guard (F-RB-004).
+        // 6. Fail-open rollback guard.
         if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
         {
             let failed_gen = rt_status
@@ -447,7 +451,7 @@ impl SwapRtSide {
             } else {
                 // The quantum was skipped: no output was produced. Publish the
                 // skip through `last_n_pw = 0` so `current_n_pw()`/`out_l()`
-                // reflect the skip and zero-frame sentinels (T5.3) fire instead
+                // reflect the skip and zero-frame sentinels fire instead
                 // of exposing stale pre-swap output.
                 self.last_n_pw = 0;
                 return 0;
@@ -462,7 +466,7 @@ impl SwapRtSide {
     }
 
     /// Same quantum as [`Self::run_callback`] but also returns the per-quantum
-    /// swap accounting (T5.3 / G-PERF-004). The drains run in the exact
+    /// swap accounting. The drains run in the exact
     /// production order; `structural_pops` is the ring-pop lower bound across
     /// the four structural channels, `param_pops` is the exact scalar pops.
     ///
@@ -494,7 +498,7 @@ impl SwapRtSide {
             }
         }
 
-        // 2. Command budgeting (F-RB-011 / T2.5): shared structural budget.
+        // 2. Command budgeting: shared structural budget.
         let mut structural_applied = 0usize;
 
         // 3. Budgeted drains in production order. Ring-pop accounting is
@@ -605,7 +609,7 @@ impl SwapRtSide {
             );
         }
 
-        // 6. Fail-open rollback guard (F-RB-004).
+        // 6. Fail-open rollback guard.
         if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
         {
             let failed_gen = rt_status
@@ -625,7 +629,7 @@ impl SwapRtSide {
             } else {
                 // The quantum was skipped: publish the skip through
                 // `last_n_pw = 0` so `current_n_pw()`/`out_l()` reflect it and
-                // zero-frame sentinels (T5.3) fire instead of exposing stale
+                // zero-frame sentinels fire instead of exposing stale
                 // pre-swap output.
                 self.last_n_pw = 0;
                 return CallbackAccounting {
@@ -853,7 +857,7 @@ impl SwapRtSide {
 /// Offline RT swap-stress harness — full drain sequence + DSP in one quantum.
 ///
 /// Thin wrapper over the two production faces ([`SwapProducer`] + [`SwapRtSide`]).
-/// All pre-T5.3 callers keep the single-handle API; concurrency-throughput
+/// Single-threaded callers keep the single-handle API; concurrency-throughput
 /// tests split it via [`RtSwapHarness::into_parts`] to remove the global mutex
 /// from the measured path.
 pub struct RtSwapHarness {
@@ -927,7 +931,7 @@ impl RtSwapHarness {
         Self::new_with_gate(host_rate, nam_rate, true)
     }
 
-    /// Splits the harness into its two production faces (T5.3 / G-PERF-004).
+    /// Splits the harness into its two production faces.
     ///
     /// The producer face moves to the main-thread side (single writer, exact
     /// production SPSC protocol); the RT side is exclusively owned by the audio
@@ -971,7 +975,7 @@ impl RtSwapHarness {
         self.producer.push_gate(params);
     }
 
-    /// Pushes an atomic slimmable L/R pair (F-RB-005).
+    /// Pushes an atomic slimmable L/R pair.
     pub fn push_slimmable(
         &mut self,
         generation: u64,
@@ -982,7 +986,7 @@ impl RtSwapHarness {
         self.producer.push_slimmable(generation, channels, l, r);
     }
 
-    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None` clears/bypasses the cab-sim (F-RB-007).
+    /// Pushes a cab-sim pair with current requested_cabsim_generation; `None` clears/bypasses the cab-sim.
     pub fn push_cabsim(&mut self, pair: Option<Box<CabSimPair>>) {
         self.producer.push_cabsim(pair);
     }

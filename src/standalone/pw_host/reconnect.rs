@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Bounded reconnect policy and recovery cycle (F-RB-010 / T4.5).
+//! Bounded reconnect policy and recovery cycle.
 //!
 //! When the PipeWire daemon is restarted by the package manager, by the user
 //! (`systemctl --user restart pipewire`) or by a USB interface reconnect, the
@@ -21,8 +21,8 @@
 //!
 //! The invariant is: **attempts are strictly bounded in number and time** — no
 //! infinite reconnect loop can exist by construction. When the budget is
-//! exhausted the host falls back to the fail-fast teardown path established in
-//! [T4.4], finalizing recordings on disk and exiting with a non-zero status.
+//! exhausted the host falls back to the fail-fast teardown path,
+//! finalizing recordings on disk and exiting with a non-zero status.
 
 use std::time::Duration;
 
@@ -33,12 +33,12 @@ pub const PRODUCTION_INITIAL_BACKOFF_MS: u64 = 250;
 /// Production default: exponential-backoff ceiling (ms).
 pub const PRODUCTION_MAX_BACKOFF_MS: u64 = 1000;
 
-/// Configurable bounded-reconnect policy (F-RB-010 / T4.5).
+/// Configurable bounded-reconnect policy.
 ///
 /// Reconnect is enabled by default with a conservative budget. It is disabled
 /// when `--fail-fast` is present on the CLI or when running in a unit-test
-/// environment, in which case the first backend failure triggers the T4.4
-/// fail-fast teardown immediately.
+/// environment, in which case the first backend failure triggers observable
+/// teardown immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectPolicy {
     /// Maximum number of reconnect attempts per session (`0` = no retries).
@@ -71,7 +71,7 @@ impl ReconnectPolicy {
 
     /// Fail-fast policy: reconnection disabled (`--fail-fast` on the CLI, or
     /// unit-test environment). The first backend failure immediately triggers
-    /// the T4.4 observable teardown with a non-zero exit code.
+    /// observable teardown with a non-zero exit code.
     pub fn fail_fast() -> Self {
         Self {
             max_attempts: 0,
@@ -119,13 +119,13 @@ impl ReconnectPolicy {
     }
 }
 
-/// Bounded reconnect-cycle state machine (F-RB-010 / T4.5).
+/// Bounded reconnect-cycle state machine.
 ///
 /// The control loop in `run.rs` owns one [`ReconnectCycle`] per host session
 /// and consults it after every backend failure. [`ReconnectCycle::begin_attempt`]
 /// returns the backoff to wait before the next stream re-instantiation, and
 /// returns `None` once the policy budget is exhausted — at which point the
-/// caller must fall back to the T4.4 fail-fast path. The budget is never
+/// caller must fall back to the fail-fast path. The budget is never
 /// reset: a session performs at most `max_attempts` reconnects total, so the
 /// recovery phase is strictly bounded in number and time by construction.
 #[derive(Debug, Clone)]
@@ -160,7 +160,7 @@ impl ReconnectCycle {
 
     /// Starts one reconnect attempt: returns the backoff to wait **before**
     /// re-instantiating the streams, or `None` when the bounded budget is
-    /// exhausted (caller must fail fast via T4.4).
+    /// exhausted (caller must fail fast).
     ///
     /// Each call atomically consumes one slot of the budget; consecutive
     /// calls return monotonically non-decreasing backoffs until `max_attempts`

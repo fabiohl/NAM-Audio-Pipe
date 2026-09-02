@@ -34,12 +34,12 @@ pub fn sync_rate(
     }
 
     if requires_rebuild && host_rate_to_request != 0 {
-        // F-RB-004: publish the requested rates FIRST, then increment the
-        // generation with Release. The main thread captures the generation
-        // with Acquire, which orders these rate stores into its build
-        // snapshot; a renegotiation arriving during a rebuild bumps the
-        // generation again, so a stale envelope can be detected by the RT
-        // drain and discarded without unmuting.
+        // Rate renegotiation synchronization: publish the requested rates
+        // FIRST, then increment the generation with Release. The main thread
+        // captures the generation with Acquire, which orders these rate stores
+        // into its build snapshot; a renegotiation arriving during a rebuild
+        // bumps the generation again, so a stale envelope can be detected by
+        // the RT drain and discarded without unmuting.
         rt_status_for_process
             .requested_host_rate
             .store(host_rate_to_request, Ordering::Relaxed);

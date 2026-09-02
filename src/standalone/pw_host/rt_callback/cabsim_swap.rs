@@ -5,7 +5,7 @@
 //! Replaces the active stereo-decoupled convolution pair without using memory
 //! allocation in the critical path.
 //!
-//! Budgeting (F-RB-011 / T2.5): at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
+//! Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
 //! structural swap applies per callback (budget shared across every RT swap
 //! drain); pairs in the coalescing window collapse to the latest one
 //! (intermediate pairs discarded to GC) and the excess is parked in the
@@ -101,7 +101,7 @@ pub fn drain_cabsims(
         }
     }
 
-    // Phase 1 — bounded drain with coalescing (F-RB-011 / T2.5).
+    // Phase 1 — bounded drain with coalescing.
     let mut candidate: Option<Box<CabSimSwapPayload>> = None;
     let mut pops = 0usize;
     while pops < STRUCTURAL_POPS_PER_CALLBACK {
@@ -183,7 +183,7 @@ pub fn drain_cabsims(
 
 /// Installs a cab-sim command atomically: the active pair (or bypass) is
 /// swapped into the payload envelope, the applied generation counter is updated,
-/// and the retired envelope cascades to GC as a single moved `Box` (F-RB-007).
+/// and the retired envelope cascades to GC as a single moved `Box`.
 #[inline(always)]
 fn install_cabsim(
     mut payload: Box<CabSimSwapPayload>,
@@ -209,7 +209,7 @@ fn install_cabsim(
     );
 }
 
-/// Discards an obsolete cab-sim command to the GC cascade as a single moved `Box` (F-RB-007).
+/// Discards an obsolete cab-sim command to the GC cascade as a single moved `Box`.
 #[inline(always)]
 fn discard_cabsim(
     payload: Box<CabSimSwapPayload>,

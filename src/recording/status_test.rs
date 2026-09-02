@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the recording startup handshake and failure propagation
-//! (F-RB-009 / T3.3): the observable status state machine, the atomic
-//! RT-suspending failure flag, and the main-thread handshake waiter with its
-//! timeout / vanished-worker / reported-failure verdicts.
+//! Unit tests for the recording startup handshake and failure propagation:
+//! the observable status state machine, the atomic RT-suspending failure flag,
+//! and the main-thread handshake waiter with its timeout / vanished-worker /
+//! reported-failure verdicts.
 
 use super::*;
 use std::path::PathBuf;

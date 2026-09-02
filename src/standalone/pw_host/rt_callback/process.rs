@@ -26,11 +26,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// the caller subsequently reinterprets the region as `&mut [f32]` (an
 /// unaligned `f32` slice is undefined behavior).
 ///
-/// Fail-closed quantum bound (G-RB-003 / T6.2): the valid frame count
-/// `size / stride` must not exceed [`MAX_BRIDGE_BUF`]. A spurious SPA
-/// descriptor with an oversized quantum is rejected here — before any access
-/// to the fixed-capacity `DspBuffers` — so `capture_dsp_pipeline` can never
-/// panic on an out-of-bounds copy inside the RT callback.
+/// Fail-closed quantum bound: the valid frame count `size / stride` must not
+/// exceed [`MAX_BRIDGE_BUF`]. A spurious SPA descriptor with an oversized
+/// quantum is rejected here — before any access to the fixed-capacity `DspBuffers` —
+/// so `capture_dsp_pipeline` can never panic on an out-of-bounds copy inside
+/// the RT callback.
 #[inline(always)]
 pub(crate) fn check_ffi_contract(raw: &[u8], offset: usize, size: usize) -> Option<(usize, usize)> {
     let align = std::mem::align_of::<f32>();
@@ -100,7 +100,7 @@ pub(crate) fn check_spa_buffer_pair(
 }
 
 /// Silences both SPA data regions after a contract violation, bounded to at most
-/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes) (F-RES-001 / T6.1).
+/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
 ///
 /// Uses raw pointer writes instead of forming `&mut` slices, so even when the
 /// Left/Right descriptors alias the same (or overlapping) memory the zeroing
@@ -112,7 +112,7 @@ pub(crate) fn check_spa_buffer_pair(
 /// (e.g. 1 MiB or malformed integer), zeroing never touches memory beyond
 /// `MAX_BRIDGE_BUF` frames (32,768 bytes), preserving RT deadlines in the fail-closed path.
 ///
-/// Medido: zeroing bounded a 32 KiB em fail-closed executa em ~0.4µs (< 0.15% do quantum de 333µs a 48kHz).
+/// Measured: bounded zeroing to 32 KiB in fail-closed executes in ~0.4µs (< 0.15% of 333µs quantum at 48kHz).
 #[inline(always)]
 pub(crate) fn silence_spa_channels(ptr_l: usize, max_l: usize, ptr_r: usize, max_r: usize) {
     let align = std::mem::align_of::<f32>();
@@ -133,7 +133,7 @@ pub(crate) fn silence_spa_channels(ptr_l: usize, max_l: usize, ptr_r: usize, max
     }
 }
 /// Silences every present SPA data descriptor, strictly bounded to at most
-/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes) (F-RES-001 / T6.1).
+/// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
 ///
 /// Pure descriptor kernel for zeroing available data regions, mockable by harness tests.
 #[cfg(test)]
@@ -173,9 +173,9 @@ pub(crate) fn silence_available_descriptors(
 }
 
 /// Silences every present SPA data region of a malformed stereo buffer, bounded
-/// to at most [`MAX_BRIDGE_BUF`] frames per channel (F-RES-001 / T6.1, F-RES-002 / T6.2).
+/// to at most [`MAX_BRIDGE_BUF`] frames per channel.
 ///
-/// Fail-closed guarantee (T4.2 / F-RES-002): a buffer handed back to the PipeWire graph
+/// Fail-closed guarantee: a buffer handed back to the PipeWire graph
 /// must never carry audio content that was not written by this callback. When
 /// the host violates the negotiated stereo contract (`datas.len() < 2`) on either capture
 /// or playback, no stereo pair can be validated, so every region present is zeroed via raw
@@ -221,9 +221,9 @@ pub(crate) fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
 
 /// Verdict of reading an SPA chunk's valid-data window.
 ///
-/// F-RB-019 / T3.1: the capture path must distinguish "no data published"
-/// (legitimate) from "non-null chunk with malformed metadata" (a real host
-/// contract violation that must raise `E2304` — never silent `(0, 0)`).
+/// The capture path must distinguish "no data published" (legitimate) from
+/// "non-null chunk with malformed metadata" (a real host contract violation
+/// that must raise `E2304` — never silent `(0, 0)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkWindow {
     /// Host-declared valid window `(offset, size)`.
@@ -231,7 +231,7 @@ pub(crate) enum ChunkWindow {
     /// Chunk pointer is null or misaligned — no descriptor to read. The
     /// consolidated fail-closed harness still rejects the pair via its own
     /// chunk-null/alignment proof (`E2304`), so the observable behavior is
-    /// unchanged from the pre-T3.1 capture path.
+    /// unchanged from the original capture path.
     Absent,
     /// Non-null chunk whose `stride` is not `sizeof(f32)` or whose
     /// `SPA_CHUNK_FLAG_CORRUPTED` bit is set. A genuine host contract
@@ -246,7 +246,7 @@ pub(crate) enum ChunkWindow {
 /// - [`ChunkWindow::Absent`] — chunk pointer is null or misaligned (no
 ///   descriptor to read);
 /// - [`ChunkWindow::Malformed`] — non-null chunk with an invalid stride or the
-///   corrupted flag set (F-RB-019 / T3.1);
+///   corrupted flag set;
 /// - [`ChunkWindow::Valid`] — the host-declared valid-data window.
 ///
 /// The capture path uses the host-declared chunk metadata to learn how many
@@ -271,7 +271,7 @@ pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> ChunkWin
 }
 
 /// Resolves one channel's capture-path valid-data window, applying the
-/// F-RB-019 / T3.1 fail-closed classification.
+/// fail-closed classification.
 ///
 /// - [`ChunkWindow::Valid`] → `Some((offset, size))` — the host-declared window;
 /// - [`ChunkWindow::Absent`] → `Some((0, 0))` — no descriptor to read; the
@@ -351,7 +351,7 @@ fn validate_spa_channel_pair(
     }
     // SAFETY: `data` pointers were validated non-null; `maxsize` is bounded
     // to MAX_BRIDGE_BUF * sizeof(f32) so `from_raw_parts` never forms an unbounded
-    // slice even on malformed or huge host descriptors (F-RES-001 / T6.1).
+    // slice even on malformed or huge host descriptors.
     // Shared `&[u8]` views are sound even when the channels alias; they only
     // feed the pure validator below and are dead before any mutable `f32` slice is formed.
     let max_cap = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
@@ -414,12 +414,12 @@ pub(crate) fn handle_spa_pair_fail_closed(
 /// Attempts to send recording metadata for `current_host_rate`.
 ///
 /// The sticky `recording_meta_sent` flag is confirmed only after a successful
-/// push into the transport's control channel (pool transport, T4.3) or the
+/// push into the transport's control channel (pool transport) or the
 /// inline ring (rollback); a failed push (or an absent channel) leaves it
 /// false so the next callback retries. A host sample-rate change invalidates
 /// the flag so a new header is emitted for the new rate.
 ///
-/// `recording_failed` (F-RB-009 / T3.3) is the RT-observable failure flag: once
+/// `recording_failed` is the RT-observable failure flag: once
 /// the disk worker reports a fatal error it is set and enqueueing is suspended —
 /// pushing into a channel whose consumer has exited would only inflate
 /// `OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT` pointlessly.
@@ -433,6 +433,9 @@ fn send_recording_metadata(
     recording_failed: Option<&AtomicBool>,
 ) {
     if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
+        if let Some(flag) = recording_data_available {
+            flag.store(false, Ordering::Relaxed);
+        }
         return;
     }
     if *recording_meta_rate != current_host_rate {
@@ -462,12 +465,12 @@ fn send_recording_metadata(
 /// persisted integrally. Blocks whose interleaved length exceeds
 /// `MAX_BLOCK_SIZE` are dropped and counted in `OVERRUN_COUNT` +
 /// `OVERRUN_FRAMES_COUNT` (fail-closed telemetry) instead of silently
-/// vanishing. On the promoted pool transport (T4.3) the block is written into
+/// vanishing. On the promoted pool transport the block is written into
 /// a preallocated slot via `try_acquire` → `fill_planar` → `publish`; a pool
 /// exhaustion (`try_acquire() == None`) also increments both counters,
 /// mirroring a full inline ring.
 ///
-/// `recording_failed` (F-RB-009 / T3.3) suspends enqueueing as soon as the disk
+/// `recording_failed` suspends enqueueing as soon as the disk
 /// worker reports a fatal error — no panics, no pointless pushes.
 #[inline(always)]
 fn send_recording_audio(
@@ -479,7 +482,13 @@ fn send_recording_audio(
     recording_data_available: Option<&AtomicBool>,
     recording_failed: Option<&AtomicBool>,
 ) {
-    if n_pw == 0 || recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
+    if n_pw == 0 {
+        return;
+    }
+    if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
+        if let Some(flag) = recording_data_available {
+            flag.store(false, Ordering::Relaxed);
+        }
         return;
     }
     let interleaved_len = n_pw * 2;
@@ -491,8 +500,8 @@ fn send_recording_audio(
     }
     match recording_sender {
         RecordingSender::Pool { pool, .. } => {
-            // Promoted T4.3 path: acquire a preallocated slot, fill it in
-            // place and publish the 4-byte descriptor — zero allocations, the
+            // Zero-copy pool path: acquire a preallocated slot, fill it in
+            // place and publish the descriptor — zero allocations, the
             // 64 KiB payload never moves.
             let Some(producer) = pool.as_mut() else {
                 return;
@@ -514,7 +523,7 @@ fn send_recording_audio(
             }
         }
         RecordingSender::Inline(producer) => {
-            // T4.1 rollback path: swap out the reusable block to avoid 64 KiB
+            // Inline ring path: swap out the reusable block to avoid 64 KiB
             // of memset per quantum, fill and push into the inline ring.
             let Some(producer) = producer.as_mut() else {
                 return;
@@ -564,7 +573,7 @@ pub fn process_dsp_buffer(
         }
     };
 
-    // T4.3 fail-closed mute: while the negotiated format contract is broken
+    // Fail-closed mute: while the negotiated format contract is broken
     // (a divergent renegotiation was rejected by the param_changed listener),
     // the DSP pipeline must not run on potentially wrong-format input. The
     // dequeued buffer is recycled via drop and the bridge publishes no new
@@ -600,15 +609,14 @@ pub fn process_dsp_buffer(
     let (ptr_r, max_r) = (d_r.as_raw().data as usize, d_r.as_raw().maxsize as usize);
     let (chunk_l, chunk_r) = (d_l.as_raw().chunk, d_r.as_raw().chunk);
 
-    // The host-declared valid-data window. Three cases are distinguished
-    // (F-RB-019 / T3.1): a *valid* window is used as declared; an *absent*
-    // chunk (null/misaligned descriptor) yields `(0, 0)` and the consolidated
-    // harness below still rejects the pair fail-closed via its own
-    // chunk-null/alignment proof; a *malformed* non-null chunk (`stride != 4`
-    // or `SPA_CHUNK_FLAG_CORRUPTED`) raises `E2304` here instead of silently
-    // degrading to `(0, 0)` — no reference is ever formed from a null chunk,
-    // no panic reaches the C trampoline, and no malformed path produces
-    // "silence with clean telemetry".
+    // The host-declared valid-data window. Three cases are distinguished:
+    // a *valid* window is used as declared; an *absent* chunk (null/misaligned
+    // descriptor) yields `(0, 0)` and the consolidated harness below still rejects
+    // the pair fail-closed via its own chunk-null/alignment proof; a *malformed*
+    // non-null chunk (`stride != 4` or `SPA_CHUNK_FLAG_CORRUPTED`) raises `E2304`
+    // here instead of silently degrading to `(0, 0)` — no reference is ever
+    // formed from a null chunk, no panic reaches the C trampoline, and no
+    // malformed path produces "silence with clean telemetry".
     let Some((offset_l, size_l)) =
         resolve_capture_chunk_window(chunk_l, ptr_l, max_l, ptr_r, max_r, rt_status_for_process)
     else {
@@ -662,7 +670,7 @@ pub fn process_dsp_buffer(
         *frame_count = frame_count.wrapping_add(1);
 
         // 1. CAPTURE TOTAL (callback start → end of SPA validation/dequeue)
-        // Medido: overhead TSC=~15ns por amostragem (LFENCE+RDTSC), total < 0.05% do quantum de 333µs
+        // Measured: TSC overhead =~15ns per sample (LFENCE+RDTSC), total < 0.05% of 333µs quantum
         if should_measure && t_cap_start > 0 {
             let t_spa_valid = rt_setup::rdtsc_nanos();
             let cap_nanos = t_spa_valid.saturating_sub(t_cap_start);

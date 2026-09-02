@@ -5,7 +5,7 @@
 //!
 //! Validates the deterministic CabSim IR fixture against its documented
 //! generation formula, the topology classification table, the coverage-matrix
-//! weights (T5.2), the per-group/per-topology minimum progress aggregation and
+//! weights, the per-group/per-topology minimum progress aggregation and
 //! the structured receipt (schema v2).
 
 use super::*;
@@ -129,7 +129,7 @@ fn json_emitter_escapes_strings_and_sorts_keys() {
     );
 }
 
-// ── T5.2 coverage-matrix tests ───────────────────────────────────────────────
+// ── Coverage matrix tests ───────────────────────────────────────────────────
 
 #[test]
 fn matrix_weights_sum_to_one_per_dimension() {

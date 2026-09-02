@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! Nanosecond RT metrics harness for the PipeWire host (T6.5 / G-RB-002).
+//! Nanosecond RT metrics harness for the PipeWire host.
 //!
 //! Runs exclusively in `utils/tests-long.sh` (Phases 3/4/5), never in the
 //! default/quick loop (rules/testing.md §1). Three `#[ignore]`d gates, each
@@ -27,7 +27,7 @@
 //!   Phase 5): 16-thread stress over swap requests, stream-state transitions
 //!   (`observe_stream_state`), simulated reconnect cycles, sample-rate
 //!   renegotiation and the cooperative `SHUTDOWN` trigger. The rate workers
-//!   follow the production renegotiation causality (T1.1): publish → `sync_rate`
+//!   follow the production renegotiation causality: publish → `sync_rate`
 //!   observes → constructor dispatches the generation-stamped envelope, so
 //!   `drain_resamplers` installs it, clears `RESAMP_SWAP_PENDING` and the RT
 //!   driver keeps incrementing `frame_count`. A watcher thread
@@ -37,7 +37,7 @@
 //!   completion proves deadlock freedom. Emits
 //!   `TEST_RESULT[concurrency_stress]=PASS ...`.
 //! - `concurrent_spsc_throughput_swap_accounting` (filter `concurrent`,
-//!   Phase 5, T5.3 / G-PERF-004): **state-machine throughput** through the
+//!   Phase 5): **state-machine throughput** through the
 //!   production SPSC protocol — [`RtSwapHarness::into_parts`] splits the
 //!   harness into its two production faces, so a single-writer producer thread
 //!   pushes swap commands through the real ring buffers while the RT side runs
@@ -54,7 +54,7 @@
 //! adjustments. Environment calibration is probed from `/proc/self/status`
 //! (`Cpus_allowed_list`), `/sys/devices/system/cpu/isolated` and
 //! `sched_getscheduler`. `NAM_RT_STRICT=1` (propagated by
-//! `utils/tests-long.sh --strict-pre-release`, T5.1) promotes every GAP
+//! `utils/tests-long.sh --strict-pre-release`) promotes every GAP
 //! condition to a hard assertion failure AND refuses to certify a PASS
 //! measured on an uncalibrated environment — a numeric pass below the limits
 //! on a non-calibrated host must fail, never emit a silent pass.
@@ -92,18 +92,18 @@ const MODEL_CHECK_THREADS: usize = 16;
 /// asserts `current_host_rate()` never leaves this set.
 const VALID_RATES: [u32; 4] = [32_000, 44_100, 48_000, 96_000];
 
-/// Rate-renegotiation publish period (T1.1): each rate worker publishes a new
+/// Rate-renegotiation publish period: each rate worker publishes a new
 /// host rate every N loop iterations. The publish strictly precedes any
 /// resampler delivery — the RT callback must observe it in `sync_rate` first.
 const RATE_PUBLISH_PERIOD: u64 = 8;
 
-/// Rate-renegotiation publish budget (T1.1): after this many loop iterations a
+/// Rate-renegotiation publish budget: after this many loop iterations a
 /// rate worker stops publishing and only plays the constructor role — keeping
 /// the resampler build/GC churn bounded while still delivering an envelope for
 /// every request the RT callback already observed (including the final one).
 const RATE_PUBLISH_BUDGET: u64 = 200;
 
-/// Calibrated micro-yield sleep for the stress workers (T1.2): 10–50 µs so the
+/// Calibrated micro-yield sleep for the stress workers: 10–50 µs so the
 /// RT driver always wins a scheduling slot on a saturated host instead of
 /// starving on the harness lock against the 15 writer threads.
 const WORKER_YIELD_US: u64 = 20;
@@ -330,7 +330,7 @@ fn rt_deadline_gate_10k_quantums() {
     );
 
     if max_ns <= budget_ns {
-        // T5.1: under NAM_RT_STRICT=1 a PASS is only certifiable on a
+        // Under NAM_RT_STRICT=1 a PASS is only certifiable on a
         // calibrated RT environment — numbers below the budget on an
         // uncalibrated host must fail, never emit a silent pass.
         if env.strict && !env.calibrated() {
@@ -338,7 +338,7 @@ fn rt_deadline_gate_10k_quantums() {
                 "RT deadline gate FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
                  environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
                  current environment is not calibrated — refusing a silent pass on an \
-                 uncalibrated host (T5.1)"
+                 uncalibrated host"
             );
         }
         eprintln!(
@@ -454,7 +454,7 @@ fn rt_jitter_gate_10k_callbacks() {
     );
 
     if max_jitter_ns <= budget_max_ns && p99_ns <= budget_p99_ns {
-        // T5.1: under NAM_RT_STRICT=1 a PASS is only certifiable on a
+        // Under NAM_RT_STRICT=1 a PASS is only certifiable on a
         // calibrated RT environment — dispersion numbers within budget on an
         // uncalibrated host must fail, never emit a silent pass.
         if env.strict && !env.calibrated() {
@@ -462,7 +462,7 @@ fn rt_jitter_gate_10k_callbacks() {
                 "RT jitter gate FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
                  environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
                  current environment is not calibrated — refusing a silent pass on an \
-                 uncalibrated host (T5.1)"
+                 uncalibrated host"
             );
         }
         eprintln!(
@@ -718,7 +718,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
     }
 
     // 4 rate workers: publisher + constructor roles following the production
-    // rate-renegotiation protocol (F-RB-004 / T1.1). The causal chain is:
+    // rate-renegotiation protocol. The causal chain is:
     //
     //   1. `publish_host_rate(rate)`   — publisher role: publish the desired rate.
     //   2. `sync_rate` (RT callback)   — detects the discrepancy, bumps
@@ -737,7 +737,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
     // armed — the fail-open rollback guard skips every callback and
     // `frame_count` never advances. The publish budget bounds the publisher
     // role; the constructor role keeps polling until `stop`, so the final
-    // published rate always receives its envelope (T1.2: both loops
+    // published rate always receives its envelope (both loops
     // yield/sleep so the RT driver wins the harness lock).
     for w in 0..4 {
         let harness = Arc::clone(&harness);
@@ -786,7 +786,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
                     }
                 }
                 iter += 1;
-                // T1.2 calibrated micro-yield: the RT driver always wins a
+                // Calibrated micro-yield: the RT driver always wins a
                 // scheduling slot even on a saturated host.
                 if iter.is_multiple_of(16) {
                     std::thread::sleep(Duration::from_micros(WORKER_YIELD_US));
@@ -883,7 +883,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
         swaps > 0,
         "rate-renegotiation workers never pushed a resampler swap request — test is vacuous"
     );
-    // T5.3 (G-PERF-004): the marker names the harness metric honestly — DSP
+    // The marker names the harness metric honestly — DSP
     // quantums processed, never "audio callbacks" (the harness throughput is
     // state-machine throughput, not RT audio throughput).
     eprintln!(
@@ -892,7 +892,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
     );
 }
 
-// ── 3b. State-machine throughput (T5.3 / G-PERF-004) ────────────────────────
+// ── 3b. State-machine throughput ───────────────────────────────────────────
 
 /// DSP quantums for the SPSC throughput gate.
 const THROUGHPUT_QUANTUMS: usize = 20_000;
@@ -903,12 +903,12 @@ const THROUGHPUT_MAX_PUSHES: u64 = 60_000;
 /// Hard bound on the command backlog any single callback may leave behind.
 /// Each SPSC ring holds `SPSC_CAPACITY` (64) payloads; with 5 channels plus 5
 /// deferred slots plus the parking-lot latch, the worst structural backlog is
-/// 64×5 + 6 = 326 — the per-callback drain budgets (F-RB-011: 16 scalar + 8
+/// 64×5 + 6 = 326 — the per-callback drain budgets (16 scalar + 8
 /// structural pops) keep the backlog inside the channel capacity, never
 /// unbounded.
 const MAX_BACKLOG_PER_QUANTUM: usize = 64 * 5 + 6;
 
-/// Production-SPSC state-machine throughput (T5.3 / G-PERF-004).
+/// Production-SPSC state-machine throughput.
 ///
 /// Unlike the 16-thread interleaving stress above, this gate measures
 /// *throughput* — and only through the production protocol. The harness is
@@ -1044,7 +1044,7 @@ fn concurrent_spsc_throughput_swap_accounting() {
         .load(Ordering::Relaxed);
     let dsp_quantums = rt.frame_count();
 
-    // Complete swap accounting (G-PERF-004 acceptance): every attempt either
+    // Complete swap accounting: every attempt either
     // entered a ring or was dropped by the bounded channel.
     assert_eq!(
         attempted,

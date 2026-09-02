@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! ER-4 service-resilience validation harness (T4.6).
+//! Service-resilience validation harness.
 //!
-//! Certifies the ER-4 gates ("Recuperação do backend e shutdown de serviço" —
-//! [`TODO-resilience-nam-audio-pipe.md`]) end to end:
+//! Certifies the backend recovery and service shutdown gates end to end:
 //!
 //! 1. **Real `SIGTERM` subprocess acceptance** — spawns the compiled
 //!    `nam-audio-pipe --record` binary under live PipeWire, drives the capture
@@ -303,7 +302,7 @@ fn assert_valid_finalized_wav(path: &std::path::Path, expect_silence: bool) {
     assert_eq!(
         data_offset + data_size as usize,
         bytes.len(),
-        "R-13/T4.6: the 'data' chunk must be closed (declared size == file tail) — \
+        "the 'data' chunk must be closed (declared size == file tail) — \
          the header was not finalized"
     );
 
@@ -591,7 +590,7 @@ fn double_signal_force_exits_via_exit1() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Bridge starvation -> analytical silence + buffer recycle (G-RB-001 / T4.2)
+// 3. Bridge starvation -> analytical silence + buffer recycle
 // ---------------------------------------------------------------------------
 
 /// SPA chunk descriptor helper (mirrors the mock used by the unit harness).
@@ -604,7 +603,7 @@ fn spa_chunk(offset: u32, size: u32, stride: i32) -> pw::spa::sys::spa_chunk {
     }
 }
 
-/// Under **zero bridge generation** (G-RB-001 starvation) the playback path
+/// Under **zero bridge generation** (starvation) the playback path
 /// (`playback_dsp_cycle` → [`deliver_silence_pair_fail_closed`]) must:
 ///
 /// * emit `0.0f32` analytical-silence sequences over the **quantum-sized
@@ -801,7 +800,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. SPA format-contract rejection (G-RB-001 / T4.3) — fail-closed mute
+// 4. SPA format-contract rejection — fail-closed mute
 // ---------------------------------------------------------------------------
 
 /// Builds a real SPA format POD for the given audio info (the exact object the
@@ -933,7 +932,7 @@ fn spa_format_rejection_signals_contract_violation_fail_closed() {
 /// (≤ 100 ms sleep) — so a fatal stream loss is detected inside the < 500 ms
 /// SLA. The full lifecycle is proven: initial `Unconnected` is not a failure,
 /// `Streaming` → `Running`, `Error`/post-streaming `Unconnected` → `Failed`,
-/// sticky-failure, and the bounded reconnect cycle (F-RB-010 / T4.5) back to
+/// sticky-failure, and the bounded reconnect cycle back to
 /// `Running`.
 ///
 /// The non-zero process exit on a real backend failure is certified end-to-end
@@ -1049,7 +1048,7 @@ fn stream_error_observable_and_shutdown_within_sla() {
         backend2.state()
     );
 
-    // Bounded reconnect (F-RB-010 / T4.5): begin_reconnect clears the sticky
+    // Bounded reconnect: begin_reconnect clears the sticky
     // failure and publishes the observable Reconnecting transition; a
     // successful reconnection returns the backend to Running.
     backend2.begin_reconnect(1, 3, Duration::from_millis(250));

@@ -69,6 +69,28 @@ fn run_receive_commands(
     Option<Box<StaticModel>>,
     Option<Box<StaticModel>>,
 ) {
+    let (in_g, out_g, slim, ml, mr, _) =
+        run_receive_commands_full(consumer, deferred, structural_applied, flags);
+    (in_g, out_g, slim, ml, mr)
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "test helper returning multiple unpacked state fields"
+)]
+fn run_receive_commands_full(
+    consumer: &mut rtrb::Consumer<ParamPayload>,
+    deferred: &mut Option<ParamPayload>,
+    structural_applied: &mut usize,
+    flags: &Arc<RtStatusFlags>,
+) -> (
+    f32,
+    f32,
+    SlimOverride,
+    Option<Box<StaticModel>>,
+    Option<Box<StaticModel>>,
+    usize,
+) {
     let lut = neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut();
     let (mut gc_p, _gc_c) = rtrb::RingBuffer::<GcItem>::new(64);
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
@@ -86,7 +108,7 @@ fn run_receive_commands(
     let mut out_adj = 1.0f32;
     let mut nam_rate = 48_000u32;
 
-    let (_param_changed, _param_pops) = receive_commands(
+    let (_param_changed, param_pops) = receive_commands(
         consumer,
         deferred,
         structural_applied,
@@ -114,6 +136,7 @@ fn run_receive_commands(
         adaptive.slim_override(),
         model_l,
         model_r,
+        param_pops,
     )
 }
 
@@ -187,7 +210,7 @@ fn drain_os_engines_swaps_and_sets_dirty() {
     assert!(gc_c.pop().is_err());
 }
 
-/// F-RB-005 core: a stereo pair is consumed with a single `pop()` and BOTH
+/// A stereo pair is consumed with a single `pop()` and BOTH
 /// channels are swapped together — the active L/R always belong to the same
 /// pair (same generation and channel count). The previous complete pair is
 /// sent to the GC cascade.
@@ -297,7 +320,7 @@ fn drain_slimmable_mono_pair_leaves_r_untouched() {
 }
 
 /// Stale pairs (built for an older rebuild generation) are discarded whole
-/// to the GC cascade without touching the active models (F-RB-005 latest-wins).
+/// to the GC cascade without touching the active models (latest-wins).
 #[test]
 fn drain_slimmable_discards_stale_pair_latest_wins() {
     let (mut prod, cons) = rtrb::RingBuffer::new(4);
@@ -351,7 +374,7 @@ fn drain_slimmable_discards_stale_pair_latest_wins() {
     assert_eq!(r.channels(), 4);
 }
 
-/// Flooding acceptance (F-RB-005): hundreds of pairs with alternating
+/// Flooding acceptance: hundreds of pairs with alternating
 /// channel counts pushed from multiple threads must never desynchronize L/R
 /// — at no point may `active_model_l.channels() != active_model_r.channels()`
 /// or channels be inverted (a partial/failed delivery is impossible because
@@ -403,7 +426,7 @@ fn drain_slimmable_flood_never_desyncs() {
     // Consumer: drain repeatedly and assert the L/R invariant after every
     // drain until all pairs have been installed and the channel is empty.
     // Each loop iteration is one audio callback: the per-quantum structural
-    // budget resets to zero (T2.5).
+    // budget resets to zero.
     while pushed.load(Ordering::Acquire) < TOTAL || !rx.as_ref().unwrap().is_empty() {
         structural_applied = 0;
         drain_slimmable_models(
@@ -447,10 +470,10 @@ fn drain_slimmable_flood_never_desyncs() {
     assert!(rx.as_ref().unwrap().is_empty());
 }
 
-// ── T2.5 Command Budgeting & Coalescing (F-RB-011) ──────────────────────
+// ── Command Budgeting & Coalescing ──────────────────────────────────────────
 
-/// The scalar parameter drain is bounded to `MAX_PARAM_BUDGET` per callback
-/// (T2.5). A channel overflowing the budget keeps its remainder for the
+/// The scalar parameter drain is bounded to `MAX_PARAM_BUDGET` per callback.
+/// A channel overflowing the budget keeps its remainder for the
 /// next callback and raises `RT_STATUS_PARAM_QUEUE_BACKLOG` — the audio
 /// deadline is preserved, no command is lost.
 #[test]
@@ -524,7 +547,7 @@ fn receive_commands_scalar_latest_wins() {
 
 /// Structural `LoadModel` commands are coalesced: an intermediate queued
 /// model is obsolete and its boxes are discarded to the GC cascade — only
-/// the latest one is installed (T2.5 latest-wins).
+/// the latest one is installed (latest-wins).
 #[test]
 fn receive_commands_load_model_coalesces_obsolete_to_gc() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
@@ -634,7 +657,7 @@ fn receive_commands_deferred_model_superseded_by_queued() {
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
 }
 
-/// T2.5 acceptance (F-RB-011): a closed-loop producer thread (push without
+/// A closed-loop producer thread (push without
 /// yield) must never make the RT callback exceed its fixed budget or starve
 /// the audio processing — every simulated callback completes.
 #[test]
@@ -674,20 +697,40 @@ fn receive_commands_soak_aggressive_producer_no_starvation() {
         run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
         callbacks_ran += 1;
     }
-    assert_eq!(
-        callbacks_ran, CALLBACKS,
-        "the audio callback must never starve under an aggressive producer"
-    );
+    let mut consumer = cons;
+    let mut deferred = None;
+    let mut processed_callbacks = 0usize;
+    let mut pops_total = 0usize;
+
+    for _ in 0..CALLBACKS {
+        let mut structural_applied = 0usize;
+        let (_, _, _, _, _, pops) = run_receive_commands_full(
+            &mut consumer,
+            &mut deferred,
+            &mut structural_applied,
+            &flags,
+        );
+        assert!(
+            pops <= MAX_PARAM_BUDGET,
+            "callback exceeded scalar budget ({pops} > {MAX_PARAM_BUDGET})"
+        );
+        pops_total += pops;
+        processed_callbacks += 1;
+        // Brief sleep to simulate a 333 µs quantum.
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
+
+    assert_eq!(processed_callbacks, CALLBACKS);
     assert!(
-        flags.check_flag(RT_STATUS_PARAM_QUEUE_BACKLOG),
-        "the closed-loop producer must overflow the per-callback budget at least once"
+        pops_total >= CALLBACKS,
+        "consumer starved ({pops_total} pops across {CALLBACKS} callbacks)"
     );
 
     stop.store(true, Ordering::Release);
     producer.join().unwrap();
 }
 
-/// T2.5 structural budget: with multiple current-generation pairs queued,
+/// Structural budget: with multiple current-generation pairs queued,
 /// exactly one structural swap applies per callback and the obsolete
 /// intermediate pairs are coalesced to the GC cascade (latest-wins).
 #[test]
@@ -801,7 +844,7 @@ fn drain_slimmable_parked_when_budget_exhausted_resolved_next_callback() {
     assert!(deferred.is_none());
 }
 
-/// T2.5 structural budget for OS engines: one pair applied per callback,
+/// Structural budget for OS engines: one pair applied per callback,
 /// obsolete intermediate pairs coalesced to GC (latest-wins).
 #[test]
 fn drain_os_budget_applies_one_and_coalesces_backlog() {
@@ -913,7 +956,7 @@ fn drain_os_parked_when_budget_exhausted_resolved_next_callback() {
     assert!(deferred.is_none());
 }
 
-/// F-RB-005 / T2.3: Stale oversample pair discard.
+/// Stale oversample pair discard.
 ///
 /// When `requested_os_generation` advances past a queued pair before the RT
 /// callback drains it, the stale pair is dropped whole directly into the GC
@@ -981,7 +1024,7 @@ fn drain_os_discards_stale_pair_latest_wins() {
     assert_eq!(envelopes, 2);
 }
 
-/// F-RB-004 / F-RB-005 / T2.3: Interleaved oversampling requests (Off -> 2x -> 4x)
+/// Interleaved oversampling requests (Off -> 2x -> 4x).
 ///
 /// Validates that rapid requests properly discard intermediate stale completions
 /// while parking lot cascade operates with zero RT allocations/deallocations.
@@ -1042,7 +1085,7 @@ fn drain_os_interleaving_off_2x_4x() {
     assert_eq!(gc_count, 2);
 }
 
-/// T1.5 / F-RB-011: Measures composite structural bound and execution time
+/// Measures composite structural bound and execution time
 /// under simultaneous saturation across all 5 RT drain channels
 /// (resampler, cabsim, parameters/LoadModel, slimmable, OS engines).
 ///

@@ -29,7 +29,7 @@ fn test_build_capture_format_pod() {
     assert!(res.is_ok());
 }
 
-// ── cabsim_rebuild_needed (T2.3 / F-RB-006) ──────────────────────────────────
+// ── cabsim_rebuild_needed ───────────────────────────────────────────────────
 
 fn make_pair(
     partition: usize,
@@ -83,10 +83,10 @@ fn rebuild_requested_on_rate_mismatch() {
 
 #[test]
 fn rebuild_not_requested_for_quantum_outside_partition_domain() {
-    // G-RB-003 / T6.2: a spurious quantum outside the convolution partition
-    // domain [16, MAX_RESAMP_BUF] must never drive a rebuild — otherwise the
-    // handler's clamp would build a pair that never matches the anomalous
-    // quantum and re-request forever. (The RT ceiling is also enforced in
+    // A spurious quantum outside the convolution partition domain
+    // [16, MAX_RESAMP_BUF] must never drive a rebuild — otherwise the handler's
+    // clamp would build a pair that never matches the anomalous quantum and
+    // re-request forever. (The RT ceiling is also enforced in
     // `check_ffi_contract`; this is the rebuild-side defense-in-depth.)
     assert!(!cabsim_rebuild_needed(
         None,

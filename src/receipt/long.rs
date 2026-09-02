@@ -6,10 +6,10 @@
 //!
 //! This is the single source of truth for the long-receipt format, shared by:
 //!
-//! - `tests/distribution_qa.rs` — the ER-6 certification audit of the runner
+//! - `tests/distribution_qa.rs` — the certification audit of the runner
 //!   and its receipt (`parse_long_receipt` + [`LongReceipt::audit`]);
 //! - `src/bin/long_receipt_check.rs` — the strict-release semantic gate
-//!   invoked by `utils/build-release.sh --release-ceremony` (T5.1 / T8.1),
+//!   invoked by `utils/build-release.sh --release-ceremony`,
 //!   which verifies the receipt via [`verify_release_certification_file`]
 //!   instead of a substring search.
 //!
@@ -18,23 +18,23 @@
 //! ```text
 //! SUITE: tests-long
 //! STRICT: 0|1
-//! NAM_RT_STRICT: 0|1               (T5.1: strict-mode propagation evidence; optional)
+//! NAM_RT_STRICT: 0|1               (strict-mode propagation evidence; optional)
 //! MODE: simulate|full
-//! SOAK_PURPOSE: accelerated_timeline ...     (T5.3: purpose of the accelerated soak; optional)
-//! ENDURANCE_PURPOSE: real_wall_clock ...     (T5.3: purpose of the real endurance; optional)
+//! SOAK_PURPOSE: accelerated_timeline ...     (purpose of the accelerated soak; optional)
+//! ENDURANCE_PURPOSE: real_wall_clock ...     (purpose of the real endurance; optional)
 //! PHASE1: PASS|FAIL|GAP|SIMULATED log=target/logs/... [duration_ms=N]
-//! ... (PHASE2..PHASE6; PHASE6 = real wall-clock endurance, T5.3)
+//! ... (PHASE2..PHASE6; PHASE6 = real wall-clock endurance)
 //! GAP: <typed reason>            (zero or more)
 //! OVERALL: PASSED|FAILED|COMPLETED_WITH_GAPS|SIMULATED
 //! ```
 //!
 //! Unknown line types, duplicated mandatory fields, invalid values, a missing
 //! mandatory phase or a missing `OVERALL:` verdict are all rejected — a receipt
-//! that cannot be parsed fail-closed must never certify anything. The T5.3
-//! purpose lines and `PHASE6` are optional at parse level (receipts written
-//! before the field existed remain parseable) but are **required** by strict
-//! release certification (T5.3 / G-PERF-004): a certified receipt must declare
-//! the purpose of each soak suite and close the real endurance phase.
+//! that cannot be parsed fail-closed must never certify anything. The purpose
+//! lines and `PHASE6` are optional at parse level (receipts written before the
+//! field existed remain parseable) but are **required** by strict release
+//! certification: a certified receipt must declare the purpose of each soak
+//! suite and close the real endurance phase.
 
 use std::path::Path;
 
@@ -69,16 +69,16 @@ pub struct LongReceipt {
     pub strict: bool,
     /// `MODE:` value (`simulate` or `full`).
     pub mode: String,
-    /// `NAM_RT_STRICT:` propagation evidence (T5.1). `None` when the line is
+    /// `NAM_RT_STRICT:` propagation evidence. `None` when the line is
     /// absent (receipts written before the field existed remain parseable).
     pub nam_rt_strict: Option<bool>,
-    /// `SOAK_PURPOSE:` declaration (T5.3) — the accelerated-timeline soak's
+    /// `SOAK_PURPOSE:` declaration — the accelerated-timeline soak's
     /// purpose. `None` when absent (optional at parse level).
     pub soak_purpose: Option<String>,
-    /// `ENDURANCE_PURPOSE:` declaration (T5.3) — the real wall-clock
+    /// `ENDURANCE_PURPOSE:` declaration — the real wall-clock
     /// endurance's purpose. `None` when absent (optional at parse level).
     pub endurance_purpose: Option<String>,
-    /// Parsed phase lines (`PHASE1..PHASE5` mandatory, `PHASE6` since T5.3).
+    /// Parsed phase lines (`PHASE1..PHASE5` mandatory, `PHASE6` for endurance).
     pub phases: Vec<LongPhaseResult>,
     /// Typed `GAP:` reasons.
     pub gaps: Vec<String>,
@@ -86,12 +86,12 @@ pub struct LongReceipt {
     pub overall: String,
 }
 
-/// Canonical prefix every `SOAK_PURPOSE:` line must carry (T5.3).
+/// Canonical prefix every `SOAK_PURPOSE:` line must carry.
 pub const SOAK_PURPOSE_TOKEN: &str = "accelerated_timeline";
-/// Canonical prefix every `ENDURANCE_PURPOSE:` line must carry (T5.3).
+/// Canonical prefix every `ENDURANCE_PURPOSE:` line must carry.
 pub const ENDURANCE_PURPOSE_TOKEN: &str = "real_wall_clock";
 
-/// Fail-closed whole-token validation for the purpose declarations (T5.3).
+/// Fail-closed whole-token validation for the purpose declarations.
 ///
 /// The runner emits `accelerated_timeline — <description>`, so the canonical
 /// token must be followed by whitespace, an em-dash or end-of-line — a crafted
@@ -276,7 +276,7 @@ impl LongReceipt {
     /// the runner's verdict logic — a `PASSED` receipt may not hide a GAP
     /// phase, a `COMPLETED_WITH_GAPS` must be backed by gap evidence, and a
     /// simulate run must close as `SIMULATED` with only simulated phases.
-    /// Additionally (T5.1) a receipt claiming `STRICT: 1` must not record
+    /// Additionally a receipt claiming `STRICT: 1` must not record
     /// `NAM_RT_STRICT: 0` — a strict run without propagation evidence is
     /// internally inconsistent.
     pub fn audit(&self) -> Result<(), String> {
@@ -319,10 +319,10 @@ impl LongReceipt {
         }
     }
 
-    /// Verifies if the receipt meets strict release certification requirements
-    /// (T8.1 + T5.1 + T5.3): `SUITE: tests-long`, `STRICT: 1`,
+    /// Verifies if the receipt meets strict release certification requirements:
+    /// `SUITE: tests-long`, `STRICT: 1`,
     /// `NAM_RT_STRICT: 1` (propagation evidence), `MODE: full`,
-    /// `OVERALL: PASSED`, a PASSED `PHASE6` (real wall-clock endurance, T5.3)
+    /// `OVERALL: PASSED`, a PASSED `PHASE6` (real wall-clock endurance)
     /// and the declared purpose of each soak suite (`SOAK_PURPOSE:`
     /// `accelerated_timeline` + `ENDURANCE_PURPOSE:` `real_wall_clock`).
     pub fn verify_release_certification(&self) -> Result<(), String> {
@@ -347,7 +347,7 @@ impl LongReceipt {
         }
         if self.nam_rt_strict != Some(true) {
             return Err(
-                "release certification requires NAM_RT_STRICT: 1 (the strict run must propagate NAM_RT_STRICT=1 to the RT harness — T5.1)"
+                "release certification requires NAM_RT_STRICT: 1 (the strict run must propagate NAM_RT_STRICT=1 to the RT harness)"
                     .into(),
             );
         }
@@ -355,7 +355,7 @@ impl LongReceipt {
             .phases
             .iter()
             .find(|p| p.id == "PHASE6")
-            .ok_or("release certification requires PHASE6 (real wall-clock endurance, T5.3)")?;
+            .ok_or("release certification requires PHASE6 (real wall-clock endurance)")?;
         if phase6.status != LongPhaseStatus::Pass {
             return Err(format!(
                 "release certification requires PHASE6: PASS (got {:?})",
@@ -365,7 +365,7 @@ impl LongReceipt {
         let soak = self.soak_purpose.as_deref().unwrap_or_default();
         if !purpose_token_valid(soak, SOAK_PURPOSE_TOKEN) {
             return Err(
-                "release certification requires SOAK_PURPOSE: accelerated_timeline (T5.3 — the \
+                "release certification requires SOAK_PURPOSE: accelerated_timeline (the \
                  accelerated soak's purpose must be declared in the receipt)"
                     .into(),
             );
@@ -373,7 +373,7 @@ impl LongReceipt {
         let endurance = self.endurance_purpose.as_deref().unwrap_or_default();
         if !purpose_token_valid(endurance, ENDURANCE_PURPOSE_TOKEN) {
             return Err(
-                "release certification requires ENDURANCE_PURPOSE: real_wall_clock (T5.3 — the \
+                "release certification requires ENDURANCE_PURPOSE: real_wall_clock (the \
                  real endurance's purpose must be declared in the receipt)"
                     .into(),
             );

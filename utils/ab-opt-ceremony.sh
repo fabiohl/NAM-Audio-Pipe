@@ -2,36 +2,36 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #
-# utils/ab-opt-ceremony.sh — T5.2 A/B optimization ceremony (HUMAN OPERATOR ONLY).
+# utils/ab-opt-ceremony.sh — A/B optimization ceremony (HUMAN OPERATOR ONLY).
 #
 # Builds the A/B harness (src/bin/ab_opt_bench.rs) three ways and compares their
 # measured DSP hot-path envelope:
 #
 #   plain → PGO → PGO+BOLT
 #
-# Each variant is built and then run with `--runs N` (default 3; the T5.2
-# acceptance requires >= 3 runs). The per-variant receipts
+# Each variant is built and then run with `--runs N` (default 3; statistical
+# validation requires >= 3 runs). The per-variant receipts
 # (`target/logs/ab-opt-<variant>.json`) retain per-block cycle counts
 # (min/mean/p50/p99/p999/max + tail latency in ns) and, when the kernel permits
 # (perf_event_open), the PMU counters cycles/instructions/iTLB misses/I-cache
 # misses with typed availability.
 #
-# Verdict (T5.2 invariant: announce an optimization only when it improves or
+# Verdict (Invariant: announce an optimization only when it improves or
 # preserves the measured envelope without fidelity regression):
 #
 #   PGO+BOLT  — BOLT improves or preserves the p99 tail-latency envelope vs PGO
 #               across all runs (no regression), and PMU counters (when
 #               available on this host) do not regress.
-#   PGO-ONLY  — explicit T5.2 rollback: BOLT did not prove gain (regression) or
+#   PGO-ONLY  — Explicit rollback: BOLT did not prove gain (regression) or
 #               the BOLT toolchain/perf was unavailable. The release continues
 #               PGO-only; PGO+BOLT is never announced without proof.
 #
 # Fidelity (NAMCore parity, f64 oracle, spectral fidelity) is NOT re-checked
-# here — the operator must also run utils/quality-dashboard.sh --check before
-# certifying any optimization (the A/B only proves the envelope).
+# here — the operator must also run quality checks before certifying any
+# optimization (the A/B only proves the execution envelope).
 #
 # AI agents MUST NOT execute this script; it is part of the operator-only
-# release ceremony (see .agents/TODO-sprints.md T5.2 acceptance).
+# release ceremony.
 
 set -euo pipefail
 
@@ -53,7 +53,7 @@ show_help() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-T5.2 A/B optimization ceremony: plain → PGO → PGO+BOLT on the DSP hot-path
+A/B optimization ceremony: plain → PGO → PGO+BOLT on the DSP hot-path
 harness. OPERATOR ONLY (never run by AI agents).
 
 Options:
@@ -84,11 +84,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ "$RUNS" -lt 3 ]; then
-    die "T5.2 acceptance requires >= 3 runs per variant (got --runs $RUNS)."
+    die "A/B ceremony requires >= 3 runs per variant for statistical confidence (got --runs $RUNS)."
 fi
 
 echo -e "${BLUE}${BOLD}========================================================================${NC}"
-echo -e "${BLUE}${BOLD}   T5.2 A/B Optimization Ceremony (plain → PGO → PGO+BOLT)              ${NC}"
+echo -e "${BLUE}${BOLD}   A/B Optimization Ceremony (plain → PGO → PGO+BOLT)                   ${NC}"
 echo -e "${BLUE}${BOLD}========================================================================${NC}"
 echo -e "  runs=${RUNS} blocks=${BLOCKS} bench-flags=${AB_BENCH_FLAGS[*]:-}"
 
@@ -337,7 +337,6 @@ if not variants["plain"] or not variants["pgo"]:
 doc = {
     "schema_version": 1,
     "tool": "ab-opt-ceremony.sh",
-    "task": "T5.2",
     "runs": int(runs),
     "variants": {
         name: {
@@ -378,10 +377,10 @@ if bolt_applied:
     bolt_regression = bolt_p99 is not None and pgo_p99 is not None and bolt_p99 > pgo_p99
     if bolt_regression:
         doc["verdict"] = "PGO-ONLY"
-        doc["rollback"] = "T5.2: BOLT regressed the p99 tail-latency envelope vs PGO; PGO-only is the explicit fallback."
+        doc["rollback"] = "BOLT regressed the p99 tail-latency envelope vs PGO; PGO-only is the explicit fallback."
     elif pgo_regression and bolt_p99 is not None and plain_p99 is not None and bolt_p99 > plain_p99:
         doc["verdict"] = "PGO-ONLY"
-        doc["rollback"] = "T5.2: neither PGO nor BOLT improved the plain envelope (both regressed p99)."
+        doc["rollback"] = "Neither PGO nor BOLT improved the plain envelope (both regressed p99)."
     else:
         doc["verdict"] = "PGO+BOLT"
         doc["rollback"] = ""
@@ -390,7 +389,7 @@ else:
     pgo_p99 = median_cycles(variants["pgo"], "p99")
     if pgo_p99 is not None and plain_p99 is not None and pgo_p99 > plain_p99:
         doc["verdict"] = "UNOPTIMIZED"
-        doc["rollback"] = "T5.2: PGO regressed the envelope vs PLAIN; do not announce any optimization."
+        doc["rollback"] = "PGO regressed the envelope vs PLAIN; do not announce any optimization."
     else:
         doc["verdict"] = "PGO-ONLY"
         doc["rollback"] = "BOLT not proven/applied on this host (PGO-only fallback)."

@@ -99,7 +99,7 @@ pub trait ThreadConfigurator {
     fn current_thread_id(&self) -> libc::pthread_t;
 
     /// Sets the thread name. `name` must be a NUL-terminated C string (the
-    /// `&CStr` type enforces this at compile time — F-RB-021).
+    /// `&CStr` type enforces this at compile time).
     fn set_thread_name(&self, thread_id: libc::pthread_t, name: &CStr) -> i32;
 
     /// Sets thread CPU affinity.

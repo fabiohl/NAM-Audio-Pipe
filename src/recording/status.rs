@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 //! Observable worker state, startup handshake and failure propagation for the
-//! WAV recording subsystem (F-RB-009 / T3.3).
+//! WAV recording subsystem.
 //!
 //! The `--record` disk worker used to be fired in background without any
 //! synchronization: if the `io_uring` runtime failed to initialize, the output
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Maximum time the main thread waits for the recording worker's startup
-/// handshake before aborting the process (fail-fast gate, F-RB-009 / T3.3).
+/// handshake before aborting the process (fail-fast gate).
 pub const RECORDING_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Observable state machine of the disk-recording worker.
@@ -166,7 +166,7 @@ pub fn record_failure(status: &SharedRecordingStatus, failed_flag: &AtomicBool, 
     failed_flag.store(true, Ordering::Release);
 }
 
-/// Main-thread side of the recording startup handshake (F-RB-009 / T3.3).
+/// Main-thread side of the recording startup handshake.
 ///
 /// Blocks — bounded by `timeout` — until the worker either confirms readiness
 /// (returning the output directory) or reports a startup failure. On timeout or

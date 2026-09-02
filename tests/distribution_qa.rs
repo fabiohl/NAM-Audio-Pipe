@@ -1,35 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! ER-5 distribution QA & release audit harness (T5.6).
+//! Distribution QA & release audit harness.
 //!
-//! Certifies that the release pipeline operates fail-closed. Four acceptance
-//! groups (findings F-RB-012 .. F-RB-015):
+//! Certifies that the release pipeline operates fail-closed across four
+//! core acceptance groups:
 //!
-//! * **(a) AppStream structural validation** — the repo metainfo must parse
+//! * **(a) AppStream structural validation** — the repository metainfo must parse
 //!   under a strict XML parser (quick-xml, end-tag/comment checking enabled)
 //!   and its `<release>` entry must carry a version matching the crate plus a
-//!   mandatory date. Any malformed document — such as the duplicated
-//!   `</release>` closing tag fixed in F-RB-012 — must be detected and
-//!   rejected.
+//!   mandatory date. Any malformed document — such as a duplicated or unmatched
+//!   `</release>` closing tag — must be detected and rejected fail-closed.
 //! * **(b) Typed test-receipt validator** — a fail-closed parser for libtest
 //!   logs: a mandatory target that was removed/renamed/filtered out, a target
 //!   section that executed zero tests (100% `#[ignore]` selection), or an
 //!   *untyped* skip (free-text `SKIP:` without a `TEST_RESULT[...]=SKIP:`
 //!   marker) must fail validation. Mirrors `utils/_lib.sh` `assert_ran_target`
-//!   and the Phase 4 skip contract in Rust (F-RB-015).
+//!   and the Phase 4 skip contract in Rust.
 //! * **(c) Provenance integrity** — `target/logs/release-provenance.json`
-//!   (F-RB-014 / T5.5) is read and every referenced artifact must exist on
-//!   disk with a SHA-256 that matches the recorded hash byte-for-byte. A
+//!   is read and every referenced artifact must exist on disk with a SHA-256
+//!   and GNU build-id that match the recorded identity byte-for-byte. A
 //!   missing receipt is a *typed* skip (no release was built); a present but
 //!   corrupt receipt is a hard failure.
 //! * **(d) Distribution binary smoke** — the `--profile dist` (stripped, LTO
-//!   fat; `panic = "unwind"` so the F-RB-020 catch_unwind containment is
-//!   effective in the shipped artifact) binary is exercised as a subprocess:
-//!   `--diagnose` must exit 0, emit the diagnostic bundle and show no crash
-//!   artifacts, and `--help` must exit 0. The artifact is located at
-//!   `target/dist/nam-audio-pipe`, the installed `~/.local/bin/nam-audio-pipe`,
-//!   or `$NAM_DIST_BIN`; its absence
+//!   fat; `panic = "unwind"` so the catch_unwind containment is effective in
+//!   the shipped artifact) binary is exercised as a subprocess: `--diagnose`
+//!   must exit 0, emit the diagnostic bundle and show no crash artifacts, and
+//!   `--help` must exit 0. The artifact is located at `target/dist/nam-audio-pipe`,
+//!   the installed `~/.local/bin/nam-audio-pipe`, or `$NAM_DIST_BIN`; its absence
 //!   is a *typed* skip.
 
 mod common;
@@ -46,22 +44,20 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 
-/// AppStream metainfo location relative to the crate root (F-RB-012 / T5.1).
+/// AppStream metainfo location relative to the crate root.
 const METAINFO_REL: &str = "packaging/flatpak/io.github.fabiohl.NAMAudioPipe.metainfo.xml";
-/// Cryptographic chain-of-custody receipt produced by `utils/build-release.sh`
-/// (F-RB-014 / T5.5).
+/// Cryptographic chain-of-custody receipt produced by `utils/build-release.sh`.
 const PROVENANCE_REL: &str = "target/logs/release-provenance.json";
 
-// ER-6 / T6.6 certification audit constants (G-RB-002, G-RB-003). The long
-// audit suite is a human-operator-only runner; this harness validates it
-// structurally — never by executing the full suite.
+// Long certification audit constants. The long audit suite is a
+// human-operator-only runner; this harness validates it structurally — never
+// by executing the full suite.
 
 /// Long-audit runner location relative to the crate root.
 const LONG_SUITE_REL: &str = "utils/tests-long.sh";
 /// Structured long-suite receipt produced by `utils/tests-long.sh`.
 const LONG_RECEIPT_REL: &str = "target/logs/long-receipt.txt";
-/// The six canonical long-audit phases (G-RB-002 / T6.3; PHASE6 = real
-/// wall-clock endurance, T5.3 / G-PERF-004).
+/// The six canonical long-audit phases (PHASE6 = real wall-clock endurance).
 const LONG_PHASE_IDS: [&str; 6] = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6"];
 /// Canonical `run_phase` names the runner must declare verbatim.
 const LONG_PHASE_NAMES: [&str; 6] = [
@@ -73,9 +69,9 @@ const LONG_PHASE_NAMES: [&str; 6] = [
     "Phase 6: Endurance real & state-machine throughput",
 ];
 
-/// Serializes tests that replace `target/logs/long-receipt.txt` (T5.1 strict
+/// Serializes tests that replace `target/logs/long-receipt.txt` (strict
 /// propagation validation via `utils/tests-long.sh --simulate`) against the
-/// ER-6 live audit that reads it — a concurrent read must never observe a
+/// live audit that reads it — a concurrent read must never observe a
 /// half-replaced receipt.
 static LONG_RECEIPT_MUTEX: Mutex<()> = Mutex::new(());
 
@@ -84,14 +80,14 @@ fn repo_root() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// (a) AppStream structural validation (F-RB-012)
+// (a) AppStream structural validation
 // ---------------------------------------------------------------------------
 
 /// Runs a strict quick-xml parse over `xml` and returns every structural
 /// error. quick-xml's defaults already enforce well-formedness: end-tag names
 /// must match their open tag (`check_end_names`), comments are syntax-checked
-/// (`check_comments`) and an unbalanced close — like the duplicate
-/// `</release>` from F-RB-012 — is rejected with a typed error. The element
+/// (`check_comments`) and an unbalanced close — like a duplicate
+/// `</release>` tag — is rejected with a typed error. The element
 /// nesting depth is tracked additionally so that a document that reaches EOF
 /// with an unclosed root element (truncation) is rejected too.
 fn strict_xml_errors(xml: &str) -> Vec<String> {
@@ -178,8 +174,7 @@ fn parse_release_entries(xml: &str) -> Result<Vec<(String, String)>, Vec<String>
 
 /// (a) Acceptance: the shipped metainfo must be well-formed under a strict XML
 /// parser, expose exactly one `<release>` whose version equals the crate
-/// version and carry the mandatory `date` attribute (F-RB-012 acceptance:
-/// "XML corrigido, appstreamcli zero").
+/// version and carry the mandatory `date` attribute (AppStream semantic gate).
 #[test]
 fn appstream_metainfo_is_strictly_well_formed_and_version_synced() {
     let path = repo_root().join(METAINFO_REL);
@@ -209,12 +204,12 @@ fn appstream_metainfo_is_strictly_well_formed_and_version_synced() {
     );
     assert!(
         !date.is_empty(),
-        "<release> is missing the mandatory date attribute (F-RB-012 semantic gate)"
+        "<release> is missing the mandatory date attribute (semantic gate)"
     );
 }
 
 /// (a) Negative acceptance: a malformed document carrying the duplicated
-/// `</release>` closing tag from F-RB-012 (`packaging/flatpak/...metainfo.xml`
+/// `</release>` closing tag (`packaging/flatpak/...metainfo.xml`
 /// lines 55-59 before the fix) must be detected and rejected by the strict
 /// parser — no gate may turn green under structurally invalid metadata.
 #[test]
@@ -254,7 +249,7 @@ fn appstream_metainfo_rejects_truncated_document() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) Typed test-receipt validator (F-RB-015)
+// (b) Typed test-receipt validator
 // ---------------------------------------------------------------------------
 
 /// Extracts the `Running <target> ` banner names from a libtest log — the same
@@ -300,7 +295,7 @@ fn target_executed_count(log: &str, target: &str) -> Option<usize> {
     Some(parse_count(result_line, "passed") + parse_count(result_line, "measured"))
 }
 
-/// Fail-closed mandatory-target gate over a libtest log (F-RB-015): every
+/// Fail-closed mandatory-target gate over a libtest log: every
 /// mandatory target must have executed at least one test. A target that is
 /// missing entirely (removed/renamed), filtered out, or whose section ran
 /// zero tests (e.g. a 100% `#[ignore]` selection) fails validation with a
@@ -350,8 +345,8 @@ fn validate_typed_receipt(log: &str, mandatory: &[&str]) -> Result<(), String> {
 }
 
 /// (b) Negative: a removed/renamed mandatory target — even with other targets
-/// keeping the aggregate positive — must fail the gate (F-RB-015: "remoção,
-/// rename ... não pode produzir PASS").
+/// keeping the aggregate positive — must fail the gate (removal, rename, or
+/// omission must never produce PASS).
 #[test]
 fn receipt_validator_detects_missing_mandatory_target() {
     let log = "\
@@ -444,7 +439,8 @@ TEST_RESULT[record_e2e]=SKIP:daemon_unavailable
 }
 
 // ---------------------------------------------------------------------------
-// (c) Provenance integrity (F-RB-014 / T5.5)
+// (c) Provenance integrity
+// ---------------------------------------------------------------------------
 fn get_git_head(dir: &Path) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
@@ -503,7 +499,7 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
 /// `true` when `path` starts with the ELF magic (`\x7fELF`) — the receipt
 /// distinguishes the installed stripped ELF from non-ELF delivery artifacts
 /// (tarball, Flatpak bundle, AppStream metainfo), and only ELF files must
-/// carry a GNU build-id (F-RB-027 / T5.2).
+/// carry a GNU build-id.
 fn is_elf_file(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
@@ -515,9 +511,8 @@ fn is_elf_file(path: &Path) -> bool {
 /// note via `readelf -n` (same source the writer uses in
 /// `utils/build-release.sh`), normalized to lowercase — so the provenance
 /// validator compares the recorded receipt value against the artifact on
-/// disk, mirroring the sha256/size_bytes recomputation (F-RB-027, review
-/// round). A missing/absent note or an unavailable `readelf` is an error
-/// (fail-closed).
+/// disk, mirroring the sha256/size_bytes recomputation. A missing/absent
+/// note or an unavailable `readelf` is an error (fail-closed).
 fn elf_gnu_build_id(path: &Path) -> Result<String, String> {
     let out = std::process::Command::new("readelf")
         .env("LC_ALL", "C")
@@ -539,7 +534,7 @@ fn elf_gnu_build_id(path: &Path) -> Result<String, String> {
         }
     }
     Err(format!(
-        "'{}': readelf -n found no GNU build-id note — 'build_id' cannot be verified (F-RB-027)",
+        "'{}': readelf -n found no GNU build-id note — 'build_id' cannot be verified",
         path.display()
     ))
 }
@@ -597,13 +592,13 @@ fn verify_single_artifact(
         ));
     }
 
-    // F-RB-027 / T5.2: an ELF artifact must carry a non-null GNU build-id. A
-    // missing `readelf` (or a binary without a build-id note) produced
-    // `build_id: null` in older receipts — a "certified" release without exact
-    // binary identity is rejected fail-closed here. The recorded value is also
-    // recomputed from the artifact's own note (review round), so a fabricated,
-    // truncated or otherwise wrong `build_id` string can never pass — mirroring
-    // the sha256/size_bytes recomputation above.
+    // An ELF artifact must carry a non-null GNU build-id. A missing `readelf`
+    // (or a binary without a build-id note) produced `build_id: null` in
+    // older receipts — a "certified" release without exact binary identity is
+    // rejected fail-closed here. The recorded value is also recomputed from
+    // the artifact's own note, so a fabricated, truncated or otherwise wrong
+    // `build_id` string can never pass — mirroring the sha256/size_bytes
+    // recomputation above.
     if is_elf_file(&abs) {
         match art_obj.get("build_id").and_then(|v| v.as_str()) {
             Some(bid) if !bid.is_empty() => {
@@ -612,14 +607,13 @@ fn verify_single_artifact(
                 if actual_bid != recorded_bid {
                     return Err(format!(
                         "'{name}': build_id mismatch (recorded {recorded_bid}, computed \
-                         {actual_bid} from the ELF note — F-RB-027)"
+                         {actual_bid} from the ELF note)"
                     ));
                 }
             }
             _ => {
                 return Err(format!(
-                    "'{name}': ELF artifact requires a non-null 'build_id' \
-                     (F-RB-027) — exact binary identity is mandatory"
+                    "'{name}': ELF artifact requires a non-null 'build_id' — exact binary identity is mandatory"
                 ));
             }
         }
@@ -642,7 +636,7 @@ fn verify_single_artifact(
 /// Fail-closed validator for the release provenance receipt: every artifact,
 /// receipt, log, source commit, git tree SHA, lockfile hash, coupled dependency
 /// commit, and ceremony chain status must exist, match on-disk hashes/content,
-/// and be semantically consistent (T8.2).
+/// and be semantically consistent.
 fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read provenance receipt {}: {e}", path.display()))?;
@@ -651,7 +645,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
 
     if doc.get("schema_version").and_then(|v| v.as_u64()) != Some(2) {
         return Err(format!(
-            "unexpected schema_version: {:?} (T5.1 identity schema requires version 2)",
+            "unexpected schema_version: {:?} (identity schema requires version 2)",
             doc.get("schema_version")
         ));
     }
@@ -724,7 +718,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         ));
     }
 
-    // 3. Validate build identity (T5.1): the receipt must identify the exact
+    // 3. Validate build identity: the receipt must identify the exact
     //    artifact — build profile, active features, the explicit opt-out of
     //    harness-measured performance claims for the final ELF — and the build
     //    environment (kernel release + pw-cli version).
@@ -760,7 +754,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         .ok_or("missing 'build.optimizations.measured_performance_claims'")?;
     if measured_claims {
         return Err(
-            "measured_performance_claims must be false: no harness metric may be attributed to the final PGO+BOLT ELF (T5.1)"
+            "measured_performance_claims must be false: no harness metric may be attributed to the final PGO+BOLT ELF"
                 .into(),
         );
     }
@@ -786,7 +780,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         }
     }
 
-    // 4. Validate ceremony_chain (Mandatory schema component, T8.2)
+    // 4. Validate ceremony_chain (Mandatory schema component)
     let chain = doc
         .get("ceremony_chain")
         .and_then(|v| v.as_object())
@@ -885,7 +879,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         };
         let long_text = std::fs::read_to_string(&long_abs)
             .map_err(|e| format!("read long_receipt {}: {e}", long_abs.display()))?;
-        // Semantic strict certification (T5.1/T8.1) — never a substring search:
+        // Semantic strict certification — never a substring search:
         // the shared parser must accept the receipt and certify it as a real
         // strict passed run (SUITE: tests-long, STRICT: 1, NAM_RT_STRICT: 1,
         // MODE: full, OVERALL: PASSED).
@@ -939,7 +933,7 @@ fn write_synthetic_receipt_with_doc(receipt_path: &Path, doc: serde_json::Value)
 }
 
 /// Writes a full synthetic provenance receipt referencing `files` (as `name -> path`)
-/// with valid worktree commit, tree hash, lockfile SHA-256 and ceremony chain (T8.2).
+/// with valid worktree commit, tree hash, lockfile SHA-256 and ceremony chain.
 fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
     let root = repo_root();
     let commit = get_git_head(&root)
@@ -964,10 +958,10 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
         );
         let size = std::fs::metadata(path).expect("stat temp file").len();
         art.insert("size_bytes".into(), size.into());
-        // F-RB-027 / T5.2: the installed ELF carries the GNU build-id note
-        // captured by `utils/build-release.sh` (readelf -n). Synthetic
-        // fixtures set a stable fake id; tests that mutate it to null prove
-        // the fail-closed rejection.
+        // The installed ELF carries the GNU build-id note captured by
+        // `utils/build-release.sh` (readelf -n). Synthetic fixtures set a
+        // stable fake id; tests that mutate it to null prove the fail-closed
+        // rejection.
         if *name == "installed_binary" {
             art.insert(
                 "build_id".into(),
@@ -1036,7 +1030,7 @@ fn provenance_validator_accepts_matching_receipt() {
     assert_eq!(audited, 1);
 }
 
-/// (c) Negative: old schema missing `ceremony_chain` must be rejected (T8.2).
+/// (c) Negative: old schema missing `ceremony_chain` must be rejected.
 #[test]
 fn provenance_validator_rejects_old_schema_without_ceremony_chain() {
     let dir = temp_dir();
@@ -1058,7 +1052,7 @@ fn provenance_validator_rejects_old_schema_without_ceremony_chain() {
     );
 }
 
-/// (c) Negative: the T5.1 identity schema bumps `schema_version` to 2 — a
+/// (c) Negative: the identity schema bumps `schema_version` to 2 — a
 /// stale v1 receipt must be rejected fail-closed.
 #[test]
 fn provenance_validator_rejects_schema_v1_receipt() {
@@ -1082,7 +1076,7 @@ fn provenance_validator_rejects_schema_v1_receipt() {
 }
 
 /// (c) Negative: `measured_performance_claims: true` must be rejected — no
-/// harness metric may ever be attributed to the final PGO+BOLT ELF (T5.1).
+/// harness metric may ever be attributed to the final PGO+BOLT ELF.
 #[test]
 fn provenance_validator_rejects_measured_performance_claims() {
     let dir = temp_dir();
@@ -1105,7 +1099,7 @@ fn provenance_validator_rejects_measured_performance_claims() {
     );
 }
 
-/// (c) Negative: the T5.1 identity fields are mandatory — a receipt without
+/// (c) Negative: the identity fields are mandatory — a receipt without
 /// `build.features` or without the `environment` block cannot identify the
 /// exact artifact and build host.
 #[test]
@@ -1148,7 +1142,7 @@ fn provenance_validator_rejects_missing_identity_fields() {
     }
 }
 
-/// (c) Negative: mismatched `project.commit` must be rejected (T8.2).
+/// (c) Negative: mismatched `project.commit` must be rejected.
 #[test]
 fn provenance_validator_rejects_mismatched_commit() {
     let dir = temp_dir();
@@ -1170,7 +1164,7 @@ fn provenance_validator_rejects_mismatched_commit() {
     );
 }
 
-/// (c) Negative: mismatched `dependencies.cargo_lock_sha256` must be rejected (T8.2).
+/// (c) Negative: mismatched `dependencies.cargo_lock_sha256` must be rejected.
 #[test]
 fn provenance_validator_rejects_mismatched_lock_hash() {
     let dir = temp_dir();
@@ -1193,7 +1187,7 @@ fn provenance_validator_rejects_mismatched_lock_hash() {
     );
 }
 
-/// (c) Negative: mismatched `dependencies.neural_amp_modeler_rs_commit` must be rejected (T8.2).
+/// (c) Negative: mismatched `dependencies.neural_amp_modeler_rs_commit` must be rejected.
 #[test]
 fn provenance_validator_rejects_mismatched_nam_commit() {
     let dir = temp_dir();
@@ -1256,8 +1250,7 @@ fn provenance_validator_rejects_tampered_hash() {
 
 /// (c) Negative: an ELF artifact with `build_id: null` (readelf missing or no
 /// build-id note on the binary) must be rejected fail-closed — a release
-/// receipt without exact binary identity can never be certified (F-RB-027 /
-/// T5.2).
+/// receipt without exact binary identity can never be certified.
 #[test]
 fn provenance_validator_rejects_null_build_id_on_elf_artifact() {
     let dir = temp_dir();
@@ -1276,13 +1269,13 @@ fn provenance_validator_rejects_null_build_id_on_elf_artifact() {
 
     let err = validate_provenance_receipt(&receipt).unwrap_err();
     assert!(
-        err.contains("build_id") && err.contains("F-RB-027"),
+        err.contains("build_id") && err.contains("exact binary identity"),
         "null build_id on an ELF artifact must be rejected, got: {err}"
     );
 }
 
 /// (c) Negative: an ELF artifact with a `build_id` that is absent entirely (the
-/// pre-T5.2 receipt shape, where only `installed_binary` got a `build_id` from
+/// pre-identity receipt shape, where only `installed_binary` got a `build_id` from
 /// `readelf` when available) must also be rejected fail-closed.
 #[test]
 fn provenance_validator_rejects_missing_build_id_on_elf_artifact() {
@@ -1303,7 +1296,7 @@ fn provenance_validator_rejects_missing_build_id_on_elf_artifact() {
 
     let err = validate_provenance_receipt(&receipt).unwrap_err();
     assert!(
-        err.contains("build_id") && err.contains("F-RB-027"),
+        err.contains("build_id") && err.contains("exact binary identity"),
         "missing build_id on an ELF artifact must be rejected, got: {err}"
     );
 }
@@ -1312,7 +1305,7 @@ fn provenance_validator_rejects_missing_build_id_on_elf_artifact() {
 /// fail — the validator recomputes the value from the ELF's own note instead
 /// of trusting the receipt string, so a fabricated/truncated build-id can
 /// never pass. A fake ELF (magic bytes only) has no note: the recomputation
-/// errors fail-closed with an F-RB-027 diagnostic.
+/// errors fail-closed with a build-id diagnostic.
 #[test]
 fn provenance_validator_rejects_unverifiable_build_id_on_elf_artifact() {
     let dir = temp_dir();
@@ -1327,13 +1320,13 @@ fn provenance_validator_rejects_unverifiable_build_id_on_elf_artifact() {
     // disk has no GNU build-id note.
     let err = validate_provenance_receipt(&receipt).unwrap_err();
     assert!(
-        err.contains("build_id") && err.contains("F-RB-027"),
+        err.contains("build_id") && err.contains("cannot be verified"),
         "an unverifiable build_id on an ELF artifact must be rejected, got: {err}"
     );
 }
 
 /// (c) Negative: `certification_status == "certified_release"` without quick `STRICT: 1` or
-/// long `STRICT: 1` + `MODE: full` + `OVERALL: PASSED` must be rejected (T8.2).
+/// long `STRICT: 1` + `MODE: full` + `OVERALL: PASSED` must be rejected.
 #[test]
 fn provenance_validator_rejects_certified_release_without_strict_quick_or_long_receipt() {
     let dir = temp_dir();
@@ -1395,12 +1388,11 @@ fn provenance_validator_rejects_certified_release_without_strict_quick_or_long_r
 /// (c) Live acceptance: the release pipeline receipt (when present) must have
 /// every artifact on disk with matching hashes. Absence of the receipt is a
 /// *typed* skip (no release was built — nothing to audit); a present but
-/// corrupt receipt is a hard failure (F-RB-014 rollback: divergence blocks
-/// the release immediately).
+/// corrupt receipt is a hard failure (divergence blocks the release immediately).
 #[test]
 fn provenance_receipt_integrity() {
     // The ceremony chain references target/logs/long-receipt.txt and the six
-    // phase logs — exactly the files the T5.1 propagation tests replace (and
+    // phase logs — exactly the files the strict propagation tests replace (and
     // restore) via `utils/tests-long.sh --simulate`. Serialize against those
     // destructive replacements so a concurrent read never hashes a half- or
     // temporarily-replaced artifact (same rationale as long_suite_receipt_audit).
@@ -1422,11 +1414,11 @@ fn provenance_receipt_integrity() {
 }
 
 // ---------------------------------------------------------------------------
-// (d) Distribution binary smoke (F-RB-014 / T5.4)
+// (d) Distribution binary smoke
 // ---------------------------------------------------------------------------
 
 /// Candidate locations of the `--profile dist` (stripped, LTO fat; panic =
-/// "unwind" so the F-RB-020 catch_unwind containment is effective in the
+/// "unwind" so the catch_unwind containment is effective in the
 /// shipped artifact) binary, in preference order: explicit override, cargo's
 /// standard dist output, the atomically installed binary, then the PGO/BOLT
 /// build tree.
@@ -1445,7 +1437,7 @@ fn dist_bin_candidates() -> Vec<PathBuf> {
 }
 
 /// (d) Acceptance: the distribution binary — compiled with `--profile dist`
-/// (`strip = true`, LTO fat; `panic = "unwind"` so the F-RB-020 containment
+/// (`strip = true`, LTO fat; `panic = "unwind"` so the containment
 /// is effective in the artifact users install) and therefore the exact
 /// artifact shipped by `utils/build-release.sh` — must run stably as a
 /// subprocess and exit cleanly with code 0: `--diagnose` must emit the
@@ -1508,11 +1500,11 @@ fn dist_binary_smoke_under_dist_profile() {
 }
 
 // ---------------------------------------------------------------------------
-// (e) ER-6 certification infrastructure audit (G-RB-002 / G-RB-003, T6.6)
+// (e) Long-suite certification infrastructure audit
 // ---------------------------------------------------------------------------
 
 /// (e) Acceptance: the long-audit runner `utils/tests-long.sh` must be a
-/// real, executable, licensed and fully specified artifact. The ER-6 closing
+/// real, executable, licensed and fully specified artifact. The closing
 /// gates depend on it being runnable by a human operator (and never silently
 /// replaced by a non-executable stub), so this structural audit is mandatory:
 /// `+x` permissions, `GPL-3.0-or-later` SPDX header, the AI-safety governance
@@ -1583,7 +1575,7 @@ fn long_suite_script_is_executable_and_fully_specified() {
 
 /// (e) Structural audit: `utils/build-release.sh` must enforce a real, strict
 /// long-suite receipt during `--release-ceremony` through the *semantic*
-/// verifier (`long_receipt_check` + `NAM_RT_STRICT: 1` propagation, T5.1/T8.1)
+/// verifier (`long_receipt_check` + `NAM_RT_STRICT: 1` propagation)
 /// — never a substring search — and strictly reject `SIMULATED`, `STRICT: 0`,
 /// `COMPLETED_WITH_GAPS`, `FAILED` or missing receipts.
 #[test]
@@ -1594,7 +1586,7 @@ fn build_release_script_requires_real_strict_long_receipt() {
 
     assert!(
         text.contains("long_receipt_check"),
-        "{} must verify the long receipt through the semantic long_receipt_check gate (T5.1), not a substring search",
+        "{} must verify the long receipt through the semantic long_receipt_check gate, not a substring search",
         path.display()
     );
     assert!(
@@ -1666,7 +1658,7 @@ fn long_suite_help_surface_is_parseable_and_fail_closed() {
 }
 
 /// (e) Negative: `LongReceipt::verify_release_certification` must reject simulated receipts
-/// (`MODE: simulate`, `OVERALL: SIMULATED`) when evaluating release certification (T8.1).
+/// (`MODE: simulate`, `OVERALL: SIMULATED`) when evaluating release certification.
 #[test]
 fn long_receipt_certification_rejects_simulated_receipt() {
     const RECEIPT: &str = "\
@@ -1690,7 +1682,7 @@ OVERALL: SIMULATED
 }
 
 /// (e) Negative: `LongReceipt::verify_release_certification` must reject `STRICT: 0` receipts
-/// even if all phases passed (T8.1).
+/// even if all phases passed.
 #[test]
 fn long_receipt_certification_rejects_non_strict_receipt() {
     const RECEIPT: &str = "\
@@ -1713,7 +1705,7 @@ OVERALL: PASSED
     );
 }
 
-/// (e) Positive: `LongReceipt::verify_release_certification` accepts real strict passed receipt (T8.1 + T5.1 + T5.3).
+/// (e) Positive: `LongReceipt::verify_release_certification` accepts real strict passed receipt.
 #[test]
 fn long_receipt_certification_accepts_real_strict_passed_receipt() {
     const RECEIPT: &str = "\
@@ -1788,7 +1780,7 @@ PHASE2: PASS log=target/logs/phase2-heap-audit.log duration_ms=90000
 PHASE3: GAP log=target/logs/phase3-rt-deadline.log duration_ms=1200
 PHASE4: PASS log=target/logs/phase4-rt-jitter.log duration_ms=1500
 PHASE5: PASS log=target/logs/phase5-concurrency.log duration_ms=3000
-GAP: phase3:rt_metrics_harness_missing (T6.5 pending)
+GAP: phase3:rt_metrics_harness_missing (pending harness integration)
 OVERALL: COMPLETED_WITH_GAPS
 ";
 
@@ -1925,7 +1917,7 @@ OVERALL: SIMULATED
 /// parse fail-closed and pass the semantic audit — a present but corrupt
 /// receipt is a hard failure. Absence is a *typed* skip (no audit run was
 /// performed); under `NAM_QUICK_STRICT=1` the skip becomes a fatal GAP, so a
-/// green ER-6 gate always implies a valid long-suite receipt was on disk.
+/// green gate always implies a valid long-suite receipt was on disk.
 #[test]
 fn long_suite_receipt_audit() {
     let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
@@ -1960,7 +1952,7 @@ fn long_suite_receipt_audit() {
 }
 
 // ---------------------------------------------------------------------------
-// T5.1: NAM_RT_STRICT propagation validation — the strict flag must reach
+// NAM_RT_STRICT propagation validation — the strict flag must reach
 // `tests/rt_metrics.rs` (via `utils/tests-long.sh --strict-pre-release`)
 // without ever running the long suite (rules/testing.md §2: AI/CI uses only
 // the non-executing `--simulate` surface).
@@ -1989,7 +1981,7 @@ impl LongSimulateGuard {
         let mut backups = Vec::new();
         for f in files {
             if f.is_file() {
-                let bk = f.with_extension("t5.1-test-backup");
+                let bk = f.with_extension("sim-test-backup");
                 let _ = std::fs::copy(&f, &bk);
                 backups.push((f, bk));
             }
@@ -2034,7 +2026,7 @@ fn run_tests_long_simulate(args: &[&str]) -> String {
     })
 }
 
-/// (T5.1) Gate acceptance: `--strict-pre-release` must propagate
+/// Gate acceptance: `--strict-pre-release` must propagate
 /// `NAM_RT_STRICT=1` — the simulate receipt records `STRICT: 1` AND
 /// `NAM_RT_STRICT: 1` (the observable propagation evidence the release
 /// ceremony requires). No long-suite test is executed.
@@ -2053,7 +2045,7 @@ fn strict_pre_release_propagates_nam_rt_strict() {
     assert_eq!(
         receipt.nam_rt_strict,
         Some(true),
-        "NAM_RT_STRICT=1 must be propagated and recorded (T5.1), receipt:\n{text}"
+        "NAM_RT_STRICT=1 must be propagated and recorded, receipt:\n{text}"
     );
     assert_eq!(
         receipt.mode, "simulate",
@@ -2064,7 +2056,7 @@ fn strict_pre_release_propagates_nam_rt_strict() {
         .unwrap_or_else(|e| panic!("strict simulate receipt must audit cleanly: {e}"));
 }
 
-/// (T5.1) Companion: a non-strict simulate run records `NAM_RT_STRICT: 0` —
+/// Companion: a non-strict simulate run records `NAM_RT_STRICT: 0` —
 /// the propagation is a strict-only behavior, never inherited by accident.
 #[test]
 fn non_strict_simulate_records_nam_rt_strict_zero() {
@@ -2085,7 +2077,7 @@ fn non_strict_simulate_records_nam_rt_strict_zero() {
         .unwrap_or_else(|e| panic!("simulate receipt must audit cleanly: {e}"));
 }
 
-/// (T5.1) Negative: an invalid `NAM_RT_STRICT:` value must be rejected
+/// Negative: an invalid `NAM_RT_STRICT:` value must be rejected
 /// fail-closed by the semantic parser.
 #[test]
 fn long_receipt_parser_rejects_invalid_nam_rt_strict_value() {
@@ -2108,7 +2100,7 @@ OVERALL: SIMULATED
     );
 }
 
-/// (T5.1) Negative: a receipt claiming `STRICT: 1` while recording
+/// Negative: a receipt claiming `STRICT: 1` while recording
 /// `NAM_RT_STRICT: 0` is internally inconsistent and must fail the semantic
 /// audit — a strict run without propagation evidence can never certify.
 #[test]
@@ -2133,7 +2125,7 @@ OVERALL: PASSED
     );
 }
 
-/// (T5.1) Negative: strict release certification requires the
+/// Negative: strict release certification requires the
 /// `NAM_RT_STRICT: 1` propagation evidence — a receipt that predates the
 /// field (or lacks the line) cannot certify a release.
 #[test]
@@ -2158,14 +2150,14 @@ OVERALL: PASSED
 }
 
 // ---------------------------------------------------------------------------
-// T5.3 (G-PERF-004): soak/endurance purpose declarations in the receipt.
+// Soak/endurance purpose declarations in the receipt.
 // The accelerated timeline soak and the real wall-clock endurance are separate
 // suites; the receipt must declare each purpose and the strict certification
 // must require PHASE6 (real endurance) — never conflating harness throughput
 // with RT audio throughput.
 // ---------------------------------------------------------------------------
 
-/// (T5.3) Gate acceptance: the `--simulate` receipt (the sanctioned
+/// Gate acceptance: the `--simulate` receipt (the sanctioned
 /// non-executing surface) declares both soak suite purposes — `SOAK_PURPOSE:
 /// accelerated_timeline` and `ENDURANCE_PURPOSE: real_wall_clock` — and
 /// closes the new PHASE6 (real endurance) as SIMULATED. No long-suite test is
@@ -2203,7 +2195,7 @@ fn simulate_receipt_declares_suite_purposes_and_phase6() {
         .unwrap_or_else(|e| panic!("simulate receipt must audit cleanly: {e}"));
 }
 
-/// (T5.3) Negative: a `SOAK_PURPOSE:` / `ENDURANCE_PURPOSE:` line carrying a
+/// Negative: a `SOAK_PURPOSE:` / `ENDURANCE_PURPOSE:` line carrying a
 /// non-canonical purpose token must be rejected fail-closed.
 #[test]
 fn long_receipt_parser_rejects_invalid_purpose_values() {
@@ -2272,7 +2264,7 @@ OVERALL: PASSED
     );
 }
 
-/// (T5.3) Negative: strict release certification requires PHASE6 (real
+/// Negative: strict release certification requires PHASE6 (real
 /// wall-clock endurance) and both purpose declarations — a receipt that lacks
 /// them can never certify a release.
 #[test]
@@ -2318,7 +2310,7 @@ OVERALL: PASSED
     );
 }
 
-/// (T5.3) The semantic audit covers PHASE6 like any other phase: a GAP or FAIL
+/// The semantic audit covers PHASE6 like any other phase: a GAP or FAIL
 /// in the real-endurance phase can never hide behind a green `OVERALL` verdict.
 #[test]
 fn long_receipt_audit_accounts_phase6_gap_and_fail() {
@@ -2333,7 +2325,7 @@ PHASE3: PASS log=target/logs/phase3-rt-deadline.log
 PHASE4: PASS log=target/logs/phase4-rt-jitter.log
 PHASE5: PASS log=target/logs/phase5-concurrency.log
 PHASE6: GAP log=target/logs/phase6-endurance.log
-GAP: phase6:endurance_harness_missing (T5.3 pending)
+GAP: phase6:endurance_harness_missing (pending harness integration)
 OVERALL: COMPLETED_WITH_GAPS
 ";
     let receipt = parse_long_receipt(PHASE6_GAP).unwrap();

@@ -8,14 +8,14 @@
 //! (standard 44-byte RIFF/WAVE header for Float32) and samples are written directly
 //! via the short-write-safe [`crate::recording::io::write_all_at`] (a single
 //! `write_at` may persist only a prefix of the buffer; looping guarantees full
-//! persistence or an explicit, observable failure — F-RB-008/T3.1). Capture files
+//! persistence or an explicit, observable failure). Capture files
 //! are opened exclusively with `create_new(true)` (O_CREAT|O_EXCL, no `truncate`)
 //! and timestamp/part collisions are resolved atomically by retrying incremental
-//! `-1`, `-2`, ... suffixes — anti-TOCTOU (F-RB-008/T3.2). On stream format changes
+//! `-1`, `-2`, ... suffixes — anti-TOCTOU. On stream format changes
 //! or graceful shutdown, the file header is rewritten with the final byte count and
 //! an `fsync` is issued to ensure file integrity before closing.
 //!
-//! ## Startup handshake & failure propagation (F-RB-009 / T3.3)
+//! ## Startup handshake & failure propagation
 //!
 //! The worker is spawned with a [`RecordingInit`] carrying a
 //! `tokio::sync::oneshot` handshake, an observable [`RecordingStatus`] and an
@@ -29,7 +29,7 @@
 //! transitions the status to `Failed` and raises the atomic flag the RT
 //! callback polls to suspend enqueueing without panics.
 //!
-//! ## Lifecycle decoupling & integral drain (F-RB-009 / T3.4)
+//! ## Lifecycle decoupling & integral drain
 //!
 //! The drain loop deliberately ignores the process-global `SHUTDOWN` flag. A
 //! SIGINT arriving while the ring is momentarily empty must never finalize
@@ -79,13 +79,13 @@ use crate::recording::wav_header::{build_wav_header, capture_filename, current_c
 
 /// Monotonic sequence suffix for the writability probe file.
 ///
-/// Multiple recording workers running **in the same process** (e.g. the T3.6
-/// anti-TOCTOU harness with 20 concurrent instances in one output directory)
-/// each call [`validate_output_dir`] at startup. A probe name derived only
-/// from `std::process::id()` would collide between those workers — the second
-/// `create_new(true)` would fail with `AlreadyExists` and a writable directory
-/// would be wrongly rejected. The atomic counter keeps every probe name unique
-/// per process while staying allocation-free on the probe path.
+/// Multiple recording workers running **in the same process** (e.g. concurrent
+/// integration tests in one output directory) each call [`validate_output_dir`]
+/// at startup. A probe name derived only from `std::process::id()` would collide
+/// between those workers — the second `create_new(true)` would fail with
+/// `AlreadyExists` and a writable directory would be wrongly rejected. The atomic
+/// counter keeps every probe name unique per process while staying allocation-free
+/// on the probe path.
 static OUTPUT_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Silence trimming is performed in the RT thread (process.rs): audio blocks are only
@@ -129,9 +129,9 @@ impl AsyncWavWriter<tokio_uring::fs::File> {
     /// truncated. Timestamp/part collisions surface as
     /// [`std::io::ErrorKind::AlreadyExists`] and are resolved by retrying with
     /// incremental `-1`, `-2`, ... suffixes — an anti-TOCTOU design that removes
-    /// the old racy `exists()` pre-check (F-RB-008/T3.2). Sequential parts
-    /// (`part > 1`) go through the same resolution. Returns the writer and the
-    /// path actually created.
+    /// the old racy `exists()` pre-check. Sequential parts (`part > 1`) go
+    /// through the same resolution. Returns the writer and the path actually
+    /// created.
     async fn create(
         base_dir: &Path,
         part: u32,
@@ -258,7 +258,7 @@ impl<W: WriteAt> AsyncWavWriter<W> {
     ///
     /// The RIFF size field is `(header_len - 8) + data_payload`, so the largest
     /// data payload that still fits is `u32::MAX - (header_len - 8)` — the 8-byte
-    /// `RIFF`+size envelope is accounted for (F-RB-008/T3.2). Checked arithmetic
+    /// `RIFF`+size envelope is accounted for. Checked arithmetic
     /// guarantees the `u32` fields can never wrap.
     fn would_overflow(&self, sample_count: usize) -> bool {
         let bytes_to_add = (sample_count as u64) * 4;
@@ -289,10 +289,10 @@ impl<W: WriteAt> AsyncWavWriter<W> {
 
 /// Factory that creates the per-part WAV writer consumed by the drain loop.
 ///
-/// Injectable (F-RB-009 / T3.4): the production sink opens real `io_uring`
-/// files under the output directory, while tests drive the full loop against
-/// a mock writer so the shutdown decoupling and the integral drain are proven
-/// deterministically without a real kernel.
+/// Injectable: the production sink opens real `io_uring` files under the output
+/// directory, while tests drive the full loop against a mock writer so the
+/// shutdown decoupling and the integral drain are proven deterministically
+/// without a real kernel.
 trait WavSink {
     /// Concrete writer type produced by [`WavSink::create`].
     type Writer: WavWriter;
@@ -354,17 +354,16 @@ impl WavSink for TokioUringSink<'_> {
 /// Main entry point for the Disk I/O thread.
 /// Consumes the lock-free ring buffer and writes WAV files fully asynchronously via `io_uring`.
 ///
-/// Before consuming anything it completes the startup handshake (F-RB-009 /
-/// T3.3): validates that the output directory is a real writable directory
+/// Before consuming anything it completes the startup handshake: validates
+/// that the output directory is a real writable directory
 /// ([`validate_output_dir`]), publishes `Active` on the handshake, then runs
-/// the drain loop. The drain loop ignores the process-global `SHUTDOWN` flag
-/// (F-RB-009 / T3.4): it terminates only when the [`RingPayload::StreamStop`]
-/// token is consumed or the ring `Producer` is dropped with the ring fully
-/// drained — never while the RT producer can still emit. Every terminal path
-/// drains all remaining data, rewrites the WAV header with the final byte
-/// count and `fsync`s before returning. Any fatal error transitions the
-/// observable [`RecordingStatus`] to `Failed` and raises the RT-observable
-/// failure flag.
+/// the drain loop. The drain loop ignores the process-global `SHUTDOWN` flag:
+/// it terminates only when the [`RingPayload::StreamStop`] token is consumed
+/// or the ring `Producer` is dropped with the ring fully drained — never
+/// while the RT producer can still emit. Every terminal path drains all
+/// remaining data, rewrites the WAV header with the final byte count and
+/// `fsync`s before returning. Any fatal error transitions the observable
+/// [`RecordingStatus`] to `Failed` and raises the RT-observable failure flag.
 pub async fn disk_writer_loop(
     mut receiver: RecordingReceiver,
     recording_data_available: Option<Arc<AtomicBool>>,
@@ -382,7 +381,7 @@ pub async fn disk_writer_loop(
 
     // Fail-fast startup: if the output directory is missing or not writable the
     // worker reports `Failed` on the handshake and exits BEFORE the main thread
-    // starts PipeWire — no silent recording loss (F-RB-009 / T3.3).
+    // starts PipeWire — no silent recording loss.
     if let Err(e) = validate_output_dir(&base_dir) {
         let reason = format!(
             "Recording output directory {} is not usable: {e:#}",
@@ -487,10 +486,10 @@ fn fail_startup(
 /// [`disk_writer_loop`] while the long-running drain loop stays focused.
 /// Dispatches to the transport selected by
 /// [`crate::recording::transport::RECORDING_POOL_TRANSPORT`]:
-/// [`disk_writer_loop_pool`] (production, T4.3) or [`disk_writer_loop_inline`]
-/// (rollback, T4.1).
+/// [`disk_writer_loop_pool`] (production) or [`disk_writer_loop_inline`]
+/// (rollback).
 ///
-/// # Lifecycle (F-RB-009 / T3.4)
+/// # Lifecycle
 ///
 /// The loop **never** observes the process-global `SHUTDOWN` flag. It exits
 /// only when the recording producer can no longer emit audio:
@@ -523,7 +522,7 @@ async fn disk_writer_loop_inner<S: WavSink>(
     }
 }
 
-/// Promoted T4.3 drain loop: consumes the dedicated control ring
+/// Promoted drain loop: consumes the dedicated control ring
 /// (Metadata/StreamStop) plus the preallocated audio pool, writing every pool
 /// block **in place** (the 64 KiB payload never moves out of its slot).
 ///
@@ -546,7 +545,7 @@ async fn disk_writer_loop_inner<S: WavSink>(
 /// `StreamStop` is pushed only after the RT loop stopped, so no new pool
 /// descriptors can arrive once it is consumed; the stop handler still drains
 /// every pending descriptor (audio or barrier) before finalizing — no block
-/// published before the stop can be orphaned (F-RB-009 / T3.4).
+/// published before the stop can be orphaned.
 async fn disk_writer_loop_pool<S: WavSink>(
     sink: &S,
     control: &mut Consumer<ControlPayload>,
@@ -666,7 +665,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
     Ok(())
 }
 
-/// T4.1 rollback drain loop: consumes the single inline SPSC ring carrying
+/// Rollback drain loop: consumes the single inline SPSC ring carrying
 /// Metadata, Audio and StreamStop in FIFO order.
 async fn disk_writer_loop_inline<S: WavSink>(
     sink: &S,
@@ -733,7 +732,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
             }
             // Brief sleep to avoid busy-spinning. `SHUTDOWN` is deliberately
             // ignored here: termination happens exclusively via the StreamStop
-            // token or a dropped+drained producer (F-RB-009 / T3.4), so a
+            // token or a dropped+drained producer, so a
             // SIGINT during a momentary empty ring can never truncate the
             // recording tail.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -780,8 +779,8 @@ async fn open_new_part<S: WavSink>(
 
 /// Writes one audio block through the shared overflow-rollover logic used by
 /// both transports: if the block would exceed the `u32` RIFF size field the
-/// current segment is finalized and a sequential `_partN` file is started
-/// (F-RB-008 / T3.2), then the block is persisted.
+/// current segment is finalized and a sequential `_partN` file is started,
+/// then the block is persisted.
 async fn write_block_with_overflow_rollover<S: WavSink>(
     sink: &S,
     wav_writer: &mut Option<S::Writer>,
@@ -825,20 +824,20 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
 
 /// Logs a warning if the RT producer reported ring overruns (audio loss),
 /// reporting both the lost block count and the lost frame count so the user can
-/// reconcile `frames_capturados == frames_enfileirados + frames_perdidos`.
+/// reconcile `frames_captured == frames_enqueued + frames_lost`.
 fn report_overruns() {
     let blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
     let frames = OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed);
     if blocks > 0 || frames > 0 {
         log::warn!(
-            "⚠️  blocos perdidos: {} (frames: {}) — possível perda de áudio.",
+            "⚠️  lost blocks: {} (frames: {}) — possible audio drop.",
             blocks,
             frames
         );
     }
 }
 
-/// Spawns the `nam-recording-io` worker thread (F-RB-009 / T3.3).
+/// Spawns the `nam-recording-io` worker thread.
 ///
 /// Probes `io_uring` **before** entering the `tokio_uring` runtime — entering
 /// the runtime with the subsystem disabled would panic on the driver build; a
@@ -847,7 +846,7 @@ fn report_overruns() {
 /// is unit-testable without a real kernel change.
 ///
 /// `receiver` is the consumer half of the recording transport (promoted pool +
-/// control ring, or the T4.1 inline ring) produced by
+/// control ring, or the inline ring) produced by
 /// [`crate::recording::transport::create_recording_transport`].
 ///
 /// Returns the thread handle. The worker communicates its startup outcome
@@ -858,8 +857,7 @@ fn report_overruns() {
 /// The thread **returns** the [`Result`] produced by
 /// [`disk_writer_loop`] (or the `io_uring`-unavailable error) so the join is
 /// observable: [`crate::recording::guard::RecordingWorkerGuard`] inspects it
-/// formally and recording failures propagate into the process exit code
-/// (F-RB-009 / T3.5).
+/// formally and recording failures propagate into the process exit code.
 pub fn spawn_recording_worker(
     receiver: RecordingReceiver,
     recording_data_available: Option<Arc<AtomicBool>>,
@@ -886,7 +884,7 @@ pub fn spawn_recording_worker(
                         // `disk_writer_loop` already records the failure on the
                         // observable status and the RT failure flag; log here
                         // as the final visible report before propagating the
-                        // error to the join (T3.5).
+                        // error to the join.
                         log::error!("🛑 Disk writer error: {e:#}");
                     }
                     result

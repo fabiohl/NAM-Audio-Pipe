@@ -6,7 +6,7 @@
 //! Provides pure mathematical and formatting utilities:
 //! - `build_wav_header`: Generates standard 44-byte (or format-patched) WAV headers
 //!   for 32-bit float PCM using `hound`, with **checked** RIFF size arithmetic so a
-//!   `u32` size field can never wrap around (F-RB-008/T3.2).
+//!   `u32` size field can never wrap around.
 //! - `current_capture_timestamp` / `capture_filename`: Pure capture filename
 //!   generation. Collision resolution is intentionally *not* done here via
 //!   `Path::exists()` (a TOCTOU race); callers combine the pure name with an atomic
@@ -49,7 +49,7 @@ pub fn current_capture_timestamp() -> String {
 ///
 /// Pure formatting with no filesystem access: the caller pairs it with an
 /// atomic `create_new(true)` open so collisions are resolved by the kernel
-/// (`AlreadyExists`) instead of a racy `exists()` pre-check (F-RB-008/T3.2).
+/// (`AlreadyExists`) instead of a racy `exists()` pre-check.
 pub fn capture_filename(timestamp: &str, part: u32, suffix: u32) -> String {
     if part <= 1 {
         if suffix == 0 {
@@ -89,7 +89,7 @@ pub fn build_wav_header(meta: &AudioMetadata, data_bytes: u32) -> Result<Vec<u8>
     let mut header = cursor.into_inner();
 
     // Patch the RIFF chunk size (bytes 4..8) with checked arithmetic so the
-    // `u32` size field can never wrap around (F-RB-008/T3.2).
+    // `u32` size field can never wrap around.
     let header_overhead = (header.len() as u64)
         .checked_sub(8)
         .context("Malformed WAV header: length is less than 8 bytes")?;

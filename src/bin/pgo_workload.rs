@@ -8,7 +8,7 @@
 //! Generates `.profraw` profiles representative of the RT callback hot-path
 //! (gate → resampler → inference → oversample → cabsim → bridge → recording).
 //!
-//! # Coverage matrix (T5.2)
+//! # Coverage matrix
 //!
 //! | Dimension            | Values                     | Weight (typical use)                       |
 //! |----------------------|----------------------------|--------------------------------------------|
@@ -25,7 +25,7 @@
 //! recording × gate), with a per-cell floor (`--min-blocks`) so each combination is
 //! **provably exercised** (fail-closed coverage, no silently skipped stage).
 //!
-//! # Fail-closed contract (F-RB-013 / T5.3, G-PERF-003)
+//! # Fail-closed contract
 //!
 //! The workload is a profiling *gate*, not a best-effort sampler:
 //!
@@ -40,11 +40,11 @@
 //! * All three oversampling modes (`Off`, `2x`, `4x`), all host rates
 //!   (44.1/48/96 kHz) and all quantums (64/256/512) must be exercised.
 //! * The recording path (`--record` halves) must push every processed block
-//!   into the production recording transport (T4.3 pool) and report a typed
+//!   into the production recording transport (pool transport) and report a typed
 //!   overrun count — an overrun is recorded, never silently dropped.
 //! * The receipt proves **per-group, per-topology minimum progress** (frames
 //!   and samples advanced through resampler / inference / oversample / cabsim
-//!   / bridge / recording), never an aggregated global number (G-PERF-003).
+//!   / bridge / recording), never an aggregated global number.
 //!   `no_stage_skipped` is only `true` when every mandatory gate above passed.
 //!
 //! # Deterministic CabSim IR fixture
@@ -104,7 +104,7 @@ const REC_YES: &str = "yes";
 const GATE_ON: &str = "on";
 const GATE_OFF: &str = "off";
 
-// ── Coverage matrix (T5.2) ───────────────────────────────────────────────────
+// ── Coverage matrix ───────────────────────────────────────────────────────────
 
 /// Host sample rates exercised (Hz). Weight documents typical use: 48 kHz is
 /// the PipeWire default, 44.1 kHz is the music/DAW rate, 96 kHz is HQ.
@@ -169,7 +169,7 @@ struct WorkloadModel {
     topology: Topology,
 }
 
-// ── Recording helper (production transport, T4.3) ────────────────────────────
+// ── Recording helper (production transport) ───────────────────────────────────
 
 /// The `--record` halves of the matrix push every processed block through the
 /// production recording transport. The consumer side is drained synchronously
@@ -235,8 +235,8 @@ impl RecordingPipe {
 
     fn finish(&mut self) {
         // Push the terminal token, then drop the producer half so the
-        // abandoned+drained terminal condition arms (production semantics,
-        // F-RB-009 / T3.5). The pool channels can then be drained integrally.
+        // abandoned+drained terminal condition arms (production semantics).
+        // The pool channels can then be drained integrally.
         let _ = self.sender.try_push_stream_stop();
         self.sender = RecordingSender::none();
         loop {
@@ -678,7 +678,7 @@ impl GroupProgress {
 }
 
 /// Aggregated per-topology minimum progress across the whole matrix
-/// (G-PERF-003: never an aggregated global number).
+/// (never an aggregated global number).
 #[derive(Debug, Clone, Default)]
 struct ProgressReport {
     min_blocks_per_topology: BTreeMap<&'static str, u64>,
@@ -1629,7 +1629,7 @@ fn main() {
 
     // Global fail-closed gates: every mandatory topology and every dimension
     // value must have advanced real progress; every DSP group must have run at
-    // least once for every mandatory topology (G-PERF-003).
+    // least once for every mandatory topology.
     let mut failures: Vec<String> = Vec::new();
     for topology in [TOPOLOGY_WAVENET_A1, TOPOLOGY_WAVENET_A2, TOPOLOGY_LSTM] {
         let blocks = receipt

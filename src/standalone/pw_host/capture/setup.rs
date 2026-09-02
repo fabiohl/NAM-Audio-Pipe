@@ -71,12 +71,11 @@ pub fn build_capture_format_pod(
 /// `capture_dsp_pipeline` — against the [`CaptureState`] and [`RtHostChannels`]
 /// owned by `run_pipewire_host` and reached through raw pointers.
 ///
-/// F-RB-010 / T4.5 (bounded reconnect): the DSP state and the SPSC channels
-/// are *not* moved into the closure — both survive a stream re-instantiation,
-/// so a daemon restart restores audio with the models, IRs and recorder
-/// intact. The main thread never aliases the pointed-to objects while the RT
-/// callback runs (it touches them only before `thread_loop.start()` and after
-/// `thread_loop.stop()`).
+/// Bounded reconnect: the DSP state and the SPSC channels are *not* moved into
+/// the closure — both survive a stream re-instantiation, so a daemon restart
+/// restores audio with the models, IRs and recorder intact. The main thread
+/// never aliases the pointed-to objects while the RT callback runs (it touches
+/// them only before `thread_loop.start()` and after `thread_loop.stop()`).
 #[expect(
     clippy::too_many_arguments,
     reason = "FFI design or complex DSP kernel signature required by construction"
@@ -130,7 +129,7 @@ pub fn setup_capture_stream<'c>(
             )
         })
         .process(move |stream: &pw::stream::Stream, _info| {
-            // F-RB-020 / T3.2: the whole callback body runs under `catch_unwind`
+            // Panic containment: the whole callback body runs under `catch_unwind`
             // (one guard per quantum, outside the inner sample loops). A panic
             // inside the RT callback is contained here — it never reaches the
             // `pipewire` crate's `extern "C"` trampoline (which would `abort`)
@@ -143,9 +142,9 @@ pub fn setup_capture_stream<'c>(
                     // run_pipewire_host. While this loop runs the RT callback is the
                     // sole accessor; the main thread touches the state only before
                     // `thread_loop.start()` and after `thread_loop.stop()`. The
-                    // bounded reconnect cycle (F-RB-010 / T4.5) re-derives the same
-                    // pointer for each fresh stream instance — the DSP state (models,
-                    // resampler, cab-sim, gains) survives daemon restarts.
+                    // bounded reconnect cycle re-derives the same pointer for each
+                    // fresh stream instance — the DSP state (models, resampler,
+                    // cab-sim, gains) survives daemon restarts.
                     let state = unsafe { &mut *state_ptr };
                     let should_measure = (state.frame_count & 0xF) == 0;
                     let t_cap_start = if should_measure {
@@ -167,9 +166,9 @@ pub fn setup_capture_stream<'c>(
                     // run_pipewire_host that outlive this closure (same contract as
                     // recording_producer_ptr). While the loop runs, the RT callback
                     // is the sole writer; after thread_loop.stop() the main thread
-                    // takes single-owner handoff and drains the 16 slots off-RT
-                    // (R-04). The periodic drain in run_pipewire_host NEVER touches
-                    // this slot — that would race with the RT flush below.
+                    // takes single-owner handoff and drains the 16 slots off-RT.
+                    // The periodic drain in run_pipewire_host NEVER touches this
+                    // slot — that would race with the RT flush below.
                     let parking_lot = unsafe { &mut *parking_lot_ptr };
                     let parking_lot_dirty = unsafe { &*parking_lot_dirty_ptr };
 
@@ -203,11 +202,11 @@ pub fn setup_capture_stream<'c>(
                         }
                     }
 
-                    // Command Budgeting (F-RB-011 / T2.5): at most one structural swap
-                    // (resampler, cab-sim, model pair, oversampling) applies per
-                    // callback. The counter is shared across every drain below; the
-                    // excess is parked in the per-channel deferred slots of
-                    // `CaptureState` and resolved at the start of the next callback.
+                    // Command Budgeting: at most one structural swap (resampler,
+                    // cab-sim, model pair, oversampling) applies per callback.
+                    // The counter is shared across every drain below; the excess
+                    // is parked in the per-channel deferred slots of `CaptureState`
+                    // and resolved at the start of the next callback.
                     let mut structural_applied = 0usize;
 
                     rt_callback::drain_resamplers(
@@ -318,7 +317,7 @@ pub fn setup_capture_stream<'c>(
                             .load(Ordering::Acquire);
 
                         if failed_gen != 0 && failed_gen == requested_gen {
-                            // Fail-open rollback (F-RB-004): the rebuild failed for requested_gen,
+                            // Fail-open rollback: the rebuild failed for requested_gen,
                             // so the callback resumes with the previous resampler in safe
                             // bypass/mute mode. Record the requested generation as
                             // resolved so the invariant
@@ -430,9 +429,9 @@ pub fn setup_capture_stream<'c>(
                         }
                     }
 
-                    // Detect cabsim partition/rate mismatch and signal rebuild
-                    // (F-RB-006): the IR must match both the host quantum
-                    // (partition size) and the applied host output rate.
+                    // Detect cabsim partition/rate mismatch and signal rebuild:
+                    // the IR must match both the host quantum (partition size)
+                    // and the applied host output rate.
                     let last_n_samples =
                         rt_status_for_process.last_n_samples.load(Ordering::Relaxed) as usize;
                     if cabsim_rebuild_needed(
@@ -485,7 +484,7 @@ pub fn setup_capture_stream<'c>(
     Ok((capture_stream, capture_listener))
 }
 
-/// Decides whether a cab-sim rebuild must be requested (F-RB-006).
+/// Decides whether a cab-sim rebuild must be requested.
 ///
 /// A rebuild is needed when an IR is loaded and any of:
 /// * no pair is active yet — first install, or safe-bypass after a failed
@@ -501,11 +500,11 @@ fn cabsim_rebuild_needed(
     host_rate: u32,
     already_pending: bool,
 ) -> bool {
-    // G-RB-003 / T6.2: only quantums inside the convolution partition domain
-    // [16, MAX_RESAMP_BUF] may drive a rebuild. A spurious quantum above the
-    // ceiling (or below the floor) must never trigger successive rebuilds —
-    // the handler would clamp it, producing a pair whose partition never
-    // matches the anomalous quantum and re-requesting forever.
+    // Only quantums inside the convolution partition domain [16, MAX_RESAMP_BUF]
+    // may drive a rebuild. A spurious quantum above the ceiling (or below the
+    // floor) must never trigger successive rebuilds — the handler would clamp it,
+    // producing a pair whose partition never matches the anomalous quantum and
+    // re-requesting forever.
     if !has_ir || !(16..=MAX_RESAMP_BUF).contains(&n_samples) {
         return false;
     }

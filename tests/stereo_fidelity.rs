@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(all(feature = "stereo", feature = "testing"))]
 
-//! ER-2 stereo-fidelity harness (T2.6).
+//! Stereo fidelity verification harness.
 //!
 //! Proves that the unified stereo pipeline (as wired by NAM-Audio-Pipe via
 //! `capture_dsp_pipeline`) processes each channel **exactly** as an isolated
@@ -16,7 +16,7 @@
 //!   committed in the repo — a deterministic plucked-string is the closest
 //!   reproducible approximation of a guitar waveform).
 //!
-//! Acceptance (ER-2 gates): bit-exact equality → `MSE == 0.0` exactly and
+//! Acceptance: bit-exact equality → `MSE == 0.0` exactly and
 //! `SNR > 120 dB`.
 
 mod common;

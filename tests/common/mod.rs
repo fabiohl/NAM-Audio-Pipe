@@ -4,21 +4,21 @@
 
 //! Shared helpers for NAM-Audio-Pipe integration test binaries.
 //!
-//! Single source of truth for the PipeWire daemon probe so Phase 3
-//! (`pw_integration`) and Phase 4 (`recording`) can never drift apart —
-//! R-17's script↔test probe-consistency guarantee depends on exactly one
+//! Single source of truth for the PipeWire daemon probe so
+//! `pw_integration` and `recording` can never drift apart —
+//! probe-consistency guarantees depend on exactly one
 //! definition of "daemon reachable".
 //!
 //! Also the single source of truth for the recording worker handshake
 //! helpers, the temporary-capture-directory factory, the `SHUTDOWN` guard and
 //! the per-binary test mutex — `tests/recording.rs` and
 //! `tests/recording_fault_injection.rs` must never drift apart on the
-//! `RecordingInit`/`RecordingStatus::Active` contract (T3.6 audit note).
+//! `RecordingInit`/`RecordingStatus::Active` contract.
 //!
 //! The `swap` submodule holds deterministic model builders and synthetic
-//! signal factories shared by the swap-stress and extended-soak harnesses
-//! (T6.4); the `proc` submodule holds the `/proc` telemetry readers shared by
-//! the accelerated-soak and real-endurance harnesses (T5.3 / G-PERF-004).
+//! signal factories shared by the swap-stress and extended-soak harnesses;
+//! the `proc` submodule holds the `/proc` telemetry readers shared by
+//! the accelerated-soak and real-endurance harnesses.
 
 pub mod proc;
 pub mod swap;
@@ -250,7 +250,7 @@ impl Drop for ShutdownGuard {
 
 /// Builds a `RecordingInit` bound to `dir` plus the handshake receiver, the
 /// observable status and the RT failure flag, so a test can drive the worker's
-/// startup handshake and assert on its outcome (F-RB-009 / T3.3).
+/// startup handshake and assert on its outcome.
 pub fn recording_init_for(
     dir: &Path,
 ) -> (
@@ -272,7 +272,7 @@ pub fn recording_init_for(
 }
 
 /// Spawns a recording worker for `receiver`, waits for the startup handshake
-/// and returns the join handle plus the observable handles (F-RB-009 / T3.3).
+/// and returns the join handle plus the observable handles.
 pub fn spawn_ready_worker(
     receiver: RecordingReceiver,
     dir: &Path,

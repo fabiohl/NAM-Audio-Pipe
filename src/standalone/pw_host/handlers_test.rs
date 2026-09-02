@@ -9,18 +9,18 @@ use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
-/// Serializes the F-RB-015 fault-injection tests: the armed fault is a single
+/// Serializes the resampler fault-injection tests: the armed fault is a single
 /// global inside `handlers.rs`, so tests that arm it must not run concurrently.
 #[cfg(feature = "testing")]
 static RESAMPLER_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Serializes the F-RB-017 oversample fault-injection tests (same global-arm
-/// constraint as the resampler hook).
+/// Serializes the oversample fault-injection tests (same global-arm constraint
+/// as the resampler hook).
 #[cfg(feature = "testing")]
 static OS_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Serializes the F-RB-018 slimmable fault-injection tests (same global-arm
-/// constraint as the resampler hook).
+/// Serializes the slimmable fault-injection tests (same global-arm constraint
+/// as the resampler hook).
 #[cfg(feature = "testing")]
 static SLIMMABLE_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -79,7 +79,7 @@ fn request_slimmable_rebuild(flags: &RtStatusFlags, ch: u32) {
     flags.set_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
 }
 
-/// F-RB-005 core (producer side): `handle_slimmable_rebuild` slices and
+/// Core slimmable rebuild (producer side): `handle_slimmable_rebuild` slices and
 /// prewarms BOTH channels before a single atomic push of a `SlimModelPair`;
 /// the envelope carries the captured generation and the requested channel count.
 #[test]
@@ -147,9 +147,9 @@ fn slimmable_mono_pair_has_no_r() {
     assert!(pair.r.is_none(), "mono config must not build an R model");
 }
 
-/// Fail-closed (F-RB-005): when the SPSC channel is full, NEITHER channel is
-/// delivered and `NEEDS_SLIMMABLE_REBUILD` stays armed for a full retry — a
-/// partial L-without-R delivery is impossible.
+/// Fail-closed: when the SPSC channel is full, NEITHER channel is delivered
+/// and `NEEDS_SLIMMABLE_REBUILD` stays armed for a full retry — a partial
+/// L-without-R delivery is impossible.
 #[test]
 fn slimmable_push_full_keeps_needs_for_retry() {
     let flags = RtStatusFlags::new();
@@ -196,9 +196,9 @@ fn slimmable_push_full_keeps_needs_for_retry() {
     assert!(cons.pop().is_err());
 }
 
-/// Lost-wakeup guard (F-RB-004 pattern): `rearm_slimmable_if_superseded` keeps
-/// the request armed exactly when a newer slimmable generation was published
-/// while the pair was being built.
+/// Lost-wakeup guard: `rearm_slimmable_if_superseded` keeps the request armed
+/// exactly when a newer slimmable generation was published while the pair was
+/// being built.
 #[test]
 fn slimmable_rearm_guard_keeps_request_when_generation_advanced() {
     let flags = RtStatusFlags::new();
@@ -450,11 +450,6 @@ fn cabsim_push_full_keeps_needs_for_retry() {
     assert!(cons.pop().is_ok());
 }
 
-/// F-RB-006 rate calibration: the preserved original IR must be resampled
-/// specifically for the requested host output rate, the delivered pair is
-/// stamped with that rate, and both channel adapters share the requested
-/// partition. The partition count scales with the rate ratio — evidence the
-/// IR was actually resampled, not merely restamped.
 #[test]
 fn cabsim_rebuild_resamples_to_requested_host_rate() {
     let sys = SystemSnapshot::capture();
@@ -505,7 +500,6 @@ fn cabsim_rebuild_resamples_to_requested_host_rate() {
     );
 }
 
-/// Same-rate rebuild takes the no-resample path and keeps the IR untouched.
 #[test]
 fn cabsim_rebuild_same_rate_no_resample() {
     let flags = RtStatusFlags::new();
@@ -522,9 +516,6 @@ fn cabsim_rebuild_same_rate_no_resample() {
     assert_eq!(pair.l.num_partitions(), 4, "256 samples / 64 partition");
 }
 
-/// G-RB-003 / T6.2: a spurious RT-requested partition outside the domain
-/// [16, MAX_RESAMP_BUF] is clamped before any `ConvEngine` is built — the
-/// delivered pair is never instantiated with an oversized (or degenerate) FFT.
 #[test]
 fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     let sys = SystemSnapshot::capture();
@@ -567,8 +558,6 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     assert_eq!(pair.partition_size(), 64);
 }
 
-/// Rollback (F-RB-006): a failed IR resample/build must deliver `None` —
-/// safe cab-sim bypass — instead of letting the RT run a divergent-rate IR.
 #[test]
 fn cabsim_rebuild_failure_pushes_none_bypass() {
     let flags = RtStatusFlags::new();
@@ -587,9 +576,6 @@ fn cabsim_rebuild_failure_pushes_none_bypass() {
     );
 }
 
-/// Lost-wakeup guard (F-RB-004 pattern): `rearm_cabsim_if_superseded` keeps
-/// the request armed exactly when a newer cabsim generation was published
-/// while the pair was being built.
 #[test]
 fn cabsim_rearm_guard_keeps_request_when_generation_advanced() {
     let flags = RtStatusFlags::new();
@@ -611,8 +597,6 @@ fn cabsim_rearm_guard_keeps_request_when_generation_advanced() {
     );
 }
 
-/// End-to-end request→deliver→drain: the delivered pair replaces the active
-/// one; the retired pair's two channel adapters reach GC (zero alloc swap).
 #[test]
 fn cabsim_full_protocol_installs_latest_and_gcs_retired_pair() {
     use crate::standalone::pw_host::rt_callback::drain_cabsims;
@@ -678,9 +662,9 @@ fn resampler_push_success_clears_needs() {
     assert_eq!(new_rs.resampler.host_rate(), 44100);
 }
 
-/// Lost-wakeup guard unit test (F-RB-004): `rearm_rebuild_if_superseded` must
-/// keep `NEEDS_RESAMPLER_REBUILD` armed exactly when a newer request generation
-/// was published while the main thread was building.
+/// Lost-wakeup guard unit test: `rearm_rebuild_if_superseded` must keep
+/// `NEEDS_RESAMPLER_REBUILD` armed exactly when a newer request generation was
+/// published while the main thread was building.
 #[test]
 fn rearm_guard_keeps_request_when_generation_advanced() {
     let flags = RtStatusFlags::new();
@@ -700,14 +684,14 @@ fn rearm_guard_keeps_request_when_generation_advanced() {
     );
 }
 
-/// F-RB-015 / T1.1 — a failed resampler rebuild for generation N must never
-/// erase a newer request (N+1) published while the failure was being handled.
+/// A failed resampler rebuild for generation N must never erase a newer request
+/// (N+1) published while the failure was being handled.
 ///
 /// Deterministic reproduction of the race: the build for generation 1 fails
 /// (fault-injected under `feature = "testing"`) and the handler is paused at
-/// the injection point; the RT side then publishes generation 2 — the exact
-/// F-RB-015 window. The fix re-arms `NEEDS_RESAMPLER_REBUILD` because the
-/// generation advanced, and generation 2 is later rebuilt and applied.
+/// the injection point; the RT side then publishes generation 2. The fix
+/// re-arms `NEEDS_RESAMPLER_REBUILD` because the generation advanced, and
+/// generation 2 is later rebuilt and applied.
 #[cfg(feature = "testing")]
 #[test]
 fn resampler_failure_preserves_newer_generation() {
@@ -721,7 +705,7 @@ fn resampler_failure_preserves_newer_generation() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
 
     // RT publishes request A (generation 1) and the main thread starts
-    // rebuilding it; the F-RB-015 fault is armed for generation 1.
+    // rebuilding it; the fault is armed for generation 1.
     request_rebuild(&flags, 44100, 48000);
     let (reached_rx, release_tx) = super::resampler_fault::arm_fail_and_pause(&flags, 1);
 
@@ -739,7 +723,7 @@ fn resampler_failure_preserves_newer_generation() {
             .expect("handler must reach the fault pause");
 
         // RT publishes request B (generation 2) while the failed generation-1
-        // rebuild is still being handled — the F-RB-015 lost-wakeup window.
+        // rebuild is still being handled.
         request_rebuild(&flags, 96000, 48000);
         release_tx.send(()).expect("release must reach the handler");
 
@@ -799,9 +783,9 @@ fn resampler_failure_preserves_newer_generation() {
     assert!(gc_cons.pop().is_ok(), "retired resampler must reach the GC");
 }
 
-/// F-RB-015 / T1.1 — without a newer generation, a failed resampler rebuild
-/// clears the request: no spurious retry is armed (preserves the existing
-/// correct behavior for the simple case).
+/// Without a newer generation, a failed resampler rebuild clears the request:
+/// no spurious retry is armed (preserves the existing correct behavior for the
+/// simple case).
 #[cfg(feature = "testing")]
 #[test]
 fn resampler_failure_without_newer_generation_still_clears() {
@@ -837,7 +821,7 @@ fn resampler_failure_without_newer_generation_still_clears() {
     );
 }
 
-/// Deterministic lost-wakeup interleaving (F-RB-004 / T2.1 acceptance):
+/// Deterministic lost-wakeup interleaving:
 ///
 /// 1. RT requests A (generation 1).
 /// 2. Main builds and delivers A while RT renegotiates to B (generation 2).
@@ -1052,7 +1036,7 @@ fn lost_wakeup_stress_invariant() {
 
         while !stop_rt.load(Ordering::Acquire) {
             // Each loop iteration is one audio callback: the per-quantum
-            // structural budget resets to zero (T2.5).
+            // structural budget resets to zero.
             structural_applied = 0;
             // Host clock renegotiation: advertise the next rate whenever the
             // DSP has not yet caught up — an adversarial renegotiation storm.
@@ -1129,7 +1113,7 @@ fn lost_wakeup_stress_invariant() {
     }
 }
 
-/// F-RB-004 / T2.3: `handle_oversample_rebuild` builds both L/R engines,
+/// Oversampling rebuild: `handle_oversample_rebuild` builds both L/R engines,
 /// stamps the pair with the captured `requested_os_generation`, pushes to SPSC,
 /// and clears the rebuild flag.
 #[test]
@@ -1162,7 +1146,7 @@ fn oversample_pair_built_stamped_and_pushed_atomically() {
     );
 }
 
-/// F-RB-004 / T2.3: Lost-wakeup guard for oversampling.
+/// Lost-wakeup guard for oversampling.
 ///
 /// If `requested_os_generation` advances while the main thread is building the
 /// engines, `rearm_os_if_superseded` re-arms `NEEDS_OS_REBUILD` so the main
@@ -1190,10 +1174,9 @@ fn oversample_rearm_when_superseded_during_build() {
     );
 }
 
-/// F-RB-004 / T2.3: Fail-closed delivery retry.
-///
-/// When the SPSC channel is full, `handle_oversample_rebuild` emits a diagnostic
-/// and retains `NEEDS_OS_REBUILD` so the swap is retried on the next cycle.
+/// Fail-closed delivery retry: when the SPSC channel is full,
+/// `handle_oversample_rebuild` emits a diagnostic and retains `NEEDS_OS_REBUILD`
+/// so the swap is retried on the next cycle.
 #[test]
 fn oversample_channel_full_keeps_flag_for_retry() {
     let flags = RtStatusFlags::new();
@@ -1236,8 +1219,8 @@ fn request_os_rebuild(flags: &RtStatusFlags, factor: OversampleFactor) {
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
 }
 
-/// F-RB-017 / T2.1 — a persistent `OversampleEngine::new` failure must not be
-/// retried on every control-loop tick.
+/// A persistent `OversampleEngine::new` failure must not be retried on every
+/// control-loop tick.
 ///
 /// The fault is armed persistently for generation 1; the handler is called N
 /// times (simulating N ≤ 100 ms control-loop iterations). Only the first call
@@ -1306,8 +1289,8 @@ fn oversample_build_failure_stops_retry_storm_until_newer_generation() {
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD));
 }
 
-/// F-RB-018 / T2.2 — deterministic slimmable rejections must clear the request
-/// immediately: no retry of the slice/prewarm allocators on later ticks.
+/// Deterministic slimmable rejections must clear the request immediately:
+/// no retry of the slice/prewarm allocators on later ticks.
 ///
 /// Covers the two terminal classes: `target_ch < 4` and a non-WaveNet model
 /// (the `lstm.nam` fixture loads as an LSTM, which `slice_wavenet_model`
@@ -1365,8 +1348,8 @@ fn slimmable_terminal_rejection_clears_flag_no_retry() {
     assert!(cons.pop().is_err(), "terminal rejection delivers nothing");
 }
 
-/// F-RB-018 / T2.2 — a transient `slice_wavenet_model` failure must not be
-/// retried on every control-loop tick.
+/// A transient `slice_wavenet_model` failure must not be retried on every
+/// control-loop tick.
 ///
 /// The slice fault is armed persistently for generation 1; the handler is
 /// called N times (simulating N ≤ 100 ms control-loop iterations). Only the

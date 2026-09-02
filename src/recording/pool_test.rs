@@ -42,7 +42,7 @@ fn assert_bits_eq(a: &[f32], b: &[f32]) {
     }
 }
 
-/// T4.2 acceptance: single-threaded round trip — acquire, fill, publish,
+/// Acceptance: single-threaded round trip — acquire, fill, publish,
 /// pop, read, release — followed by a full free-ring drain proving every
 /// index is present exactly once (no ABA, no double-return).
 #[test]
@@ -235,7 +235,7 @@ fn descriptor_is_a_small_word() {
     assert_eq!(POOL_CAPACITY, super::super::buffer::RING_CAPACITY);
 }
 
-/// T4.3 ordering contract: a control barrier must (a) be published through
+/// Ordering contract: a control barrier must (a) be published through
 /// the `work` ring in FIFO position, (b) surface as `is_barrier()` without
 /// an audio block, (c) release as a no-op (no slot recycled), and (d) never
 /// disturb the slot ownership around it — audio descriptors before and

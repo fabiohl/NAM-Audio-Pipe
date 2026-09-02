@@ -37,9 +37,9 @@ pub fn detect_hardware_sink() -> Option<String> {
 /// whole wait, so the watchdog terminates the probe via
 /// [`std::process::Child::kill`] — which targets the kernel's handle for the
 /// spawned process and can therefore never signal a recycled PID. This closes
-/// the F-RB-016 race of the previous implementation, which killed a raw
-/// `libc::pid_t` with `libc::kill(pid, SIGKILL)` after the joiner thread had
-/// already reaped the child (the PID could have been recycled in between).
+/// the race of killing a raw `libc::pid_t` with `libc::kill(pid, SIGKILL)`
+/// after a joiner thread has already reaped the child (where the PID could have
+/// been recycled in between).
 ///
 /// Returns `None` when the child fails to exit within `timeout` (it is killed
 /// via the handle and reaped within a bounded grace window — never blocking
@@ -188,8 +188,8 @@ mod tests {
     #[test]
     fn watchdog_child_exiting_before_timeout_is_reaped_without_signal() {
         // The trivial `sleep 0` child terminates almost immediately — well before
-        // the watchdog deadline — exercising the exact race of F-RB-016 (child
-        // exits shortly before the 500 ms timeout). The new watchdog keeps the
+        // the watchdog deadline — exercising the fast-exit race (child
+        // exits shortly before the 500 ms timeout). The watchdog keeps the
         // `Child` handle and reaps via `try_wait`, so no raw `libc::kill(pid,
         // SIGKILL)` is ever issued and no signal can reach a recycled PID.
         let child = std::process::Command::new("sleep")

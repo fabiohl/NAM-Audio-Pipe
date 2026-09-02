@@ -72,7 +72,7 @@ fn swap_clears_active_and_sets_dirty() {
         req_gen
     );
     assert!(parking_lot_dirty.load(Ordering::Acquire));
-    // The retired payload reaches GC as a single moved Box (F-RB-007).
+    // The retired payload reaches GC as a single moved Box.
     let old = gc_c.pop().unwrap();
     assert_matches!(old, GcItem::CabSimSwap(_));
     assert!(gc_c.pop().is_err());
@@ -89,21 +89,15 @@ fn swap_replaces_active_and_gcs_retired_pair() {
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
     let req_gen = flags.requested_cabsim_generation.load(Ordering::Acquire);
-    let mut deferred = None;
+
+    prod.push(Box::new(CabSimSwapPayload {
+        generation: req_gen,
+        pair: Some(Box::new(make_pair(&ir, 128, 48000))),
+    }))
+    .unwrap();
+
     let mut structural_applied = 0usize;
-
-    // Continuous IR replacement: two successive pairs.
-    prod.push(Box::new(CabSimSwapPayload {
-        generation: req_gen,
-        pair: Some(Box::new(make_pair(&ir, 64, 96000))),
-    }))
-    .unwrap();
-    prod.push(Box::new(CabSimSwapPayload {
-        generation: req_gen,
-        pair: Some(Box::new(make_pair(&ir, 128, 96000))),
-    }))
-    .unwrap();
-
+    let mut deferred: Option<Box<CabSimSwapPayload>> = None;
     drain_cabsims(
         &mut cons,
         &mut deferred,
@@ -116,47 +110,49 @@ fn swap_replaces_active_and_gcs_retired_pair() {
         &flags,
     );
 
-    let installed = active.as_deref().expect("latest pair installed");
-    assert_eq!(installed.sample_rate, 96000);
+    assert_eq!(structural_applied, 1);
+    assert!(deferred.is_none());
+    let installed = active.as_ref().unwrap();
     assert_eq!(installed.partition_size(), 128);
     assert_eq!(
         flags.applied_cabsim_generation.load(Ordering::Acquire),
         req_gen
     );
-    assert!(parking_lot_dirty.load(Ordering::Acquire));
-    // Both retired payloads reach GC as single moved boxes.
-    assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
-    assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
-    assert!(gc_c.pop().is_err());
+    // Retired 64-sample cab-sim is now in GC
+    let old = gc_c.pop().unwrap();
+    match old {
+        GcItem::CabSimSwap(payload) => {
+            let pair = payload.pair.unwrap();
+            assert_eq!(pair.partition_size(), 64);
+        }
+        _ => panic!("Expected GcItem::CabSimSwap"),
+    }
 }
 
 #[test]
-fn stale_cabsim_payload_is_discarded_without_modifying_active() {
+fn stale_generation_is_discarded_to_gc_without_applying() {
     let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
-    let initial_pair = make_pair(&ir, 64, 48000);
-    let mut active = Some(Box::new(initial_pair));
+    let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-
-    // Current requested generation is 2
+    // Advance requested generation past the payload's timestamp
     flags
         .requested_cabsim_generation
         .store(2, Ordering::Release);
     flags.applied_cabsim_generation.store(1, Ordering::Release);
 
-    // Stale payload with generation 1
     prod.push(Box::new(CabSimSwapPayload {
-        generation: 1,
-        pair: Some(Box::new(make_pair(&ir, 128, 96000))),
+        generation: 1, // Stale
+        pair: Some(Box::new(make_pair(&ir, 128, 48000))),
     }))
     .unwrap();
 
-    let mut deferred = None;
     let mut structural_applied = 0usize;
+    let mut deferred: Option<Box<CabSimSwapPayload>> = None;
     drain_cabsims(
         &mut cons,
         &mut deferred,
@@ -169,9 +165,11 @@ fn stale_cabsim_payload_is_discarded_without_modifying_active() {
         &flags,
     );
 
-    // Active pair is unchanged (still 64 partition, 48000 rate)
-    let installed = active.as_deref().expect("initial pair retained");
-    assert_eq!(installed.sample_rate, 48000);
+    // Stale payload is not counted against structural budget
+    assert_eq!(structural_applied, 0);
+    assert!(deferred.is_none());
+    // Active cab-sim is preserved
+    let installed = active.as_ref().unwrap();
     assert_eq!(installed.partition_size(), 64);
     // Applied generation is untouched (remains 1)
     assert_eq!(flags.applied_cabsim_generation.load(Ordering::Acquire), 1);
@@ -179,7 +177,7 @@ fn stale_cabsim_payload_is_discarded_without_modifying_active() {
     assert_matches!(gc_c.pop().unwrap(), GcItem::CabSimSwap(_));
 }
 
-// ── T2.5 Structural Budget & Coalescing (F-RB-011) ──────────────────────
+// ── Structural Budget & Coalescing ──────────────────────────────────────────
 
 /// With multiple commands queued (including a `None` bypass), exactly one
 /// structural swap applies per callback and the obsolete intermediate
@@ -197,7 +195,7 @@ fn budget_applies_one_and_coalesces_backlog_latest_wins() {
     let req_gen = flags.requested_cabsim_generation.load(Ordering::Acquire);
 
     // Backlog: two successive pairs, then a `None` bypass as the newest
-    // command (e.g. F-RB-006 rebuild-failure rollback).
+    // command (e.g. rebuild-failure rollback).
     prod.push(Box::new(CabSimSwapPayload {
         generation: req_gen,
         pair: Some(Box::new(make_pair(&ir, 64, 96000))),

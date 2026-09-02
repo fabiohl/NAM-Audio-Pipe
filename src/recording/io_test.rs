@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the injectable positioned-write backend (F-RB-008 / T3.1).
+//! Unit tests for the injectable positioned-write backend.
 //!
 //! Exercises [`write_all_at`] against the [`FaultInjectingWriter`] mock with
 //! short writes of 1 byte, 7 bytes and arbitrary patterns, zero-progress

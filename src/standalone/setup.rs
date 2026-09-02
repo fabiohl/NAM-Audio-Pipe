@@ -109,7 +109,7 @@ pub fn load_initial_model(
     }
 }
 
-/// Preserved original cab-sim IR kept for rate-calibrated rebuilds (F-RB-006):
+/// Preserved original cab-sim IR kept for rate-calibrated rebuilds:
 /// the raw samples and the rate they were recorded at.
 pub struct InitialCabSimIr {
     /// Original (normalized) IR samples at `source_rate`.
@@ -119,7 +119,7 @@ pub struct InitialCabSimIr {
 }
 
 /// Derives the initial CabSim convolution partition size from the requested
-/// buffer size (G-RB-003 / T6.2).
+/// buffer size.
 ///
 /// The partition is clamped to the safe domain `[16, MAX_RESAMP_BUF]` and
 /// rounded up to a power of two before any `ConvEngine` is instantiated, so a
@@ -144,7 +144,7 @@ pub(crate) fn initial_cabsim_partition_size(buffer_size: u32) -> usize {
 /// and dispatched. The original samples and source rate are preserved: the
 /// pair is recalibrated for the applied host output rate on the first rebuild
 /// — never at the model rate, since the cab-sim stage runs after the return
-/// to host rate (F-RB-006).
+/// to host rate.
 pub fn load_initial_cabsim(
     cab_path: Option<&Path>,
     buffer_size: u32,
@@ -233,7 +233,7 @@ mod tests {
 
     #[test]
     fn initial_cabsim_partition_size_domain_and_pow2() {
-        // G-RB-003 / T6.2: the initial partition is clamped to [16, MAX_RESAMP_BUF]
+        // The initial partition is clamped to [16, MAX_RESAMP_BUF]
         // and rounded up to a power of two; 0 means auto (256).
         assert_eq!(initial_cabsim_partition_size(0), 256);
         assert_eq!(initial_cabsim_partition_size(16), 16);

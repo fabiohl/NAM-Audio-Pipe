@@ -164,7 +164,7 @@ fn no_args_prints_help_and_exits_zero() {
     );
 }
 
-// --buffer-size domain contract (G-RB-003 / T6.1) -------------------------
+// --buffer-size domain contract -------------------------------------------
 // The negative acceptances must fail fast with a non-zero exit and a clear
 // stderr message BEFORE any PipeWire connection is attempted.
 

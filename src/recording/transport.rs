@@ -1,18 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Recording transport selection (T4.3).
+//! Recording transport selection.
 //!
-//! Production recording audio now travels through the **promoted preallocated
-//! pool** (T4.2 verdict PROMOTE — `src/recording/pool.rs`): the RT thread
-//! `try_acquire`s a slot, fills it in place and `publish`es a 4-byte
-//! [`Descriptor`]; the I/O thread pops the descriptor, writes the 64 KiB block
-//! **in place** and `release`s the slot back to the free ring. The pool only
-//! carries audio — [`ControlPayload::Metadata`] and
-//! [`ControlPayload::StreamStop`] travel on a small dedicated control ring
-//! ([`CONTROL_CAPACITY`] slots).
+//! Production recording audio travels through the **promoted preallocated
+//! pool** (`src/recording/pool.rs`): the RT thread `try_acquire`s a slot,
+//! fills it in place and `publish`es a 4-byte [`Descriptor`]; the I/O thread
+//! pops the descriptor, writes the 64 KiB block **in place** and `release`s
+//! the slot back to the free ring. The pool only carries audio —
+//! [`ControlPayload::Metadata`] and [`ControlPayload::StreamStop`] travel on
+//! a small dedicated control ring ([`CONTROL_CAPACITY`] slots).
 //!
-//! # Rollback path (T4.1 inline ring)
+//! # Rollback path (inline ring)
 //!
 //! The pre-promotion transport — a single `rtrb` ring carrying
 //! [`RingPayload`] (Audio + Metadata + StreamStop) — remains fully wired as
@@ -29,7 +28,7 @@
 //! [`StreamStop`](ControlPayload::StreamStop) and then dropping the sender
 //! (which drops both the control producer and the pool producer) arms the
 //! worker's "abandoned **and** drained" terminal condition — identical
-//! semantics to the inline ring's producer drop (F-RB-009 / T3.4/T3.5).
+//! semantics to the inline ring's producer drop.
 
 use rtrb::{Consumer, Producer};
 
@@ -39,23 +38,22 @@ use super::buffer::{
 };
 use super::pool::{POOL_CAPACITY, PoolConsumer, PoolProducer, RecordingPool};
 
-/// Recording audio transport switch (T4.3).
+/// Recording audio transport switch.
 ///
 /// * `true`  — promoted preallocated-pool transport (pool + small descriptor
 ///   for audio, dedicated control ring for Metadata/StreamStop).
-/// * `false` — T4.1 inline SPSC ring (rollback: single ring carries every
-///   payload; used only if the pool introduces ABA/lifetime risk in the real
-///   path).
+/// * `false` — inline SPSC ring (rollback: single ring carries every payload;
+///   used only if the pool introduces ABA/lifetime risk in the real path).
 ///
-/// # Status (F-RB-025 / T5.4)
+/// # Status
 ///
 /// The `Inline` rollback branch is **structurally unreachable in production**:
 /// `RECORDING_POOL_TRANSPORT` is hard-coded to `true` and nothing flips it at
 /// runtime, so the inline path has no coverage on the production surface —
-/// only dedicated unit tests (see `docs/testing.md`, T4.1/T5.4 note). It is
-/// kept intentionally as the documented T4.1 rollback; if it is never needed,
-/// it should be removed entirely in a future release rather than maintained
-/// as dead weight.
+/// only dedicated unit tests (see `docs/testing.md`). It is kept
+/// intentionally as the documented rollback; if it is never needed, it
+/// should be removed entirely in a future release rather than maintained as
+/// dead weight.
 pub const RECORDING_POOL_TRANSPORT: bool = true;
 
 /// Producer half of the recording transport, held by
@@ -63,9 +61,9 @@ pub const RECORDING_POOL_TRANSPORT: bool = true;
 /// by the RT callback through a raw pointer.
 ///
 /// The RT thread is the sole writer of every channel it owns; the guard keeps
-/// custody for the shutdown path (F-RB-009 / T3.5).
+/// custody for the shutdown path.
 pub enum RecordingSender {
-    /// Promoted T4.3 transport: a small dedicated control ring
+    /// Promoted transport: a small dedicated control ring
     /// (Metadata/StreamStop) plus the preallocated audio pool producer.
     Pool {
         /// Control-ring producer (`None` when recording is disabled).
@@ -73,21 +71,21 @@ pub enum RecordingSender {
         /// Pool producer (`None` when recording is disabled).
         pool: Option<PoolProducer<POOL_CAPACITY>>,
     },
-    /// T4.1 rollback transport: the single inline ring producer.
+    /// Rollback transport: the single inline ring producer.
     Inline(Option<Producer<RingPayload<MAX_BLOCK_SIZE>>>),
 }
 
 /// Consumer half of the recording transport, moved to the `nam-recording-io`
 /// worker thread.
 pub enum RecordingReceiver {
-    /// Promoted T4.3 transport: control-ring consumer + pool consumer.
+    /// Promoted transport: control-ring consumer + pool consumer.
     Pool {
         /// Control-ring consumer.
         control: Consumer<ControlPayload>,
         /// Pool consumer (audio descriptors + slot recycling).
         pool: PoolConsumer<POOL_CAPACITY>,
     },
-    /// T4.1 rollback transport: the single inline ring consumer.
+    /// Rollback transport: the single inline ring consumer.
     Inline(Consumer<RingPayload<MAX_BLOCK_SIZE>>),
 }
 
@@ -132,8 +130,8 @@ impl RecordingSender {
     ///
     /// On the pool transport the metadata content travels on the control ring
     /// **and** a control barrier is pushed into the pool `work` ring so the
-    /// I/O thread applies the header change at the exact stream position
-    /// (T4.3). The metadata is considered confirmed only when **both** pushes
+    /// I/O thread applies the header change at the exact stream position.
+    /// The metadata is considered confirmed only when **both** pushes
     /// succeed — a failed barrier push leaves it unconfirmed and audio
     /// publication stays gated on the confirmation, so no ordering can break.
     #[inline]
@@ -206,7 +204,7 @@ impl Default for RecordingSender {
 
 impl RecordingReceiver {
     /// `true` when every producer side is gone and every channel is fully
-    /// drained — the worker's terminal condition (2) (F-RB-009 / T3.4).
+    /// drained — the worker's terminal condition (2).
     pub fn is_fully_drained(&self) -> bool {
         match self {
             RecordingReceiver::Pool { control, pool } => {
@@ -223,8 +221,8 @@ impl RecordingReceiver {
 /// Builds a fresh recording transport pair (sender → RT / guard, receiver →
 /// worker) for the transport selected by [`RECORDING_POOL_TRANSPORT`].
 ///
-/// The pool preallocates `POOL_CAPACITY` × ~64 KiB slots (≈ 16,8 MiB — the
-/// same memory budget as the inline ring, T4.2); the control ring adds a
+/// The pool preallocates `POOL_CAPACITY` × ~64 KiB slots (≈ 16.8 MiB — the
+/// same memory budget as the inline ring); the control ring adds a
 /// negligible 4 × 128 B.
 pub fn create_recording_transport() -> (RecordingSender, RecordingReceiver) {
     if RECORDING_POOL_TRANSPORT {

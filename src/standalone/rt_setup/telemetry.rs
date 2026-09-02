@@ -6,11 +6,11 @@
 //! Translates atomic signals from the DSP thread into diagnostic logs for
 //! the main loop, acting as the "dashboard" of NAM-Audio-Pipe.
 //!
-//! Sprint 6 / T6.1: runtime telemetry emits concise `log::*` lines
+//! Runtime telemetry emits concise `log::*` lines
 //! (`[Exxxx | MNEMONIC]` code + cause + recovery hint) **without** the
 //! `DiagnosticBundle` support block — the `──── Recent Log Trace ────`
 //! render is reserved for explicit `--diagnose`/`--diagnose-full` dumps and
-//! crash/panic reports. Sprint 6 / T6.2: every recurrent signal is latched
+//! crash/panic reports. Every recurrent signal is latched
 //! ([`TelemetryLatches`]) so a continuous condition warns at most once per
 //! episode instead of once per control-loop iteration.
 
@@ -20,7 +20,7 @@ use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtS
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// Per-signal episode latch (Sprint 6 / T6.2).
+/// Per-signal episode latch.
 ///
 /// A condition observed continuously by the control loop (starvation, queue
 /// saturation, rate churn, clipping, …) emits **at most once per episode**:
@@ -92,7 +92,7 @@ pub struct PollState {
     pub hugepage_synced: bool,
     pub telemetry_throttle: u32,
     pub cpu_receipt: Option<super::affinity::CpuSelectionReceipt>,
-    /// Per-signal episode latches (Sprint 6 / T6.2).
+    /// Per-signal episode latches.
     pub latches: TelemetryLatches,
 }
 
@@ -122,7 +122,7 @@ impl PollState {
 /// Returns a tuple (current_silent, current_fading) for state control in the main loop.
 ///
 /// `_sys` is retained for API stability (callers/tests pass the startup snapshot);
-/// runtime telemetry is intentionally bundle-free (Sprint 6 / T6.1).
+/// runtime telemetry is intentionally bundle-free.
 pub fn poll_rt_status(
     rt_status: &RtStatusFlags,
     _sys: &SystemSnapshot,
@@ -140,7 +140,7 @@ pub fn poll_rt_status(
     // If the cleanup channel is full, it means we are swapping neural models
     // faster than the system can discard old ones. We prioritize audio
     // "leaking" memory temporarily to avoid clicks (drops) in the sound.
-    // (T6.2) sustained pressure is latched: one concise warning per episode.
+    // Sustained pressure is latched: one concise warning per episode.
     let gc_overflow =
         rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_OVERFLOW);
     if state.latches.gc_overflow.observe(gc_overflow) {
@@ -171,7 +171,7 @@ pub fn poll_rt_status(
         );
     }
 
-    // Command Budgeting telemetry (F-RB-011 / T2.5): the RT callback drains
+    // Command Budgeting telemetry: the RT callback drains
     // under fixed per-quantum budgets. These flags make saturation explicit —
     // no command is ever lost; the excess is deferred to the next callback.
     let param_backlog = rt_status
@@ -279,7 +279,7 @@ pub fn poll_rt_status(
 
     // 4. REAL-TIME PRIORITY & ATOMIC ERRORS:
     // Reads error flags set atomically by configure_realtime_thread during stream
-    // state transition before readiness (T3.1 / F-RES-003) and emits the corresponding
+    // state transition before readiness and emits the corresponding
     // diagnostic messages from the main thread. On full success, prints the classic
     // thread optimization confirmation.
 
@@ -396,7 +396,7 @@ pub fn poll_rt_status(
     // 5. PROCESSING OVERLOAD (Overloads):
     // Warns if the processor (CPU) is not fast enough to compute
     // the neural network before the next audio block is needed.
-    // (T6.2) latched: a sustained overload episode warns once.
+    // Latched: a sustained overload episode warns once.
     let overloads = rt_status.dsp_overloads.swap(0, Ordering::Relaxed);
     if overloads > 0 {
         rt_status.xruns.fetch_add(overloads, Ordering::Relaxed);
@@ -436,7 +436,7 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.55 HOST SPA FORMAT CONTRACT VIOLATION (T4.3 / G-RB-001):
+    // 5.55 HOST SPA FORMAT CONTRACT VIOLATION:
     // The audio host handed buffers or negotiated a format diverging from the
     // strict F32P planar stereo contract (raised by the RT harness or by the
     // param_changed listeners). The backend state machine acknowledges the
@@ -453,12 +453,12 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.6 PLAYBACK BRIDGE STARVATION (T4.2 / G-RB-001):
+    // 5.6 PLAYBACK BRIDGE STARVATION:
     // The bridge produced no new DSP block (capture paused, resampler rebuild
     // pending, clock drift or quantum miss). The playback callback delivered a
     // recycled buffer filled with deterministic silence instead of repeating
     // stale audio — expected behavior, surfaced as info telemetry.
-    // (T6.2) latched: sustained starvation (e.g. paused capture) informs once
+    // Latched: sustained starvation (e.g. paused capture) informs once
     // per episode instead of every control-loop iteration.
     let playback_bridge_starvation = rt_status
         .playback_bridge_starvation
@@ -479,7 +479,7 @@ pub fn poll_rt_status(
     // Occurs when you use different devices for input and output (e.g. USB Microphone
     // and P2 Headphones). If one is slightly faster than the other, the system needs to discard
     // some small audio chunks to maintain synchronization.
-    // (T6.2) latched: a sustained drift episode warns once.
+    // Latched: a sustained drift episode warns once.
     let drops = bridge.drain_dropped_frames();
     if state.latches.drift_drops.observe(drops > 0) {
         log::warn!(
@@ -631,7 +631,7 @@ pub fn poll_rt_status(
             let budget_us = (samples_val as f64 / rate_val as f64) * 1_000_000.0;
             let elapsed_us = duration.as_micros() as f64;
 
-            // (T6.2) latched: sustained deadline overruns report once per
+            // Latched: sustained deadline overruns report once per
             // episode instead of once per telemetry window. The observation
             // runs on every throttle window so the latch releases as soon as
             // the DSP stays within budget.

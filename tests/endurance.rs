@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! Real wall-clock endurance suite (T5.3 / G-PERF-004).
+//! Real wall-clock endurance suite.
 //!
 //! Purpose (declared in the long-suite receipt as `ENDURANCE_REAL_PURPOSE`):
 //! the timeline is **not** compressed — the suite runs for a real wall-clock
@@ -18,7 +18,7 @@
 //! thread count (`/proc/self/status`) and open FD count (`/proc/self/fd`) —
 //! registered in the `TEST_RESULT[endurance_real]=PASS ...` marker.
 //!
-//! Medido: soak 320k blocos em <elapsed> s, RSS delta=<delta> MB, faults=0
+//! Measured: soak 320k blocks in <elapsed> s, RSS delta=<delta> MB, faults=0
 //! (filled by the operator after a calibrated run; the marker carries the live
 //! numbers every run).
 
@@ -33,8 +33,7 @@ use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 use std::time::{Duration, Instant};
 
 /// Validation window cadence: every N blocks a mandatory Linear A/B polarity
-/// window must complete (fail-closed — see the acceptance "zero janelas
-/// desaparecidas").
+/// window must complete (fail-closed — zero vanished windows).
 const VALIDATION_INTERVAL: usize = 500;
 
 /// Telemetry cadence: a raw RSS/faults/threads/FD sample every N blocks.
@@ -84,7 +83,7 @@ fn endurance_window_seconds() -> u64 {
     raw.clamp(MIN_WINDOW_SECS, 600)
 }
 
-/// Real wall-clock endurance (T5.3 / G-PERF-004).
+/// Real wall-clock endurance.
 ///
 /// Runs continuous audio + periodic swap batches for a real wall-clock window,
 /// with mandatory fail-closed validation windows every `VALIDATION_INTERVAL`

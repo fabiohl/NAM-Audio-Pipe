@@ -20,8 +20,7 @@ use pw::properties::properties;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// Handles playback stream state changes — feeds the backend state machine
-/// (F-RB-010 / T4.4).
+/// Handles playback stream state changes — feeds the backend state machine.
 ///
 /// Mirrors the capture `state_changed_handler`: a fatal `StreamState::Error` or
 /// a post-streaming `StreamState::Unconnected` (daemon crash/restart) marks the
@@ -40,7 +39,7 @@ pub fn playback_state_changed_handler(
 
 /// Handles playback stream `param_changed` events (format negotiation).
 ///
-/// Enforces the strict SPA format contract (G-RB-001 / T4.3) through the
+/// Enforces the strict SPA format contract through the
 /// canonical [`validate_audio_raw_format`] gate: only `F32P` planar stereo is
 /// accepted. A diverging renegotiation (mono, interleaved, S16, surround) is
 /// rejected fail-closed — `RT_STATUS_HOST_CONTRACT_VIOLATION` is raised on
@@ -144,7 +143,7 @@ pub fn setup_playback_stream<'c>(
             )
         })
         .process(move |stream: &pw::stream::Stream, _info| {
-            // F-RB-020 / T3.2: contain RT-callback panics here — they never
+            // Contain RT-callback panics here — they never
             // reach the `pipewire` crate's `extern "C"` trampoline (which would
             // `abort`); the fatal `RT_STATUS_PANIC_CAPTURED` latch drives the
             // ordered teardown from the main control loop.

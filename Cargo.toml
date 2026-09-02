@@ -31,7 +31,7 @@ name = "pgo_workload"
 path = "src/bin/pgo_workload.rs"
 required-features = ["testing"]
 
-# T5.1 / T8.1: fail-closed semantic verifier for the long-suite receipt. Used
+# Fail-closed semantic verifier for the long-suite receipt. Used
 # by utils/build-release.sh --release-ceremony as the strict-receipt gate (no
 # substring search). Deliberately free of `required-features`: the release
 # ceremony must be able to build it without the `testing` feature.
@@ -39,7 +39,7 @@ required-features = ["testing"]
 name = "long_receipt_check"
 path = "src/bin/long_receipt_check.rs"
 
-# T4.2 / EP-PERF-4: A/B benchmark of the recording transports (inline SPSC ring
+# A/B benchmark of the recording transports (inline SPSC ring
 # vs preallocated pool + small descriptor). A profiling-only harness like
 # pgo_workload: excluded from the standard test path, compiled only when the
 # `testing` feature is active.
@@ -48,7 +48,7 @@ name = "recording_ab_bench"
 path = "src/bin/recording_ab_bench.rs"
 required-features = ["testing"]
 
-# T5.2 / G-PERF-003: A/B optimization benchmark of the DSP hot-path envelope
+# A/B optimization benchmark of the DSP hot-path envelope
 # (plain → PGO → PGO+BOLT). A profiling-only harness like pgo_workload: excluded
 # from the standard test path, compiled only when the `testing` feature is
 # active. The comparison ceremony is executed by utils/ab-opt-ceremony.sh.
@@ -72,22 +72,22 @@ env_logger = { version = "0.11.11", default-features = false }
 
 [features]
 default = ["stereo"]
-# True stereo DSP (ER-2): enables the engine's stereo feature so the unified
+# True stereo DSP: enables the engine's stereo feature so the unified
 # L/R pipeline processes each channel independently instead of folding R as a
 # mono copy of L (mono detection becomes dynamic per-block).
 stereo = ["NeuralAmpModeler-rs/stereo"]
 testing = ["NeuralAmpModeler-rs/testing", "stereo"]
 # Enables the RT heap-audit allocator (CountingAllocator) and the swap
-# zero-allocation gates (F-RB-007).
+# zero-allocation gates.
 heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
 
 [dev-dependencies]
-# Property-based testing for AlignedBlock invariants (F-RB-001) and future fuzz targets.
+# Property-based testing for AlignedBlock invariants and future fuzz targets.
 proptest = "1.11.0"
-# ER-5 / T5.6 distribution QA harness: strict XML well-formedness parsing for
+# Distribution QA harness: strict XML well-formedness parsing for
 # the AppStream metainfo audit (tests/distribution_qa.rs).
 quick-xml = "0.42"
-# ER-5 / T5.6 distribution QA harness: JSON parsing + SHA-256 verification of
+# Distribution QA harness: JSON parsing + SHA-256 verification of
 # the release provenance receipt (tests/distribution_qa.rs).
 serde_json = "1"
 sha2 = "0.11"
@@ -95,26 +95,21 @@ sha2 = "0.11"
 [lints.clippy]
 allow_attributes = "warn"
 
-# D3 (F-RB-023, S5; review round 2026-09-02): `dist` intentionally inherits
-# `panic = "unwind"` from `release`.
+# Profile Configuration: `dist` intentionally inherits `panic = "unwind"` from `release`.
 #
-# - `release` keeps `panic = "unwind"`: the tests-quick.sh Fase 2 runs the
-#   `--lib` suite in `--release` and T3.2 (F-RB-020) relies on `catch_unwind`
-#   to prove panics inside RT callbacks never cross the PipeWire `extern "C"`
-#   boundary. Uniformizing `release` to `panic = "abort"` would make that
-#   evidence unusable.
+# - `release` keeps `panic = "unwind"`: the tests-quick.sh Phase 2 runs the
+#   `--lib` suite in `--release` and relies on `catch_unwind` to prove panics
+#   inside RT callbacks never cross the PipeWire `extern "C"` boundary.
+#   Uniformizing `release` to `panic = "abort"` would make that evidence unusable.
 # - `dist` is the profile effectively distributed by `utils/build-release.sh`
 #   (stripped, LTO fat) — the exact artifact certified by the release
-#   ceremony. It **also** inherits `unwind`: under `panic = "abort"` the
+#   ceremony. It also inherits `unwind`: under `panic = "abort"` the
 #   `std::panic::catch_unwind` wrapper around the RT callbacks
-#   (`run_rt_callback_body`, F-RB-020) could never catch — a panic would still
+#   (`run_rt_callback_body`) could never catch — a panic would still
 #   `abort` with a corrupted recording. Keeping `unwind` makes the contained
 #   teardown guarantee (WAV finalized, ordered shutdown) real in the artifact
-#   users actually install. The earlier rationale ("the difference is moot —
-#   Rust ≥ 1.81 aborts at the `extern "C"` shim either way") was wrong exactly
-#   because the wrapper prevents the panic from ever reaching that shim.
-# Do not uniformize `release`/`dist` to `abort` without a new decision (see D3
-# in .agents/TODO-sprints.md).
+#   users actually install. The wrapper prevents the panic from ever reaching
+#   the extern "C" boundary, guaranteeing orderly recovery and data safety.
 [profile.release]
 strip = true
 lto = "fat"

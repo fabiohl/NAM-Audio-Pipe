@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Fail-closed semantic verifier for the long-suite receipt (T5.1 / T8.1).
+//! Fail-closed semantic verifier for the long-suite release receipt.
 //!
 //! Invoked by `utils/build-release.sh` at the release-ceremony gate to verify
 //! `target/logs/long-receipt.txt` with the shared semantic parser

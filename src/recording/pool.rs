@@ -1,27 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Preallocated pool + small-descriptor SPSC transport for the recording path
-//! (T4.2 / EP-PERF-4 candidate).
+//! Preallocated pool + small-descriptor SPSC transport for the recording path.
 //!
 //! # Why this transport exists
 //!
-//! The production recording transport (T4.1) moves every 64 KiB audio block
-//! *by value* through an `rtrb` SPSC ring: the RT thread copies the PipeWire
-//! frames into a scratch block and `push`es it (64 KiB write into the ring
-//! slot), and the I/O thread `pop`s it (64 KiB read out of the ring slot into
-//! its own stack block) before interleaving it into the WAV I/O buffer. The
-//! block therefore crosses the L1/L2/LLC hierarchy an extra round-trip per
-//! quantum.
+//! The inline recording transport moves every 64 KiB audio block *by value*
+//! through an `rtrb` SPSC ring: the RT thread copies the PipeWire frames into a
+//! scratch block and `push`es it (64 KiB write into the ring slot), and the
+//! I/O thread `pop`s it (64 KiB read out of the ring slot into its own stack
+//! block) before interleaving it into the WAV I/O buffer. The block therefore
+//! crosses the L1/L2/LLC hierarchy an extra round-trip per quantum.
 //!
-//! This module is the T4.2 alternative: a **preallocated slot pool** whose
-//! data never moves. The RT thread pops a small slot *index* from a free-list
-//! ring, copies the frames directly into the preallocated slot, and publishes
-//! a 4-byte `Descriptor` through a second SPSC ring. The I/O thread pops the
+//! This module provides a **preallocated slot pool** whose data never moves.
+//! The RT thread pops a small slot *index* from a free-list ring, copies the
+//! frames directly into the preallocated slot, and publishes a 4-byte
+//! `Descriptor` through a second SPSC ring. The I/O thread pops the
 //! descriptor, reads the block **in place**, and returns the index to the
-//! free-list ring — the "return" (volta) channel. The 64 KiB payload is
-//! written once and read once; only 4-byte descriptors and 2-byte indices
-//! travel through the rings.
+//! free-list ring — the "return" channel. The 64 KiB payload is written once
+//! and read once; only 4-byte descriptors and 2-byte indices travel through the
+//! rings.
 //!
 //! ```text
 //!            ┌──────────── free ring (u16 indices, I/O → RT) ────────────┐
@@ -44,13 +42,11 @@
 //!
 //! | path | producer | consumer | total data lines |
 //! |------|----------|----------|------------------|
-//! | inline (T4.1) | fill scratch (`B`W) + push (`B`R+`B`W) | pop (`B`R+`B`W) + write (`B`R+`B`W) | **7·B/64** |
+//! | inline | fill scratch (`B`W) + push (`B`R+`B`W) | pop (`B`R+`B`W) + write (`B`R+`B`W) | **7·B/64** |
 //! | pool + descriptor | fill slot in place (`B`W) | read slot + write io buf (`B`R+`B`W) | **3·B/64** |
 //!
-//! The pool therefore touches ~57% fewer data cache lines per quantum; the
-//! A/B benchmark (`src/bin/recording_ab_bench.rs`) measures whether that
-//! translates into a reproducible ≥ 5 % p99 latency gain before this transport
-//! is ever promoted over the inline one.
+//! The pool touches ~57% fewer data cache lines per quantum, significantly
+//! reducing CPU cache pressure and memory bandwidth consumption on the RT thread.
 //!
 //! # Ownership protocol & soundness
 //!
@@ -92,11 +88,11 @@ use rtrb::{Consumer, Producer, RingBuffer};
 use super::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 
 /// Number of preallocated slots. Mirrors [`super::buffer::RING_CAPACITY`]
-/// (256 × ~64 KiB ≈ 16,8 MiB) so the A/B compares transports at the same
-/// memory budget as the inline ring.
+/// (256 × ~64 KiB ≈ 16.8 MiB) so both transports operate within the same
+/// memory budget.
 pub const POOL_CAPACITY: usize = 256;
 
-/// Reserved slot index marking a **control barrier** in the `work` ring (T4.3).
+/// Reserved slot index marking a **control barrier** in the `work` ring.
 ///
 /// `0xFFFF` can never be handed out by [`PoolProducer::try_acquire`] (the free
 /// ring is seeded with `0..N` and `N <= 256`), so the value is free to act as
@@ -294,7 +290,7 @@ impl<const N: usize> PoolProducer<N> {
         out
     }
 
-    /// Publishes a **control barrier** into the `work` ring (T4.3).
+    /// Publishes a **control barrier** into the `work` ring.
     ///
     /// The barrier is a pure ordering marker: it tells the I/O thread that a
     /// control message — pushed into the dedicated control ring **just before**

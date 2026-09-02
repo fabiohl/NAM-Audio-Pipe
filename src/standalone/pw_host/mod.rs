@@ -96,7 +96,7 @@ pub use status::{
 };
 pub use wakeup::ControlPlaneWakeup;
 
-/// Offline RT swap-stress harness (T2.6 / ER-2) — full capture-callback drain
+/// Offline RT swap-stress harness — full capture-callback drain
 /// sequence + DSP with no PipeWire daemon. Compiled only under `testing`.
 #[cfg(feature = "testing")]
 pub use rt_callback::harness::RtSwapHarness;

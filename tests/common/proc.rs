@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Shared `/proc` telemetry readers for the soak and endurance harnesses
-//! (T5.3 / G-PERF-004).
+//! Shared `/proc` telemetry readers for the soak and endurance harnesses.
 //!
 //! Single source of truth for the raw RSS / page-fault / thread / FD probes so
 //! `tests/soak_extended.rs` and `tests/endurance.rs` never drift apart — a

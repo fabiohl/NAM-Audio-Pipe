@@ -172,7 +172,7 @@ fn test_configure_realtime_thread_max_cpu_boundary() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Injectable ThreadConfigurator Mock & Policy Invariant Tests (T3.1)
+// Injectable ThreadConfigurator Mock & Policy Invariant Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct MockThreadConfigurator {

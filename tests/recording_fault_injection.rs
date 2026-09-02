@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! ER-3 fault-injection, byte-by-byte validation and resource-leak harness
-//! for the recording subsystem (T3.6).
+//! Fault-injection, byte-by-byte validation and resource-leak harness
+//! for the recording subsystem.
 //!
 //! Complements `tests/recording.rs` (functional lifecycle) with the
-//! certification battery required by the ER-3 gates:
+//! certification battery:
 //!
 //! * **Independent RIFF validator** — a hand-rolled chunk walker (no `hound`)
 //!   that structurally validates the `RIFF`/`WAVE` envelope, `fmt `, `fact`
@@ -586,7 +586,7 @@ fn wav_byte_exact_sine_noise_ramp_roundtrip() {
     assert_eq!(reader.duration() as usize, 24 * 480);
 }
 
-/// T4.1 acceptance — capacity-domain boundaries: blocks of exactly 2048
+/// Capacity-domain boundaries: blocks of exactly 2048
 /// frames (the old hard drop ceiling of `MAX_BLOCK_SIZE / 2`), 2049 frames
 /// (the first frame past it) and 8192 frames (`MAX_BRIDGE_BUF`, the largest
 /// legal quantum) must all be persisted **integrally** and byte-exact. No
@@ -836,8 +836,7 @@ fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {
 /// Simulates a `SIGINT` (`SHUTDOWN = true`, exactly what the app's signal
 /// handler does) arriving under high audio transfer rate. The worker must keep
 /// draining every block produced after the signal and finalize 100% of the
-/// samples — the T3.4 lifecycle invariant, now proven at integration level
-/// against the real `io_uring` writer.
+/// samples — proven at integration level against the real `io_uring` writer.
 #[test]
 #[ignore = "requires io_uring support"]
 fn sigint_shutdown_under_high_rate_never_truncates() {
@@ -932,8 +931,8 @@ fn sigterm_producer_drop_drains_and_finalizes_byte_exact() {
 /// 20 recording instances racing to create files in the same directory at the
 /// same instant must each land on a distinct atomically-created capture file —
 /// the kernel's `O_EXCL` (via `create_new(true)`) plus the `-1`, `-2`, ...
-/// suffix resolution guarantees no clobbering and no lost capture (F-RB-008 /
-/// T3.2), now proven end-to-end through the real `io_uring` workers.
+/// suffix resolution guarantees no clobbering and no lost capture,
+/// now proven end-to-end through the real `io_uring` workers.
 #[test]
 #[ignore = "requires io_uring support"]
 fn concurrent_workers_same_dir_atomic_creation_no_clobber() {

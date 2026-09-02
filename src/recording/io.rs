@@ -8,7 +8,7 @@
 //! write). Persisting a WAV header or an audio block partially would silently
 //! corrupt the recorded stream, so every recording write goes through
 //! [`write_all_at`], which loops until 100% of the buffer is written or the
-//! operation fails explicitly (F-RB-008 / T3.1).
+//! operation fails explicitly.
 //!
 //! The [`WriteAt`] trait abstracts the positioned-write file so the real
 //! `io_uring` file and the test-only `FaultInjectingWriter` mock are

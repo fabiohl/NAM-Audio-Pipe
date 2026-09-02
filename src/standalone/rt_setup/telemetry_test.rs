@@ -41,7 +41,7 @@ fn test_poll_state_default_and_independent_instances() {
     assert_eq!(state2.telemetry_throttle, 43);
     assert_eq!(state1.telemetry_throttle, 0);
 
-    // Sprint 6 / T6.2: latches default to inactive and stay independent.
+    // Latches default to inactive and stay independent.
     assert_eq!(state1.latches, TelemetryLatches::default());
     assert_eq!(state2.latches, TelemetryLatches::default());
     state2.latches.clipping.observe(true);
@@ -302,7 +302,7 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
         .expect("LogBuffer must be initialized");
     let records = log_buf.snapshot();
 
-    // Sprint 6 / T6.1: runtime warnings/errors are concise `log::*` lines
+    // Runtime warnings/errors are concise `log::*` lines
     // carrying the typed code + mnemonic — never the full support bundle.
     assert!(
         records
@@ -335,7 +335,7 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
         "clipping must keep its concise warning"
     );
 
-    // Sprint 6 / T6.1: the retrospective `Recent Log Trace` support block is
+    // The retrospective `Recent Log Trace` support block is
     // reserved for `--diagnose`/`--diagnose-full` and crash reports — runtime
     // telemetry must never re-print it.
     assert!(

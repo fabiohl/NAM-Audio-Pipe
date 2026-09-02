@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! RAII custody of the `nam-recording-io` worker thread and its stop channel
-//! (F-RB-009 / T3.5).
+//! RAII custody of the `nam-recording-io` worker thread and its stop channel.
 //!
 //! The worker used to be handed to the PipeWire host as a bare
 //! [`std::thread::JoinHandle`] whose join result was discarded
@@ -16,11 +15,11 @@
 //!
 //! * **RAII custody** — the guard owns the [`JoinHandle`] *and* the recording
 //!   transport [`RecordingSender`] (the worker's stop channel: dropping it
-//!   arms the "abandoned + drained" terminal condition, F-RB-009 / T3.4). On a
-//!   premature drop — an error `?` return or a panic unwinding during host
-//!   initialization — the guard pushes `StreamStop`, drops the sender and
-//!   joins the worker with a bounded timeout, so no zombie thread or open file
-//!   descriptor survives any exit path.
+//!   arms the "abandoned + drained" terminal condition). On a premature drop —
+//!   an error `?` return or a panic unwinding during host initialization — the
+//!   guard pushes `StreamStop`, drops the sender and joins the worker with a
+//!   bounded timeout, so no zombie thread or open file descriptor survives
+//!   any exit path.
 //! * **Observable join** — [`RecordingWorkerGuard::shutdown`] formally
 //!   inspects the `JoinHandle` result (worker `Err`, panic payload, join
 //!   timeout) and returns a [`RecordingWorkerOutcome`] that the caller
@@ -49,8 +48,7 @@ pub const STREAM_STOP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::
 /// recording: every other variant must surface to the process exit code so
 /// scripts and automation can tell a successful capture apart from a
 /// partial/failed one — including [`RecordingWorkerOutcome::SuccessWithLoss`],
-/// a recording that completed but dropped audio to ring overruns (F-RB-024 /
-/// T5.1).
+/// a recording that completed but dropped audio to ring overruns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingWorkerOutcome {
     /// The worker drained every block, rewrote the WAV header with the final
@@ -59,8 +57,8 @@ pub enum RecordingWorkerOutcome {
     /// The worker drained and finalized the WAV, but the RT producer reported
     /// ring overruns: `blocks` audio blocks (totaling `frames` stereo frames)
     /// were dropped on the capture path. The recording is complete but lossy
-    /// and must surface as a non-zero exit (D1) so `frames_capturados ==
-    /// frames_enfileirados + frames_perdidos` is reconcilable and never silent.
+    /// and must surface as a non-zero exit so `frames_captured ==
+    /// frames_enqueued + frames_lost` is reconcilable and never silent.
     SuccessWithLoss {
         /// Number of audio blocks lost to overruns.
         blocks: u64,
@@ -89,11 +87,10 @@ pub enum RecordingWorkerOutcome {
 }
 
 impl RecordingWorkerOutcome {
-    /// D1 exit-code policy (F-RB-024 / T5.1): `Success` is the only clean
-    /// outcome (exit 0). Every other variant — including `SuccessWithLoss` —
-    /// maps to a non-zero exit, so a recording that dropped audio never
-    /// masquerades as a lossless capture for automation that checks only the
-    /// process exit code.
+    /// Exit-code policy: `Success` is the only clean outcome (exit 0).
+    /// Every other variant — including `SuccessWithLoss` — maps to a non-zero
+    /// exit, so a recording that dropped audio never masquerades as a lossless
+    /// capture for automation that checks only the process exit code.
     pub fn exit_code(&self) -> i32 {
         match self {
             RecordingWorkerOutcome::Success => 0,
@@ -145,7 +142,7 @@ impl std::fmt::Display for RecordingWorkerOutcome {
 /// * the recording transport [`RecordingSender`] — the worker's stop channel.
 ///   Pushing [`StreamStop`](crate::recording::buffer::ControlPayload::StreamStop)
 ///   and then dropping the sender (which drops every producer half) arms the
-///   worker's terminal "abandoned + drained" condition (F-RB-009 / T3.4), so a
+///   worker's terminal "abandoned + drained" condition, so a
 ///   premature drop terminates the worker in bounded time.
 ///
 /// # Lifecycle
@@ -169,7 +166,7 @@ pub struct RecordingWorkerGuard {
     sender: Option<RecordingSender>,
     /// RT-observable failure flag; `Some` only under `--record`. When raised,
     /// the worker already exited and the `StreamStop` push is skipped (the
-    /// ring would never drain — F-RB-009 / T3.3).
+    /// ring would never drain).
     failed: Option<Arc<AtomicBool>>,
     /// Set once the ordered teardown ran, so a consumed guard never tears down
     /// twice (the `Drop` of a guard finished by [`RecordingWorkerGuard::shutdown`]
@@ -215,7 +212,7 @@ impl RecordingWorkerGuard {
         self.failed.as_ref()
     }
 
-    /// Ordered teardown of the recording worker (F-RB-009 / T3.4 + T3.5):
+    /// Ordered teardown of the recording worker:
     ///
     /// 1. **`StreamStop`** — best-effort delivery (bounded retry) of the
     ///    terminal token through the transport's control channel. It is only
@@ -233,8 +230,7 @@ impl RecordingWorkerGuard {
     /// capture path counted ring overruns (`OVERRUN_COUNT` /
     /// `OVERRUN_FRAMES_COUNT`), the outcome is promoted to
     /// [`RecordingWorkerOutcome::SuccessWithLoss`] — a recording that dropped
-    /// audio never surfaces as a pristine capture (F-RB-024 / T5.1, D1:
-    /// non-zero exit).
+    /// audio never surfaces as a pristine capture (non-zero exit).
     pub fn shutdown(mut self) -> RecordingWorkerOutcome {
         let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
         self.teardown_done = true;
@@ -251,8 +247,8 @@ impl Drop for RecordingWorkerGuard {
         // initialization reached this frame before the explicit shutdown path
         // ran. Signal the worker (StreamStop → sender drop) and join with a
         // bounded timeout so no zombie thread or open WAV descriptor outlives
-        // the guard (F-RB-009 / T3.5). The join result cannot be returned from
-        // `Drop`; a non-clean teardown is logged for the diagnostics trace.
+        // the guard. The join result cannot be returned from `Drop`; a
+        // non-clean teardown is logged for the diagnostics trace.
         let outcome = classify_loss(teardown(
             &mut self.handle,
             &mut self.sender,
@@ -289,7 +285,7 @@ fn teardown(
 }
 
 /// Promotes a clean join outcome to [`RecordingWorkerOutcome::SuccessWithLoss`]
-/// when the capture path counted ring overruns (F-RB-024 / T5.1).
+/// when the capture path counted ring overruns.
 ///
 /// The overrun counters are process-wide and only incremented on the recording
 /// path (`send_recording_audio` in `process.rs`); a non-recording session keeps
@@ -315,7 +311,7 @@ fn classify_loss(outcome: RecordingWorkerOutcome) -> RecordingWorkerOutcome {
 /// stopped, so the I/O thread is the only remaining consumer and should drain
 /// capacity quickly. On timeout the token is dropped; the worker then
 /// terminates through the sender-drop + drained-channels condition armed by
-/// [`teardown`] (F-RB-009 / T3.4).
+/// [`teardown`].
 pub(crate) fn push_stream_stop(sender: &mut RecordingSender, timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -338,8 +334,7 @@ pub(crate) fn push_stream_stop(sender: &mut RecordingSender, timeout: std::time:
     }
 }
 
-/// Bounded join for the `nam-recording-io` thread with formal result
-/// inspection (F-RB-009 / T3.5).
+/// Bounded join for the `nam-recording-io` thread with formal result inspection.
 ///
 /// Polls `is_finished()` and, once true, joins — which guarantees an immediate
 /// return. The join result is never discarded:
@@ -365,12 +360,10 @@ pub(crate) fn join_recording_io(
     let deadline = std::time::Instant::now() + timeout;
     while !handle.is_finished() {
         if std::time::Instant::now() >= deadline {
-            // Rollback (F-RB-009): detailed diagnostic before detaching — the
-            // process must never report a successful recording on a stall.
             log::warn!(
                 "nam-recording-io did not finish within {timeout:?}; \
                  detaching — the WAV header may be incomplete and the process \
-                 exit code will reflect the timeout (T3.5)."
+                 exit code will reflect the timeout."
             );
             return RecordingWorkerOutcome::TimedOut { timeout };
         }

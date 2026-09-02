@@ -63,17 +63,16 @@ fn custom_policy_respects_initial_and_max_backoff() {
 
 #[test]
 fn total_backoff_budget_is_the_hard_time_ceiling() {
-    // Acceptance (F-RB-010 / T4.5): the recovery phase must have a strict
-    // time ceiling, impeding infinite loops. Production: 250+500+1000 = 1750 ms.
+    // The recovery phase must have a strict time ceiling, impeding infinite loops.
+    // Production: 250+500+1000 = 1750 ms.
     let policy = ReconnectPolicy::production();
     assert_eq!(policy.total_backoff_budget(), Duration::from_millis(1750));
 }
 
 #[test]
 fn cycle_hands_out_exactly_max_attempts_backoffs_then_none() {
-    // Acceptance (F-RB-010 / T4.5): a daemon that stays inaccessible must
-    // exhaust the retry budget and then yield nothing — the caller fails fast
-    // instead of looping forever.
+    // A daemon that stays inaccessible must exhaust the retry budget and then
+    // yield nothing — the caller fails fast instead of looping forever.
     let mut cycle = ReconnectCycle::new(ReconnectPolicy::production());
     assert!(cycle.can_retry());
     assert_eq!(cycle.attempts_made(), 0);
@@ -102,8 +101,8 @@ fn cycle_with_disabled_policy_never_retries() {
 
 #[test]
 fn simulated_reconnect_recovers_without_losing_carried_state() {
-    // Acceptance (F-RB-010 / T4.5): a momentary daemon drop is recovered and
-    // the internal state (models, IRs, recording) survives the re-instantiation.
+    // A momentary daemon drop is recovered and the internal state
+    // (models, IRs, recording) survives the re-instantiation.
     // This drives the exact begin_attempt protocol `run.rs` uses: wait the
     // backoff, re-instantiate, and on failure consume the next slot.
     let mut cycle = ReconnectCycle::new(ReconnectPolicy::production());
@@ -140,8 +139,8 @@ fn simulated_reconnect_recovers_without_losing_carried_state() {
 
 #[test]
 fn simulated_exhaustion_terminates_cleanly_with_error_outcome() {
-    // Acceptance (F-RB-010 / T4.5): a daemon that never comes back must exhaust
-    // retries and terminate cleanly with an error (the fail-fast T4.4 path).
+    // A daemon that never comes back must exhaust retries and terminate
+    // cleanly with an error (observable fail-fast path).
     let mut cycle = ReconnectCycle::new(ReconnectPolicy::production());
     let mut attempts = 0u32;
     let outcome: Result<(), &str> = loop {
@@ -161,7 +160,7 @@ fn simulated_exhaustion_terminates_cleanly_with_error_outcome() {
 
 #[test]
 fn simulated_stream_setup_failure_stages_during_reconnect_route_through_budget() {
-    // Acceptance (T8.3): temporary stream setup failures (capture setup, playback setup,
+    // Temporary stream setup failures (capture setup, playback setup,
     // or stream connect) after a previous reconnection attempt consume the reconnect
     // budget, execute interruptible backoff, and retry until success or exhaustion.
     for stage in ["capture_setup", "playback_setup", "stream_connect"] {
@@ -199,7 +198,7 @@ fn simulated_stream_setup_failure_stages_during_reconnect_route_through_budget()
 
 #[test]
 fn stream_setup_failure_on_initial_attempt_fails_fast() {
-    // Acceptance (T8.3): failure on startup (attempts_made == 0) must fail fast
+    // Failure on startup (attempts_made == 0) must fail fast
     // without triggering reconnect backoff loops.
     let cycle = ReconnectCycle::new(ReconnectPolicy::production());
     assert_eq!(cycle.attempts_made(), 0);

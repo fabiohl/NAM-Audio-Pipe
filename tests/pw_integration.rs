@@ -99,7 +99,7 @@ fn test_pipewire_integration() {
                 requested_cpu: None,
                 // Reconnect disabled in the deterministic integration harness:
                 // the daemon probe already guarantees it is up, so any backend
-                // failure is a defect that must surface immediately (T4.5).
+                // failure is a defect that must surface immediately.
                 fail_fast: true,
                 gate_enabled: true,
             },
@@ -162,7 +162,7 @@ fn test_pipewire_integration() {
     )
 }
 
-/// Opt-in acceptance for F-RB-010 / T4.5: a momentary PipeWire daemon restart
+/// Opt-in acceptance: a momentary PipeWire daemon restart
 /// must be recovered by the bounded reconnect cycle with the internal state
 /// (models/IRs/recording) intact.
 ///
@@ -474,7 +474,7 @@ impl Drop for PipewireRestartGuard {
     }
 }
 
-/// Opt-in acceptance for F-RB-010 / T4.5: with the daemon inaccessible, the
+/// Opt-in acceptance: with the daemon inaccessible, the
 /// bounded reconnect cycle must exhaust its retry budget and terminate the host
 /// cleanly with an error (fail-fast fallback) — never spin forever.
 ///
@@ -634,11 +634,11 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Opt-in acceptance for F-RB-010 / T4.4 / T4.6 (ER-4 gate): with
+/// Opt-in acceptance: with
 /// `--fail-fast`, a forced backend failure (the stream observing a
 /// post-streaming disconnect when the daemon is stopped) must tear the host
 /// down and exit with a **non-zero code inside the SLA** — the immediate
-/// fail-fast path that the bounded reconnect (T4.5) rolls back to when no
+/// fail-fast path that the bounded reconnect rolls back to when no
 /// retry is available.
 ///
 /// This exercises the **compiled binary** as a black box (the real process exit

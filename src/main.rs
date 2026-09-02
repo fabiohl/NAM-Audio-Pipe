@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
     // the first signal cooperatively sets the process-global `SHUTDOWN` flag so
     // the main loop stops the audio cleanly (thread_loop.stop, recording drain,
     // WAV header rewrite + fsync); a second signal force-exits via `_exit(1)`.
-    // Installation validates every `libc::sigaction` return code (F-RB-010).
+    // Installation validates every `libc::sigaction` return code.
     signals::install_termination_signal_handlers()?;
 
     // 5. COMMUNICATION CHANNELS: Creates ultra-fast "pipes" for communication.
@@ -188,16 +188,16 @@ fn main() -> anyhow::Result<()> {
     rt_setup::configure_process_wide();
 
     // Create the recording transport (promoted preallocated-pool + control
-    // ring, or the T4.1 inline ring behind RECORDING_POOL_TRANSPORT) and spawn
+    // ring, or the inline ring behind RECORDING_POOL_TRANSPORT) and spawn
     // the disk I/O thread (opt-in via --record). The startup handshake
-    // (F-RB-009 / T3.3) is a hard fail-fast gate: PipeWire is only started
+    // is a hard fail-fast gate: PipeWire is only started
     // with `--record` after the worker confirms io_uring is up and the output
     // directory is writable — an invalid directory or an unavailable io_uring
     // aborts the process here instead of silently discarding all audio into
     // the transport.
     //
     // The worker thread, the transport sender (the stop channel) and the RT
-    // failure flag are handed to a `RecordingWorkerGuard` (F-RB-009 / T3.5):
+    // failure flag are handed to a `RecordingWorkerGuard`:
     // RAII custody guarantees the worker is signalled and joined with a
     // bounded timeout even if the PipeWire host returns early via `?`, and the
     // guard's shutdown outcome propagates recording failures into the process
@@ -240,7 +240,7 @@ fn main() -> anyhow::Result<()> {
 
         // Fail-fast handshake: never start PipeWire with `--record` until the worker
         // confirms readiness (io_uring + writable output dir). On failure or timeout,
-        // abort before any audio stream is connected (F-RB-009 / T3.3 rollback).
+        // abort before any audio stream is connected.
         match recording::wait_for_recording_init(init_rx, recording::RECORDING_INIT_TIMEOUT) {
             Ok(dir) => {
                 log::info!(
@@ -305,7 +305,7 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("{} Encerrando NAM-Audio-Pipe...", "🔌".yellow());
 
-    // Final observable state of the recording worker (F-RB-009 / T3.3): Stopped
+    // Final observable state of the recording worker: Stopped
     // on a clean drain, Failed if a fatal error suspended the recording.
     if let Some(status) = &recording_status
         && let Ok(guard) = status.lock()
@@ -321,7 +321,7 @@ fn main() -> anyhow::Result<()> {
     }
     let recording_outcome = match res {
         Ok(outcome) => outcome,
-        // F-RB-010 / T4.4: a fatal backend failure surfaced by the host
+        // A fatal backend failure surfaced by the host
         // (PipeWire daemon crash/restart, stream Error, post-streaming
         // disconnect) becomes a non-zero process exit — `main` returns
         // `Result`, so the runtime reports the error and exits with code 1.
@@ -332,12 +332,11 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    // Propagate recording failures into the process exit code (F-RB-009 / T3.5):
+    // Propagate recording failures into the process exit code:
     // a worker error, a panic or a join timeout must never masquerade as a
     // successful run — scripts and automation rely on the non-zero exit.
     // A recording that completed but lost audio blocks to ring overruns is
-    // likewise a non-zero exit (F-RB-024 / T5.1, D1): `SuccessWithLoss` never
-    // masquerades as a lossless capture.
+    // likewise a non-zero exit: `SuccessWithLoss` never masquerades as a lossless capture.
     match recording_outcome {
         None | Some(recording::RecordingWorkerOutcome::Success) => {}
         Some(outcome @ recording::RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }) => {

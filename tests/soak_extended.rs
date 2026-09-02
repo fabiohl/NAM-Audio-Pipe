@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! Accelerated-timeline soak harness for the PipeWire host (T6.4 / G-RB-002;
-//! T5.3 / G-PERF-004).
+//! Accelerated-timeline soak harness for the PipeWire host.
 //!
 //! Purpose (declared in the long-suite receipt as `SOAK_ACCELERATED_PURPOSE`):
 //! the audio timeline is **compressed** — 320 000 continuous audio blocks
@@ -15,8 +14,8 @@
 //! sentinel skips (a callback that processed no frames) are counted and
 //! bounded, never silently ignored.
 //!
-//! Distinct from the real wall-clock endurance suite (`tests/endurance.rs`,
-//! T5.3): the accelerated soak compresses the timeline; the endurance suite
+//! Distinct from the real wall-clock endurance suite (`tests/endurance.rs`):
+//! the accelerated soak compresses the timeline; the endurance suite
 //! runs in real wall-clock time with periodic raw RSS/faults/threads/FD
 //! telemetry.
 //!
@@ -32,7 +31,7 @@
 //!   soak and asserts the post-warmup drift is below the OS page-margin
 //!   threshold (zero memory leak; RSS shrinkage is never a failure).
 //!
-//! Medido: soak 320k blocos em <elapsed> s, RSS delta=<delta> MB, faults=0
+//! Measured: soak 320k blocks in <elapsed> s, RSS delta=<delta> MB, faults=0
 //! (filled by the operator after a calibrated run; the markers carry the live
 //! numbers every run).
 
@@ -43,7 +42,7 @@ use common::swap::*;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 
 /// Total continuous audio blocks for the soak (≈426 s of nominal timeline at
-/// 48 kHz / BLOCK=64 — the G-PERF-004 accelerated-timeline target).
+/// 48 kHz / BLOCK=64).
 const TOTAL_BLOCKS: usize = 320_000;
 
 /// Validation window: every N blocks, install Linear A/B and verify polarity
@@ -72,7 +71,7 @@ const MAX_RSS_DRIFT_KB: usize = 256;
 /// Maximum allowed major page faults over the whole soak.
 const MAX_MAJOR_FAULTS: u64 = 8;
 
-/// Aggregate soak metrics (T5.3): integrity signals that are either asserted
+/// Aggregate soak metrics: integrity signals that are either asserted
 /// fail-closed or reported in the measurement marker.
 #[derive(Debug, Default, Clone, Copy)]
 struct SoakMetrics {

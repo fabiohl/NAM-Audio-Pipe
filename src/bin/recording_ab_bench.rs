@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! T4.2 / EP-PERF-4 A/B benchmark: inline SPSC ring vs preallocated
+//! Recording transport A/B benchmark: inline SPSC ring vs preallocated
 //! pool + small-descriptor SPSC transport for the recording path.
 //!
 //! # What it measures
@@ -13,7 +13,7 @@
 //! * **Consumer-side op** per quantum (dequeue + consume into the WAV I/O
 //!   buffer + return): same distribution.
 //! * **Recording latency per quantum** = producer op + consumer op (SPSC FIFO
-//!   aligns the samples by index) — the metric the T4.2 promotion rule is
+//!   aligns the samples by index) — the metric the promotion rule is
 //!   judged on: promote only if the pool's **p99 recording latency** is
 //!   reproducibly **≥ 5 % lower** than inline's across all runs.
 //! * **bytes/ciclos** — copy bytes per cycle on the producer hot path.
@@ -656,8 +656,8 @@ fn main() -> ExitCode {
     let mut jsonl_lines: Vec<JsonValue> = Vec::new();
     let mut txt = String::new();
     txt.push_str(&format!(
-        "NAM-Audio-Pipe recording transport A/B — T4.2 / EP-PERF-4\n\
-         ==========================================================\n\
+        "NAM-Audio-Pipe recording transport A/B\n\
+         ======================================\n\
          runs={} quanta={} freq={:.3} GHz (measured)\n",
         cfg.runs,
         cfg.quanta,
@@ -723,24 +723,20 @@ fn main() -> ExitCode {
         all_ok &= ok;
     }
 
-    // T4.2 promotion rule (single, self-consistent): PROMOTE only when the A/B
+    // Promotion rule (single, self-consistent): PROMOTE only when the A/B
     // ran both transports and every run at every quantum size met the gate —
     // zero overruns, zero leaked slots, and a >= 5 % p99 recording-latency gain
     // (`run_ok` in `emit_size_report` already encodes integrity + gain). Any
-    // other case keeps the inline transport from T4.1 (invariant: the inline
+    // other case keeps the inline transport (invariant: the inline
     // ring is never replaced without a reproducible gain).
     let promote = cfg.transport == TransportFilter::Both && all_ok;
     let verdict = match cfg.transport {
         TransportFilter::Both if promote => {
-            "PROMOTE: pool+descriptor com ganho p99 >= 5% reproduzível em todos os runs/tamanhos"
+            "PROMOTE: pool+descriptor with reproducible p99 gain >= 5% across all runs/sizes"
         }
-        TransportFilter::Both => {
-            "KEEP_INLINE: ganho não reproduzível (manter transporte inline corrigido de T4.1)"
-        }
-        TransportFilter::InlineOnly => {
-            "FILTERED: transporte único (inline) — sem veredito de promoção"
-        }
-        TransportFilter::PoolOnly => "FILTERED: transporte único (pool) — sem veredito de promoção",
+        TransportFilter::Both => "KEEP_INLINE: gain not reproducible (keep inline transport)",
+        TransportFilter::InlineOnly => "FILTERED: single transport (inline) — no promotion verdict",
+        TransportFilter::PoolOnly => "FILTERED: single transport (pool) — no promotion verdict",
     };
 
     let started = SystemTime::now()
@@ -751,7 +747,6 @@ fn main() -> ExitCode {
     let mut header = vec![
         kv("event", JsonValue::Str("header".into())),
         kv("suite", JsonValue::Str("recording-ab".into())),
-        kv("task", JsonValue::Str("T4.2".into())),
         kv("verdict", JsonValue::Str(verdict.into())),
         kv("promote", JsonValue::Bool(promote)),
         kv("runs", JsonValue::Int(cfg.runs as u64)),

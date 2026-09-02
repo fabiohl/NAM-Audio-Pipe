@@ -16,7 +16,7 @@ use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 
 use std::path::PathBuf;
 
-// Domain contract for `--buffer-size` (G-RB-003 / T6.1).
+// Domain contract for `--buffer-size`.
 //
 // The accepted set is `{0} ∪ {2^k | 4 <= k <= 13}`:
 // - `BUFFER_SIZE_AUTO` (`0`) delegates the quantum choice to the PipeWire
@@ -78,11 +78,10 @@ pub fn validate_buffer_size(size: u32) -> Result<u32, BufferSizeError> {
     }
 }
 
-// NOTA DE DESIGN: As funções abaixo usam `println!` (stdout) e `eprintln!` (stderr)
-// intencionalmente — o backend `NamLogger` ainda não foi inicializado no momento
-// do parsing dos argumentos CLI. Isso é prática POSIX padrão para ferramentas de
-// linha de comando. NÃO substituir por `log::*` sem antes garantir que o logger
-// esteja inicializado antes de `parse_args()`.
+// DESIGN NOTE: The functions below use `println!` (stdout) and `eprintln!` (stderr)
+// intentionally — the `NamLogger` backend has not yet been initialized at the time
+// of CLI argument parsing. This is standard POSIX practice for command-line tools.
+// Do NOT replace with `log::*` without ensuring the logger is initialized prior to `parse_args()`.
 
 /// Prints usage instructions and help in the terminal.
 pub fn print_help() {
@@ -190,7 +189,7 @@ pub struct CliArgs {
     /// Enable WAV recording of the raw PipeWire capture stream.
     pub record: bool,
     /// Disable the bounded backend reconnect cycle (`--fail-fast`): the first
-    /// PipeWire stream failure triggers the T4.4 fail-fast teardown instead of
+    /// PipeWire stream failure triggers fail-fast teardown instead of
     /// a bounded reconnection attempt.
     pub fail_fast: bool,
     /// Noise gate mode (`On` default, or `Off`).

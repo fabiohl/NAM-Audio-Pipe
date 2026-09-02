@@ -14,7 +14,7 @@
 # Phases:
 #   1. Structural (debug)   — unit + integration tests with debug assertions ON.
 #   2. Release verification — integration tests only (release codegen surface;
-#      unit logic is already covered by Phase 1 assertions — S6-T04 / RES-04).
+#      unit logic is already covered by Phase 1 assertions).
 #   3. PipeWire Live        — live end-to-end integration (requires running daemon).
 #   4. Recording io_uring   — disk_writer_loop tests (requires kernel io_uring).
 #
@@ -69,7 +69,7 @@ emit "STRICT: ${NAM_QUICK_STRICT:-0}"
 
 # Environment capability deviations (daemon, io_uring, release artifacts) are
 # collected as typed GAPs; NAM_QUICK_STRICT=1 promotes any GAP to a hard
-# failure (F-RB-015 rollback: release requires strict mode).
+# failure (release requires strict mode).
 declare -a GAPS=()
 
 # ── Phase 1: Structural unit & integration tests (debug) ─────────────────────
@@ -77,20 +77,20 @@ phase "Structural: unit & integration tests (debug)..."
 # Use --bin nam-audio-pipe instead of --bins to avoid accidentally triggering
 # pgo_workload (a profiling-only binary) in the standard test path. The
 # pgo_workload binary is exercised exclusively by build-release.sh.
-# T2.6 / ER-2: the stereo-fidelity and swap-stress harnesses are part of the
-# consolidated ER-2 gates and run in every quick pass.
-# T3.6 / ER-3: the fault-injection + RIFF-validation harness
-# (recording_fault_injection) joins the quick loop; its io_uring-dependent
-# tests remain #[ignore]d and are executed in Phase 4.
-# T4.6 / ER-4: the service-resilience harness (service_resilience) contributes
-# its daemon-free acceptances here (bridge-starvation silence, SPA format
+# The stereo-fidelity and swap-stress harnesses are part of the
+# consolidated gates and run in every quick pass.
+# The fault-injection + RIFF-validation harness (recording_fault_injection)
+# joins the quick loop; its io_uring-dependent tests remain #[ignore]d and
+# are executed in Phase 4.
+# The service-resilience harness (service_resilience) contributes its
+# daemon-free acceptances here (bridge-starvation silence, SPA format
 # rejection, stream-error SLA); its live subprocess tests run in Phase 3.
-# T5.6 / ER-5: the distribution-QA harness (distribution_qa) contributes the
-# release audit acceptances here (strict AppStream XML, typed receipt
-# validator, provenance integrity, dist binary smoke).
-# T5.3 / G-PERF-004: the endurance telemetry parsers (endurance) contribute
-# the fast /proc diagnostics gate; the wall-clock endurance stays #[ignore]d
-# and runs exclusively in tests-long.sh Phase 6.
+# The distribution-QA harness (distribution_qa) contributes the release
+# audit acceptances here (strict AppStream XML, typed receipt validator,
+# provenance integrity, dist binary smoke).
+# The endurance telemetry parsers (endurance) contribute the fast /proc
+# diagnostics gate; the wall-clock endurance stays #[ignore]d and runs
+# exclusively in tests-long.sh Phase 6.
 timeout 420 cargo test --features testing \
     --lib \
     --bin nam-audio-pipe \
@@ -104,9 +104,9 @@ timeout 420 cargo test --features testing \
     --test distribution_qa \
     2>&1 | tee target/logs/quick-phase1.log
 assert_ran_tests target/logs/quick-phase1.log 1
-# T5.2 / F-RB-015: every mandatory target must have executed individually —
-# a removed/renamed target, empty filter or full skip fails the gate even when
-# another target keeps the aggregate positive.
+# Every mandatory target must have executed individually — a removed/renamed
+# target, empty filter or full skip fails the gate even when another target
+# keeps the aggregate positive.
 for t in \
     "unittests src/lib.rs" \
     "tests/stereo_fidelity.rs" \
@@ -132,18 +132,18 @@ for t in \
 done
 emit "PHASE1: PASS log=target/logs/quick-phase1.log"
 
-# ── Phase 2: Release verification (release, S6-T04 / RES-04) ─────────────────
+# ── Phase 2: Release verification (release) ──────────────────────────────────
 # Only the integration tests run in release — the codegen-sensitive surface
 # (e2e_cli + recording). Unit tests (--lib, --bin nam-audio-pipe) are already
 # validated in Phase 1 debug with assertions ON; their release re-run was
-# purely redundant wall-clock (RES-04 / SIB-03). The live PipeWire integration
+# purely redundant wall-clock. The live PipeWire integration
 # and the io_uring recording suite remain in Phases 3 and 4 respectively.
 phase "Release verification: integration tests (release)..."
-# T2.6 / ER-2: stereo-fidelity and swap-stress harnesses run in release too
+# Stereo-fidelity and swap-stress harnesses run in release too
 # (the codegen-sensitive surface, alongside recording/e2e_cli).
-# T4.6 / ER-4: service_resilience daemon-free acceptances run in release too.
-# T5.6 / ER-5: distribution_qa release audit acceptances run in release too.
-# T5.3 / G-PERF-004: endurance parser gate runs in release too.
+# service_resilience daemon-free acceptances run in release too.
+# distribution_qa release audit acceptances run in release too.
+# endurance parser gate runs in release too.
 timeout 420 cargo test --features testing \
     --test stereo_fidelity \
     --test swap_stress \
@@ -157,7 +157,7 @@ timeout 420 cargo test --features testing \
     -- --test-threads=1 --nocapture \
     2>&1 | tee target/logs/quick-phase2.log
 assert_ran_tests target/logs/quick-phase2.log 1
-# T5.2 / F-RB-015: per-target execution gate (same rationale as Phase 1).
+# Per-target execution gate (same rationale as Phase 1).
 for t in \
     "tests/stereo_fidelity.rs" \
     "tests/swap_stress.rs" \
@@ -171,12 +171,12 @@ for t in \
 done
 assert_ran_target target/logs/quick-phase2.log "tests/recording.rs" 0 \
     || die "Phase 2 mandatory target 'tests/recording.rs' missing from log."
-# T5.6 / ER-5: release-artifact audit skips (typed TEST_RESULT[...]=SKIP:
-# markers emitted by tests/distribution_qa.rs for the provenance/dist-artifact
-# tests that found no release build to audit) are surfaced as GAPs — an ER-5
-# gate never goes green under a silent or undocumented skip, and strict mode
-# promotes them to a hard failure. Phase 2 runs with --nocapture, so this is
-# where the markers are observable (Phase 1 output is libtest-captured).
+# Release-artifact audit skips (typed TEST_RESULT[...]=SKIP: markers emitted by
+# tests/distribution_qa.rs for the provenance/dist-artifact tests that found no
+# release build to audit) are surfaced as GAPs — an audit gate never goes green
+# under a silent or undocumented skip, and strict mode promotes them to a hard
+# failure. Phase 2 runs with --nocapture, so this is where the markers are
+# observable (Phase 1 output is libtest-captured).
 while IFS= read -r marker; do
     GAPS+=("distribution_qa:$marker")
     echo -e "${YELLOW}${BOLD}WARN GAP: distribution_qa:$marker${NC}"
@@ -188,9 +188,9 @@ phase "PipeWire Live Integration (release)..."
 echo -e "  Checking PipeWire daemon..."
 if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
     echo -e "  ${GREEN}PipeWire detected.${NC} Executing live integration tests..."
-    # T4.6 / ER-4: besides the pw_integration lifecycle, the service-resilience
-    # subprocess acceptances (real SIGTERM WAV finalization + double-signal
-    # _exit(1)) join the live phase — real signals against the compiled binary.
+    # Besides the pw_integration lifecycle, the service-resilience subprocess
+    # acceptances (real SIGTERM WAV finalization + double-signal _exit(1))
+    # join the live phase — real signals against the compiled binary.
     timeout 120 cargo test --features testing --release \
         --test pw_integration \
         --test service_resilience \
@@ -218,9 +218,9 @@ fi
 io_uring_probe() {
     IO_URING_STATUS="probe_tool_missing"
     local probe_bin="${CARGO_TARGET_DIR:-target}/debug/io_uring_probe"
-    # T5.2 / F-RB-015: always rebuild incrementally. Cargo skips compilation
-    # when sources and dependencies are unchanged, but a stale probe built
-    # from older sources/deps must never be reused.
+    # Always rebuild incrementally. Cargo skips compilation when sources and
+    # dependencies are unchanged, but a stale probe built from older
+    # sources/deps must never be reused.
     if ! cargo build --bin io_uring_probe >/dev/null 2>&1; then
         warn "io_uring native probe build failed"
         return 2
@@ -238,9 +238,9 @@ io_uring_probe() {
 phase "Recording io_uring capability (release, --ignored)..."
 if io_uring_probe; then
     echo -e "  ${GREEN}io_uring available.${NC} Executing recording disk-writer tests..."
-    # ER-3 / T3.6: the full recording certification battery — the lifecycle
-    # suite (recording.rs) plus the fault-injection, byte-by-byte RIFF
-    # validation, SIGINT/SIGTERM, anti-TOCTOU and FD/thread leak sweep harness
+    # The full recording certification battery — the lifecycle suite
+    # (recording.rs) plus the fault-injection, byte-by-byte RIFF validation,
+    # SIGINT/SIGTERM, anti-TOCTOU and FD/thread leak sweep harness
     # (recording_fault_injection.rs).
     timeout 180 cargo test --features testing --release \
         --test recording \
@@ -252,14 +252,14 @@ if io_uring_probe; then
         || die "Phase 4 mandatory target 'tests/recording.rs' failed its execution gate."
     assert_ran_target target/logs/quick-phase4.log "tests/recording_fault_injection.rs" \
         || die "Phase 4 mandatory target 'tests/recording_fault_injection.rs' failed its execution gate."
-    # T5.2 / F-RB-015: skip detection is typed — the E2E record test emits a
-    # structured TEST_RESULT[record_e2e]=... marker, never a free-text "SKIP:"
-    # probe. If the marker is absent entirely, the test was removed/renamed
-    # and the gate must fail instead of reporting PASS.
+    # Skip detection is typed — the E2E record test emits a structured
+    # TEST_RESULT[record_e2e]=... marker, never a free-text "SKIP:" probe.
+    # If the marker is absent entirely, the test was removed/renamed and the
+    # gate must fail instead of reporting PASS.
     if grep -qF "TEST_RESULT[record_e2e]=SKIP:daemon_unavailable" target/logs/quick-phase4.log; then
-        # R-13 / S7.T3: the E2E --record test prints an honest SKIP marker when
-        # the PipeWire daemon is absent. A skip must never masquerade as RAN —
-        # the receipt is SKIP with a GAP instead.
+        # The E2E --record test prints an honest SKIP marker when the PipeWire
+        # daemon is absent. A skip must never masquerade as RAN — the receipt
+        # is SKIP with a GAP instead.
         GAPS+=("record_e2e:daemon_unavailable")
         echo -e "${YELLOW}${BOLD}WARN GAP: record_e2e:daemon_unavailable — PipeWire daemon not reachable; E2E recording test SKIPPED.${NC}"
         emit "PHASE4: SKIP reason=record_e2e_daemon_unavailable"
