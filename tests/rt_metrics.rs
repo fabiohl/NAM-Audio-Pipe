@@ -402,10 +402,19 @@ fn rt_jitter_gate_10k_callbacks() {
     let stressers: Vec<_> = (0..6)
         .map(|i| {
             let stop = Arc::clone(&stop);
-            std::thread::spawn(move || match i % 3 {
-                0 => io_churn_loop(&stop),
-                1 => cache_thrash_loop(&stop),
-                _ => syscall_storm_loop(&stop),
+            std::thread::spawn(move || {
+                // Background contention threads must run under normal scheduling
+                // (SCHED_OTHER / priority 0) so the SCHED_FIFO callback thread
+                // preempts them predictably rather than starving in the same FIFO queue.
+                let param = libc::sched_param { sched_priority: 0 };
+                unsafe {
+                    libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+                }
+                match i % 3 {
+                    0 => io_churn_loop(&stop),
+                    1 => cache_thrash_loop(&stop),
+                    _ => syscall_storm_loop(&stop),
+                }
             })
         })
         .collect();
@@ -512,6 +521,7 @@ fn cache_thrash_loop(stop: &AtomicBool) {
             buf[i] = buf[i].wrapping_add(1);
             idx = idx.wrapping_add(64 * 1024);
         }
+        std::thread::yield_now();
     }
 }
 
