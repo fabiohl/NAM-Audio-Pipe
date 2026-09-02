@@ -1414,7 +1414,8 @@ if ceremony_status == "certified_release":
         missing.append("git_tree_sha256")
     if not lock_sha:
         missing.append("Cargo.lock sha256")
-    if not nam_commit or nam_commit == "not-a-git-repo":
+    nam_repo_dir = os.path.join(os.path.dirname(lock_path), "..", "NeuralAmpModeler-rs", ".git")
+    if not nam_commit or (os.path.isdir(nam_repo_dir) and nam_commit in ("not-a-git-repo", "unknown")):
         missing.append("neural_amp_modeler_rs_commit")
     if not quick_art:
         missing.append("quick_receipt")
