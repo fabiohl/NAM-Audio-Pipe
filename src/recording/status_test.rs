@@ -23,19 +23,21 @@ fn recording_status_derives_debug_clone_partial_eq() {
     let stopped = RecordingStatus::Stopped;
 
     assert_eq!(starting.clone(), starting);
+    assert_eq!(active.clone(), active);
+    assert_eq!(failed.clone(), failed);
+    assert_eq!(stopped.clone(), stopped);
     assert_eq!(
-        active.clone(),
+        active,
         RecordingStatus::Active {
             path: PathBuf::from("/tmp/capture_20260826_000000.wav")
         }
     );
     assert_eq!(
-        failed.clone(),
+        failed,
         RecordingStatus::Failed {
             reason: "ENOSPC".into()
         }
     );
-    assert_eq!(stopped.clone(), stopped);
     assert_ne!(active, stopped);
     // The enum must be printable for observability logs.
     let _ = format!("{starting:?} {active:?} {failed:?} {stopped:?}");

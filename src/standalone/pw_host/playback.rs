@@ -100,7 +100,7 @@ pub fn setup_playback_stream<'c>(
     backend_status: Arc<SharedBackendStatus>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let bridge_ptr_playback = unsafe { DspBridgeReader::new(bridge_ptr.as_ptr()) };
-    let rt_status_playback = rt_status.clone();
+    let rt_status_playback = rt_status;
 
     let mut playback_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -126,7 +126,7 @@ pub fn setup_playback_stream<'c>(
 
     let rt_status_for_params = rt_status_playback.clone();
     let backend_for_state = backend_status.clone();
-    let backend_for_params = backend_status.clone();
+    let backend_for_params = backend_status;
 
     let playback_listener = playback_stream
         .add_local_listener::<()>()

@@ -189,7 +189,7 @@ pub fn run_pipewire_host(
     // 2. CORE OPTIMIZATION (CPU Affinity)
     // =========================================================
     let cpu_receipt = rt_setup::select_optimal_cpu_with_receipt(requested_cpu);
-    let target_cpu = cpu_receipt.as_ref().map(|r| r.selected_cpu).unwrap_or(0);
+    let target_cpu = cpu_receipt.as_ref().map_or(0, |r| r.selected_cpu);
 
     // =========================================================
     // 3. PROTECTED CONFIGURATION SCOPE (RAII)

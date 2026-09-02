@@ -340,11 +340,7 @@ pub fn poll_rt_status(
                 "FIFO"
             };
 
-            let is_dedicated = state
-                .cpu_receipt
-                .as_ref()
-                .map(|r| r.is_dedicated)
-                .unwrap_or(false);
+            let is_dedicated = state.cpu_receipt.as_ref().is_some_and(|r| r.is_dedicated);
 
             if is_dedicated {
                 log::info!(
@@ -356,10 +352,9 @@ pub fn poll_rt_status(
                     tid
                 );
             } else {
-                let reason_str = state
-                    .cpu_receipt
-                    .as_ref()
-                    .map(|r| match &r.reason {
+                let reason_str = state.cpu_receipt.as_ref().map_or(
+                    "Conservative heuristic / unverified topology",
+                    |r| match &r.reason {
                         super::affinity::CpuSelectionReason::ConservativeHeuristic {
                             explanation,
                             ..
@@ -370,8 +365,8 @@ pub fn poll_rt_status(
                         super::affinity::CpuSelectionReason::FullyIsolated { .. } => {
                             "Fully isolated core"
                         }
-                    })
-                    .unwrap_or("Conservative heuristic / unverified topology");
+                    },
+                );
 
                 log::info!(
                     "{} Real-Time Priority: Active ({}, Prio={}, Core {}, TID={}) [Affinity: {}]",

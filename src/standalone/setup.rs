@@ -150,9 +150,8 @@ pub fn load_initial_cabsim(
     buffer_size: u32,
     cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
 ) -> anyhow::Result<Option<InitialCabSimIr>> {
-    let cab_path = match cab_path {
-        Some(p) => p,
-        None => return Ok(None),
+    let Some(cab_path) = cab_path else {
+        return Ok(None);
     };
 
     let partition_size = initial_cabsim_partition_size(buffer_size);

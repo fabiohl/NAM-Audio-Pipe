@@ -771,9 +771,7 @@ async fn open_new_part<S: WavSink>(
 
     // Keep the observable status pointed at the live capture file.
     if let Ok(mut guard) = status.lock() {
-        *guard = RecordingStatus::Active {
-            path: filename.clone(),
-        };
+        *guard = RecordingStatus::Active { path: filename };
     }
 
     *wav_writer = Some(writer);
@@ -812,9 +810,7 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
             log::info!("🎬 Continuing capture in: {}", filename.display());
 
             if let Ok(mut guard) = status.lock() {
-                *guard = RecordingStatus::Active {
-                    path: filename.clone(),
-                };
+                *guard = RecordingStatus::Active { path: filename };
             }
 
             *wav_writer = Some(new_writer);

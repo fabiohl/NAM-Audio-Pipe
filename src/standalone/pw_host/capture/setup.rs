@@ -107,9 +107,9 @@ pub fn setup_capture_stream<'c>(
 
     let rate_for_process = rate_for_param.clone();
     let rt_status_for_listener = rt_status.clone();
-    let rt_status_for_process = rt_status.clone();
+    let rt_status_for_process = rt_status;
     let backend_for_state = backend_status.clone();
-    let backend_for_params = backend_status.clone();
+    let backend_for_params = backend_status;
 
     let lut = neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut();
 

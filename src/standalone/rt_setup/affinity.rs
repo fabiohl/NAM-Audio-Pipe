@@ -319,13 +319,11 @@ pub fn select_cpu_with_source<S: SysfsTopologySource>(
     if let Some(target) = requested_cpu {
         if allowed_cpus.contains(&target) {
             let target_topo = topology.iter().find(|t| t.logical_id == target);
-            let is_isolated = target_topo.map(|t| t.is_isolated).unwrap_or(false);
-            let is_nohz = target_topo.map(|t| t.is_nohz_full).unwrap_or(false);
+            let is_isolated = target_topo.is_some_and(|t| t.is_isolated);
+            let is_nohz = target_topo.is_some_and(|t| t.is_nohz_full);
             let pkg_id = target_topo.and_then(|t| t.package_id);
             let core_id = target_topo.and_then(|t| t.core_id);
-            let siblings = target_topo
-                .map(|t| t.smt_siblings.clone())
-                .unwrap_or_else(|| vec![target]);
+            let siblings = target_topo.map_or_else(|| vec![target], |t| t.smt_siblings.clone());
 
             let housekeeping_cpus: Vec<usize> = allowed_cpus
                 .iter()
@@ -333,7 +331,7 @@ pub fn select_cpu_with_source<S: SysfsTopologySource>(
                 .filter(|&c| c != target && !siblings.contains(&c))
                 .collect();
             let final_housekeeping = if housekeeping_cpus.is_empty() {
-                allowed_cpus.clone()
+                allowed_cpus
             } else {
                 housekeeping_cpus
             };
@@ -492,7 +490,7 @@ pub fn select_cpu_with_source<S: SysfsTopologySource>(
         .filter(|&c| c != chosen.logical_id && !chosen.smt_siblings.contains(&c))
         .collect();
     let final_housekeeping = if housekeeping_cpus.is_empty() {
-        allowed_cpus.clone()
+        allowed_cpus
     } else {
         housekeeping_cpus
     };
