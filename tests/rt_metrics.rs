@@ -419,6 +419,10 @@ fn rt_jitter_gate_10k_callbacks() {
         })
         .collect();
 
+    // Allow background threads to complete spawning, scheduler reassignment,
+    // and initial memory paging so the timing loop measures pure steady-state contention.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
     let mut deltas = Vec::with_capacity(JITTER_CALLBACKS - 1);
     let mut next = now_ns() + nominal_ns;
     let mut prev = now_ns();
@@ -507,6 +511,7 @@ fn io_churn_loop(stop: &AtomicBool) {
         if let Ok(mut f) = std::fs::File::open("/dev/zero") {
             let _ = std::io::Read::read(&mut f, &mut buf);
         }
+        std::thread::yield_now();
     }
 }
 
