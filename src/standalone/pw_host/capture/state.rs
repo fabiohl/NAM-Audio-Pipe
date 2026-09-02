@@ -125,6 +125,7 @@ impl CaptureState {
     pub fn init(
         sys: &neural_amp_modeler_rs::common::diagnostics::SystemSnapshot,
         os: OversampleFactor,
+        gate_enabled: bool,
     ) -> Self {
         let resampler = NamResampler::new(48_000, 48_000, 2048).unwrap_or_else(|e| {
             NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
@@ -150,8 +151,14 @@ impl CaptureState {
 
         let gate_params = GateParams::default();
         let lut = gain_lut::get_gain_lut();
-        let open_lin = lut.db_to_linear(gate_params.threshold_open_db);
-        let close_lin = lut.db_to_linear(gate_params.threshold_close_db);
+        let (open_lin, close_lin) = if gate_enabled {
+            (
+                lut.db_to_linear(gate_params.threshold_open_db),
+                lut.db_to_linear(gate_params.threshold_close_db),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         Self {
             active_model_l: None,
@@ -225,3 +232,7 @@ impl CaptureState {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gate_property_test.rs"]
+mod gate_property_test;

@@ -154,6 +154,10 @@ fn matrix_weights_sum_to_one_per_dimension() {
         (RECORDING_NO_WEIGHT + RECORDING_YES_WEIGHT - 1.0).abs() < 1e-9,
         "recording weights must sum to 1"
     );
+    assert!(
+        (GATE_ON_WEIGHT + GATE_OFF_WEIGHT - 1.0).abs() < 1e-9,
+        "gate weights must sum to 1"
+    );
     // Documented typical-use dominance: 48 kHz and 64-frame quantum are the
     // most-weighted cells (low-latency default first).
     const {
@@ -368,6 +372,8 @@ fn receipt_json_contains_matrix_fields() {
     Coverage::bump(&mut receipt.coverage.cabsim, "bypass", 3600);
     Coverage::bump(&mut receipt.coverage.recording, REC_NO, 3600);
     Coverage::bump(&mut receipt.coverage.recording, REC_YES, 3600);
+    Coverage::bump(&mut receipt.coverage.gate, GATE_ON, 3600);
+    Coverage::bump(&mut receipt.coverage.gate, GATE_OFF, 3600);
 
     for topo in [TOPOLOGY_WAVENET_A1, TOPOLOGY_WAVENET_A2, TOPOLOGY_LSTM] {
         receipt.progress.min_blocks_per_topology.insert(topo, 2400);
@@ -403,6 +409,7 @@ fn receipt_json_contains_matrix_fields() {
         os_mode: MODE_OFF,
         cabsim_ir: true,
         recording: true,
+        gate: true,
         progress: CellProgress {
             blocks: 2400,
             frames: 153600,
@@ -421,6 +428,7 @@ fn receipt_json_contains_matrix_fields() {
         r#""tool":"pgo_workload""#,
         r#""rates_hz":[44100,48000,96000]"#,
         r#""quantums_frames":[64,256,512]"#,
+        r#""gate_modes":["on","off"]"#,
         r#""no_stage_skipped":true"#,
         r#""disabled":true"#,
         r#""min_blocks_per_topology"#,
@@ -429,6 +437,7 @@ fn receipt_json_contains_matrix_fields() {
         r#""topology_blocks":{"lstm":2400,"wavenet_a1":2400,"wavenet_a2":2400}"#,
         r#""oversampling_blocks":{"2x":1800,"4x":1800,"Off":3600}"#,
         r#""recording":{"no":3600,"yes":3600}"#,
+        r#""gate":{"off":3600,"on":3600}"#,
     ] {
         assert!(
             json.contains(needle),
@@ -447,4 +456,5 @@ fn mandatory_gate_sets_cover_all_families() {
     let coverage = Coverage::default();
     assert!(coverage.topologies.is_empty());
     assert!(coverage.recording.is_empty());
+    assert!(coverage.gate.is_empty());
 }

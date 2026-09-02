@@ -266,8 +266,10 @@ impl Drop for ToneAttacher {
 /// * **Bit-exact samples**: every sample decodes to a finite `f32` bit pattern
 ///   and a fully independent reader (`hound`) decodes the exact same bits — no
 ///   corruption, no lost tail.
-/// * **Signal present**: the gate opened and real audio was captured.
-fn assert_valid_finalized_wav(path: &std::path::Path) {
+/// * **Signal present / silence expected**: if `expect_silence` is false, asserts
+///   that real non-degenerate audio flowed; if true, permits silence while
+///   guaranteeing WAV container and sample integrity.
+fn assert_valid_finalized_wav(path: &std::path::Path, expect_silence: bool) {
     let bytes = std::fs::read(path).expect("recorded WAV must be readable");
     assert!(
         bytes.len() >= 44 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
@@ -296,7 +298,7 @@ fn assert_valid_finalized_wav(path: &std::path::Path) {
     let (data_size, data_offset) = data.expect("missing data chunk");
     assert!(
         data_size > 0,
-        "WAV data chunk is empty — the noise gate never opened / no audio flowed"
+        "WAV data chunk is empty — no audio flowed to disk"
     );
     assert_eq!(
         data_offset + data_size as usize,
@@ -362,11 +364,13 @@ fn assert_valid_finalized_wav(path: &std::path::Path) {
         );
     }
 
-    // The noise gate opened: real (non-degenerate) signal reached the disk.
-    assert!(
-        independent.iter().any(|s| s.abs() > 0.01),
-        "recorded signal is degenerate (all samples near zero) — no real audio flowed"
-    );
+    if !expect_silence {
+        // The noise gate opened: real (non-degenerate) signal reached the disk.
+        assert!(
+            independent.iter().any(|s| s.abs() > 0.01),
+            "recorded signal is degenerate (all samples near zero) — no real audio flowed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -448,7 +452,70 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
     );
 
     // The WAV the child finalized while handling the signal must be complete.
-    assert_valid_finalized_wav(&wav_path);
+    assert_valid_finalized_wav(&wav_path, false);
+}
+
+/// Spawns `nam-audio-pipe --record --gate off` under live PipeWire, drives the
+/// capture sink, sends `SIGTERM` via `libc::kill`, and proves graceful exit 0
+/// and full WAV finalization with silence preserved.
+#[test]
+#[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-quick Phase 3"]
+fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
+    if !common::probe_pipewire_daemon() {
+        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
+        return;
+    }
+    if !common::pw_play_available() {
+        eprintln!("SKIP: pw-play unavailable; cannot drive the capture sink deterministically.");
+        return;
+    }
+    if probe_io_uring() != IoUringSupport::Available {
+        eprintln!("SKIP: io_uring unavailable; --record cannot start.");
+        return;
+    }
+
+    let _lock = common::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _sd = common::ShutdownGuard::new();
+
+    let dir = common::temp_dir();
+    let _guard = common::DirGuard::new(dir.clone());
+
+    let tone_path = dir.join("tone.wav");
+    generate_tone_wav(&tone_path);
+    let mut tone = ToneAttacher::new(tone_path);
+
+    let (mut child, stderr_path) = spawn_host(&["--record", "--gate", "off"], &dir);
+
+    assert!(
+        common::wait_for_nam_sink(Duration::from_secs(10)),
+        "host capture sink never registered; stderr:\n{}",
+        read_child_stderr(&stderr_path)
+    );
+    tone.attach();
+
+    let wav_path = wait_for_recorded_audio(&mut child, &dir, Duration::from_secs(10));
+
+    send_signal(&child, libc::SIGTERM);
+
+    let started = Instant::now();
+    let status = child.wait(Duration::from_secs(15));
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "SIGTERM under --gate off must produce a graceful exit 0 (got {status:?} after {elapsed:?}); \
+         stderr:\n{}",
+        read_child_stderr(&stderr_path)
+    );
+    println!(
+        "SIGTERM gate off acceptance: child exited 0 in {elapsed:?} after signal; WAV at {}",
+        wav_path.display()
+    );
+
+    // Under --gate off, the WAV is finalized cleanly and validates regardless of silence content.
+    assert_valid_finalized_wav(&wav_path, true);
 }
 
 // ---------------------------------------------------------------------------

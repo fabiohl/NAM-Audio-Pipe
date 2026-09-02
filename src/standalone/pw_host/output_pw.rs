@@ -61,6 +61,8 @@ pub struct PipewireHostConfig {
     /// (F-RB-010 / T4.5) — the first backend failure triggers the T4.4
     /// fail-fast teardown immediately.
     pub fail_fast: bool,
+    /// Noise gate enabled flag from CLI (`--gate on|off`).
+    pub gate_enabled: bool,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).

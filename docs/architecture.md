@@ -146,7 +146,7 @@ The PipeWire host lifecycle is governed by a thread-safe backend state machine (
 
 On a fatal connectivity loss the control loop enters the **bounded reconnect cycle** (F-RB-010 / T4.5, `src/standalone/pw_host/reconnect.rs`):
 
-1. The **DSP state** (`CaptureState`: models, resampler, cab-sim, gains, gate) and the **RT-side SPSC channels** (`RtHostChannels`) live in heap `Box`es reached via raw pointers — never moved into the stream closures. Re-instantiating the streams after a daemon restart **preserves every piece of internal state** (models, IRs, recording worker).
+1. The **DSP state** (`CaptureState`: models, resampler, cab-sim, gains, gate configuration) and the **RT-side SPSC channels** (`RtHostChannels`) live in heap `Box`es reached via raw pointers — never moved into the stream closures. Re-instantiating the streams after a daemon restart **preserves every piece of internal state** (models, IRs, recording worker).
 2. A `ReconnectCycle` (production policy: 3 attempts, progressive 250 → 500 → 1000 ms exponential backoff, total ceiling 1.75 s) hands out at most `max_attempts` backoffs and then `None` forever — the retry phase is **strictly bounded in number and time** by construction; no infinite reconnect loop can exist.
 3. Each attempt re-creates a fresh `ThreadLoop`/`Context`/`Core` and both streams (the old instance is torn down first: `thread_loop.stop()`, R-04 final GC drain, `thread_configured` reset so RT setup re-runs on the new data thread).
 4. On success the streams renegotiate the format and rate; the existing rebuild handlers re-sync sample rates and audio resumes. On budget exhaustion the host falls back to the **T4.4 fail-fast path**: integral teardown (RT stop, GC drain, recording `StreamStop` + bounded join) and a non-zero process exit.
@@ -239,9 +239,9 @@ graph TD
     SPSCDrain --> InGain["Input Gain Stage\n(SIMD Vectorized + ParamSmoother)"]
     InGain --> Dither["Anti-Subnormal Dither\n(-220 dBFS)"]
 
-    Dither --> GateFSM{"Universal Noise Gate\n(Envelope Detector & State Machine)"}
-    GateFSM -->|"Gate Closed (Silence)"| MuteOutput["Zero Working Buffer"]
-    GateFSM -->|"Gate Open"| RateCheck{"Sample Rate == 48kHz?"}
+    Dither --> GateFSM{"Silence Gate\n(--gate on: FSM / off: Open)"}
+    GateFSM -->|"Gate Closed (Silence, --gate on)"| MuteOutput["Zero Working Buffer"]
+    GateFSM -->|"Gate Open / --gate off"| RateCheck{"Sample Rate == 48kHz?"}
 
     RateCheck -->|"No"| ResampleUp["NamResampler\n(Host Rate -> 48kHz Native)"]
     RateCheck -->|"Yes"| Inference
@@ -261,17 +261,18 @@ graph TD
 
     OutGain --> BridgeWrite["Write Processed Audio to DspBridge\n(Double-Buffered Float32)"]
     OutGain --> RecCheck{"--record Enabled?"}
-    RecCheck -->|"Yes (n_pw > 0)"| RecEnqueue["Enqueue to SPSC Recording Ring\n(Silence Trimmed by Gate)"]
+    RecCheck -->|"Yes (n_pw > 0 or --gate off)"| RecEnqueue["Enqueue to SPSC Recording Ring\n(Silence Trimmed when Gate Active)"]
     RecCheck -->|"No / Silence"| Telemetry
     RecEnqueue --> Telemetry["Update Atomic Telemetry\n(RtStatusFlags, CPU Cycles, Peaks)"]
 ```
 
-### 6.1 Universal Noise Gate & Silence Trimming
+### 6.1 Silence Gate & Silence Trimming
 
-The Noise Gate FSM is active across **all operational modes** (with or without neural models or cabinet IRs). It continuously tracks the RMS signal envelope and applies smooth linear gain ramps:
+The Noise Gate FSM is configurable via the `--gate on|off` CLI option (default: `on`) and operates across all operational modes (with or without neural models or cabinet IRs). When enabled, it continuously tracks the RMS signal envelope and applies smooth linear gain ramps:
 
 - **Zero Playing Residual Noise:** Silences amp model idle hiss and electromagnetic pickup hum when the musician pauses.
-- **Recording Silence Trimming:** Only audio blocks processed while the gate is open (`n_pw > 0`) are forwarded to the recording queue. Background pauses are trimmed automatically without RT thread overhead.
+- **Recording Silence Trimming:** When active (`--gate on`, default), only audio blocks processed while the gate is open (`n_pw > 0`) are forwarded to the recording queue. Background pauses are trimmed automatically without RT thread overhead.
+- **Pass-Through Mode (`--gate off`):** When explicitly disabled via `--gate off`, the gate remains permanently open (`gate_enabled = false`), passing full dynamic content and un-trimmed silence through to both real-time monitoring and WAV recording.
 
 ### 6.2 Adaptive Compute (Auto-Slimming Watchdog)
 
@@ -338,7 +339,7 @@ When launched with `--record`, NAM-Audio-Pipe captures high-fidelity 32-bit floa
 │                           Recording Architecture                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Audio Thread (RT)                                                          │
-│    - Checks gate state (n_pw > 0)                                           │
+│    - Checks gate state (n_pw > 0 / gate-off pass-through)                    │
 │    - Audio: try_acquire() slot → fill_planar in place → publish()           │
 │      (preallocated pool, 4-byte descriptor; zero alloc on RT)               │
 │    - Control: Metadata/StreamStop on a dedicated small control ring         │

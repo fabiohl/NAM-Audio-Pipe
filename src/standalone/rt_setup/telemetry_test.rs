@@ -147,6 +147,7 @@ fn test_poll_rt_status_telemetry_throttle_advances() {
 
 #[test]
 fn test_poll_rt_status_clears_diagnostic_flags() {
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -175,7 +176,7 @@ fn test_poll_rt_status_clears_diagnostic_flags() {
 
 #[test]
 fn test_latched_flag_emits_once_per_episode() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -234,7 +235,7 @@ fn test_latched_flag_emits_once_per_episode() {
 
 #[test]
 fn test_latched_counter_emits_once_per_episode() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -283,7 +284,7 @@ fn test_latched_counter_emits_once_per_episode() {
 
 #[test]
 fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -404,17 +405,21 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     assert_eq!(rt_status.e2e_hist.total_count(), 0);
 }
 
-fn init_test_logger() {
+static TEST_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn init_test_logger() -> std::sync::MutexGuard<'static, ()> {
     use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+    let guard = TEST_LOGGER_MUTEX.lock().unwrap();
     let _ = NamLogger::init(LoggerConfig {
         level_filter: log::LevelFilter::Info,
         emit_stderr: false,
     });
+    guard
 }
 
 #[test]
 fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -466,7 +471,7 @@ fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
 
 #[test]
 fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -519,7 +524,7 @@ fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
 
 #[test]
 fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -550,7 +555,7 @@ fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
 
 #[test]
 fn test_poll_rt_status_sched_rr_is_rt_and_suppresses_denied() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -589,7 +594,7 @@ fn test_poll_rt_status_sched_rr_is_rt_and_suppresses_denied() {
 
 #[test]
 fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -633,7 +638,7 @@ fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
 
 #[test]
 fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
-    init_test_logger();
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();

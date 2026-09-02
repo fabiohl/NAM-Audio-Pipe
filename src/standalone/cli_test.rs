@@ -118,6 +118,58 @@ fn test_parse_args_record_keeps_reconnect_enabled() {
     assert!(!cli_args.fail_fast);
 }
 
+#[test]
+fn test_parse_args_gate_defaults_to_on() {
+    let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.gate, GateMode::On);
+}
+
+#[test]
+fn test_parse_args_gate_off_flag() {
+    let args = vec!["nam-audio-pipe", "--gate", "off"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.gate, GateMode::Off);
+}
+
+#[test]
+fn test_parse_args_gate_on_explicit() {
+    let args = vec!["nam-audio-pipe", "--gate", "on"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.gate, GateMode::On);
+}
+
+#[test]
+fn test_parse_args_gate_case_insensitive() {
+    let args = vec!["nam-audio-pipe", "--gate", "OFF"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.gate, GateMode::Off);
+}
+
+#[test]
+fn test_parse_args_gate_invalid_value_exits() {
+    // `exit_with_error` terminates the process via std::process::exit(1), so the
+    // invalid-value path is proven end-to-end through the real binary in
+    // tests/e2e_cli.rs::invalid_gate_mode_exits_with_error. Here we pin the
+    // mapping contract that drives that exit: any value other than on/off yields
+    // the exact fatal message exit_with_error would print.
+    assert_eq!(
+        parse_gate_mode("invalid"),
+        Err("Invalid gate mode: 'invalid'. Expected 'on' or 'off'.".to_string()),
+        "the mapping error must carry the exact message exit_with_error prints"
+    );
+    assert_eq!(
+        parse_gate_mode(""),
+        Err("Invalid gate mode: ''. Expected 'on' or 'off'.".to_string())
+    );
+    assert_eq!(parse_gate_mode("ON"), Ok(GateMode::On));
+    assert_eq!(parse_gate_mode("oFf"), Ok(GateMode::Off));
+}
+
 // --buffer-size domain contract (G-RB-003 / T6.1) -------------------------
 
 #[test]

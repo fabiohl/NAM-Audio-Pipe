@@ -130,6 +130,11 @@ pub fn wait_for_nam_sink(timeout: std::time::Duration) -> bool {
 /// graph deterministically schedules the capture node — a silent stream still
 /// produces real quantums (`last_n_samples` advances) without any audible
 /// tone reaching the hardware.
+///
+/// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
+/// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
+/// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
+/// Não usar com `gate_enabled = false`.
 pub fn generate_silent_wav(path: &Path, seconds: u32) {
     let spec = hound::WavSpec {
         channels: 2,

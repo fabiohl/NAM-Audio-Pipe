@@ -864,10 +864,14 @@ pub struct RtSwapHarness {
 impl RtSwapHarness {
     /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
     /// rates already consistent, so the first `run_callback` processes
-    /// immediately without a resampler renegotiation).
-    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
+    /// immediately without a resampler renegotiation) with custom `gate_enabled`.
+    pub fn new_with_gate(
+        host_rate: u32,
+        nam_rate: u32,
+        gate_enabled: bool,
+    ) -> anyhow::Result<Self> {
         let sys = SystemSnapshot::capture();
-        let mut state = CaptureState::init(&sys, OversampleFactor::Off);
+        let mut state = CaptureState::init(&sys, OversampleFactor::Off, gate_enabled);
         state.resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
         state.current_nam_rate = nam_rate;
         state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
@@ -914,6 +918,13 @@ impl RtSwapHarness {
         };
 
         Ok(Self { producer, rt })
+    }
+
+    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
+    /// rates already consistent, so the first `run_callback` processes
+    /// immediately without a resampler renegotiation) with default gate enabled.
+    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
+        Self::new_with_gate(host_rate, nam_rate, true)
     }
 
     /// Splits the harness into its two production faces (T5.3 / G-PERF-004).

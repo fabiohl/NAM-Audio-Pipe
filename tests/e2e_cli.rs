@@ -31,6 +31,14 @@ fn help_flag_exits_zero_and_prints_usage() {
         stdout.contains("--model"),
         "--help should list --model option"
     );
+    assert!(
+        stdout.contains("--gate on|off"),
+        "--help should list --gate on|off option, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[default: on]"),
+        "--help should declare default for --gate, got:\n{stdout}"
+    );
 }
 
 #[test]
@@ -248,4 +256,45 @@ fn buffer_size_above_max_exits_with_error_before_pipewire() {
         "validation must reject before any PipeWire connection, got: {}",
         stderr
     );
+}
+
+#[test]
+fn invalid_gate_mode_exits_with_error() {
+    let output = binary()
+        .args(["--gate", "invalid"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit code for invalid gate mode"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Invalid gate mode"),
+        "stderr should explain the invalid gate mode, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn gate_flag_options_accepted_in_diagnose() {
+    for mode in ["on", "off"] {
+        let output = binary()
+            .args(["--gate", mode, "--diagnose"])
+            .output()
+            .expect("failed to execute binary");
+
+        assert!(
+            output.status.success(),
+            "expected exit code 0 when passing --gate {mode} with --diagnose, got: {:?}",
+            output.status
+        );
+    }
 }

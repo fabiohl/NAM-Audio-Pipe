@@ -1466,3 +1466,109 @@ fn capture_datas_less_than_two_sets_contract_violation_flag() {
     assert_eq!(chunk.size, 256);
     assert_eq!(chunk.stride, 4);
 }
+
+// ── Sprint 3: Gate Off Guarantee Tests (T3.2, T3.3, T3.4) ───────────────────
+
+#[test]
+#[cfg(feature = "testing")]
+fn gate_off_does_not_affect_mono_detection() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    let mut h = RtSwapHarness::new_with_gate(48000, 48000, false).expect("harness with gate off");
+
+    // Initially process_mono is false
+    assert!(!h.process_mono());
+
+    // Feed truly mono signal (L == R != 0) for enough blocks to trigger mono hysteresis
+    let mut in_l = [0.25f32; 64];
+    let mut in_r = [0.25f32; 64];
+    for _ in 0..50 {
+        h.run_callback(&mut in_l, &mut in_r, 64);
+    }
+    assert!(
+        h.process_mono(),
+        "mono detection must engage on identical L/R input even with gate off"
+    );
+
+    // Feed truly stereo signal (L != R) for enough blocks to break mono hysteresis
+    let mut in_l_stereo = [0.25f32; 64];
+    let mut in_r_stereo = [0.0f32; 64];
+    for _ in 0..50 {
+        h.run_callback(&mut in_l_stereo, &mut in_r_stereo, 64);
+    }
+    assert!(
+        !h.process_mono(),
+        "mono detection must disengage on divergent L/R input even with gate off"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "testing", feature = "heap-audit"))]
+fn gate_off_zero_alloc() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    let mut h = RtSwapHarness::new_with_gate(48000, 48000, false).expect("harness with gate off");
+
+    // Warm up one callback
+    let mut in_l = [0.0f32; 64];
+    let mut in_r = [0.0f32; 64];
+    let _ = h.run_callback(&mut in_l, &mut in_r, 64);
+
+    // Execute 1000 callbacks with absolute digital silence (zero energy) under TrackingGuard
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        let mut in_l = [0.0f32; 64];
+        let mut in_r = [0.0f32; 64];
+        for _ in 0..1000 {
+            h.run_callback(&mut in_l, &mut in_r, 64);
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+
+    assert_eq!(
+        allocs, 0,
+        "heap allocations detected in gate off zero energy state: {allocs}"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "heap deallocations detected in gate off zero energy state: {deallocs}"
+    );
+    assert_eq!(
+        reallocs, 0,
+        "heap reallocations detected in gate off zero energy state: {reallocs}"
+    );
+}
+
+#[test]
+fn recording_audio_pushed_when_gate_off_and_energy_zero() {
+    // With gate off, capture_dsp_pipeline_streaming produces n_pw > 0 even for
+    // digital silence (zero energy). send_recording_audio must enqueue the
+    // zero-energy block into the recording transport rather than discarding it.
+    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
+    let resamp_l = [0.0f32; 64];
+    let resamp_r = [0.0f32; 64];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+
+    send_recording_audio(
+        &mut sender,
+        64,
+        &resamp_l,
+        &resamp_r,
+        &mut block,
+        None,
+        None,
+    );
+
+    let in_flight = pool_c
+        .try_pop()
+        .expect("zero-energy block must be published when n_pw > 0");
+    assert_eq!(in_flight.block().valid_len(), 128);
+    assert!(
+        in_flight.block().as_slice()[..128]
+            .iter()
+            .all(|&x| x == 0.0f32)
+    );
+    in_flight.release();
+}

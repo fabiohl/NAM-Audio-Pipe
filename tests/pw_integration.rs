@@ -101,6 +101,7 @@ fn test_pipewire_integration() {
                 // the daemon probe already guarantees it is up, so any backend
                 // failure is a defect that must surface immediately (T4.5).
                 fail_fast: true,
+                gate_enabled: true,
             },
             gc_cons,
             sl_cons,
@@ -244,6 +245,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
                 requested_cpu: None,
                 // Reconnect ENABLED: this is exactly what the bounce exercises.
                 fail_fast: false,
+                gate_enabled: true,
             },
             gc_cons,
             sl_cons,
@@ -329,6 +331,11 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
 
 /// Spawns `pw-play` playing `wav` into the NAM capture sink (silent stream,
 /// volume 0) so the graph deterministically schedules the capture node.
+///
+/// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
+/// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
+/// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
+/// Não usar com `gate_enabled = false`.
 fn spawn_silent_tone(wav: &std::path::Path) -> Option<std::process::Child> {
     std::process::Command::new("pw-play")
         .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
@@ -355,6 +362,11 @@ fn kill_tone(mut tone: Option<std::process::Child>) {
 /// silent stream still produces real quantums and advances the stream clock,
 /// with no audible tone reaching the hardware. Re-attachable after a daemon
 /// restart (the tone process dies with the daemon).
+///
+/// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
+/// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
+/// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
+/// Não usar com `gate_enabled = false`.
 struct ToneDriver {
     wav_path: std::path::PathBuf,
     child: Option<std::process::Child>,
@@ -535,6 +547,7 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
                 oversample: OversampleFactor::Off,
                 requested_cpu: None,
                 fail_fast: false,
+                gate_enabled: true,
             },
             gc_cons,
             sl_cons,

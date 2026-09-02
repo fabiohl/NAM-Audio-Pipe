@@ -116,6 +116,10 @@ pub fn print_help() {
     println!(
         "      --activation MODE    Activation precision: standard (default, exact-grade) or fast"
     );
+    println!(
+        "      --gate on|off        Silence gate: 'on' trims silence from monitoring and --record \
+         (default); 'off' passes silence through gracefully [default: on]"
+    );
     println!("      --cpu INDEX          Pin RT audio thread to explicit CPU core index");
     println!("      --record             Record raw PipeWire input to a WAV file");
     println!(
@@ -130,6 +134,30 @@ pub fn exit_with_error(msg: impl std::fmt::Display) -> ! {
     eprintln!("{} {}", "❌ Argument error:".red().bold(), msg);
     eprintln!("{}", "👉 Use '-h' to show the help screen".yellow());
     std::process::exit(1);
+}
+
+/// Silence gate mode for monitoring and recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateMode {
+    /// Silence gate enabled (default): trims silence from monitoring and recording.
+    On,
+    /// Silence gate disabled: passes silence through gracefully.
+    Off,
+}
+
+/// Maps a `--gate` value to its [`GateMode`], case-insensitively.
+///
+/// Returns the exact fatal message [`exit_with_error`] would print for an
+/// invalid value, so the caller owns the exit decision (making the mapping
+/// unit-testable without terminating the test process).
+fn parse_gate_mode(value: &str) -> Result<GateMode, String> {
+    match value.to_lowercase().as_str() {
+        "on" => Ok(GateMode::On),
+        "off" => Ok(GateMode::Off),
+        other => Err(format!(
+            "Invalid gate mode: '{other}'. Expected 'on' or 'off'."
+        )),
+    }
 }
 
 /// Parsed command line arguments.
@@ -165,6 +193,8 @@ pub struct CliArgs {
     /// PipeWire stream failure triggers the T4.4 fail-fast teardown instead of
     /// a bounded reconnection attempt.
     pub fail_fast: bool,
+    /// Noise gate mode (`On` default, or `Off`).
+    pub gate: GateMode,
 }
 
 /// Parses command-line arguments.
@@ -187,6 +217,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut cpu = None;
     let mut record = false;
     let mut fail_fast = false;
+    let mut gate = GateMode::On;
     let mut has_args = false;
 
     while let Some(arg) = parser.next().unwrap_or_else(|e| exit_with_error(e)) {
@@ -207,6 +238,13 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
             }
             Long("fail-fast") => {
                 fail_fast = true;
+            }
+            Long("gate") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid gate mode value."));
+                gate = parse_gate_mode(&val_str).unwrap_or_else(|e| exit_with_error(e));
             }
             Long("cpu") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -374,6 +412,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         cpu,
         record,
         fail_fast,
+        gate,
     }
 }
 

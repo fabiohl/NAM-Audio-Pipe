@@ -211,7 +211,8 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 | `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                | `off`               |
 | `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                            | `standard`          |
 | `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                  | `auto`              |
-| `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed by noise gate) | `false`             |
+| `--gate <MODE>`          | Silence gate: `on` (default) trims silence from monitoring and `--record`; `off` passes silence through gracefully             | `on`                |
+| `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`) | `false`             |
 | `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                             | `false`             |
 | `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                               | `false`             |
 | `-h, --help`             | Displays command-line help screen and exits                                                                                    | —                   |
@@ -264,10 +265,11 @@ nam-audio-pipe \
 *Creates timestamped `capture_YYYYMMDD_HHMMSS.wav` files in the current working directory (32-bit float stereo PCM at PipeWire sample rate, automatically splitting into `_partN.wav` if reaching the 4 GiB RIFF size limit).*
 
 > [!NOTE]
-> **Universal Noise Gate Behavior & Recording Impact**
-> The Noise Gate is active in **all operational modes** of `NAM-Audio-Pipe` (with or without a `.nam` neural model, with or without a cabinet IR). There is no "gate off" mode — this is an intentional architectural decision: the gate is part of the application's core value proposition, ensuring playing pauses do not produce residual background noise at the output.
+> **Silence Gate Behavior & Recording Impact**
+> The Silence Gate is configurable via `--gate on|off` (default: `on`) and operates across all operational modes of `NAM-Audio-Pipe` (with or without a `.nam` neural model, with or without a cabinet IR).
 >
-> **Recording with `--record`:** Audio is recorded **post-DSP** (neural model + cabinet IR + gain staging), matching exactly what is monitored on hardware output. Only blocks processed while the noise gate is open (`n_pw > 0`) are enqueued for recording. Silence before, during, and after performance is automatically trimmed in real-time with zero RT thread overhead.
+> - **Default (`--gate on`):** Eliminates residual background noise (idle hiss and pickup hum) during playing pauses in both real-time monitoring and recording. Audio recorded via `--record` only enqueues blocks processed while the gate is open (`n_pw > 0`), automatically trimming silence in real-time with zero RT thread overhead.
+> - **Pass-Through (`--gate off`):** Explicit opt-in that keeps the gate permanently open (`gate_enabled = false`). All audio — including background noise and silent passages — is passed through gracefully to live hardware output and recorded continuously to WAV without trimming.
 
 #### Full Production Command
 

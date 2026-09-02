@@ -538,6 +538,7 @@ for dim, required in (
     ("oversampling", ("Off", "2x", "4x")),
     ("cabsim", ("ir", "bypass")),
     ("recording", ("no", "yes")),
+    ("gate", ("on", "off")),
 ):
     counts = coverage.get(dim) or {}
     for value in required:

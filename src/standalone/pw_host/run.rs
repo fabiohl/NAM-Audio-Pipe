@@ -107,6 +107,7 @@ pub fn run_pipewire_host(
         oversample,
         requested_cpu,
         fail_fast,
+        gate_enabled,
     } = config;
 
     // F-RB-010 / T4.5: bounded reconnect policy. `--fail-fast` disables the
@@ -129,7 +130,7 @@ pub fn run_pipewire_host(
     // and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
-    let mut rt_state = Box::new(CaptureState::init(&sys, oversample));
+    let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_enabled));
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
     rt_state.slimmable_rx = Some(slimmable_consumer);

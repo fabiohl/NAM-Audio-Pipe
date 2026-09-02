@@ -90,8 +90,9 @@ static OUTPUT_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // Silence trimming is performed in the RT thread (process.rs): audio blocks are only
 // enqueued when the noise gate is open (n_pw > 0). The disk writer receives only
-// blocks containing real signal — never silence, never padding.
-// The gate is always active regardless of DSP configuration (architectural invariant).
+// blocks containing real signal — never silence, never padding — UNLESS the gate is
+// explicitly disabled via `--gate off` (see CaptureState::init in capture/state.rs).
+// The gate is configurable via CLI; the default is active (gate_enabled = true).
 
 /// Asynchronous WAV writer using `tokio_uring` for purely zero-blocking disk I/O.
 ///

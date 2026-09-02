@@ -344,6 +344,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 requested_cpu: None,
                 // Fail-fast under the deterministic harness (see pw_integration).
                 fail_fast: true,
+                gate_enabled: true,
             },
             gc_cons,
             sl_cons,

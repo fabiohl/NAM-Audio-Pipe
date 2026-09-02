@@ -18,10 +18,11 @@
 //! | Oversampling         | Off / 2× / 4×              | **0.60** / 0.20 / 0.20 (Live first)        |
 //! | CabSim               | IR / bypass                | **0.70** / 0.30 (IR is the default path)   |
 //! | Recording            | on / off (`--record`)      | 0.50 / 0.50 (both halves are profiled)     |
+//! | Gate                 | on / off (`--gate`)        | 0.50 / 0.50 (both halves are profiled)     |
 //!
 //! The total simulation budget is distributed by weight across every cell of
 //! the cross product (models × rates × quantums × oversampling × CabSim ×
-//! recording), with a per-cell floor (`--min-blocks`) so each combination is
+//! recording × gate), with a per-cell floor (`--min-blocks`) so each combination is
 //! **provably exercised** (fail-closed coverage, no silently skipped stage).
 //!
 //! # Fail-closed contract (F-RB-013 / T5.3, G-PERF-003)
@@ -100,6 +101,8 @@ const MODE_2X: &str = "2x";
 const MODE_4X: &str = "4x";
 const REC_NO: &str = "no";
 const REC_YES: &str = "yes";
+const GATE_ON: &str = "on";
+const GATE_OFF: &str = "off";
 
 // ── Coverage matrix (T5.2) ───────────────────────────────────────────────────
 
@@ -128,8 +131,13 @@ const CABSIM_BYPASS_WEIGHT: f64 = 0.30;
 const RECORDING_NO_WEIGHT: f64 = 0.50;
 const RECORDING_YES_WEIGHT: f64 = 0.50;
 
-/// Default total simulation budget (seconds of model audio) per recording half
-/// of the matrix. Distributed across every cell by weight.
+/// Noise gate: both halves of the matrix are profiled (with thresholds active
+/// and with thresholds zeroed/off).
+const GATE_ON_WEIGHT: f64 = 0.50;
+const GATE_OFF_WEIGHT: f64 = 0.50;
+
+/// Default total simulation budget (seconds of model audio) per matrix half.
+/// Distributed across every cell by weight.
 const DEFAULT_TOTAL_SECONDS: f64 = 10.0;
 /// Per-cell block floor: every combination of the matrix must run at least
 /// this many blocks so its hot-path instructions are provably in the profile.
@@ -266,6 +274,7 @@ struct CellConfig {
     os_mode: &'static str,
     cabsim_ir: bool,
     recording: bool,
+    gate: bool,
     blocks: u64,
 }
 
@@ -386,8 +395,11 @@ fn run_cell(
     let mut model_out_l = vec![0.0; MAX_RESAMP_BUF];
     let mut model_out_r = vec![0.0; MAX_RESAMP_BUF];
 
-    let threshold_open_sq = (-70.0f32).powf(10.0 / 20.0);
-    let threshold_close_sq = (-80.0f32).powf(10.0 / 20.0);
+    let (threshold_open_sq, threshold_close_sq) = if cfg.gate {
+        ((-70.0f32).powf(10.0 / 20.0), (-80.0f32).powf(10.0 / 20.0))
+    } else {
+        (0.0f32, 0.0f32)
+    };
 
     let mut signal_offset: usize = 0;
 
@@ -603,6 +615,7 @@ struct CellRecord {
     os_mode: &'static str,
     cabsim_ir: bool,
     recording: bool,
+    gate: bool,
     progress: CellProgress,
 }
 
@@ -621,6 +634,10 @@ impl CellRecord {
         obj.insert(
             "recording",
             JsonValue::Str(if self.recording { REC_YES } else { REC_NO }.to_string()),
+        );
+        obj.insert(
+            "gate",
+            JsonValue::Str(if self.gate { GATE_ON } else { GATE_OFF }.to_string()),
         );
         obj.insert("blocks", JsonValue::Int(p.blocks));
         obj.insert("frames", JsonValue::Int(p.frames));
@@ -707,6 +724,7 @@ struct Coverage {
     oversampling: BTreeMap<String, u64>,
     cabsim: BTreeMap<String, u64>,
     recording: BTreeMap<String, u64>,
+    gate: BTreeMap<String, u64>,
 }
 
 impl Coverage {
@@ -729,6 +747,7 @@ impl Coverage {
         obj.insert("oversampling", dim(&self.oversampling));
         obj.insert("cabsim", dim(&self.cabsim));
         obj.insert("recording", dim(&self.recording));
+        obj.insert("gate", dim(&self.gate));
         obj
     }
 
@@ -833,6 +852,15 @@ impl WorkloadReceipt {
                     .collect(),
             ),
         );
+        matrix.insert(
+            "gate_modes",
+            JsonValue::Arr(
+                [GATE_ON, GATE_OFF]
+                    .iter()
+                    .map(|s| JsonValue::Str(s.to_string()))
+                    .collect(),
+            ),
+        );
         matrix.insert("weights", matrix_weights_json());
 
         let cabsim = {
@@ -856,8 +884,8 @@ impl WorkloadReceipt {
             g.insert(
                 "note",
                 JsonValue::Str(
-                    "gate state is constructed and traversed but forced open (DISABLE_GATE=true); \
-                         effective progress is proven by the receipt, not assumed by bypass"
+                    "gate dimension exercises on (thresholds active) and off (thresholds zeroed) across the matrix; \
+                     effective progress is proven by the receipt"
                         .to_string(),
                 ),
             );
@@ -901,6 +929,10 @@ fn matrix_weights_json() -> JsonValue {
     recording.insert(REC_NO, JsonValue::Num(RECORDING_NO_WEIGHT));
     recording.insert(REC_YES, JsonValue::Num(RECORDING_YES_WEIGHT));
     obj.insert("recording", recording);
+    let mut gate = JsonValue::new_obj();
+    gate.insert(GATE_ON, JsonValue::Num(GATE_ON_WEIGHT));
+    gate.insert(GATE_OFF, JsonValue::Num(GATE_OFF_WEIGHT));
+    obj.insert("gate", gate);
     obj
 }
 
@@ -1130,9 +1162,17 @@ enum RecordArg {
     Both,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateArg {
+    On,
+    Off,
+    Both,
+}
+
 /// Manual CLI parsing (keeps the profiling harness dependency-free).
 struct Cli {
     record: RecordArg,
+    gate: GateArg,
     seconds: f64,
     min_blocks: u64,
     receipt_path: PathBuf,
@@ -1142,6 +1182,7 @@ impl Default for Cli {
     fn default() -> Self {
         Self {
             record: RecordArg::Both,
+            gate: GateArg::Both,
             seconds: DEFAULT_TOTAL_SECONDS,
             min_blocks: DEFAULT_MIN_BLOCKS_PER_CELL,
             receipt_path: PathBuf::from(DEFAULT_RECEIPT_PATH),
@@ -1156,6 +1197,19 @@ fn parse_cli() -> Cli {
         match arg.as_str() {
             "--record" => cli.record = RecordArg::Yes,
             "--no-record" => cli.record = RecordArg::No,
+            "--gate" => {
+                let val = args.next().expect("--gate <on|off>");
+                match val.as_str() {
+                    "on" => cli.gate = GateArg::On,
+                    "off" => cli.gate = GateArg::Off,
+                    other => {
+                        eprintln!(
+                            "pgo_workload: FATAL: invalid gate mode {other:?} (expected 'on' or 'off')"
+                        );
+                        process::exit(1);
+                    }
+                }
+            }
             "--seconds" => {
                 cli.seconds = args
                     .next()
@@ -1173,7 +1227,7 @@ fn parse_cli() -> Cli {
             }
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: pgo_workload [--record|--no-record] [--seconds S] \
+                    "usage: pgo_workload [--record|--no-record] [--gate on|off] [--seconds S] \
                      [--min-blocks N] [--receipt PATH]"
                 );
                 process::exit(0);
@@ -1207,26 +1261,6 @@ fn main() {
             model.topology.label()
         );
     }
-    eprintln!(
-        "pgo_workload: matrix={} rates × {} quantums × {} os × 2 cabsim × 2 recording → {} cells/model",
-        RATES_HZ.len(),
-        QUANTUMS.len(),
-        OS_WEIGHTS.len(),
-        RATES_HZ.len() * QUANTUMS.len() * OS_WEIGHTS.len() * 2 * 2
-    );
-
-    neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    let ir_path = resolve_ir_path();
-
-    let mut receipt = WorkloadReceipt::new();
-    receipt.ir = ir_path.display().to_string();
-    receipt.gate_disabled = true;
-
-    // Uniform per-model weight keeps every topology far above the mandatory
-    // block gate regardless of NAM_MODEL/fallback additions.
-    let model_weight = 1.0 / models.len() as f64;
 
     let recording_modes: &[(&str, bool, f64)] = match cli.record {
         RecordArg::No => &[(REC_NO, false, 1.0)],
@@ -1236,6 +1270,43 @@ fn main() {
             (REC_YES, true, RECORDING_YES_WEIGHT),
         ],
     };
+
+    let gate_modes: &[(&str, bool, f64)] = match cli.gate {
+        GateArg::Off => &[(GATE_OFF, false, 1.0)],
+        GateArg::On => &[(GATE_ON, true, 1.0)],
+        GateArg::Both => &[
+            (GATE_ON, true, GATE_ON_WEIGHT),
+            (GATE_OFF, false, GATE_OFF_WEIGHT),
+        ],
+    };
+
+    eprintln!(
+        "pgo_workload: matrix={} rates × {} quantums × {} os × 2 cabsim × {} recording × {} gate → {} cells/model",
+        RATES_HZ.len(),
+        QUANTUMS.len(),
+        OS_WEIGHTS.len(),
+        recording_modes.len(),
+        gate_modes.len(),
+        RATES_HZ.len()
+            * QUANTUMS.len()
+            * OS_WEIGHTS.len()
+            * 2
+            * recording_modes.len()
+            * gate_modes.len()
+    );
+
+    neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    let ir_path = resolve_ir_path();
+
+    let mut receipt = WorkloadReceipt::new();
+    receipt.ir = ir_path.display().to_string();
+    receipt.gate_disabled = false;
+
+    // Uniform per-model weight keeps every topology far above the mandatory
+    // block gate regardless of NAM_MODEL/fallback additions.
+    let model_weight = 1.0 / models.len() as f64;
 
     // Per-topology provisional accumulators. `min_blocks`/`min_frames` start at
     // u64::MAX and are tightened per cell (every topology runs cells). Group
@@ -1336,202 +1407,214 @@ fn main() {
         };
 
         for &(rec_label, rec_on, rec_weight) in recording_modes {
-            for (ri, &rate) in RATES_HZ.iter().enumerate() {
-                for (qi, &quantum) in QUANTUMS.iter().enumerate() {
-                    for &(os_mode, os_weight) in &OS_WEIGHTS {
-                        for &(cabsim_ir, cabsim_weight) in
-                            &[(true, CABSIM_IR_WEIGHT), (false, CABSIM_BYPASS_WEIGHT)]
-                        {
-                            let cell_seconds = cli.seconds
-                                * model_weight
-                                * RATE_WEIGHTS[ri]
-                                * QUANTUM_WEIGHTS[qi]
-                                * os_weight
-                                * cabsim_weight
-                                * rec_weight;
-                            let blocks = (((rate as f64 * cell_seconds) / quantum as f64).round()
-                                as u64)
-                                .max(cli.min_blocks);
+            for &(gate_label, gate_on, gate_weight) in gate_modes {
+                for (ri, &rate) in RATES_HZ.iter().enumerate() {
+                    for (qi, &quantum) in QUANTUMS.iter().enumerate() {
+                        for &(os_mode, os_weight) in &OS_WEIGHTS {
+                            for &(cabsim_ir, cabsim_weight) in
+                                &[(true, CABSIM_IR_WEIGHT), (false, CABSIM_BYPASS_WEIGHT)]
+                            {
+                                let cell_seconds = cli.seconds
+                                    * model_weight
+                                    * RATE_WEIGHTS[ri]
+                                    * QUANTUM_WEIGHTS[qi]
+                                    * os_weight
+                                    * cabsim_weight
+                                    * rec_weight
+                                    * gate_weight;
+                                let blocks = (((rate as f64 * cell_seconds) / quantum as f64)
+                                    .round() as u64)
+                                    .max(cli.min_blocks);
 
-                            let cfg = CellConfig {
-                                rate,
-                                quantum,
-                                os_mode,
-                                cabsim_ir,
-                                recording: rec_on,
-                                blocks,
-                            };
+                                let cfg = CellConfig {
+                                    rate,
+                                    quantum,
+                                    os_mode,
+                                    cabsim_ir,
+                                    recording: rec_on,
+                                    gate: gate_on,
+                                    blocks,
+                                };
 
-                            eprintln!(
-                                "  cell: {rate} Hz / {quantum} fr / os={os_mode} / cabsim={} / rec={rec_label} → {blocks} blocks ({cell_seconds:.3}s)",
-                                if cabsim_ir { "ir" } else { "bypass" }
-                            );
-
-                            let cell = run_cell(
-                                &mut opt_model_l,
-                                &mut opt_model_r,
-                                model_sr,
-                                &stress_signal,
-                                stereo_offset,
-                                &cfg,
-                                &ir_path,
-                            );
-
-                            // Fail-closed per-cell gate: the pipeline must have
-                            // advanced real frames on every cell (with CabSim
-                            // attached, `n_pw` is the post-resampler count).
-                            if cell.blocks == 0 || cell.frames == 0 {
                                 eprintln!(
-                                    "pgo_workload: FATAL: cell {rate}/{quantum}/{os_mode}/{}/{rec_label} advanced 0 frames.",
+                                    "  cell: {rate} Hz / {quantum} fr / os={os_mode} / cabsim={} / rec={rec_label} / gate={gate_label} → {blocks} blocks ({cell_seconds:.3}s)",
                                     if cabsim_ir { "ir" } else { "bypass" }
                                 );
-                                process::exit(1);
-                            }
-                            if rec_on && cell.recording_accepted != cell.blocks {
-                                eprintln!(
-                                    "pgo_workload: FATAL: recording cell accepted {} of {} blocks (overruns={}).",
-                                    cell.recording_accepted, cell.blocks, cell.recording_overruns
+
+                                let cell = run_cell(
+                                    &mut opt_model_l,
+                                    &mut opt_model_r,
+                                    model_sr,
+                                    &stress_signal,
+                                    stereo_offset,
+                                    &cfg,
+                                    &ir_path,
                                 );
-                                process::exit(1);
-                            }
 
-                            total_frames += cell.frames;
-                            if cabsim_ir {
-                                cabsim_total_frames += cell.cabsim_frames;
-                            }
-
-                            // Coverage buckets.
-                            Coverage::bump(
-                                &mut receipt.coverage.rates,
-                                &rate.to_string(),
-                                cell.blocks,
-                            );
-                            Coverage::bump(
-                                &mut receipt.coverage.quantums,
-                                &quantum.to_string(),
-                                cell.blocks,
-                            );
-                            Coverage::bump(
-                                &mut receipt.coverage.topologies,
-                                topo_label,
-                                cell.blocks,
-                            );
-                            Coverage::bump(
-                                &mut receipt.coverage.oversampling,
-                                os_mode,
-                                cell.blocks,
-                            );
-                            Coverage::bump(
-                                &mut receipt.coverage.cabsim,
-                                if cabsim_ir { "ir" } else { "bypass" },
-                                cell.blocks,
-                            );
-                            Coverage::bump(&mut receipt.coverage.recording, rec_label, cell.blocks);
-
-                            // Per-topology minimum progress (frames/blocks) and
-                            // per-group minima (only over cells that exercised
-                            // the group). `tighten_min` assumes the slot starts
-                            // at u64::MAX (every topology runs cells);
-                            // `tighten_group` slots start at 0 and must be set
-                            // by the first exercised cell before narrowing.
-                            let tighten_min = |slot: &mut u64, v: u64| {
-                                *slot = (*slot).min(v);
-                            };
-                            let tighten_group = |slot: &mut u64, v: u64| {
-                                if *slot == 0 || v < *slot {
-                                    *slot = v;
+                                // Fail-closed per-cell gate: the pipeline must have
+                                // advanced real frames on every cell (with CabSim
+                                // attached, `n_pw` is the post-resampler count).
+                                if cell.blocks == 0 || cell.frames == 0 {
+                                    eprintln!(
+                                        "pgo_workload: FATAL: cell {rate}/{quantum}/{os_mode}/{}/{rec_label}/{gate_label} advanced 0 frames.",
+                                        if cabsim_ir { "ir" } else { "bypass" }
+                                    );
+                                    process::exit(1);
                                 }
-                            };
-                            tighten_min(
-                                progress
-                                    .min_blocks_per_topology
-                                    .get_mut(topo_label)
-                                    .expect("min blocks bucket"),
-                                cell.blocks,
-                            );
-                            tighten_min(
-                                progress
-                                    .min_frames_per_topology
-                                    .get_mut(topo_label)
-                                    .expect("min frames bucket"),
-                                cell.frames,
-                            );
-                            tighten_group(
-                                progress
-                                    .groups
-                                    .get_mut("resampler")
-                                    .expect("resampler")
-                                    .min_frames_per_topology
-                                    .get_mut(topo_label)
-                                    .expect("resampler bucket"),
-                                cell.resampler_frames,
-                            );
-                            tighten_group(
-                                progress
-                                    .groups
-                                    .get_mut("inference")
-                                    .expect("inference")
-                                    .min_frames_per_topology
-                                    .get_mut(topo_label)
-                                    .expect("inference bucket"),
-                                cell.frames,
-                            );
-                            tighten_group(
-                                progress
-                                    .groups
-                                    .get_mut("bridge")
-                                    .expect("bridge")
-                                    .min_frames_per_topology
-                                    .get_mut(topo_label)
-                                    .expect("bridge bucket"),
-                                cell.frames,
-                            );
-                            if cell.oversample_frames > 0 {
-                                tighten_group(
-                                    progress
-                                        .groups
-                                        .get_mut("oversample")
-                                        .expect("oversample")
-                                        .min_frames_per_topology
-                                        .get_mut(topo_label)
-                                        .expect("oversample bucket"),
-                                    cell.oversample_frames,
-                                );
-                            }
-                            if cell.cabsim_frames > 0 {
-                                tighten_group(
-                                    progress
-                                        .groups
-                                        .get_mut("cabsim")
-                                        .expect("cabsim")
-                                        .min_frames_per_topology
-                                        .get_mut(topo_label)
-                                        .expect("cabsim bucket"),
-                                    cell.cabsim_frames,
-                                );
-                            }
-                            if cell.recording_frames > 0 {
-                                tighten_group(
-                                    progress
-                                        .groups
-                                        .get_mut("recording")
-                                        .expect("recording")
-                                        .min_frames_per_topology
-                                        .get_mut(topo_label)
-                                        .expect("recording bucket"),
-                                    cell.recording_frames,
-                                );
-                            }
+                                if rec_on && cell.recording_accepted != cell.blocks {
+                                    eprintln!(
+                                        "pgo_workload: FATAL: recording cell accepted {} of {} blocks (overruns={}).",
+                                        cell.recording_accepted,
+                                        cell.blocks,
+                                        cell.recording_overruns
+                                    );
+                                    process::exit(1);
+                                }
 
-                            receipt.cells.push(CellRecord {
-                                rate,
-                                quantum,
-                                topology: topo_label,
-                                os_mode,
-                                cabsim_ir,
-                                recording: rec_on,
-                                progress: cell,
-                            });
+                                total_frames += cell.frames;
+                                if cabsim_ir {
+                                    cabsim_total_frames += cell.cabsim_frames;
+                                }
+
+                                // Coverage buckets.
+                                Coverage::bump(
+                                    &mut receipt.coverage.rates,
+                                    &rate.to_string(),
+                                    cell.blocks,
+                                );
+                                Coverage::bump(
+                                    &mut receipt.coverage.quantums,
+                                    &quantum.to_string(),
+                                    cell.blocks,
+                                );
+                                Coverage::bump(
+                                    &mut receipt.coverage.topologies,
+                                    topo_label,
+                                    cell.blocks,
+                                );
+                                Coverage::bump(
+                                    &mut receipt.coverage.oversampling,
+                                    os_mode,
+                                    cell.blocks,
+                                );
+                                Coverage::bump(
+                                    &mut receipt.coverage.cabsim,
+                                    if cabsim_ir { "ir" } else { "bypass" },
+                                    cell.blocks,
+                                );
+                                Coverage::bump(
+                                    &mut receipt.coverage.recording,
+                                    rec_label,
+                                    cell.blocks,
+                                );
+                                Coverage::bump(&mut receipt.coverage.gate, gate_label, cell.blocks);
+
+                                // Per-topology minimum progress (frames/blocks) and
+                                // per-group minima (only over cells that exercised
+                                // the group). `tighten_min` assumes the slot starts
+                                // at u64::MAX (every topology runs cells);
+                                // `tighten_group` slots start at 0 and must be set
+                                // by the first exercised cell before narrowing.
+                                let tighten_min = |slot: &mut u64, v: u64| {
+                                    *slot = (*slot).min(v);
+                                };
+                                let tighten_group = |slot: &mut u64, v: u64| {
+                                    if *slot == 0 || v < *slot {
+                                        *slot = v;
+                                    }
+                                };
+                                tighten_min(
+                                    progress
+                                        .min_blocks_per_topology
+                                        .get_mut(topo_label)
+                                        .expect("min blocks bucket"),
+                                    cell.blocks,
+                                );
+                                tighten_min(
+                                    progress
+                                        .min_frames_per_topology
+                                        .get_mut(topo_label)
+                                        .expect("min frames bucket"),
+                                    cell.frames,
+                                );
+                                tighten_group(
+                                    progress
+                                        .groups
+                                        .get_mut("resampler")
+                                        .expect("resampler")
+                                        .min_frames_per_topology
+                                        .get_mut(topo_label)
+                                        .expect("resampler bucket"),
+                                    cell.resampler_frames,
+                                );
+                                tighten_group(
+                                    progress
+                                        .groups
+                                        .get_mut("inference")
+                                        .expect("inference")
+                                        .min_frames_per_topology
+                                        .get_mut(topo_label)
+                                        .expect("inference bucket"),
+                                    cell.frames,
+                                );
+                                tighten_group(
+                                    progress
+                                        .groups
+                                        .get_mut("bridge")
+                                        .expect("bridge")
+                                        .min_frames_per_topology
+                                        .get_mut(topo_label)
+                                        .expect("bridge bucket"),
+                                    cell.frames,
+                                );
+                                if cell.oversample_frames > 0 {
+                                    tighten_group(
+                                        progress
+                                            .groups
+                                            .get_mut("oversample")
+                                            .expect("oversample")
+                                            .min_frames_per_topology
+                                            .get_mut(topo_label)
+                                            .expect("oversample bucket"),
+                                        cell.oversample_frames,
+                                    );
+                                }
+                                if cell.cabsim_frames > 0 {
+                                    tighten_group(
+                                        progress
+                                            .groups
+                                            .get_mut("cabsim")
+                                            .expect("cabsim")
+                                            .min_frames_per_topology
+                                            .get_mut(topo_label)
+                                            .expect("cabsim bucket"),
+                                        cell.cabsim_frames,
+                                    );
+                                }
+                                if cell.recording_frames > 0 {
+                                    tighten_group(
+                                        progress
+                                            .groups
+                                            .get_mut("recording")
+                                            .expect("recording")
+                                            .min_frames_per_topology
+                                            .get_mut(topo_label)
+                                            .expect("recording bucket"),
+                                        cell.recording_frames,
+                                    );
+                                }
+
+                                receipt.cells.push(CellRecord {
+                                    rate,
+                                    quantum,
+                                    topology: topo_label,
+                                    os_mode,
+                                    cabsim_ir,
+                                    recording: rec_on,
+                                    gate: gate_on,
+                                    progress: cell,
+                                });
+                            }
                         }
                     }
                 }
@@ -1604,12 +1687,18 @@ fn main() {
         RecordArg::Yes => &[REC_YES],
         RecordArg::Both => &[REC_NO, REC_YES],
     };
+    let required_gate: &[&str] = match cli.gate {
+        GateArg::Off => &[GATE_OFF],
+        GateArg::On => &[GATE_ON],
+        GateArg::Both => &[GATE_ON, GATE_OFF],
+    };
     for (dim, required) in [
         ("rates", &["44100", "48000", "96000"] as &[&str]),
         ("quantums", &["64", "256", "512"] as &[&str]),
         ("oversampling", &[MODE_OFF, MODE_2X, MODE_4X] as &[&str]),
         ("cabsim", &["ir", "bypass"] as &[&str]),
         ("recording", required_recording),
+        ("gate", required_gate),
     ] {
         let counts = match dim {
             "rates" => &receipt.coverage.rates,
@@ -1617,6 +1706,7 @@ fn main() {
             "oversampling" => &receipt.coverage.oversampling,
             "cabsim" => &receipt.coverage.cabsim,
             "recording" => &receipt.coverage.recording,
+            "gate" => &receipt.coverage.gate,
             _ => unreachable!("dim {dim}"),
         };
         for value in required {

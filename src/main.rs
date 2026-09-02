@@ -294,6 +294,7 @@ fn main() -> anyhow::Result<()> {
             oversample: args.oversample,
             requested_cpu: args.cpu,
             fail_fast: args.fail_fast,
+            gate_enabled: matches!(args.gate, cli::GateMode::On),
         },
         gc_consumer,
         slimmable_consumer,
