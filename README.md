@@ -300,7 +300,7 @@ When started, `NAM-Audio-Pipe` automatically registers the following PipeWire no
 | **Playback Stream** | `NAM-Audio-Pipe-Output`       | —                                 | Processed audio stream routed to speakers/headphones |
 
 * **Synchronous Driver Loop:** Both streams are bound to `node.group = "nam-audio-pipe-dsp"` and `node.link-group = "nam-audio-pipe-link-group"`, ensuring they are scheduled synchronously on the same PipeWire driver thread (`nam-audio-pipe-loop`) without inter-thread context switching.
-* **Auto-Routing & Anti-Loopback Watchdog:** Automatically discovers the default hardware output sink via `pw-metadata` with an asynchronous 500 ms watchdog timeout, filtering out its own virtual input node to prevent feedback loops.
+* **Auto-Routing & Anti-Loopback Watchdog:** Automatically discovers the default hardware output sink via `pw-metadata` with a 500 ms watchdog deadline (terminating the probe through the owned child-process handle, immune to PID recycling), filtering out its own virtual input node to prevent feedback loops.
 
 ---
 

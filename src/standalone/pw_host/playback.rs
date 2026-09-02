@@ -10,6 +10,7 @@ use crate::standalone::pw_host::output_pw::{
     SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, mark_format_contract_ok,
     playback_dsp_cycle, reject_negotiated_format_violation, validate_audio_raw_format,
 };
+use crate::standalone::pw_host::rt_callback;
 use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 use neural_amp_modeler_rs::dsp::pipeline::{BridgeRef, DspBridgeReader};
@@ -143,27 +144,36 @@ pub fn setup_playback_stream<'c>(
             )
         })
         .process(move |stream: &pw::stream::Stream, _info| {
-            if (pb_frame_count & 0x3F) == 0
-                && let Ok(pw_time) = stream.time()
-            {
-                rt_status_playback
-                    .playback_host_now
-                    .store(pw_time.now(), Ordering::Relaxed);
-                rt_status_playback
-                    .playback_host_ticks
-                    .store(pw_time.ticks(), Ordering::Relaxed);
-                rt_status_playback
-                    .playback_host_delay
-                    .store(pw_time.delay(), Ordering::Relaxed);
-            }
-            pb_frame_count = pb_frame_count.wrapping_add(1);
-
-            playback_dsp_cycle(
-                stream,
-                bridge_ptr_playback,
-                &mut last_bridge_gen,
+            // F-RB-020 / T3.2: contain RT-callback panics here — they never
+            // reach the `pipewire` crate's `extern "C"` trampoline (which would
+            // `abort`); the fatal `RT_STATUS_PANIC_CAPTURED` latch drives the
+            // ordered teardown from the main control loop.
+            rt_callback::run_rt_callback_body(
                 &rt_status_playback,
-                pb_frame_count,
+                std::panic::AssertUnwindSafe(|| {
+                    if (pb_frame_count & 0x3F) == 0
+                        && let Ok(pw_time) = stream.time()
+                    {
+                        rt_status_playback
+                            .playback_host_now
+                            .store(pw_time.now(), Ordering::Relaxed);
+                        rt_status_playback
+                            .playback_host_ticks
+                            .store(pw_time.ticks(), Ordering::Relaxed);
+                        rt_status_playback
+                            .playback_host_delay
+                            .store(pw_time.delay(), Ordering::Relaxed);
+                    }
+                    pb_frame_count = pb_frame_count.wrapping_add(1);
+
+                    playback_dsp_cycle(
+                        stream,
+                        bridge_ptr_playback,
+                        &mut last_bridge_gen,
+                        &rt_status_playback,
+                        pb_frame_count,
+                    );
+                }),
             );
         })
         .register()?;

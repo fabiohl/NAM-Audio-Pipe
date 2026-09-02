@@ -750,13 +750,98 @@ impl FfiHarnessBuf {
 
 #[test]
 fn read_chunk_meta_rejects_null_pointer() {
-    assert_eq!(read_chunk_meta(std::ptr::null()), None);
+    assert_eq!(read_chunk_meta(std::ptr::null()), ChunkWindow::Absent);
 }
 
 #[test]
 fn read_chunk_meta_reads_host_window() {
     let chunk = chunk_of(8, 64);
-    assert_eq!(read_chunk_meta(&chunk), Some((8, 64)));
+    assert_eq!(read_chunk_meta(&chunk), ChunkWindow::Valid(8, 64));
+}
+
+// ── F-RB-019 / T3.1 — malformed non-null chunks raise E2304, never silence ──
+
+#[test]
+fn spa_corrupted_chunk_raises_contract_violation() {
+    // A non-null chunk with the SPA corrupted flag set (bit 0 of `flags`) must
+    // be classified `Malformed` and raise `RT_STATUS_HOST_CONTRACT_VIOLATION`
+    // (E2304) on the capture path — both channels silenced fail-closed —
+    // instead of degrading silently to `(0, 0)` with clean telemetry.
+    let mut l = FfiHarnessBuf::new(16);
+    let mut r = FfiHarnessBuf::new(16);
+    l.fill_pattern(0x11);
+    r.fill_pattern(0x22);
+    let rt = RtStatusFlags::default();
+    let mut chunk = chunk_of(0, 64);
+    chunk.flags = 1; // SPA_CHUNK_FLAG_CORRUPTED
+
+    assert_eq!(read_chunk_meta(&chunk), ChunkWindow::Malformed);
+    let resolved =
+        resolve_capture_chunk_window(&chunk, l.ptr(), l.maxsize(), r.ptr(), r.maxsize(), &rt);
+    assert_eq!(resolved, None);
+    assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+    assert!(
+        l.all_zero() && r.all_zero(),
+        "corrupted chunk must silence both channels fail-closed"
+    );
+}
+
+#[test]
+fn spa_bad_stride_raises_contract_violation() {
+    // A non-null chunk whose stride diverges from sizeof(f32) must be
+    // classified `Malformed` and raise E2304 on the capture path — the
+    // descriptors can no longer be interpreted as a valid `f32` window.
+    let mut l = FfiHarnessBuf::new(16);
+    let mut r = FfiHarnessBuf::new(16);
+    l.fill_pattern(0x33);
+    r.fill_pattern(0x44);
+    let rt = RtStatusFlags::default();
+    let mut chunk = chunk_of(0, 64);
+    chunk.stride = 2;
+
+    assert_eq!(read_chunk_meta(&chunk), ChunkWindow::Malformed);
+    let resolved =
+        resolve_capture_chunk_window(&chunk, l.ptr(), l.maxsize(), r.ptr(), r.maxsize(), &rt);
+    assert_eq!(resolved, None);
+    assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+    assert!(
+        l.all_zero() && r.all_zero(),
+        "bad-stride chunk must silence both channels fail-closed"
+    );
+}
+
+#[test]
+fn spa_absent_chunk_stays_silent_no_violation() {
+    // A legitimate zero window (valid chunk, `size == 0`, no data published
+    // this quantum) is NOT a violation: the capture path resolves `(0, 0)`
+    // and the consolidated harness accepts it (n_samples == 0), so the DSP is
+    // skipped silently with no E2304 and no telemetry signal.
+    let l = FfiHarnessBuf::new(16);
+    let r = FfiHarnessBuf::new(16);
+    let rt = RtStatusFlags::default();
+    let chunk = chunk_of(0, 0);
+
+    assert_eq!(read_chunk_meta(&chunk), ChunkWindow::Valid(0, 0));
+    let resolved =
+        resolve_capture_chunk_window(&chunk, l.ptr(), l.maxsize(), r.ptr(), r.maxsize(), &rt);
+    assert_eq!(resolved, Some((0, 0)));
+    assert!(!rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+
+    let got = handle_spa_pair_fail_closed(
+        l.ptr(),
+        l.maxsize(),
+        &chunk,
+        0,
+        0,
+        r.ptr(),
+        r.maxsize(),
+        &chunk,
+        0,
+        0,
+        &rt,
+    );
+    assert_eq!(got, Some((0, 0)));
+    assert!(!rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
 }
 
 #[test]
@@ -1093,18 +1178,33 @@ fn ffi_harness_capture_null_chunk_flagged_no_panic_no_reference() {
     l.fill_pattern(0x11);
     r.fill_pattern(0x22);
     let rt = RtStatusFlags::default();
+    let null: *const pw::spa::sys::spa_chunk = std::ptr::null();
 
-    // The capture path reads chunk metadata via `read_chunk_meta`; a null chunk
-    // must never form a reference and the callback must react fail-closed
-    // (flag + silence + early return) — the exact branch `process_dsp_buffer`
-    // takes when `read_chunk_meta` yields `None`.
-    let meta_l = read_chunk_meta(std::ptr::null());
-    let meta_r = read_chunk_meta(std::ptr::null());
-    if meta_l.is_none() || meta_r.is_none() {
-        report_ffi_contract_violation(&rt, l.ptr(), l.maxsize(), r.ptr(), r.maxsize());
-    }
+    // The capture path classifies a null chunk as `Absent` → `(0, 0)`; the
+    // consolidated fail-closed harness below rejects the null pair via its own
+    // chunk-null proof — E2304 raised, both channels silenced, no panic, and
+    // no reference ever formed from the null chunk.
+    let meta_l =
+        resolve_capture_chunk_window(null, l.ptr(), l.maxsize(), r.ptr(), r.maxsize(), &rt);
+    let meta_r =
+        resolve_capture_chunk_window(null, l.ptr(), l.maxsize(), r.ptr(), r.maxsize(), &rt);
+    assert_eq!(meta_l, Some((0, 0)));
+    assert_eq!(meta_r, Some((0, 0)));
 
-    assert!(meta_l.is_none() && meta_r.is_none());
+    let res = handle_spa_pair_fail_closed(
+        l.ptr(),
+        l.maxsize(),
+        null,
+        0,
+        0,
+        r.ptr(),
+        r.maxsize(),
+        null,
+        0,
+        0,
+        &rt,
+    );
+    assert_eq!(res, None);
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
     assert!(
         l.all_zero(),

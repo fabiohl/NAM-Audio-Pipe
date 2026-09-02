@@ -9,6 +9,21 @@ use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+/// Serializes the F-RB-015 fault-injection tests: the armed fault is a single
+/// global inside `handlers.rs`, so tests that arm it must not run concurrently.
+#[cfg(feature = "testing")]
+static RESAMPLER_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes the F-RB-017 oversample fault-injection tests (same global-arm
+/// constraint as the resampler hook).
+#[cfg(feature = "testing")]
+static OS_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes the F-RB-018 slimmable fault-injection tests (same global-arm
+/// constraint as the resampler hook).
+#[cfg(feature = "testing")]
+static SLIMMABLE_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Minimal structurally-invalid-but-drop-safe `WavenetDyn` used to occupy a
 /// slimmable channel slot (the drain never runs DSP on these).
 fn fake_wavenet(ch: usize) -> Box<StaticModel> {
@@ -75,6 +90,7 @@ fn slimmable_pair_built_and_pushed_atomically() {
     request_slimmable_rebuild(&flags, 4);
 
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(2);
+    let mut failures = RebuildFailureTracker::default();
 
     handle_slimmable_rebuild(
         &flags,
@@ -83,6 +99,7 @@ fn slimmable_pair_built_and_pushed_atomically() {
         true,
         &sys,
         &mut prod,
+        &mut failures,
     );
 
     assert!(
@@ -112,8 +129,17 @@ fn slimmable_mono_pair_has_no_r() {
     request_slimmable_rebuild(&flags, 4);
 
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(2);
+    let mut failures = RebuildFailureTracker::default();
 
-    handle_slimmable_rebuild(&flags, Some(full.as_ref()), None, false, &sys, &mut prod);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        None,
+        false,
+        &sys,
+        &mut prod,
+        &mut failures,
+    );
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
     let pair = cons.pop().expect("one pair must be delivered");
@@ -134,6 +160,7 @@ fn slimmable_push_full_keeps_needs_for_retry() {
     // Saturate the single-slot channel so the handler's push must fail.
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(1);
     prod.push(fake_pair(0, 8)).unwrap();
+    let mut failures = RebuildFailureTracker::default();
 
     handle_slimmable_rebuild(
         &flags,
@@ -142,6 +169,7 @@ fn slimmable_push_full_keeps_needs_for_retry() {
         true,
         &sys,
         &mut prod,
+        &mut failures,
     );
 
     assert!(
@@ -159,6 +187,7 @@ fn slimmable_push_full_keeps_needs_for_retry() {
         true,
         &sys,
         &mut prod,
+        &mut failures,
     );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
     let pair = cons.pop().expect("retry must deliver the pair");
@@ -215,6 +244,7 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     let mut model_r: Option<Box<StaticModel>> = Some(fake_wavenet(7));
     let mut deferred_slimmable = None;
     let mut structural_applied = 0usize;
+    let mut failures = RebuildFailureTracker::default();
 
     // RT requests A (gen 1, ch 4); main builds and pushes pair A.
     request_slimmable_rebuild(&flags, 4);
@@ -225,6 +255,7 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
         true,
         &sys,
         &mut sl_prod,
+        &mut failures,
     );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 
@@ -259,6 +290,7 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
         true,
         &sys,
         &mut sl_prod,
+        &mut failures,
     );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 
@@ -668,6 +700,143 @@ fn rearm_guard_keeps_request_when_generation_advanced() {
     );
 }
 
+/// F-RB-015 / T1.1 — a failed resampler rebuild for generation N must never
+/// erase a newer request (N+1) published while the failure was being handled.
+///
+/// Deterministic reproduction of the race: the build for generation 1 fails
+/// (fault-injected under `feature = "testing"`) and the handler is paused at
+/// the injection point; the RT side then publishes generation 2 — the exact
+/// F-RB-015 window. The fix re-arms `NEEDS_RESAMPLER_REBUILD` because the
+/// generation advanced, and generation 2 is later rebuilt and applied.
+#[cfg(feature = "testing")]
+#[test]
+fn resampler_failure_preserves_newer_generation() {
+    use crate::standalone::pw_host::rt_callback::drain_resamplers;
+    use neural_amp_modeler_rs::common::spsc::GcItem;
+    use std::sync::atomic::AtomicBool;
+
+    let _serial = RESAMPLER_FAULT_TEST_LOCK.lock().unwrap();
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
+
+    // RT publishes request A (generation 1) and the main thread starts
+    // rebuilding it; the F-RB-015 fault is armed for generation 1.
+    request_rebuild(&flags, 44100, 48000);
+    let (reached_rx, release_tx) = super::resampler_fault::arm_fail_and_pause(&flags, 1);
+
+    // Main-thread side: the handler captures generation 1, fails the build and
+    // pauses at the injection point until the test releases it.
+    let mut prod = std::thread::scope(|scope| {
+        let handler = scope.spawn(|| {
+            handle_resampler_rebuild(&flags, &sys, &mut prod);
+            prod
+        });
+
+        // Wait for the handler to be paused after capturing generation 1.
+        reached_rx
+            .recv()
+            .expect("handler must reach the fault pause");
+
+        // RT publishes request B (generation 2) while the failed generation-1
+        // rebuild is still being handled — the F-RB-015 lost-wakeup window.
+        request_rebuild(&flags, 96000, 48000);
+        release_tx.send(()).expect("release must reach the handler");
+
+        handler.join().expect("handler must finish")
+    });
+
+    // The newer generation survives the failed rebuild of the older one.
+    assert!(
+        flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD),
+        "a newer generation must survive a failed rebuild of an older one"
+    );
+    assert_eq!(
+        flags.resampler_failed_generation.load(Ordering::Relaxed),
+        1,
+        "the failed generation must remain recorded for the RT fail-open guard"
+    );
+    assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+
+    // The main thread processes the surviving request B (generation 2).
+    handle_resampler_rebuild(&flags, &sys, &mut prod);
+    assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD));
+
+    // RT drain installs B (generation 2) and unmutes the callback.
+    let mut active = make_rs(48000, 48000);
+    let mut active_stream = make_stream(48000, 48000);
+    let (mut gc_prod, mut gc_cons) = rtrb::RingBuffer::<GcItem>::new(8);
+    let gc_overflow = GcOverflowBuffer::default();
+    let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+    let parking_lot_dirty = AtomicBool::new(false);
+    let mut deferred = None;
+    let mut structural_applied = 0usize;
+
+    drain_resamplers(
+        &mut cons,
+        &mut deferred,
+        &mut structural_applied,
+        &mut active,
+        &mut active_stream,
+        &mut gc_prod,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+        &flags,
+    );
+
+    assert_eq!(
+        active.host_rate(),
+        96000,
+        "generation N+1 must be the one applied"
+    );
+    assert_eq!(
+        flags.applied_rate_generation.load(Ordering::Relaxed),
+        2,
+        "applied generation must equal the requested generation before unmute"
+    );
+    assert!(!flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+    assert!(gc_cons.pop().is_ok(), "retired resampler must reach the GC");
+}
+
+/// F-RB-015 / T1.1 — without a newer generation, a failed resampler rebuild
+/// clears the request: no spurious retry is armed (preserves the existing
+/// correct behavior for the simple case).
+#[cfg(feature = "testing")]
+#[test]
+fn resampler_failure_without_newer_generation_still_clears() {
+    let _serial = RESAMPLER_FAULT_TEST_LOCK.lock().unwrap();
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
+
+    // RT publishes request A (generation 1); the build for it is fault-injected
+    // to fail deterministically.
+    request_rebuild(&flags, 44100, 48000);
+    super::resampler_fault::arm_fail_once(&flags, 1);
+
+    handle_resampler_rebuild(&flags, &sys, &mut prod);
+
+    // No newer generation: the request is cleared (no infinite retry loop)...
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD),
+        "a failure without a newer request must clear the rebuild flag"
+    );
+    // ...the failed generation stays recorded for the RT fail-open guard...
+    assert_eq!(
+        flags.resampler_failed_generation.load(Ordering::Relaxed),
+        1,
+        "the failed generation must remain recorded"
+    );
+    // ...and no payload is delivered (the RT stays muted until the fail-open
+    // rollback resolves the failed generation).
+    assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
+    assert!(
+        cons.pop().is_err(),
+        "failure path must not deliver a payload"
+    );
+}
+
 /// Deterministic lost-wakeup interleaving (F-RB-004 / T2.1 acceptance):
 ///
 /// 1. RT requests A (generation 1).
@@ -968,6 +1137,7 @@ fn oversample_pair_built_stamped_and_pushed_atomically() {
     let flags = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(2);
+    let mut failures = RebuildFailureTracker::default();
 
     flags
         .requested_os_factor
@@ -975,7 +1145,7 @@ fn oversample_pair_built_stamped_and_pushed_atomically() {
     flags.requested_os_generation.store(7, Ordering::Release);
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
 
-    handle_oversample_rebuild(&flags, &sys, &mut prod);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
 
     assert!(
         !flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
@@ -1029,6 +1199,7 @@ fn oversample_channel_full_keeps_flag_for_retry() {
     let flags = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let (mut prod, _cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(1);
+    let mut failures = RebuildFailureTracker::default();
 
     // Saturate the queue
     prod.push(Box::new(OsEnginePair {
@@ -1044,10 +1215,247 @@ fn oversample_channel_full_keeps_flag_for_retry() {
     flags.requested_os_generation.store(1, Ordering::Release);
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
 
-    handle_oversample_rebuild(&flags, &sys, &mut prod);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
 
     assert!(
         flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
         "channel full must retain the flag for automatic retry"
     );
+}
+
+/// Requests an oversampling engine rebuild exactly like the RT callback does
+/// (factor first, then the generation bump, then the flag).
+#[cfg(feature = "testing")]
+fn request_os_rebuild(flags: &RtStatusFlags, factor: OversampleFactor) {
+    flags
+        .requested_os_factor
+        .store(factor.to_f32() as u32, Ordering::Relaxed);
+    flags
+        .requested_os_generation
+        .fetch_add(1, Ordering::Release);
+    flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+}
+
+/// F-RB-017 / T2.1 — a persistent `OversampleEngine::new` failure must not be
+/// retried on every control-loop tick.
+///
+/// The fault is armed persistently for generation 1; the handler is called N
+/// times (simulating N ≤ 100 ms control-loop iterations). Only the first call
+/// attempts the build (counted by the fault hook); the failed-generation latch
+/// suppresses the rest, so a persistent OOM produces exactly one allocation
+/// attempt and one `log::error!` per generation. A newer request (generation 2)
+/// re-enables the rebuild, which fails once and latches again. The latch also
+/// suppresses a hypothetical same-generation flag re-arm (defense in depth).
+#[cfg(feature = "testing")]
+#[test]
+fn oversample_build_failure_stops_retry_storm_until_newer_generation() {
+    let _serial = OS_FAULT_TEST_LOCK.lock().unwrap();
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(4);
+    let mut failures = RebuildFailureTracker::default();
+
+    // RT requests gen 1; the engine build for it fails persistently.
+    request_os_rebuild(&flags, OversampleFactor::X2);
+    super::os_fault::arm_fail(&flags, 1);
+
+    // N control-loop ticks with the same generation: exactly one build attempt.
+    for _ in 0..16 {
+        handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    }
+    assert_eq!(
+        super::os_fault::attempts(&flags, 1),
+        1,
+        "a failed generation must be attempted at most once, never per tick"
+    );
+    assert_eq!(
+        failures.os_failed_generation, 1,
+        "the failed generation must be latched"
+    );
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
+        "a failure without a newer request must clear the rebuild flag"
+    );
+    assert!(
+        cons.pop().is_err(),
+        "no payload may be delivered for a failed build"
+    );
+
+    // Defense in depth: even if the flag were re-armed for the SAME generation
+    // (a path that today does not exist), the failed-generation latch must
+    // suppress the rebuild rather than storm.
+    flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    assert_eq!(
+        super::os_fault::attempts(&flags, 1),
+        1,
+        "same-generation re-arm must stay suppressed by the latch"
+    );
+
+    // A newer request (gen 2) re-enables the rebuild: one more attempt, one
+    // more latch.
+    super::os_fault::arm_fail(&flags, 2);
+    request_os_rebuild(&flags, OversampleFactor::X4);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    assert_eq!(
+        super::os_fault::attempts(&flags, 2),
+        1,
+        "a newer generation must re-enable exactly one rebuild attempt"
+    );
+    assert_eq!(failures.os_failed_generation, 2);
+    assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD));
+}
+
+/// F-RB-018 / T2.2 — deterministic slimmable rejections must clear the request
+/// immediately: no retry of the slice/prewarm allocators on later ticks.
+///
+/// Covers the two terminal classes: `target_ch < 4` and a non-WaveNet model
+/// (the `lstm.nam` fixture loads as an LSTM, which `slice_wavenet_model`
+/// cannot process).
+#[test]
+fn slimmable_terminal_rejection_clears_flag_no_retry() {
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(2);
+    let mut failures = RebuildFailureTracker::default();
+
+    // Terminal case 1: target_ch < 4.
+    request_slimmable_rebuild(&flags, 2);
+    handle_slimmable_rebuild(&flags, None, None, false, &sys, &mut prod, &mut failures);
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
+        "target_ch < 4 is terminal: the request must be cleared"
+    );
+    assert!(!flags.check_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED));
+    assert!(cons.pop().is_err(), "terminal rejection delivers nothing");
+
+    // Repeated ticks stay inert: no retry storm.
+    for _ in 0..8 {
+        handle_slimmable_rebuild(&flags, None, None, false, &sys, &mut prod, &mut failures);
+    }
+    assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
+
+    // Terminal case 2: model not sliceable (non-WaveNetDyn). A later request
+    // (new generation) is also rejected terminally — still no retry.
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.push("tests/fixtures/models/lstm.nam");
+    let loaded = loader::load_and_build_model(&path, &sys, true, loader::LoadOptions::default())
+        .expect("lstm fixture must load");
+    let lstm = loaded.model_l.expect("lstm fixture must expose an L model");
+    assert!(
+        !matches!(lstm.as_ref(), StaticModel::WavenetDyn(_)),
+        "precondition: the fixture must not be a WavenetDyn"
+    );
+
+    request_slimmable_rebuild(&flags, 4);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(lstm.as_ref()),
+        None,
+        false,
+        &sys,
+        &mut prod,
+        &mut failures,
+    );
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
+        "non-WaveNet is terminal: the request must be cleared, no retry"
+    );
+    assert!(!flags.check_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED));
+    assert!(cons.pop().is_err(), "terminal rejection delivers nothing");
+}
+
+/// F-RB-018 / T2.2 — a transient `slice_wavenet_model` failure must not be
+/// retried on every control-loop tick.
+///
+/// The slice fault is armed persistently for generation 1; the handler is
+/// called N times (simulating N ≤ 100 ms control-loop iterations). Only the
+/// first call enters `slice_wavenet_model` + `prewarm()` (counted by the fault
+/// hook); the failed-generation latch suppresses the rest. A newer request
+/// (generation 2) re-enables the rebuild, which fails once and latches again.
+#[cfg(feature = "testing")]
+#[test]
+fn slimmable_slice_failure_does_not_retry_every_control_loop_tick() {
+    let _serial = SLIMMABLE_FAULT_TEST_LOCK.lock().unwrap();
+    let flags = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let full = load_slimmable_full_model().expect("fixture model");
+    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(4);
+    let mut failures = RebuildFailureTracker::default();
+
+    // RT requests gen 1 (ch 4); slicing it fails persistently.
+    request_slimmable_rebuild(&flags, 4);
+    super::slimmable_fault::arm_fail(&flags, 1);
+
+    // N control-loop ticks with the same generation: exactly one slice attempt.
+    for _ in 0..16 {
+        handle_slimmable_rebuild(
+            &flags,
+            Some(full.as_ref()),
+            Some(full.as_ref()),
+            true,
+            &sys,
+            &mut prod,
+            &mut failures,
+        );
+    }
+    assert_eq!(
+        super::slimmable_fault::attempts(&flags, 1),
+        1,
+        "a failed generation must be sliced at most once, never per tick"
+    );
+    assert_eq!(
+        failures.slimmable_failed_generation, 1,
+        "the failed generation must be latched"
+    );
+    assert!(
+        !flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
+        "a slice failure without a newer request must clear the rebuild flag"
+    );
+    assert!(
+        flags.check_flag(spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED),
+        "the transient failure signal must be published for telemetry"
+    );
+    assert!(
+        cons.pop().is_err(),
+        "no pair may be delivered for a failed slice"
+    );
+
+    // Defense in depth: a same-generation flag re-arm stays suppressed.
+    flags.set_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut prod,
+        &mut failures,
+    );
+    assert_eq!(
+        super::slimmable_fault::attempts(&flags, 1),
+        1,
+        "same-generation re-arm must stay suppressed by the latch"
+    );
+
+    // A newer request (gen 2) re-enables the rebuild: one more attempt, one
+    // more latch.
+    super::slimmable_fault::arm_fail(&flags, 2);
+    request_slimmable_rebuild(&flags, 4);
+    handle_slimmable_rebuild(
+        &flags,
+        Some(full.as_ref()),
+        Some(full.as_ref()),
+        true,
+        &sys,
+        &mut prod,
+        &mut failures,
+    );
+    assert_eq!(
+        super::slimmable_fault::attempts(&flags, 2),
+        1,
+        "a newer generation must re-enable exactly one slice attempt"
+    );
+    assert_eq!(failures.slimmable_failed_generation, 2);
+    assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 }

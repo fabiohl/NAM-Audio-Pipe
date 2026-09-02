@@ -335,15 +335,37 @@ fn main() -> anyhow::Result<()> {
     // Propagate recording failures into the process exit code (F-RB-009 / T3.5):
     // a worker error, a panic or a join timeout must never masquerade as a
     // successful run — scripts and automation rely on the non-zero exit.
+    // A recording that completed but lost audio blocks to ring overruns is
+    // likewise a non-zero exit (F-RB-024 / T5.1, D1): `SuccessWithLoss` never
+    // masquerades as a lossless capture.
     match recording_outcome {
         None | Some(recording::RecordingWorkerOutcome::Success) => {}
+        Some(outcome @ recording::RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }) => {
+            log::error!(
+                "🛑 Recording completed with lost audio: {blocks} block(s) / \
+                 {frames} frame(s) dropped by overruns — exit {}.",
+                outcome.exit_code()
+            );
+            eprintln!(
+                "{}",
+                format!(
+                    "Recording completed with lost audio: {blocks} block(s) / \
+                     {frames} frame(s) dropped by overruns — the capture is \
+                     incomplete (exit {}).",
+                    outcome.exit_code()
+                )
+                .bright_red()
+                .bold()
+            );
+            std::process::exit(outcome.exit_code());
+        }
         Some(outcome) => {
             log::error!("🛑 Recording worker did not complete cleanly: {outcome}");
             eprintln!(
                 "{}",
                 format!("Recording failed: {outcome}").bright_red().bold()
             );
-            anyhow::bail!("recording worker failed: {outcome}");
+            std::process::exit(outcome.exit_code());
         }
     }
     log::info!("{} NAM-Audio-Pipe encerrado. 🎸", "✅".green());

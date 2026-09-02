@@ -46,6 +46,16 @@ use super::pool::{POOL_CAPACITY, PoolConsumer, PoolProducer, RecordingPool};
 /// * `false` — T4.1 inline SPSC ring (rollback: single ring carries every
 ///   payload; used only if the pool introduces ABA/lifetime risk in the real
 ///   path).
+///
+/// # Status (F-RB-025 / T5.4)
+///
+/// The `Inline` rollback branch is **structurally unreachable in production**:
+/// `RECORDING_POOL_TRANSPORT` is hard-coded to `true` and nothing flips it at
+/// runtime, so the inline path has no coverage on the production surface —
+/// only dedicated unit tests (see `docs/testing.md`, T4.1/T5.4 note). It is
+/// kept intentionally as the documented T4.1 rollback; if it is never needed,
+/// it should be removed entirely in a future release rather than maintained
+/// as dead weight.
 pub const RECORDING_POOL_TRANSPORT: bool = true;
 
 /// Producer half of the recording transport, held by

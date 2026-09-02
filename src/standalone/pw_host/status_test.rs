@@ -95,6 +95,56 @@ fn mark_failed_is_sticky_and_exposes_detail() {
 }
 
 #[test]
+#[cfg(feature = "testing")]
+fn observe_rt_panic_transitions_backend_to_failed() {
+    // F-RB-020 / T3.2: a panic contained inside an RT callback (the capture
+    // and playback `process` closures run under `run_rt_callback_body`) raises
+    // the fatal `RT_STATUS_PANIC_CAPTURED` latch; the main control loop's
+    // `observe_rt_panic` poll must transition the backend to `Failed` so the
+    // ordered teardown — including `RecordingWorkerGuard::shutdown` with the
+    // WAV finalized — runs instead of an `abort` with a corrupted capture.
+    use crate::standalone::pw_host::rt_callback::{RT_STATUS_PANIC_CAPTURED, run_rt_callback_body};
+
+    let rt = Arc::new(RtStatusFlags::default());
+    let backend = SharedBackendStatus::with_rt_status(Arc::clone(&rt));
+
+    // No panic observed yet -> no transition.
+    assert!(!observe_rt_panic(&rt, &backend));
+    assert!(!backend.is_failed());
+
+    // Contain a panic exactly like the RT closures do and observe the fatal
+    // flag on the next control-loop poll.
+    let ok = run_rt_callback_body(
+        &rt,
+        std::panic::AssertUnwindSafe(|| {
+            panic!("injected RT callback panic");
+        }),
+    );
+    assert!(!ok, "panicking body must report failure");
+    assert!(
+        rt.check_flag(RT_STATUS_PANIC_CAPTURED),
+        "panic must raise the fatal RT flag"
+    );
+
+    assert!(observe_rt_panic(&rt, &backend));
+    assert!(backend.is_failed());
+    assert_eq!(
+        backend.state(),
+        BackendState::Failed {
+            stream: "rt_callback",
+            reason: "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)".into(),
+        }
+    );
+    assert_eq!(
+        backend.failure(),
+        Some((
+            "rt_callback",
+            "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)".to_string()
+        ))
+    );
+}
+
+#[test]
 fn mark_terminated_closes_lifecycle() {
     let backend = SharedBackendStatus::new();
     backend.mark_running();
@@ -182,6 +232,9 @@ fn observe_unconnected_after_streaming_marks_failed() {
     // Sprint 2 / T2.1 strict path: without `SHUTDOWN` the post-streaming
     // disconnect is an unexpected drop — it must fail the backend and be
     // logged at `ERROR` (daemon restart/crash alarm).
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(false, Ordering::Release);
     init_log_capture();
@@ -225,6 +278,9 @@ fn observe_unconnected_during_shutdown_is_cooperative_and_not_fatal() {
     // `thread_loop.stop()` emit a post-streaming `Unconnected`. That disconnect
     // is expected — it must NOT transition the backend to the sticky `Failed`
     // state (no false "daemon crash" alarm) and must be logged below `ERROR`.
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(true, Ordering::Release);
     init_log_capture();
@@ -275,6 +331,9 @@ fn observe_error_stays_fatal_even_during_shutdown() {
     // Sprint 2 / T2.1 scope guard: `SHUTDOWN` only downgrades the cooperative
     // disconnect (`Unconnected`). A genuine `StreamState::Error` remains fatal
     // even while shutting down — a failing stream is never masked as expected.
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(true, Ordering::Release);
 
@@ -296,6 +355,9 @@ fn observe_error_stays_fatal_even_during_shutdown() {
 fn observe_unconnected_after_paused_marks_failed() {
     // Sprint 2 / T2.1 strict path (Paused origin): unexpected drop, not
     // shutdown — must remain fatal.
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(false, Ordering::Release);
     let backend = SharedBackendStatus::new();
@@ -361,6 +423,9 @@ fn failure_detection_terminates_control_loop_within_sla() {
     // the control loop and lead to teardown + error return within < 200 ms —
     // zero zombie processes. This mirrors the exact poll pattern of the main
     // control loop in `run.rs` (SHUTDOWN condition + `is_failed` fast-path).
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     let backend = Arc::new(SharedBackendStatus::new());
     let loop_handle = {

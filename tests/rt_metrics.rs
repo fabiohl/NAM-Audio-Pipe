@@ -351,10 +351,17 @@ fn rt_deadline_gate_10k_quantums() {
     // calibrated RT machine (isolated core + SCHED_FIFO) turns the miss into
     // a hard failure; a noisy/dev host reports a typed GAP; `NAM_RT_STRICT=1`
     // promotes the GAP to a failure as well.
-    if env.strict || env.calibrated() {
+    if env.calibrated() {
         panic!(
             "RT deadline gate FAILED: max callback {max_ns} ns exceeds the {budget_ns} ns budget \
              (mean {mean_ns} ns, p99 {p99_ns} ns) on a calibrated/RT environment — real xrun risk"
+        );
+    } else if env.strict {
+        panic!(
+            "RT deadline gate FAILED: max callback {max_ns} ns exceeds the {budget_ns} ns budget \
+             (mean {mean_ns} ns, p99 {p99_ns} ns) — NAM_RT_STRICT=1 promoted this GAP to a hard \
+             failure (environment is not calibrated: CPU not isolated/pinned or no SCHED_FIFO); \
+             re-run on the calibrated RT host"
         );
     }
     eprintln!(
@@ -465,10 +472,17 @@ fn rt_jitter_gate_10k_callbacks() {
         return;
     }
 
-    if env.strict || env.calibrated() {
+    if env.calibrated() {
         panic!(
             "RT jitter gate FAILED: max jitter {max_jitter_us:.1} us exceeds budget {budget_max_us:.1} us \
              (p99 {p99_jitter_us:.1} us vs {budget_p99_us:.1} us) on a calibrated RT environment"
+        );
+    } else if env.strict {
+        panic!(
+            "RT jitter gate FAILED: max jitter {max_jitter_us:.1} us exceeds budget {budget_max_us:.1} us \
+             (p99 {p99_jitter_us:.1} us vs {budget_p99_us:.1} us) — NAM_RT_STRICT=1 promoted this GAP to a \
+             hard failure (environment is not calibrated: CPU not isolated/pinned or no SCHED_FIFO); \
+             re-run on the calibrated RT host"
         );
     }
     eprintln!(

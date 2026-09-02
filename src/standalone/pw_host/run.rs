@@ -8,6 +8,7 @@
 use super::SharedBackendStatus;
 use super::capture::state::{CaptureState, RtHostChannels};
 use super::handlers;
+use super::observe_rt_panic;
 use super::output_pw::AppState;
 use super::reconnect::{ReconnectCycle, ReconnectPolicy};
 use super::wakeup::ControlPlaneWakeup;
@@ -225,6 +226,12 @@ pub fn run_pipewire_host(
     // return below.
     let mut backend_failure: Option<(&'static str, String)> = None;
 
+    // F-RB-017 / F-RB-018: main-thread latches for failed oversample and
+    // slimmable rebuild generations. Lives here (outside the 'host loop) so a
+    // reconnect never re-opens the retry storm for a generation that already
+    // failed.
+    let mut rebuild_failures = handlers::RebuildFailureTracker::default();
+
     // =========================================================
     // 4. HOST INSTANCE LOOP (one per bounded-reconnect attempt)
     // =========================================================
@@ -376,6 +383,12 @@ pub fn run_pipewire_host(
         // failure for this instance. Drives either the bounded reconnect
         // (T4.5) or the fail-fast teardown + `Err` return below.
         let mut instance_failure: Option<(&'static str, String)> = None;
+        // F-RB-020 (review round): a contained RT panic is not a recoverable
+        // connectivity loss — the callback code that panicked will panic again
+        // on any reconnected instance and the `RT_STATUS_PANIC_CAPTURED` latch
+        // persists. Marking it terminal skips the bounded reconnect cycle
+        // (which would burn all attempts guaranteed-futile) and fails fast.
+        let mut panic_is_terminal = false;
         while !SHUTDOWN.load(Ordering::Acquire) {
             // F-RB-010 / T4.4: a fatal loss of backend connectivity (daemon
             // crash/restart, stream `Error`, post-streaming `Unconnected`)
@@ -386,6 +399,22 @@ pub fn run_pipewire_host(
             // after the instance teardown.
             if let Some((stream, reason)) = backend_status.failure() {
                 instance_failure = Some((stream, reason));
+                break;
+            }
+
+            // F-RB-020 / T3.2: a panic contained inside an RT callback (capture
+            // or playback `process` closure) is never an abort — the fatal
+            // `RT_STATUS_PANIC_CAPTURED` latch is observed on this poll
+            // (< 100 ms), the backend transitions to `Failed` and the ordered
+            // teardown runs (thread-loop stop, GC drain,
+            // `RecordingWorkerGuard::shutdown` finalizing the WAV).
+            if observe_rt_panic(&rt_status, &backend_status) {
+                panic_is_terminal = true;
+                instance_failure = Some((
+                    "rt_callback",
+                    "panic captured in an RT callback closure (contained — ordered teardown follows)"
+                        .to_owned(),
+                ));
                 break;
             }
 
@@ -412,8 +441,14 @@ pub fn run_pipewire_host(
                 has_model_r,
                 &sys,
                 &mut slimmable_producer,
+                &mut rebuild_failures,
             );
-            handlers::handle_oversample_rebuild(&rt_status, &sys, &mut os_producer);
+            handlers::handle_oversample_rebuild(
+                &rt_status,
+                &sys,
+                &mut os_producer,
+                &mut rebuild_failures,
+            );
 
             (was_silent, was_fading) = rt_setup::poll_rt_status(
                 &rt_status,
@@ -444,6 +479,24 @@ pub fn run_pipewire_host(
             // stream state transitions, with 100 ms as health-poll fallback to ensure
             // liveness and prevent busy-spin.
             wakeup.wait_timeout(std::time::Duration::from_millis(100));
+        }
+
+        // F-RB-020 (review round): the panic latch is only observed inside the
+        // control loop above. A panic captured in the same window as a SIGINT
+        // (the loop exits via the `SHUTDOWN` condition before the next poll)
+        // would otherwise be swallowed by a clean exit 0 with the captured
+        // audio silently lost. Re-check the latch once after the loop so a
+        // contained panic always surfaces as a failure, never as a `Success`.
+        if instance_failure.is_none()
+            && rt_status
+                .check_flag(crate::standalone::pw_host::rt_callback::RT_STATUS_PANIC_CAPTURED)
+        {
+            panic_is_terminal = true;
+            instance_failure = Some((
+                "rt_callback",
+                "panic captured in an RT callback closure (observed at shutdown — never a clean exit)"
+                    .to_owned(),
+            ));
         }
 
         // =========================================================
@@ -485,6 +538,14 @@ pub fn run_pipewire_host(
             // and the final teardown below finalizes the recording.
             None => break 'host,
             Some((stream, reason)) => {
+                // F-RB-020 (review round): a contained RT panic is terminal —
+                // reconnecting re-runs the same callback code and the latch
+                // persists, so every attempt would fail on the first poll.
+                // Skip the bounded reconnect cycle and fail fast instead.
+                if panic_is_terminal {
+                    backend_failure = Some((stream, reason));
+                    break 'host;
+                }
                 if let Some(backoff) = reconnect.begin_attempt() {
                     log::warn!(
                         "{} PipeWire backend lost the '{stream}' stream ({reason}). \

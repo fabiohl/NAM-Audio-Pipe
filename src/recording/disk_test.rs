@@ -608,8 +608,18 @@ impl WavSink for MockWavSink {
 /// empty channels (barrier), then emits blocks **after** `SHUTDOWN` through the
 /// promoted pool transport (T4.3) — the worker must ignore the flag, drain
 /// 100% of the samples and finalize a bit-exact WAV with exactly one `fsync`.
+// REASON (T-C1): serializing SHUTDOWN-touching tests requires holding the
+// std MutexGuard across `.await`; this is Send-safe because the runtime is
+// `current_thread` (LocalSet), so the guard never crosses threads.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "T-C1 SHUTDOWN test serialization"
+)]
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     // `InFlightBlock` owns a raw pointer into the pool slot and crosses an
     // `.await` inside the drain loop, so the worker future is `!Send`; it must
     // run inside a `LocalSet` (the production worker runs under the

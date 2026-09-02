@@ -434,6 +434,35 @@ pub fn observe_stream_state(
     }
 }
 
+/// Observes the RT panic-captured latch (F-RB-020 / T3.2) and transitions the
+/// backend to [`BackendState::Failed`] when a panic was contained inside an RT
+/// callback closure.
+///
+/// Called by the main control loop on every poll iteration (< 100 ms): a
+/// contained panic must never become an `abort` — the backend machine drives
+/// the ordered teardown (thread-loop stop, GC drain,
+/// `RecordingWorkerGuard::shutdown` with the WAV finalized) exactly like any
+/// other fatal backend failure.
+///
+/// Returns `true` when the panic flag was observed (the caller breaks the
+/// control loop into the teardown path).
+pub fn observe_rt_panic(rt_status: &RtStatusFlags, backend: &SharedBackendStatus) -> bool {
+    if rt_status.check_flag(super::rt_callback::RT_STATUS_PANIC_CAPTURED) {
+        log::error!(
+            "{} Panic captured inside an RT callback closure — contained, \
+             ordered teardown follows (no abort, capture will be finalized).",
+            "🔥".red(),
+        );
+        backend.mark_failed(
+            "rt_callback",
+            "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)",
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Whether `old` indicates the stream previously held an established
 /// connection (`Paused` or `Streaming`), i.e. `Unconnected` now means a real
 /// disconnect rather than the initial not-yet-connected state.

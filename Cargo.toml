@@ -95,6 +95,26 @@ sha2 = "0.11"
 [lints.clippy]
 allow_attributes = "warn"
 
+# D3 (F-RB-023, S5; review round 2026-09-02): `dist` intentionally inherits
+# `panic = "unwind"` from `release`.
+#
+# - `release` keeps `panic = "unwind"`: the tests-quick.sh Fase 2 runs the
+#   `--lib` suite in `--release` and T3.2 (F-RB-020) relies on `catch_unwind`
+#   to prove panics inside RT callbacks never cross the PipeWire `extern "C"`
+#   boundary. Uniformizing `release` to `panic = "abort"` would make that
+#   evidence unusable.
+# - `dist` is the profile effectively distributed by `utils/build-release.sh`
+#   (stripped, LTO fat) — the exact artifact certified by the release
+#   ceremony. It **also** inherits `unwind`: under `panic = "abort"` the
+#   `std::panic::catch_unwind` wrapper around the RT callbacks
+#   (`run_rt_callback_body`, F-RB-020) could never catch — a panic would still
+#   `abort` with a corrupted recording. Keeping `unwind` makes the contained
+#   teardown guarantee (WAV finalized, ordered shutdown) real in the artifact
+#   users actually install. The earlier rationale ("the difference is moot —
+#   Rust ≥ 1.81 aborts at the `extern "C"` shim either way") was wrong exactly
+#   because the wrapper prevents the panic from ever reaching that shim.
+# Do not uniformize `release`/`dist` to `abort` without a new decision (see D3
+# in .agents/TODO-sprints.md).
 [profile.release]
 strip = true
 lto = "fat"
@@ -102,9 +122,9 @@ opt-level = 3
 codegen-units = 1
 panic = "unwind"
 
+# The shipped profile (see the D3 note on `release` above).
 [profile.dist]
 inherits = "release"
-panic = "abort"
 
 [profile.dev]
 debug = 1

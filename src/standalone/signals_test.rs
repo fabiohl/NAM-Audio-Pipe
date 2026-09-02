@@ -78,6 +78,9 @@ fn test_install_registers_sigint_and_sigterm_with_sa_restart() {
 
 #[test]
 fn test_first_signal_sets_cooperative_shutdown_flag() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
     let restore = ShutdownRestore::capture();
     assert!(
         !SHUTDOWN.load(Ordering::Acquire),

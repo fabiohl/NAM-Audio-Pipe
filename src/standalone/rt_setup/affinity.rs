@@ -114,16 +114,28 @@ pub fn parse_interrupts_per_cpu() -> HashMap<usize, u64> {
 /// imposed by the operating system or the user (e.g. taskset).
 pub fn get_allowed_cpus() -> Vec<usize> {
     let mut allowed = Vec::new();
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
 
-        // Kernel call to get the affinity mask of the current process (pid 0)
-        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpuset) == 0 {
-            for i in 0..libc::CPU_SETSIZE as usize {
-                if libc::CPU_ISSET(i, &cpuset) {
-                    allowed.push(i);
-                }
+    // SAFETY: on the supported Linux targets (glibc/musl) `cpu_set_t` is a C
+    // bitmask whose all-zero bit pattern denotes the empty CPU set, so a
+    // zero-initialized `cpu_set_t` is a fully valid value — no Rust reference
+    // is formed over uninitialized storage.
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `CPU_ZERO` only mutates the already-initialized bitmask in place;
+    // `sched_getaffinity` fills the same valid object. On failure the mask is
+    // left untouched and the `ok` flag below keeps the loop from reading it.
+    let ok = unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpuset) == 0
+    };
+
+    if ok {
+        for i in 0..libc::CPU_SETSIZE as usize {
+            // SAFETY: `cpuset` was filled by the successful `sched_getaffinity`
+            // above; `CPU_ISSET` only reads bits within the initialized
+            // `[u64; CPU_SETSIZE/64]` storage for indexes in `[0, CPU_SETSIZE)`.
+            if unsafe { libc::CPU_ISSET(i, &cpuset) } {
+                allowed.push(i);
             }
         }
     }

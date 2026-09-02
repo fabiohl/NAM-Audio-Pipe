@@ -11,8 +11,9 @@
 /// This function attempts to identify which physical device audio should be sent to
 /// by default. It parses the output of the PipeWire `pw-metadata` utility.
 ///
-/// A watchdog thread with a 500ms timeout prevents hanging if the PipeWire daemon
-/// or `pw-metadata` is unresponsive.
+/// A watchdog deadline of 500 ms prevents hanging if the PipeWire daemon
+/// or `pw-metadata` is unresponsive; the timeout path terminates the probe
+/// through the owned [`std::process::Child`] handle (immune to PID recycling).
 ///
 /// Returns `Some(name)` if a valid sink that is not NAM-Audio-Pipe itself is found,
 /// or `None` otherwise (allowing routing to be decided by WirePlumber).
@@ -26,30 +27,73 @@ pub fn detect_hardware_sink() -> Option<String> {
         .spawn()
         .ok()?;
 
-    let pid = child.id() as libc::pid_t;
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
+    let output = collect_child_output_with_watchdog(child, TIMEOUT)?;
+    parse_sink_name_from_metadata(&output.stdout)
+}
 
-    let output = match rx.recv_timeout(TIMEOUT) {
-        Ok(Ok(out)) => out,
-        Ok(Err(_)) => return None,
-        Err(_) => {
-            // SAFETY: terminating unresponsive child by PID unblocks the joiner thread.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
+/// Waits up to `timeout` for `child` to exit and collects its stdout.
+///
+/// The [`std::process::Child`] handle stays owned by the calling thread for the
+/// whole wait, so the watchdog terminates the probe via
+/// [`std::process::Child::kill`] — which targets the kernel's handle for the
+/// spawned process and can therefore never signal a recycled PID. This closes
+/// the F-RB-016 race of the previous implementation, which killed a raw
+/// `libc::pid_t` with `libc::kill(pid, SIGKILL)` after the joiner thread had
+/// already reaped the child (the PID could have been recycled in between).
+///
+/// Returns `None` when the child fails to exit within `timeout` (it is killed
+/// via the handle and reaped within a bounded grace window — never blocking
+/// past the watchdog deadline) or when its status cannot be obtained.
+pub(crate) fn collect_child_output_with_watchdog(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut stdout = child.stdout.take();
+    let deadline = std::time::Instant::now() + timeout;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                // `kill`/`wait` operate on the owned Child handle, immune to PID
+                // recycling. SIGKILL normally terminates immediately, but a
+                // child stuck in an uninterruptible D-state cannot be reaped
+                // until it wakes — bound the reap so the 500 ms watchdog
+                // deadline is preserved even then (review round); the kernel
+                // reaps the abandoned child once it leaves D-state.
+                let _ = child.kill();
+                let reap_deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(100);
+                loop {
+                    if matches!(child.try_wait(), Ok(Some(_)))
+                        || std::time::Instant::now() >= reap_deadline
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                log::warn!(
+                    "detect_hardware_sink: pw-metadata did not respond within {}ms — \
+                     skipping default sink detection (WirePlumber will decide routing).",
+                    timeout.as_millis()
+                );
+                return None;
             }
-            log::warn!(
-                "detect_hardware_sink: pw-metadata did not respond within {}ms — \
-                 skipping default sink detection (WirePlumber will decide routing).",
-                TIMEOUT.as_millis()
-            );
-            return None;
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
+            Err(_) => return None,
         }
     };
 
-    parse_sink_name_from_metadata(&output.stdout)
+    let mut stdout_bytes = Vec::new();
+    if let Some(mut out) = stdout.take() {
+        let _ = std::io::Read::read_to_end(&mut out, &mut stdout_bytes);
+    }
+
+    Some(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: Vec::new(),
+    })
 }
 
 /// Parses the default sink name from `pw-metadata` raw output.
@@ -139,5 +183,56 @@ mod tests {
     fn detect_hardware_sink_terminates_promptly() {
         // Runs detect_hardware_sink to ensure it executes without panicking and respects the 500ms timeout.
         let _ = detect_hardware_sink();
+    }
+
+    #[test]
+    fn watchdog_child_exiting_before_timeout_is_reaped_without_signal() {
+        // The trivial `sleep 0` child terminates almost immediately — well before
+        // the watchdog deadline — exercising the exact race of F-RB-016 (child
+        // exits shortly before the 500 ms timeout). The new watchdog keeps the
+        // `Child` handle and reaps via `try_wait`, so no raw `libc::kill(pid,
+        // SIGKILL)` is ever issued and no signal can reach a recycled PID.
+        let child = std::process::Command::new("sleep")
+            .arg("0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep must be spawnable for the watchdog test");
+        let pid = child.id() as libc::pid_t;
+
+        let output =
+            collect_child_output_with_watchdog(child, std::time::Duration::from_millis(500))
+                .expect("a child that exits before the timeout must yield its output");
+
+        assert!(output.status.success());
+        // The child was reaped by the caller via the owned handle; `kill(pid, 0)`
+        // must report ESRCH (no such process) — not a zombie, and nothing left
+        // for a recycled-PID signal to hit.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::ESRCH);
+    }
+
+    #[test]
+    fn watchdog_timeout_kills_via_handle_and_reaps() {
+        // A long-lived child with a short deadline forces the timeout path:
+        // termination must go through `Child::kill()`/`wait()` on the owned
+        // handle, leaving no zombie and never signaling a raw PID.
+        let child = std::process::Command::new("sleep")
+            .arg("10")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("sleep must be spawnable for the watchdog test");
+        let pid = child.id() as libc::pid_t;
+
+        let result =
+            collect_child_output_with_watchdog(child, std::time::Duration::from_millis(100));
+        assert!(
+            result.is_none(),
+            "a child that outlives the deadline must yield None"
+        );
+
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(unsafe { *libc::__errno_location() }, libc::ESRCH);
     }
 }

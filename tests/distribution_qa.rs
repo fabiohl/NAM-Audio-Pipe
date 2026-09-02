@@ -23,11 +23,13 @@
 //!   disk with a SHA-256 that matches the recorded hash byte-for-byte. A
 //!   missing receipt is a *typed* skip (no release was built); a present but
 //!   corrupt receipt is a hard failure.
-//! * **(d) Distribution binary smoke** — the `--profile dist` (panic = "abort",
-//!   stripped) binary is exercised as a subprocess: `--diagnose` must exit 0,
-//!   emit the diagnostic bundle and show no crash artifacts, and `--help` must
-//!   exit 0. The artifact is located at `target/dist/nam-audio-pipe`, the
-//!   installed `~/.local/bin/nam-audio-pipe`, or `$NAM_DIST_BIN`; its absence
+//! * **(d) Distribution binary smoke** — the `--profile dist` (stripped, LTO
+//!   fat; `panic = "unwind"` so the F-RB-020 catch_unwind containment is
+//!   effective in the shipped artifact) binary is exercised as a subprocess:
+//!   `--diagnose` must exit 0, emit the diagnostic bundle and show no crash
+//!   artifacts, and `--help` must exit 0. The artifact is located at
+//!   `target/dist/nam-audio-pipe`, the installed `~/.local/bin/nam-audio-pipe`,
+//!   or `$NAM_DIST_BIN`; its absence
 //!   is a *typed* skip.
 
 mod common;
@@ -498,6 +500,50 @@ fn sha256_hex(path: &Path) -> Result<String, String> {
         .collect())
 }
 
+/// `true` when `path` starts with the ELF magic (`\x7fELF`) — the receipt
+/// distinguishes the installed stripped ELF from non-ELF delivery artifacts
+/// (tarball, Flatpak bundle, AppStream metainfo), and only ELF files must
+/// carry a GNU build-id (F-RB-027 / T5.2).
+fn is_elf_file(path: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    bytes.starts_with(b"\x7fELF")
+}
+
+/// Recomputes the GNU build-id of an ELF file from its `.note.gnu.build-id`
+/// note via `readelf -n` (same source the writer uses in
+/// `utils/build-release.sh`), normalized to lowercase — so the provenance
+/// validator compares the recorded receipt value against the artifact on
+/// disk, mirroring the sha256/size_bytes recomputation (F-RB-027, review
+/// round). A missing/absent note or an unavailable `readelf` is an error
+/// (fail-closed).
+fn elf_gnu_build_id(path: &Path) -> Result<String, String> {
+    let out = std::process::Command::new("readelf")
+        .env("LC_ALL", "C")
+        .arg("-n")
+        .arg(path)
+        .output()
+        .map_err(|e| format!("spawn readelf -n {}: {e}", path.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let candidate = line
+            .split("Build ID:")
+            .nth(1)
+            .or_else(|| line.split("ID de compilação:").nth(1));
+        if let Some(rest) = candidate {
+            let id = rest.trim();
+            if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Ok(id.to_ascii_lowercase());
+            }
+        }
+    }
+    Err(format!(
+        "'{}': readelf -n found no GNU build-id note — 'build_id' cannot be verified (F-RB-027)",
+        path.display()
+    ))
+}
+
 fn verify_single_artifact(
     name: &str,
     art: &serde_json::Value,
@@ -549,6 +595,34 @@ fn verify_single_artifact(
         return Err(format!(
             "'{name}': size mismatch (recorded {recorded_size}, actual {actual_size})"
         ));
+    }
+
+    // F-RB-027 / T5.2: an ELF artifact must carry a non-null GNU build-id. A
+    // missing `readelf` (or a binary without a build-id note) produced
+    // `build_id: null` in older receipts — a "certified" release without exact
+    // binary identity is rejected fail-closed here. The recorded value is also
+    // recomputed from the artifact's own note (review round), so a fabricated,
+    // truncated or otherwise wrong `build_id` string can never pass — mirroring
+    // the sha256/size_bytes recomputation above.
+    if is_elf_file(&abs) {
+        match art_obj.get("build_id").and_then(|v| v.as_str()) {
+            Some(bid) if !bid.is_empty() => {
+                let recorded_bid = bid.trim().to_ascii_lowercase();
+                let actual_bid = elf_gnu_build_id(&abs)?;
+                if actual_bid != recorded_bid {
+                    return Err(format!(
+                        "'{name}': build_id mismatch (recorded {recorded_bid}, computed \
+                         {actual_bid} from the ELF note — F-RB-027)"
+                    ));
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "'{name}': ELF artifact requires a non-null 'build_id' \
+                     (F-RB-027) — exact binary identity is mandatory"
+                ));
+            }
+        }
     }
 
     if let Some((prev_sha, prev_size)) = seen_paths.get(&abs) {
@@ -890,6 +964,16 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
         );
         let size = std::fs::metadata(path).expect("stat temp file").len();
         art.insert("size_bytes".into(), size.into());
+        // F-RB-027 / T5.2: the installed ELF carries the GNU build-id note
+        // captured by `utils/build-release.sh` (readelf -n). Synthetic
+        // fixtures set a stable fake id; tests that mutate it to null prove
+        // the fail-closed rejection.
+        if *name == "installed_binary" {
+            art.insert(
+                "build_id".into(),
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".into(),
+            );
+        }
         artifacts.insert((*name).into(), art.into());
     }
 
@@ -1170,6 +1254,84 @@ fn provenance_validator_rejects_tampered_hash() {
     );
 }
 
+/// (c) Negative: an ELF artifact with `build_id: null` (readelf missing or no
+/// build-id note on the binary) must be rejected fail-closed — a release
+/// receipt without exact binary identity can never be certified (F-RB-027 /
+/// T5.2).
+#[test]
+fn provenance_validator_rejects_null_build_id_on_elf_artifact() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    // Minimal ELF magic header — enough for the `is_elf_file` gate (the
+    // validator never parses beyond the identity fields).
+    let elf = dir.join("nam-audio-pipe");
+    std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00").expect("write fake ELF");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &elf)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["artifacts"]["installed_binary"]["build_id"] = serde_json::Value::Null;
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("build_id") && err.contains("F-RB-027"),
+        "null build_id on an ELF artifact must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: an ELF artifact with a `build_id` that is absent entirely (the
+/// pre-T5.2 receipt shape, where only `installed_binary` got a `build_id` from
+/// `readelf` when available) must also be rejected fail-closed.
+#[test]
+fn provenance_validator_rejects_missing_build_id_on_elf_artifact() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let elf = dir.join("nam-audio-pipe");
+    std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00").expect("write fake ELF");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &elf)]);
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["artifacts"]["installed_binary"]
+        .as_object_mut()
+        .unwrap()
+        .remove("build_id");
+    write_synthetic_receipt_with_doc(&receipt, doc);
+
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("build_id") && err.contains("F-RB-027"),
+        "missing build_id on an ELF artifact must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative (review round): a **non-null but wrong** `build_id` must also
+/// fail — the validator recomputes the value from the ELF's own note instead
+/// of trusting the receipt string, so a fabricated/truncated build-id can
+/// never pass. A fake ELF (magic bytes only) has no note: the recomputation
+/// errors fail-closed with an F-RB-027 diagnostic.
+#[test]
+fn provenance_validator_rejects_unverifiable_build_id_on_elf_artifact() {
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let elf = dir.join("nam-audio-pipe");
+    std::fs::write(&elf, b"\x7fELF\x02\x01\x01\x00").expect("write fake ELF");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &elf)]);
+
+    // `write_synthetic_receipt` already records a non-empty fake build_id
+    // ("deadbeef...") — the recomputation must reject it because the file on
+    // disk has no GNU build-id note.
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("build_id") && err.contains("F-RB-027"),
+        "an unverifiable build_id on an ELF artifact must be rejected, got: {err}"
+    );
+}
+
 /// (c) Negative: `certification_status == "certified_release"` without quick `STRICT: 1` or
 /// long `STRICT: 1` + `MODE: full` + `OVERALL: PASSED` must be rejected (T8.2).
 #[test]
@@ -1263,9 +1425,11 @@ fn provenance_receipt_integrity() {
 // (d) Distribution binary smoke (F-RB-014 / T5.4)
 // ---------------------------------------------------------------------------
 
-/// Candidate locations of the `--profile dist` (panic = "abort", stripped)
-/// binary, in preference order: explicit override, cargo's standard dist
-/// output, the atomically installed binary, then the PGO/BOLT build tree.
+/// Candidate locations of the `--profile dist` (stripped, LTO fat; panic =
+/// "unwind" so the F-RB-020 catch_unwind containment is effective in the
+/// shipped artifact) binary, in preference order: explicit override, cargo's
+/// standard dist output, the atomically installed binary, then the PGO/BOLT
+/// build tree.
 fn dist_bin_candidates() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(override_path) = std::env::var("NAM_DIST_BIN") {
@@ -1281,13 +1445,14 @@ fn dist_bin_candidates() -> Vec<PathBuf> {
 }
 
 /// (d) Acceptance: the distribution binary — compiled with `--profile dist`
-/// (`panic = "abort"`, `strip = true`, LTO fat) and therefore the exact
+/// (`strip = true`, LTO fat; `panic = "unwind"` so the F-RB-020 containment
+/// is effective in the artifact users install) and therefore the exact
 /// artifact shipped by `utils/build-release.sh` — must run stably as a
 /// subprocess and exit cleanly with code 0: `--diagnose` must emit the
 /// diagnostic bundle and neither stdout nor stderr may carry crash artifacts,
 /// and `--help` must print usage. Absence of the artifact is a *typed* skip.
 #[test]
-fn dist_binary_smoke_under_panic_abort_profile() {
+fn dist_binary_smoke_under_dist_profile() {
     let Some(bin) = dist_bin_candidates().into_iter().find(|p| p.is_file()) else {
         eprintln!(
             "TEST_RESULT[dist_bin_smoke]=SKIP:dist_binary_not_found (expected at target/dist/nam-audio-pipe, ~/.local/bin/nam-audio-pipe or $NAM_DIST_BIN; run cargo build --profile dist or ./utils/build-release.sh)"
@@ -1301,7 +1466,7 @@ fn dist_binary_smoke_under_panic_abort_profile() {
         .unwrap_or_else(|e| panic!("failed to spawn dist binary {}: {e}", bin.display()));
     assert!(
         diagnose.status.success(),
-        "dist binary --diagnose must exit 0 under the panic=abort profile (got {:?})",
+        "dist binary --diagnose must exit 0 under the dist profile (got {:?})",
         diagnose.status.code()
     );
 

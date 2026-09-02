@@ -219,9 +219,9 @@ impl thread::ThreadConfigurator for MockThreadConfigurator {
         self.thread_id
     }
 
-    fn set_thread_name(&self, _thread_id: libc::pthread_t, name: &[u8]) -> i32 {
+    fn set_thread_name(&self, _thread_id: libc::pthread_t, name: &std::ffi::CStr) -> i32 {
         if let Ok(mut guard) = self.thread_name.lock() {
-            *guard = Some(name.to_vec());
+            *guard = Some(name.to_bytes().to_vec());
         }
         0
     }
@@ -336,7 +336,7 @@ fn test_mock_thread_configurator_sched_rr() {
             .load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    // When PipeWire/RTKit sets SCHED_RR, do NOT convert RR to FIFO 90: report honestly!
+    // When PipeWire/RTKit sets SCHED_RR, do NOT convert RR to FIFO 88: report honestly!
     assert_eq!(
         mock.setsched_called
             .load(std::sync::atomic::Ordering::Relaxed),

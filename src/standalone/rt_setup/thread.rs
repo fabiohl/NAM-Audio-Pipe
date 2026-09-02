@@ -7,6 +7,7 @@
 //! to ensure deterministic execution of the DSP thread.
 
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
+use std::ffi::CStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -97,8 +98,9 @@ pub trait ThreadConfigurator {
     /// Obtains the current thread ID (`libc::pthread_t`).
     fn current_thread_id(&self) -> libc::pthread_t;
 
-    /// Sets the thread name.
-    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &[u8]) -> i32;
+    /// Sets the thread name. `name` must be a NUL-terminated C string (the
+    /// `&CStr` type enforces this at compile time — F-RB-021).
+    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &CStr) -> i32;
 
     /// Sets thread CPU affinity.
     fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32;
@@ -133,8 +135,8 @@ impl ThreadConfigurator for SystemThreadConfigurator {
         unsafe { libc::pthread_self() }
     }
 
-    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &[u8]) -> i32 {
-        unsafe { libc::pthread_setname_np(thread_id, name.as_ptr() as *const libc::c_char) }
+    fn set_thread_name(&self, thread_id: libc::pthread_t, name: &CStr) -> i32 {
+        unsafe { libc::pthread_setname_np(thread_id, name.as_ptr()) }
     }
 
     fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32 {
@@ -185,8 +187,8 @@ impl ThreadConfigurator for SystemThreadConfigurator {
 /// 3. **Scheduler Policy** — Inspects the existing scheduler policy honestly:
 ///    - `SCHED_FIFO`: keeps FIFO, records confirmed priority, sets `RT_STATUS_RT_IS_FIFO`.
 ///    - `SCHED_RR`: legitimate PipeWire / RTKit RT policy; keeps RR, records confirmed priority,
-///      clears `RT_STATUS_RT_IS_FIFO` (it is RR, not FIFO), does NOT force elevation to FIFO 90.
-///    - `SCHED_OTHER` (or other non-RT): attempts elevation to `SCHED_FIFO 90`. If elevation fails,
+///      clears `RT_STATUS_RT_IS_FIFO` (it is RR, not FIFO), does NOT force elevation to FIFO 88.
+///    - `SCHED_OTHER` (or other non-RT): attempts elevation to `SCHED_FIFO 88`. If elevation fails,
 ///      records errno in `rt_sched_err` and reports policy honestly without panicking.
 ///
 /// After configuring, publishes the result via `rt_status` (atomic flags):
@@ -205,7 +207,7 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     cfg.set_daz_ftz();
 
     let thread_id = cfg.current_thread_id();
-    cfg.set_thread_name(thread_id, b"nam_pipe_dsp\0");
+    cfg.set_thread_name(thread_id, c"nam_pipe_dsp");
 
     pin_thread_affinity_with(thread_id, target_cpu, rt_status, cfg);
 
@@ -319,14 +321,4 @@ pub(crate) fn pin_thread_affinity_with<C: ThreadConfigurator>(
             .rt_target_cpu
             .store(target_cpu as i32, Ordering::Relaxed);
     }
-}
-
-/// Pins `thread_id` to `target_cpu` using `SystemThreadConfigurator`.
-#[expect(dead_code, reason = "helper for standalone thread pinning")]
-pub(crate) fn pin_thread_affinity(
-    thread_id: libc::pthread_t,
-    target_cpu: usize,
-    rt_status: &RtStatusFlags,
-) {
-    pin_thread_affinity_with(thread_id, target_cpu, rt_status, &SystemThreadConfigurator);
 }

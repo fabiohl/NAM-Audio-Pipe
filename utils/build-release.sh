@@ -798,7 +798,9 @@ index=0
 for model_file in "\$@"; do
     index=\$((index + 1))
     echo "[model \$index] \$model_file"
-    NAM_DISABLE_GATE=1 "\$PGO_BIN" -m "\$model_file" -b 64 &
+    # Pass --gate off via CLI: NAM_DISABLE_GATE is only honoured under
+    # #[cfg(feature = "testing")], which is absent in release builds.
+    "\$PGO_BIN" -m "\$model_file" -b 64 --gate off &
     pid=\$!
     ready=0
     for i in \$(seq 1 30); do
@@ -815,6 +817,17 @@ for model_file in "\$@"; do
         wait "\$pid" 2>/dev/null || true
         exit 1
     fi
+    # Start pw-play BEFORE probing CPU ticks: without an audio signal the
+    # noise gate closes the DSP path and the process consumes near-zero
+    # cycles, causing the tick-delta check to always fail.
+    play=""
+    if command -v pw-play >/dev/null 2>&1; then
+        pw-play --target="NAM-Audio-Pipe-input" "\$TEST_WAV" &
+        play=\$!
+        # Brief stabilisation so PipeWire wires up the loopback before we
+        # start measuring.
+        sleep 0.3
+    fi
     advancing=0
     for i in \$(seq 1 6); do
         t1=\$(cpu_ticks "\$pid")
@@ -825,22 +838,17 @@ for model_file in "\$@"; do
             break
         fi
     done
+    if [ -n "\$play" ]; then
+        kill "\$play" 2>/dev/null || true
+        wait "\$play" 2>/dev/null || true
+    fi
     if [ "\$advancing" != 1 ]; then
         echo "ERROR: no sample consumption (CPU not advancing) for \$model_file" >&2
         kill "\$pid" 2>/dev/null || true
         wait "\$pid" 2>/dev/null || true
         exit 1
     fi
-    play=""
-    if command -v pw-play >/dev/null 2>&1; then
-        pw-play --target="NAM-Audio-Pipe-input" "\$TEST_WAV" &
-        play=\$!
-    fi
     sleep 2
-    if [ -n "\$play" ]; then
-        kill "\$play" 2>/dev/null || true
-        wait "\$play" 2>/dev/null || true
-    fi
     kill "\$pid" 2>/dev/null || true
     wait "\$pid" 2>/dev/null || true
 done
@@ -881,9 +889,10 @@ EOF
     if [ -z "$BOLT_CAUSE" ]; then
         # Strict Build-ID confirmation: never convert traces from a
         # non-identical binary (removes the old --ignore-build-id escape hatch).
-        # LC_ALL=C keeps readelf output locale-independent so the 40-hex-digit
-        # Build ID is always matched regardless of the operator's locale.
-        ELF_BID=$(LC_ALL=C readelf -n "$PGO_BIN" 2>/dev/null | grep -oP 'Build ID:\s+\K[0-9a-fA-F]{40}' | head -n1 || true)
+        # LC_ALL=C keeps readelf output locale-independent and the token is
+        # captured at full width (sha1 = 40 hex, sha256 = 64 hex, ...) and
+        # lowercased so the comparison with `perf buildid-list` never truncates.
+        ELF_BID=$(LC_ALL=C readelf -n "$PGO_BIN" 2>/dev/null | grep -oP 'Build ID:\s+\K[0-9a-fA-F]+' | head -n1 | tr 'A-F' 'a-f' || true)
         PERF_BID=$(LC_ALL=C perf buildid-list -i "$BOLT_DIR/perf.data" 2>/dev/null | grep -F "$PGO_BIN" | head -n1 | sed -E 's/.*=//' | awk '{print $1}' || true)
         if [ -z "$ELF_BID" ] || [ -z "$PERF_BID" ] || [ "$PERF_BID" != "$ELF_BID" ]; then
             BOLT_CAUSE="BOLT_FAILED: Build-ID mismatch (perf=${PERF_BID:-none}, elf=${ELF_BID:-none}); refusing to optimize a non-identical binary."
@@ -1014,12 +1023,13 @@ fi
 # ---------------------------------------------------------------------------
 # run_live_smoke <staging_bin> <model_abs> <smoke_dir> <out_file>
 #   Runs the stripped staging binary against a real fixture model with
-#   `--record` (distribution profile, panic = "abort"), drives the PipeWire
-#   graph with a silent tone so the capture node consumes real audio quantums,
-#   requests graceful shutdown via SIGTERM and validates the final exit code,
-#   the absence of runtime crash artifacts and the production of a coherent,
-#   non-empty recording WAV. Sets SMOKE_CAUSE="" on success, otherwise a
-#   "SMOKE_FAILED: ..." defect description (returns 1).
+#   `--record` (distribution profile; panic = "unwind" so the F-RB-020
+#   catch_unwind containment is effective in the shipped artifact), drives the
+#   PipeWire graph with a silent tone so the capture node consumes real audio
+#   quantums, requests graceful shutdown via SIGTERM and validates the final
+#   exit code, the absence of runtime crash artifacts and the production of a
+#   coherent, non-empty recording WAV. Sets SMOKE_CAUSE="" on success,
+#   otherwise a "SMOKE_FAILED: ..." defect description (returns 1).
 run_live_smoke() {
     local bin="$1" model="$2" dir="$3" out="$4"
     local cab="$PROJECT_DIR/tests/fixtures/models/cabsim_ir_pgo.wav"
@@ -1119,8 +1129,8 @@ PY
         return 1
     fi
 
-    # Runtime crash artifact detection (panic = "abort" profile: panics,
-    # segfaults and double-frees must never be silent in a certified release).
+    # Runtime crash artifact detection (panics, segfaults and double-frees must
+    # never be silent in a certified release).
     if grep -qiE "panicked|Segmentation fault|double free|core dumped" "$out"; then
         SMOKE_CAUSE="SMOKE_FAILED: runtime crash artifact detected in the smoke output."
         return 1
@@ -1261,14 +1271,27 @@ print(json.dumps(features))
 ' 2>/dev/null || echo "[]")
     # T5.1: build environment identity — kernel release + PipeWire CLI version.
     kernel_release="$(uname -r 2>/dev/null || echo 'unknown')"
-    pw_cli_version="$(command -v pw-cli >/dev/null 2>&1 && pw-cli --version 2>/dev/null | head -n1 || true)"
+    # T5.1: build environment identity — PipeWire version.
+    # NOTE: `pw-cli --version` emits only the binary name ("pw-cli") with no
+    # version number on this PipeWire build. Use the package manager as the
+    # authoritative source; fall back gracefully when running outside a deb/rpm
+    # environment (e.g., in a container or nix derivation).
+    pw_cli_version="$(dpkg-query -W -f='pipewire ${Version}' pipewire 2>/dev/null \
+        || rpm -q --qf 'pipewire %{VERSION}-%{RELEASE}' pipewire 2>/dev/null \
+        || (command -v pw-cli > /dev/null 2>&1 && pw-cli --version 2>/dev/null | grep -v '^pw-cli$' | head -n1) \
+        || true)"
+    pw_cli_version="${pw_cli_version:-unknown}"
     lock_path="$PROJECT_DIR/Cargo.lock"
     nam_rs_dir="$PROJECT_DIR/../NeuralAmpModeler-rs"
     if [ -d "$nam_rs_dir/.git" ]; then
         nam_commit="$(git -C "$nam_rs_dir" rev-parse HEAD 2>/dev/null || true)"
     fi
     nam_commit="${nam_commit:-not-a-git-repo}"
-    bin_bid="$(LC_ALL=C readelf -n "$BIN_TARGET" 2>/dev/null | grep -oP 'Build ID:\s+\K[0-9a-fA-F]{40}' | head -n1 || true)"
+    # Full-width GNU build-id note: sha1 = 40 hex, sha256 = 64 hex, etc. The
+    # token is captured at its real width (never truncated to 40) and
+    # lowercased so the provenance validator can compare it byte-for-byte with
+    # the value it recomputes from the ELF on disk.
+    bin_bid="$(LC_ALL=C readelf -n "$BIN_TARGET" 2>/dev/null | grep -oP 'Build ID:\s+\K[0-9a-fA-F]+' | head -n1 | tr 'A-F' 'a-f' || true)"
     bin_path="$BIN_TARGET"
     tar_path=""
     if [ "$BUILD_TARBALL" = true ] && [ -f "$TARBALL" ]; then tar_path="$TARBALL"; fi
@@ -1280,6 +1303,17 @@ print(json.dumps(features))
     ceremony_status="uncertified"
     if [ "$RELEASE_CEREMONY" = true ] && [ "$STRICT_RELEASE" = true ]; then
         ceremony_status="certified_release"
+    fi
+
+    # F-RB-027 / T5.2: a certified release requires exact binary identity. If
+    # readelf is absent or the ELF carries no GNU build-id note, bin_bid is
+    # empty and the ceremony must fail fail-closed — a "certified_release"
+    # receipt with `build_id: null` is rejected by tests/distribution_qa.rs
+    # anyway, so refusing here prevents emitting an uncertifiable receipt.
+    if [ "$RELEASE_CEREMONY" = true ] && [ -z "$bin_bid" ]; then
+        die "Release ceremony requires a non-empty ELF Build-ID on $BIN_TARGET \
+(readelf -n found no GNU build-id note, or readelf is unavailable). A \
+certified release without exact binary identity is not a release (F-RB-027)."
     fi
 
     quick_receipt="$PROJECT_DIR/target/logs/quick-receipt.txt"
@@ -1488,8 +1522,8 @@ chmod +x "$STAGING_BIN"
 echo -e "  ${GREEN}✓${NC} Staged stripped artifact (${STAGING_LABEL}): $STAGING_BIN"
 
 # 2. FUNCTIONAL SMOKE TEST BATTERY against the stripped staging ELF. The
-#    distribution profile is compiled with panic = "abort" (no testing feature)
-#    and aggressively transformed (PGO/BOLT + strip), so a static --diagnose
+#    distribution profile carries no testing feature and is aggressively
+#    transformed (PGO/BOLT + strip), so a static --diagnose
 #    alone cannot prove model loading, PipeWire stream allocation, CabSim
 #    convolution, recording-worker shutdown or symbol/linkage integrity.
 SMOKE_STATUS="DIAGNOSE_ONLY"

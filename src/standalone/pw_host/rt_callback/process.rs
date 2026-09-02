@@ -219,28 +219,88 @@ pub(crate) fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
     }
 }
 
-/// Reads `(offset, size)` from an SPA chunk descriptor, or `None` when the
-/// chunk pointer is null or misaligned, stride is not sizeof(f32), or corrupted flag set.
+/// Verdict of reading an SPA chunk's valid-data window.
+///
+/// F-RB-019 / T3.1: the capture path must distinguish "no data published"
+/// (legitimate) from "non-null chunk with malformed metadata" (a real host
+/// contract violation that must raise `E2304` — never silent `(0, 0)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkWindow {
+    /// Host-declared valid window `(offset, size)`.
+    Valid(usize, usize),
+    /// Chunk pointer is null or misaligned — no descriptor to read. The
+    /// consolidated fail-closed harness still rejects the pair via its own
+    /// chunk-null/alignment proof (`E2304`), so the observable behavior is
+    /// unchanged from the pre-T3.1 capture path.
+    Absent,
+    /// Non-null chunk whose `stride` is not `sizeof(f32)` or whose
+    /// `SPA_CHUNK_FLAG_CORRUPTED` bit is set. A genuine host contract
+    /// violation: the caller must raise `RT_STATUS_HOST_CONTRACT_VIOLATION`
+    /// instead of degrading silently to a zero window.
+    Malformed,
+}
+
+/// Reads `(offset, size)` from an SPA chunk descriptor, classifying the
+/// outcome per [`ChunkWindow`]:
+///
+/// - [`ChunkWindow::Absent`] — chunk pointer is null or misaligned (no
+///   descriptor to read);
+/// - [`ChunkWindow::Malformed`] — non-null chunk with an invalid stride or the
+///   corrupted flag set (F-RB-019 / T3.1);
+/// - [`ChunkWindow::Valid`] — the host-declared valid-data window.
 ///
 /// The capture path uses the host-declared chunk metadata to learn how many
-/// valid audio bytes the host published this quantum. Reading the two scalar
+/// valid audio bytes the host published this quantum. Reading the scalar
 /// fields as integers never forms a reference to the audio bytes themselves.
 #[inline(always)]
-pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> Option<(usize, usize)> {
+pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> ChunkWindow {
     if chunk.is_null()
         || !(chunk as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
     {
         core::hint::cold_path();
-        return None;
+        return ChunkWindow::Absent;
     }
     // SAFETY: `chunk` was validated non-null and correctly aligned; the struct is owned by the SPA
     // buffer and stable for the duration of the callback.
     let c = unsafe { &*chunk };
     if c.stride != std::mem::size_of::<f32>() as i32 || (c.flags & 1) != 0 {
         core::hint::cold_path();
-        return None;
+        return ChunkWindow::Malformed;
     }
-    Some((c.offset as usize, c.size as usize))
+    ChunkWindow::Valid(c.offset as usize, c.size as usize)
+}
+
+/// Resolves one channel's capture-path valid-data window, applying the
+/// F-RB-019 / T3.1 fail-closed classification.
+///
+/// - [`ChunkWindow::Valid`] → `Some((offset, size))` — the host-declared window;
+/// - [`ChunkWindow::Absent`] → `Some((0, 0))` — no descriptor to read; the
+///   consolidated [`handle_spa_pair_fail_closed`] harness below still rejects a
+///   null/misaligned chunk pair via its own proof;
+/// - [`ChunkWindow::Malformed`] → raises the fail-closed contract violation
+///   (`RT_STATUS_HOST_CONTRACT_VIOLATION` / `E2304`) and silences both
+///   channels, returning `None` — a corrupted non-null chunk never degrades
+///   silently to `(0, 0)` with clean telemetry.
+///
+/// Zero allocations, zero panics, zero locks (RT-safe).
+#[inline(always)]
+pub(crate) fn resolve_capture_chunk_window(
+    chunk: *const pw::spa::sys::spa_chunk,
+    ptr_l: usize,
+    max_l: usize,
+    ptr_r: usize,
+    max_r: usize,
+    rt_status: &RtStatusFlags,
+) -> Option<(usize, usize)> {
+    match read_chunk_meta(chunk) {
+        ChunkWindow::Valid(offset, size) => Some((offset, size)),
+        ChunkWindow::Absent => Some((0, 0)),
+        ChunkWindow::Malformed => {
+            core::hint::cold_path();
+            report_ffi_contract_violation(rt_status, ptr_l, max_l, ptr_r, max_r);
+            None
+        }
+    }
 }
 
 /// Raises `RT_STATUS_HOST_CONTRACT_VIOLATION` and silences both SPA data
@@ -540,12 +600,25 @@ pub fn process_dsp_buffer(
     let (ptr_r, max_r) = (d_r.as_raw().data as usize, d_r.as_raw().maxsize as usize);
     let (chunk_l, chunk_r) = (d_l.as_raw().chunk, d_r.as_raw().chunk);
 
-    // The host-declared valid-data window. A null chunk (malformed descriptor)
-    // yields `(0, 0)`; the consolidated harness below still rejects the pair
-    // fail-closed via its own chunk-null proof, so no reference is ever formed
-    // from a null chunk and no panic reaches the C trampoline.
-    let (offset_l, size_l) = read_chunk_meta(chunk_l).unwrap_or((0, 0));
-    let (offset_r, size_r) = read_chunk_meta(chunk_r).unwrap_or((0, 0));
+    // The host-declared valid-data window. Three cases are distinguished
+    // (F-RB-019 / T3.1): a *valid* window is used as declared; an *absent*
+    // chunk (null/misaligned descriptor) yields `(0, 0)` and the consolidated
+    // harness below still rejects the pair fail-closed via its own
+    // chunk-null/alignment proof; a *malformed* non-null chunk (`stride != 4`
+    // or `SPA_CHUNK_FLAG_CORRUPTED`) raises `E2304` here instead of silently
+    // degrading to `(0, 0)` — no reference is ever formed from a null chunk,
+    // no panic reaches the C trampoline, and no malformed path produces
+    // "silence with clean telemetry".
+    let Some((offset_l, size_l)) =
+        resolve_capture_chunk_window(chunk_l, ptr_l, max_l, ptr_r, max_r, rt_status_for_process)
+    else {
+        return;
+    };
+    let Some((offset_r, size_r)) =
+        resolve_capture_chunk_window(chunk_r, ptr_l, max_l, ptr_r, max_r, rt_status_for_process)
+    else {
+        return;
+    };
 
     // Consolidated fail-closed FFI/SPA validation: proves per-channel
     // alignment, bounds, cardinality, frame symmetry and strict pointer

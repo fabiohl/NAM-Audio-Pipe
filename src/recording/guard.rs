@@ -27,6 +27,7 @@
 //!   propagates into the process exit code: recording failures can no longer
 //!   masquerade as a successful run.
 
+use crate::recording::buffer::{OVERRUN_COUNT, OVERRUN_FRAMES_COUNT};
 use crate::recording::transport::RecordingSender;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,16 +45,28 @@ pub const STREAM_STOP_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::
 
 /// Observable result of joining the `nam-recording-io` worker thread.
 ///
-/// `Success` is the only variant that may be treated as a clean recording:
-/// every failure variant must surface to the process exit code so scripts and
-/// automation can tell a successful capture apart from a partial/failed one
-/// (F-RB-009 / T3.5 rollback: never declare success, never discard the join
-/// result).
+/// `Success` is the only variant that may be treated as a clean, lossless
+/// recording: every other variant must surface to the process exit code so
+/// scripts and automation can tell a successful capture apart from a
+/// partial/failed one — including [`RecordingWorkerOutcome::SuccessWithLoss`],
+/// a recording that completed but dropped audio to ring overruns (F-RB-024 /
+/// T5.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingWorkerOutcome {
     /// The worker drained every block, rewrote the WAV header with the final
     /// byte count and `fsync`ed before exiting cleanly.
     Success,
+    /// The worker drained and finalized the WAV, but the RT producer reported
+    /// ring overruns: `blocks` audio blocks (totaling `frames` stereo frames)
+    /// were dropped on the capture path. The recording is complete but lossy
+    /// and must surface as a non-zero exit (D1) so `frames_capturados ==
+    /// frames_enfileirados + frames_perdidos` is reconcilable and never silent.
+    SuccessWithLoss {
+        /// Number of audio blocks lost to overruns.
+        blocks: u64,
+        /// Number of frames lost to overruns.
+        frames: u64,
+    },
     /// The worker returned an explicit error — a fatal runtime failure in
     /// [`crate::recording::disk::disk_writer_loop`] (`EIO`, `ENOSPC`, failed
     /// header rewrite or `fsync`, ...).
@@ -75,11 +88,35 @@ pub enum RecordingWorkerOutcome {
     },
 }
 
+impl RecordingWorkerOutcome {
+    /// D1 exit-code policy (F-RB-024 / T5.1): `Success` is the only clean
+    /// outcome (exit 0). Every other variant — including `SuccessWithLoss` —
+    /// maps to a non-zero exit, so a recording that dropped audio never
+    /// masquerades as a lossless capture for automation that checks only the
+    /// process exit code.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            RecordingWorkerOutcome::Success => 0,
+            RecordingWorkerOutcome::SuccessWithLoss { .. }
+            | RecordingWorkerOutcome::Failed { .. }
+            | RecordingWorkerOutcome::Panicked { .. }
+            | RecordingWorkerOutcome::TimedOut { .. } => 1,
+        }
+    }
+}
+
 impl std::fmt::Display for RecordingWorkerOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RecordingWorkerOutcome::Success => {
                 write!(f, "recording completed successfully")
+            }
+            RecordingWorkerOutcome::SuccessWithLoss { blocks, frames } => {
+                write!(
+                    f,
+                    "recording completed with lost audio: {blocks} block(s) / \
+                     {frames} frame(s) dropped by overruns"
+                )
             }
             RecordingWorkerOutcome::Failed { reason } => {
                 write!(f, "recording worker failed: {reason}")
@@ -191,10 +228,17 @@ impl RecordingWorkerGuard {
     /// 3. **Bounded join with formal result inspection** — the worker's
     ///    returned `Result<()>`, a panic payload or a join timeout become the
     ///    returned [`RecordingWorkerOutcome`].
+    ///
+    /// When the join reports [`RecordingWorkerOutcome::Success`] but the
+    /// capture path counted ring overruns (`OVERRUN_COUNT` /
+    /// `OVERRUN_FRAMES_COUNT`), the outcome is promoted to
+    /// [`RecordingWorkerOutcome::SuccessWithLoss`] — a recording that dropped
+    /// audio never surfaces as a pristine capture (F-RB-024 / T5.1, D1:
+    /// non-zero exit).
     pub fn shutdown(mut self) -> RecordingWorkerOutcome {
         let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
         self.teardown_done = true;
-        outcome
+        classify_loss(outcome)
     }
 }
 
@@ -209,7 +253,11 @@ impl Drop for RecordingWorkerGuard {
         // bounded timeout so no zombie thread or open WAV descriptor outlives
         // the guard (F-RB-009 / T3.5). The join result cannot be returned from
         // `Drop`; a non-clean teardown is logged for the diagnostics trace.
-        let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
+        let outcome = classify_loss(teardown(
+            &mut self.handle,
+            &mut self.sender,
+            self.failed.as_deref(),
+        ));
         self.teardown_done = true;
         if !matches!(outcome, RecordingWorkerOutcome::Success) {
             log::warn!(
@@ -238,6 +286,29 @@ fn teardown(
         drop(sender);
     }
     join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT)
+}
+
+/// Promotes a clean join outcome to [`RecordingWorkerOutcome::SuccessWithLoss`]
+/// when the capture path counted ring overruns (F-RB-024 / T5.1).
+///
+/// The overrun counters are process-wide and only incremented on the recording
+/// path (`send_recording_audio` in `process.rs`); a non-recording session keeps
+/// them at zero, so a plain [`RecordingWorkerOutcome::Success`] is preserved.
+/// Any other outcome (failure, panic, timeout) is passed through unchanged —
+/// loss classification is only relevant on an otherwise-clean join.
+fn classify_loss(outcome: RecordingWorkerOutcome) -> RecordingWorkerOutcome {
+    match outcome {
+        RecordingWorkerOutcome::Success => {
+            let blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
+            let frames = OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed);
+            if blocks > 0 || frames > 0 {
+                RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }
+            } else {
+                RecordingWorkerOutcome::Success
+            }
+        }
+        other => other,
+    }
 }
 
 /// Pushes `StreamStop` with a short retry. The audio callback is already
