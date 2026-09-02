@@ -32,21 +32,21 @@ Designed for live performance, automated studio routing, and headless Linux audi
 
 ## 🥊 Feature Showcase ("Roofshoot")
 
-| Feature / Attribute            | Technical Implementation                                                 | Benefit & Impact                                                   |
-|:------------------------------ |:------------------------------------------------------------------------ |:------------------------------------------------------------------ |
-| **Inference Engine**           | Core `NeuralAmpModeler-rs` engine (WaveNet A1/A2, LSTM, ConvNet, Linear) | Full model compatibility with exact C++ f32 & f64 reference parity |
-| **Audio Subsystem**            | Direct PipeWire Client API (`libpipewire-0.3-dev`)                       | Sub-millisecond buffer sizes and native Linux audio graph routing  |
-| **RT Determinism**             | Strict Zero Heap Drop, Zero Locks, Zero Hot-Path Logging                 | Guaranteed audio stability without buffer underruns (xruns)        |
-| **Kernel Latency Tuning**      | Zero DMA latency (`/dev/cpu_dma_latency` 0 µs), `mlockall`, THP disable  | Eliminates CPU C-state wake-up lag and virtual memory page faults  |
-| **CPU & IRQ Isolation**        | Dynamic `/proc/interrupts` load profiling + `pthread_setaffinity_np`     | Pins audio loop to the least-interrupted core (noisy neighbor safe)|
-| **SIMD Hardware Acceleration** | Engine `x86-64-v3` (AVX2/FMA) production backend                         | Ultra-low CPU usage (< 3% of 1.33 ms quantum on the AVX2 path)     |
-| **Binary Optimization**        | Profile-Guided Optimization (PGO) + LLVM BOLT basic block reordering     | Drastically minimizes I-Cache and iTLB misses in DSP loops         |
-| **Cabinet IR Convolution**     | Partitioned FFT & Direct FIR convolution engine (.wav IRs)               | Seamless, zero-latency speaker cabinet simulation                  |
-| **WAV Recording**              | High-performance `tokio-uring` ringbuffer + 4 GiB auto-split (`--record`)| Records 32-bit float stereo WAV files in real-time with gate trim  |
-| **Oversampling**               | Half-band polyphase FIR filters (`off`, `2x`, `4x`)                      | Eliminates aliasing distortion in high-gain amp models             |
-| **Activation Precision**       | `Standard` (exact-grade, default) vs `Fast` (Padé approximations)        | User-selectable trade-off between math precision and latency       |
-| **Adaptive Compute**           | Auto-slimming (`--slim auto\|full\|lite`)                                | Prevents audio drops by dynamically throttling model complexity    |
-| **PipeWire Naming**            | Native node names (`NAM-Audio-Pipe-input`, `NAM-Audio-Pipe-playback`)    | Clean, distinct graph identity in `qpwgraph` & `Helvum` patchbays  |
+| Feature / Attribute            | Technical Implementation                                                  | Benefit & Impact                                                    |
+|:------------------------------ |:------------------------------------------------------------------------- |:------------------------------------------------------------------- |
+| **Inference Engine**           | Core `NeuralAmpModeler-rs` engine (WaveNet A1/A2, LSTM, ConvNet, Linear)  | Full model compatibility with exact C++ f32 & f64 reference parity  |
+| **Audio Subsystem**            | Direct PipeWire Client API (`libpipewire-0.3-dev`)                        | Sub-millisecond buffer sizes and native Linux audio graph routing   |
+| **RT Determinism**             | Strict Zero Heap Drop, Zero Locks, Zero Hot-Path Logging                  | Guaranteed audio stability without buffer underruns (xruns)         |
+| **Kernel Latency Tuning**      | Zero DMA latency (`/dev/cpu_dma_latency` 0 µs), `mlockall`, THP disable   | Eliminates CPU C-state wake-up lag and virtual memory page faults   |
+| **CPU & IRQ Isolation**        | Dynamic `/proc/interrupts` load profiling + `pthread_setaffinity_np`      | Pins audio loop to the least-interrupted core (noisy neighbor safe) |
+| **SIMD Hardware Acceleration** | Engine `x86-64-v3` (AVX2/FMA) production backend                          | Ultra-low CPU usage (< 3% of 1.33 ms quantum on the AVX2 path)      |
+| **Binary Optimization**        | Profile-Guided Optimization (PGO) + LLVM BOLT basic block reordering      | Drastically minimizes I-Cache and iTLB misses in DSP loops          |
+| **Cabinet IR Convolution**     | Partitioned FFT & Direct FIR convolution engine (.wav IRs)                | Seamless, zero-latency speaker cabinet simulation                   |
+| **WAV Recording**              | High-performance `tokio-uring` ringbuffer + 4 GiB auto-split (`--record`) | Records 32-bit float stereo WAV files in real-time with gate trim   |
+| **Oversampling**               | Half-band polyphase FIR filters (`off`, `2x`, `4x`)                       | Eliminates aliasing distortion in high-gain amp models              |
+| **Activation Precision**       | `Standard` (exact-grade, default) vs `Fast` (Padé approximations)         | User-selectable trade-off between math precision and latency        |
+| **Adaptive Compute**           | Auto-slimming (`--slim auto\|full\|lite`)                                 | Prevents audio drops by dynamically throttling model complexity     |
+| **PipeWire Naming**            | Native node names (`NAM-Audio-Pipe-input`, `NAM-Audio-Pipe-playback`)     | Clean, distinct graph identity in `qpwgraph` & `Helvum` patchbays   |
 
 ---
 
@@ -113,21 +113,21 @@ For maximum performance in live setups, `NAM-Audio-Pipe` includes a 5-phase opti
 
 #### CLI Options
 
-| Option          | Description                                                                                                     |
-|:--------------- |:--------------------------------------------------------------------------------------------------------------- |
-| `--install`     | Automatically installs the Flatpak application locally (`flatpak install --user`) in addition to `~/.local/bin/`|
-| `--no-flatpak`  | Skips Phase 7 (Flatpak bundle creation).                                                                        |
-| `--no-tarball`  | Skips Phase 6 (.tar.zst archive creation).                                                                      |
-| `--no-pgo`      | Skips Phase 2/3 (Profile-Guided Optimization) and compiles directly with the `dist` release profile.            |
-| `--no-bolt`     | Skips Phase 4 (LLVM BOLT post-link optimization).                                                               |
+| Option             | Description                                                                                                                                    |
+|:------------------ |:---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--install`        | Automatically installs the Flatpak application locally (`flatpak install --user`) in addition to `~/.local/bin/`                               |
+| `--no-flatpak`     | Skips Phase 7 (Flatpak bundle creation).                                                                                                       |
+| `--no-tarball`     | Skips Phase 6 (.tar.zst archive creation).                                                                                                     |
+| `--no-pgo`         | Skips Phase 2/3 (Profile-Guided Optimization) and compiles directly with the `dist` release profile.                                           |
+| `--no-bolt`        | Skips Phase 4 (LLVM BOLT post-link optimization).                                                                                              |
 | `--strict-release` | Fails the release whenever the declared optimization cannot be proven (BOLT failure/unavailability is fatal instead of degrading to PGO-ONLY). |
-| `-h, --help`    | Displays command-line help screen and exits.                                                                    |
+| `-h, --help`       | Displays command-line help screen and exits.                                                                                                   |
 
 ---
 
 ### 3. Flatpak Standalone Application Distribution (`.flatpak`)
 
-In addition to traditional native binary deployment (`~/.local/bin/nam-audio-pipe`), `NAM-Audio-Pipe` is distributed as a standalone **Flatpak Application** (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform` runtime (`25.08`).
+In addition to traditional native binary deployment (`~/.local/bin/nam-audio-pipe`), `NAM-Audio-Pipe` is distributed as a standalone **Flatpak Application** (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform` runtime (`26.08`).
 
 The Flatpak bundle provides an isolated, reproducible runtime while retaining direct access to host PipeWire low-latency audio graphs, real-time power management QoS, and user model libraries.
 
@@ -201,21 +201,21 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 
 ### CLI Argument Reference
 
-| Option                   | Description                                                                                                                    | Default             |
-|:------------------------ |:------------------------------------------------------------------------------------------------------------------------------ |:------------------- |
-| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (supports `~`, `../`)                                                              | *Optional (Bypass)* |
-| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file                                                                                   | *Optional (bypass)* |
-| `-i, --input-gain <DB>`  | Input gain staging in dB (`-20.0` to `+20.0`)                                                                                  | `0.0`               |
-| `-o, --output-gain <DB>` | Output gain staging in dB (`-20.0` to `+20.0`)                                                                                 | `0.0`               |
-| `-b, --buffer-size <N>`  | Quantum block size in samples (e.g. `64`, `256`, `512`; `0` for auto)                                                          | `256`               |
-| `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                | `off`               |
-| `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                            | `standard`          |
-| `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                  | `auto`              |
-| `--gate <MODE>`          | Silence gate: `on` (default) trims silence from monitoring and `--record`; `off` passes silence through gracefully             | `on`                |
+| Option                   | Description                                                                                                                       | Default             |
+|:------------------------ |:--------------------------------------------------------------------------------------------------------------------------------- |:------------------- |
+| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (supports `~`, `../`)                                                                 | *Optional (Bypass)* |
+| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file                                                                                      | *Optional (bypass)* |
+| `-i, --input-gain <DB>`  | Input gain staging in dB (`-20.0` to `+20.0`)                                                                                     | `0.0`               |
+| `-o, --output-gain <DB>` | Output gain staging in dB (`-20.0` to `+20.0`)                                                                                    | `0.0`               |
+| `-b, --buffer-size <N>`  | Quantum block size in samples (e.g. `64`, `256`, `512`; `0` for auto)                                                             | `256`               |
+| `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                   | `off`               |
+| `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                               | `standard`          |
+| `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                     | `auto`              |
+| `--gate <MODE>`          | Silence gate: `on` (default) trims silence from monitoring and `--record`; `off` passes silence through gracefully                | `on`                |
 | `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`) | `false`             |
-| `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                             | `false`             |
-| `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                               | `false`             |
-| `-h, --help`             | Displays command-line help screen and exits                                                                                    | —                   |
+| `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                                | `false`             |
+| `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                                  | `false`             |
+| `-h, --help`             | Displays command-line help screen and exits                                                                                       | —                   |
 
 ---
 
@@ -268,8 +268,8 @@ nam-audio-pipe \
 > **Silence Gate Behavior & Recording Impact**
 > The Silence Gate is configurable via `--gate on|off` (default: `on`) and operates across all operational modes of `NAM-Audio-Pipe` (with or without a `.nam` neural model, with or without a cabinet IR).
 >
-> - **Default (`--gate on`):** Eliminates residual background noise (idle hiss and pickup hum) during playing pauses in both real-time monitoring and recording. Audio recorded via `--record` only enqueues blocks processed while the gate is open (`n_pw > 0`), automatically trimming silence in real-time with zero RT thread overhead.
-> - **Pass-Through (`--gate off`):** Explicit opt-in that keeps the gate permanently open (`gate_enabled = false`). All audio — including background noise and silent passages — is passed through gracefully to live hardware output and recorded continuously to WAV without trimming.
+> * **Default (`--gate on`):** Eliminates residual background noise (idle hiss and pickup hum) during playing pauses in both real-time monitoring and recording. Audio recorded via `--record` only enqueues blocks processed while the gate is open (`n_pw > 0`), automatically trimming silence in real-time with zero RT thread overhead.
+> * **Pass-Through (`--gate off`):** Explicit opt-in that keeps the gate permanently open (`gate_enabled = false`). All audio — including background noise and silent passages — is passed through gracefully to live hardware output and recorded continuously to WAV without trimming.
 
 #### Full Production Command
 

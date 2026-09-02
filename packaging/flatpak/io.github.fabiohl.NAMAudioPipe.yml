@@ -3,8 +3,8 @@
 
 id: io.github.fabiohl.NAMAudioPipe
 runtime: org.freedesktop.Platform
-runtime-version: "25.08"
-sdk: org.freedesktop.Sdk//25.08
+runtime-version: "26.08"
+sdk: org.freedesktop.Sdk//26.08
 command: nam-audio-pipe
 
 finish-args:
