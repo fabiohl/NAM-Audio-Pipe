@@ -1717,17 +1717,17 @@ if [ "$BUILD_FLATPAK" = true ]; then
     FLATPAK_REPO_DIR="$(mktemp -d -t nam-audio-pipe-flatpak-repo.XXXXXX)"
 
     SDK_NAME="org.freedesktop.Sdk"
-    if ! flatpak info org.freedesktop.Sdk//26.08 &>/dev/null; then
+    if ! flatpak info org.freedesktop.Sdk//25.08 &>/dev/null; then
         SDK_NAME="org.freedesktop.Platform"
     fi
 
-    echo -e "  Initializing Flatpak application build environment (26.08 using $SDK_NAME)..."
+    echo -e "  Initializing Flatpak application build environment (25.08 using $SDK_NAME)..."
     flatpak build-init \
         "$FLATPAK_BUILD_DIR" \
         io.github.fabiohl.NAMAudioPipe \
         "$SDK_NAME" \
         org.freedesktop.Platform \
-        26.08
+        25.08
 
     mkdir -p "$FLATPAK_BUILD_DIR/files/bin"
     mkdir -p "$FLATPAK_BUILD_DIR/files/share/applications"

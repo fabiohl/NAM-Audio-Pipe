@@ -127,7 +127,7 @@ For maximum performance in live setups, `NAM-Audio-Pipe` includes a 5-phase opti
 
 ### 3. Flatpak Standalone Application Distribution (`.flatpak`)
 
-In addition to traditional native binary deployment (`~/.local/bin/nam-audio-pipe`), `NAM-Audio-Pipe` is distributed as a standalone **Flatpak Application** (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform` runtime (`26.08`).
+In addition to traditional native binary deployment (`~/.local/bin/nam-audio-pipe`), `NAM-Audio-Pipe` is distributed as a standalone **Flatpak Application** (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform` runtime (`25.08`).
 
 The Flatpak bundle provides an isolated, reproducible runtime while retaining direct access to host PipeWire low-latency audio graphs, real-time power management QoS, and user model libraries.
 

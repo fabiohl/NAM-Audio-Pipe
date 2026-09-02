@@ -423,7 +423,7 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 
 ## 10. Flatpak Packaging & Sandbox Architecture
 
-NAM-Audio-Pipe supports standalone distribution as an isolated, high-performance Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//26.08`:
+NAM-Audio-Pipe supports standalone distribution as an isolated, high-performance Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//25.08`:
 
 ### 10.1 Sandbox Topology & Low-Latency Audio IPC
 
@@ -466,13 +466,13 @@ The packaging directory (`packaging/flatpak/`) provides standard XDG desktop int
 
 ### 10.3 Flatpak Manifest Specification (`io.github.fabiohl.NAMAudioPipe.yml`)
 
-The Flatpak manifest defines the standalone application package targeting `org.freedesktop.Platform//26.08`:
+The Flatpak manifest defines the standalone application package targeting `org.freedesktop.Platform//25.08`:
 
 ```yaml
 id: io.github.fabiohl.NAMAudioPipe
 runtime: org.freedesktop.Platform
-runtime-version: "26.08"
-sdk: org.freedesktop.Sdk//26.08
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk//25.08
 command: nam-audio-pipe
 
 finish-args:
@@ -501,7 +501,7 @@ modules:
 
 Flatpak packaging is embedded directly into Phase 7 of `utils/build-release.sh`:
 
-1. **Environment Initialization:** Runs `flatpak build-init` configuring `org.freedesktop.Sdk//26.08` (falling back to `org.freedesktop.Platform` if SDK is uninstalled).
+1. **Environment Initialization:** Runs `flatpak build-init` configuring `org.freedesktop.Sdk//25.08` (falling back to `org.freedesktop.Platform` if SDK is uninstalled).
 2. **Artifact Installation:** Installs optimized binary, desktop entry, AppStream XML, hicolor icon hierarchy, and GPL-3.0 license. The desktop entry, metainfo and icon theme are **mandatory** — any missing file aborts the release (fail-closed).
 3. **AppStream Validation:** Runs `appstreamcli validate --no-net --strict` against the metainfo and refuses to export a Flatpak with structural or semantic errors.
 4. **Catalog Payload Synthesis:** Generates the per-app `share/app-info` payload (AppStream XML + icons, the `appstream-compose` equivalent) so `flatpak build-export --update-appstream` aggregates a real, indexable catalog instead of emitting "No appstream data".
