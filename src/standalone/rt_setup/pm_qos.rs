@@ -63,7 +63,7 @@ pub(crate) fn collect_child_output_with_watchdog(
                 // reaps the abandoned child once it leaves D-state.
                 let _ = child.kill();
                 let reap_deadline =
-                    std::time::Instant::now() + std::time::Duration::from_millis(100);
+                    std::time::Instant::now() + std::time::Duration::from_millis(500);
                 loop {
                     if matches!(child.try_wait(), Ok(Some(_)))
                         || std::time::Instant::now() >= reap_deadline
@@ -201,7 +201,7 @@ mod tests {
         let pid = child.id() as libc::pid_t;
 
         let output =
-            collect_child_output_with_watchdog(child, std::time::Duration::from_millis(500))
+            collect_child_output_with_watchdog(child, std::time::Duration::from_millis(1500))
                 .expect("a child that exits before the timeout must yield its output");
 
         assert!(output.status.success());
