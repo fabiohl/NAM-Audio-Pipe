@@ -25,14 +25,24 @@ impl Drop for ShutdownRestore {
     }
 }
 
+static TEST_STATUS_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Initializes the global `NamLogger` once per test binary (idempotent) so the
 /// disconnect tests can assert the log level of the disconnect records.
-fn init_log_capture() {
+fn init_log_capture() -> std::sync::MutexGuard<'static, ()> {
     use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+    let guard = TEST_STATUS_LOGGER_MUTEX
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _ = NamLogger::init(LoggerConfig {
         level_filter: log::LevelFilter::Trace,
         emit_stderr: false,
     });
+    if let Some(logger) = NamLogger::global() {
+        logger.set_max_level(log::LevelFilter::Trace);
+        log::set_max_level(log::LevelFilter::Trace);
+    }
+    guard
 }
 
 /// Returns the buffered log records (after [`init_log_capture`]), if the
@@ -237,7 +247,7 @@ fn observe_unconnected_after_streaming_marks_failed() {
         .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(false, Ordering::Release);
-    init_log_capture();
+    let _log_guard = init_log_capture();
 
     let backend = SharedBackendStatus::new();
     observe_stream_state(
@@ -283,7 +293,7 @@ fn observe_unconnected_during_shutdown_is_cooperative_and_not_fatal() {
         .expect("shutdown test lock");
     let _shutdown = ShutdownRestore::capture();
     SHUTDOWN.store(true, Ordering::Release);
-    init_log_capture();
+    let _log_guard = init_log_capture();
 
     let backend = SharedBackendStatus::new();
     backend.mark_running();

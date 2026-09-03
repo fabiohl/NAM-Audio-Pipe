@@ -23,6 +23,22 @@ fn create_test_bridge() -> DspBridge {
     }
 }
 
+static TEST_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn init_test_logger() -> std::sync::MutexGuard<'static, ()> {
+    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
+    let guard = TEST_LOGGER_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = NamLogger::init(LoggerConfig {
+        level_filter: log::LevelFilter::Info,
+        emit_stderr: false,
+    });
+    if let Some(logger) = NamLogger::global() {
+        logger.set_max_level(log::LevelFilter::Info);
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    guard
+}
+
 #[test]
 fn test_poll_state_default_and_independent_instances() {
     let state1 = PollState::default();
@@ -73,6 +89,7 @@ fn test_latched_signal_observe_semantics() {
 
 #[test]
 fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -96,6 +113,7 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
 
 #[test]
 fn test_poll_rt_status_silence_and_fading_transitions() {
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -127,6 +145,7 @@ fn test_poll_rt_status_silence_and_fading_transitions() {
 
 #[test]
 fn test_poll_rt_status_telemetry_throttle_advances() {
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -348,6 +367,7 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
 
 #[test]
 fn test_5_stage_latency_metrics_and_telemetry_reporting() {
+    let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
@@ -403,18 +423,6 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     assert_eq!(rt_status.record_hist.total_count(), 0);
     assert_eq!(rt_status.playback_hist.total_count(), 0);
     assert_eq!(rt_status.e2e_hist.total_count(), 0);
-}
-
-static TEST_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn init_test_logger() -> std::sync::MutexGuard<'static, ()> {
-    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
-    let guard = TEST_LOGGER_MUTEX.lock().unwrap();
-    let _ = NamLogger::init(LoggerConfig {
-        level_filter: log::LevelFilter::Info,
-        emit_stderr: false,
-    });
-    guard
 }
 
 #[test]

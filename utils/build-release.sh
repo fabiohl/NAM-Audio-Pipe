@@ -208,6 +208,80 @@ verify_clean_worktree() {
         fi
     fi
     echo -e "  ${GREEN}✓${NC} Worktree pristine: Cargo.lock identical to HEAD ($(git rev-parse --short HEAD)) and coupled NeuralAmpModeler-rs clean."
+    check_engine_provenance
+}
+
+CORE_PATH=""
+CORE_VERSION="unknown"
+CORE_GIT_COMMIT="unknown"
+CORE_GIT_BRANCH="unknown"
+CORE_GIT_DIRTY=false
+CORE_TREE_SHA=""
+
+# Provenance check: Inspect DSP engine crate NeuralAmpModeler-rs
+check_engine_provenance() {
+    if [ -d "$PROJECT_DIR/../NeuralAmpModeler-rs" ] && grep -q 'NeuralAmpModeler-rs.*path.*=.*"\.\./NeuralAmpModeler-rs"' "$PROJECT_DIR/Cargo.toml" 2>/dev/null; then
+        CORE_PATH="$PROJECT_DIR/../NeuralAmpModeler-rs"
+        if [ -f "$CORE_PATH/Cargo.toml" ]; then
+            CORE_VERSION=$(grep '^version\s*=' "$CORE_PATH/Cargo.toml" | head -n 1 | cut -d'"' -f2 || echo "unknown")
+        fi
+        if git -C "$CORE_PATH" rev-parse --is-inside-work-tree &>/dev/null; then
+            CORE_GIT_COMMIT=$(git -C "$CORE_PATH" rev-parse HEAD 2>/dev/null || echo "unknown")
+            CORE_GIT_BRANCH=$(git -C "$CORE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+            if [ -n "$(git -C "$CORE_PATH" status --porcelain 2>/dev/null || true)" ]; then
+                CORE_GIT_DIRTY=true
+            fi
+            CORE_TREE_SHA=$(git -C "$CORE_PATH" rev-parse HEAD^{tree} 2>/dev/null || echo "")
+        fi
+
+        if [ "$CORE_GIT_DIRTY" = "true" ]; then
+            if [ "$RELEASE_CEREMONY" = "true" ]; then
+                die "Engine repository '$CORE_PATH' has uncommitted changes in release ceremony mode (provenance fail-closed). Commit, stash or clean before generating a certified release."
+            else
+                warn "Engine repository '$CORE_PATH' is dirty (non-ceremony build)."
+            fi
+        else
+            echo -e "  ${GREEN}✓${NC} Engine ($CORE_PATH) provenance verified clean (commit: ${CORE_GIT_COMMIT:0:12}, branch: $CORE_GIT_BRANCH, version: $CORE_VERSION)."
+        fi
+    else
+        # Default: public crate from crates.io (host-agnostic, zero sibling checkout dependency)
+        CORE_PATH=""
+        CORE_GIT_COMMIT=""
+        CORE_GIT_BRANCH=""
+        CORE_GIT_DIRTY=false
+        local lock_info
+        lock_info=$(python3 -c '
+import tomllib
+try:
+    with open("Cargo.lock", "rb") as f:
+        data = tomllib.load(f)
+    for p in data.get("package", []):
+        if p.get("name") == "NeuralAmpModeler-rs":
+            v = p.get("version", "unknown")
+            c = p.get("checksum", "")
+            print(f"{v}|{c}")
+            break
+except Exception:
+    pass
+' 2>/dev/null || true)
+        if [ -n "$lock_info" ]; then
+            CORE_VERSION="${lock_info%%|*}"
+            CORE_TREE_SHA="${lock_info##*|}"
+        else
+            CORE_VERSION=$(grep -A 2 'name = "NeuralAmpModeler-rs"' "$PROJECT_DIR/Cargo.lock" 2>/dev/null | grep 'version =' | head -n 1 | cut -d'"' -f2 || echo "unknown")
+            CORE_TREE_SHA=$(grep -A 4 'name = "NeuralAmpModeler-rs"' "$PROJECT_DIR/Cargo.lock" 2>/dev/null | grep 'checksum =' | head -n 1 | cut -d'"' -f2 || echo "")
+        fi
+
+        if [ "$CORE_VERSION" = "unknown" ] && [ "$RELEASE_CEREMONY" = "true" ]; then
+            die "Failed to resolve NeuralAmpModeler-rs engine version from Cargo.lock in release ceremony mode (provenance fail-closed)."
+        fi
+
+        if [ -n "$CORE_TREE_SHA" ]; then
+            echo -e "  ${GREEN}✓${NC} Engine (NeuralAmpModeler-rs) crates.io provenance verified (version: $CORE_VERSION, checksum: ${CORE_TREE_SHA:0:12}...)."
+        else
+            echo -e "  ${GREEN}✓${NC} Engine (NeuralAmpModeler-rs) crates.io provenance verified (version: $CORE_VERSION)."
+        fi
+    fi
 }
 trap cleanup EXIT INT TERM HUP
 
@@ -348,6 +422,8 @@ for cmd in "${REQUIRED_CMDS[@]}"; do
     fi
     echo -e "  ${GREEN}✓${NC} '$cmd' found."
 done
+
+check_engine_provenance
 
 # Ensure non-empty rustflags were extracted from .cargo/config.toml
 if [ -z "${CONFIG_RUSTFLAGS:-}" ]; then
