@@ -407,12 +407,17 @@ run_rt_deadline_phase() {
     fi
     local rc=0
     echo "  → rt_metrics deadline gate (nanosecond budget, core ${BENCH_CORE})"
-    if [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-        taskset -c "$BENCH_CORE" cargo test --features testing --release --no-fail-fast \
-            --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
-    else
-        cargo test --features testing --release --no-fail-fast \
-            --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+    # Pre-compile without CPU affinity so all cores participate in compilation,
+    # leaving BENCH_CORE cool and quiescent before running the RT benchmark.
+    cargo test --features testing --release --no-run --test rt_metrics || rc=1
+    if [ "$rc" -eq 0 ]; then
+        if [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
+            taskset -c "$BENCH_CORE" cargo test --features testing --release --no-fail-fast \
+                --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+        else
+            cargo test --features testing --release --no-fail-fast \
+                --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+        fi
     fi
     # A real cargo failure is a hard FAIL and must never be masked by a typed
     # GAP marker lingering in the same log. Marker classification is

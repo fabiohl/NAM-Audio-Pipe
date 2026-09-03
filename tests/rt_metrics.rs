@@ -299,9 +299,21 @@ fn rt_deadline_gate_10k_quantums() {
     let budget_ns = ((BLOCK as f64 / SAMPLE_RATE as f64) * 1e9 * BUDGET_FACTOR) as u64;
 
     let (sig_l, sig_r) = test_signal_blocks(DEADLINE_QUANTUMS);
+
+    // Warm up the signal pathway so instruction and data caches (L1i/L1d)
+    // and neural activation tables are hot before starting nanosecond measurement.
+    for block in 0..16 {
+        let mut in_l = [0f32; BLOCK];
+        let mut in_r = [0f32; BLOCK];
+        in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+        in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+        h.run_callback(&mut in_l, &mut in_r, BLOCK);
+    }
+
     let mut samples = Vec::with_capacity(DEADLINE_QUANTUMS);
     let mut min_ns = u64::MAX;
     let mut max_ns = 0u64;
+    let mut max_block = 0usize;
     let mut sum_ns = 0u128;
 
     for block in 0..DEADLINE_QUANTUMS {
@@ -315,7 +327,10 @@ fn rt_deadline_gate_10k_quantums() {
         let dur = t1 - t0;
         samples.push(dur);
         min_ns = min_ns.min(dur);
-        max_ns = max_ns.max(dur);
+        if dur > max_ns {
+            max_ns = dur;
+            max_block = block;
+        }
         sum_ns += dur as u128;
     }
     h.consume_gc();
@@ -326,7 +341,7 @@ fn rt_deadline_gate_10k_quantums() {
 
     eprintln!(
         "RT_METRICS rt_deadline quantums={DEADLINE_QUANTUMS} min_ns={min_ns} mean_ns={mean_ns} \
-         p99_ns={p99_ns} max_ns={max_ns} budget_ns={budget_ns} margin_pct={margin_pct:.1}"
+         p99_ns={p99_ns} max_ns={max_ns} (block {max_block}) budget_ns={budget_ns} margin_pct={margin_pct:.1}"
     );
 
     if max_ns <= budget_ns {
