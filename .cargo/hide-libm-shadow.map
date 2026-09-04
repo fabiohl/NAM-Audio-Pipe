@@ -2,9 +2,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #
 # Linker version script — permanent fix + regression guard for an ELF
-# symbol-interposition hang. Full writeup, root-cause mechanism, and the
-# lessons learned from diagnosing it:
-# docs/postmortem-libm-symbol-interposition.md
+# symbol-interposition hang. Full writeup and root-cause mechanism:
 #
 # Root cause (summary): some part of the crate's dependency graph can pull
 # in libm-shaped fallback symbols (`log10f`, `atan2f`, `acosf`, ...) that
@@ -19,7 +17,7 @@
 # loop: two `jmp` instructions, zero computation, zero syscalls, spinning
 # forever. Confirmed (via a live GDB attach reading the actual runtime GOT
 # contents — a static `nm`/`readelf` inspection is NOT sufficient to catch
-# this class of bug, see the postmortem doc) to affect the test binary, the
+# this class of bug) to affect the test binary, the
 # standalone binary, and the CLAP plugin `cdylib`.
 #
 # Fix: explicitly force every standard libm C symbol name to `local` binding
@@ -33,8 +31,7 @@
 # `acosf`), since the underlying mechanism is generic and could affect any
 # of them if a dependency's feature set changes.
 #
-# For regression checks, see the activation test and ELF verification
-# checklist in docs/postmortem-libm-symbol-interposition.md §3–4.
+# For regression checks, see the activation tests and ELF verification checklists.
 {
   local:
     /* f64 */

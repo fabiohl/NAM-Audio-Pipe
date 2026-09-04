@@ -155,7 +155,7 @@ fn test_parse_args_gate_numeric_threshold_accepted() {
     assert_eq!(cli_args.gate, GateConfig::from_open_db(-60.0));
 }
 
-// --gate polymorphic threshold contract (Sprint 1, Tarefa 1.1 acceptance) --
+// --gate polymorphic threshold contract validation --
 
 #[test]
 fn test_parse_args_gate_invalid_value_exits() {
@@ -198,7 +198,7 @@ fn gate_mode_literals_accept_all_synonyms() {
 
 #[test]
 fn gate_numeric_thresholds_are_accepted() {
-    // Tarefa 1.1 acceptance: "-60", "-65.5", "-45dB" and the "60" sign alias.
+    // Polymorphic parsing acceptance: "-60", "-65.5", "-45dB" and the "60" sign alias.
     assert_eq!(parse_gate_mode("-60"), Ok(GateConfig::from_open_db(-60.0)));
     assert_eq!(
         parse_gate_mode("-65.5"),
@@ -216,7 +216,7 @@ fn gate_numeric_thresholds_are_accepted() {
         parse_gate_mode("-50dbfs"),
         Ok(GateConfig::from_open_db(-50.0))
     );
-    // Tarefa 2.1 unit matrix: "-50dB" and "-50db" (suffix case-insensitivity).
+    // Unit suffix matrix: "-50dB" and "-50db" (suffix case-insensitivity).
     assert_eq!(
         parse_gate_mode("-50dB"),
         Ok(GateConfig::from_open_db(-50.0))

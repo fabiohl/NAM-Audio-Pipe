@@ -22,7 +22,6 @@ use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger
 use neural_amp_modeler_rs::common::spsc::ParamPayload;
 use neural_amp_modeler_rs::math::activations::set_activation_tls;
 
-use std::ffi::CStr;
 use std::path::PathBuf;
 #[cfg(feature = "testing")]
 use std::sync::atomic::Ordering;
@@ -69,7 +68,9 @@ fn main() -> anyhow::Result<()> {
     // PipeWire socket is not available and a full `pw_init()` would abort or return an error.
     if args.diagnose || args.diagnose_full {
         pipewire::init();
-        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(pw_library_version());
+        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
+            pw_host::identity::pw_library_version(),
+        );
         let bundle =
             neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
         println!("{}", bundle.render());
@@ -82,7 +83,9 @@ fn main() -> anyhow::Result<()> {
     // 2. PREPARE THE AUDIO: Initialize PipeWire (the Linux sound system)
     // and calibrate internal "clocks" to ensure sound output without delays (latency).
     pipewire::init();
-    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(pw_library_version());
+    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
+        pw_host::identity::pw_library_version(),
+    );
 
     rt_setup::calibrate_tsc();
 
@@ -369,18 +372,4 @@ fn main() -> anyhow::Result<()> {
     }
     log::info!("{} NAM-Audio-Pipe encerrado. 🎸", "✅".green());
     std::process::exit(0);
-}
-
-fn pw_library_version() -> String {
-    unsafe {
-        let ptr = pw_get_library_version();
-        if ptr.is_null() {
-            return "unknown".to_string();
-        }
-        CStr::from_ptr(ptr).to_string_lossy().into_owned()
-    }
-}
-
-unsafe extern "C" {
-    fn pw_get_library_version() -> *const std::ffi::c_char;
 }

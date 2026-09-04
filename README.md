@@ -136,7 +136,7 @@ The Flatpak bundle provides an isolated, reproducible runtime while retaining di
 Install the `.flatpak` bundle directly into your local user Flatpak repository:
 
 ```bash
-flatpak install --user --reinstall ~/nam-audio-pipe-v0.7.0-linux-x86_64-v3.flatpak
+flatpak install --user --reinstall ~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.flatpak
 ```
 
 #### Running via Flatpak
@@ -201,21 +201,21 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 
 ### CLI Argument Reference
 
-| Option                   | Description                                                                                                                       | Default             |
-|:------------------------ |:--------------------------------------------------------------------------------------------------------------------------------- |:------------------- |
-| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (supports `~`, `../`)                                                                 | *Optional (Bypass)* |
-| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file                                                                                      | *Optional (bypass)* |
-| `-i, --input-gain <DB>`  | Input gain staging in dB (`-20.0` to `+20.0`)                                                                                     | `0.0`               |
-| `-o, --output-gain <DB>` | Output gain staging in dB (`-20.0` to `+20.0`)                                                                                    | `0.0`               |
-| `-b, --buffer-size <N>`  | Quantum block size in samples (e.g. `64`, `256`, `512`; `0` for auto)                                                             | `256`               |
-| `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                   | `off`               |
-| `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                               | `standard`          |
-| `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                     | `auto`              |
-| `--gate <MODE>`          | Polymorphic silence gate: `on` (`-70 dB` default), `off` (disabled), or an explicit dBFS threshold (e.g. `-60`, `-65.5`, `-45dB`; positive values auto-normalized) | `on` (`-70 dB`)       |
-| `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`) | `false`             |
-| `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                                | `false`             |
-| `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                                  | `false`             |
-| `-h, --help`             | Displays command-line help screen and exits                                                                                       | —                   |
+| Option                   | Description                                                                                                                                                        | Default             |
+|:------------------------ |:------------------------------------------------------------------------------------------------------------------------------------------------------------------ |:------------------- |
+| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (supports `~`, `../`)                                                                                                  | *Optional (Bypass)* |
+| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file                                                                                                                       | *Optional (bypass)* |
+| `-i, --input-gain <DB>`  | Input gain staging in dB (`-20.0` to `+20.0`)                                                                                                                      | `0.0`               |
+| `-o, --output-gain <DB>` | Output gain staging in dB (`-20.0` to `+20.0`)                                                                                                                     | `0.0`               |
+| `-b, --buffer-size <N>`  | Quantum block size in samples (e.g. `64`, `256`, `512`; `0` for auto)                                                                                              | `256`               |
+| `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                                                    | `off`               |
+| `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                                                                | `standard`          |
+| `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                                                      | `auto`              |
+| `--gate <MODE>`          | Polymorphic silence gate: `on` (`-70 dB` default), `off` (disabled), or an explicit dBFS threshold (e.g. `-60`, `-65.5`, `-45dB`; positive values auto-normalized) | `on` (`-70 dB`)     |
+| `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`)                                  | `false`             |
+| `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                                                                 | `false`             |
+| `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                                                                   | `false`             |
+| `-h, --help`             | Displays command-line help screen and exits                                                                                                                        | —                   |
 
 ---
 
@@ -360,7 +360,7 @@ The following technical documents are maintained in the source repository:
 
 ### AI Transparency Note
 
-The system architecture, real-time safety guarantees, DSP pipeline design, and optimization engineering are intellectual work (and love) of the maintainer (**Fábio Lima**). Implementation was accelerated through pair programming (*Vibe Coding*) using artificial intelligence models (Gemini, Claude, Grok, DeepSeek and others) within Google Antigravity IDE. IA is just a tool that make wonder in wise hands.
+The system architecture, real-time safety guarantees, DSP pipeline design, and optimization engineering are intellectual work (and love) of the maintainer (**Fábio Lima**). Implementation was accelerated through pair programming (*Vibe Coding*) using artificial intelligence models (Gemini, Claude, Grok, DeepSeek and others) within Google Antigravity IDE. AI is just a tool that works wonders in wise hands.
 
 ### License
 

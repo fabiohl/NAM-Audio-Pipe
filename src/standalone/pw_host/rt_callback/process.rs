@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! 5.1.4. REAL-TIME DSP LOGIC
+//! Real-time DSP logic
 //! Acquires the raw system buffer and delegates the heavy lifting to the Audio Factory (pipeline).
 
 use crate::recording::buffer::{

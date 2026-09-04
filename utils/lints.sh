@@ -65,6 +65,7 @@ spdx_scope=$(
     {
         find "${rs_dirs[@]}" -type f -name '*.rs'
         find utils -maxdepth 1 -type f -name '*.sh'
+        test -d packaging && find packaging -type f \( -name '*.py' -o -name '*.sh' \)
         test -f build.rs && echo build.rs
         test -f Cargo.toml && echo Cargo.toml
     }

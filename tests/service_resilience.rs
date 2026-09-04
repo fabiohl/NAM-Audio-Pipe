@@ -617,7 +617,7 @@ fn spa_chunk(offset: u32, size: u32, stride: i32) -> pw::spa::sys::spa_chunk {
 ///   `playback_bridge_starvation`, no `output_buffer_miss` is fabricated and no
 ///   host-contract violation flag is raised — including when the host hands us
 ///   a **large `maxsize` buffer (64 KiB)** that exceeds `MAX_BRIDGE_BUF × 4`
-///   (the false-`E2304` regression this sprint fixes).
+///   (preventing false-`E2304` contract violation errors).
 ///
 /// Daemon-independent — runs in every quick pass.
 #[test]

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-# Ignorar arquivos temporários
+# Ignore temporary files
 *.tmp*
 .DS_Store
 Thumbs.db
@@ -10,59 +10,58 @@ repomix-*.xml
 *.swp
 *.log
 
-# Defesa em profundidade: impede commit de metadados .git/ aninhados em qualquer subdiretório
-# (ex.: se /github.com/ for futuramente unignorado por engano, .git/ aninhados não serão stagedos).
+# Defense-in-depth: prevent committing nested .git/ metadata from any subdirectory
 **/.git/
 
-# Ignorar artefatos do Rust
+# Ignore Rust build artifacts
 #Cargo.lock
 /target
 
-# Ignorar diretório de scratch (artefatos de debug/protótipos temporários)
+# Ignore scratch directory (debug artifacts and temporary prototypes)
 scratch/
 scratch
 scratch.rs
 
-# Binários e scripts de debug compilados ad-hoc na raiz
+# Ad-hoc debug binaries and scripts in root
 /test_*
 !/tests/
 
-# Golden vectors de validação numérica (não ignorar)
+# Numerical validation golden vectors (do not ignore)
 !tests/fixtures/*.bin
 
-# Ignorar arquivos json desnecessários mas liberar os de testes
+# Ignore extraneous json files but allow test fixtures
 *.json
 !tests/fixtures/**/*.json
 
-# Proptest regression files (gerados automaticamente)
+# Proptest regression files (automatically generated)
 *.proptest-regressions
 
 # Fuzzing (cargo-fuzz)
-# Mantemos apenas os targets e a configuração. Ignoramos o corpus evoluído e artefatos de crash.
+# Keep only target definitions and configuration; ignore corpus and crash artifacts.
 fuzz/target/
 fuzz/artifacts/
 fuzz/corpus/
 fuzz/Cargo.lock
 
-# Artefatos do cargo-mutants
+# cargo-mutants artifacts
 .mutants/
 .out/
 mutants.out.old/
 
-# Build artifacts do render tool C++
+# Build artifacts from C++ render tool
 /tests/fixtures/render_ir
 /build/
 
-# Arquivos temporários dos scripts de geração de golden vectors
+# Temporary files from golden vector generation scripts
 /tests/fixtures/.temp_golden/
 /tests/fixtures/.temp_live/
 
-# Gravacões de sessão de WAV (artefatos de teste manual)
+# Session WAV recordings (manual testing artifacts)
 capture_*.wav
 
-# Artefatos de bytecode Python (scripts de fixtures/utilitários)
+# Python bytecode artifacts (fixture/utility scripts)
 __pycache__/
 *.pyc
 
-# Artefatos de ferramentas locais de IDE:
+# Local IDE tool artifacts
 /.kilo/

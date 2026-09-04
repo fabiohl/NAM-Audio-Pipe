@@ -305,7 +305,7 @@ fn gate_flag_options_accepted_in_diagnose() {
 
 #[test]
 fn gate_numeric_thresholds_accepted_in_diagnose() {
-    // Tarefa 2.1 E2E acceptance: numeric dBFS thresholds (and the positive
+    // E2E acceptance: numeric dBFS thresholds (and the positive
     // auto-normalized alias) must survive CLI parsing and reach --diagnose with
     // exit code 0 — before any live PipeWire stream is attempted.
     for value in ["-60", "-65.5", "-50dB", "-45db", "60"] {

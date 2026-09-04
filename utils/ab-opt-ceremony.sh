@@ -407,21 +407,21 @@ if doc.get("rollback"):
 print()
 if bolt_applied:
     print(
-        f"  // Medido: BOLT ganho p99={fmt(doc['bolt_gain_pct']['p99'])} "
+        f"  // Measured: BOLT gain p99={fmt(doc['bolt_gain_pct']['p99'])} "
         f"(PGO p99={median_cycles(variants['pgo'], 'p99')} → BOLT p99={median_cycles(variants['pgo+bolt'], 'p99')} cyc), "
         f"max={fmt(doc['bolt_gain_pct']['max'])}, mean={fmt(doc['bolt_gain_pct']['mean'])}"
     )
     print(
-        "  // Medido: BOLT iTLB=" + fmt(doc["pmu_bolt_gain_pct"]["itlb_misses"])
+        "  // Measured: BOLT iTLB=" + fmt(doc["pmu_bolt_gain_pct"]["itlb_misses"])
         + ", I-cache=" + fmt(doc["pmu_bolt_gain_pct"]["icache_misses"])
     )
     print(
-        "  // Medido: PGO ganho p99=" + fmt(doc["pgo_gain_pct"]["p99"])
+        "  // Measured: PGO gain p99=" + fmt(doc["pgo_gain_pct"]["p99"])
         + ", max=" + fmt(doc["pgo_gain_pct"]["max"]) + ", mean=" + fmt(doc["pgo_gain_pct"]["mean"])
     )
 else:
     print(
-        "  // Medido: PGO ganho p99=" + fmt(doc["pgo_gain_pct"]["p99"])
+        "  // Measured: PGO gain p99=" + fmt(doc["pgo_gain_pct"]["p99"])
         + ", max=" + fmt(doc["pgo_gain_pct"]["max"]) + ", mean=" + fmt(doc["pgo_gain_pct"]["mean"])
     )
 print()

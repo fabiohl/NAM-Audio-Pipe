@@ -76,7 +76,7 @@ pub struct CaptureState {
     pub os_in_r: Box<[f32; MAX_OS_BUF]>,
     pub os_model_l: Box<[f32; MAX_OS_BUF]>,
     pub os_model_r: Box<[f32; MAX_OS_BUF]>,
-    /// WaveNet crossfade scratch buffers (motor 0.5.0 `DspBuffers`): second
+    /// WaveNet crossfade scratch buffers (engine 0.5.0 `DspBuffers`): second
     /// pass output used when processing is chunked (active resampler).
     pub xfd_scratch_l: Box<[f32; MAX_RESAMP_BUF]>,
     pub xfd_scratch_r: Box<[f32; MAX_RESAMP_BUF]>,

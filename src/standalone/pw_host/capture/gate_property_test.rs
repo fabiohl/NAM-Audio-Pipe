@@ -9,7 +9,7 @@
 //!    sequence;
 //! 2. [`CaptureState::init`] resolves every `GateConfig` variant into the
 //!    correct `gate_params` dBFS fields and linear/quadratic thresholds
-//!    (Sprint 1, Tarefa 1.2 acceptance evidence).
+//!    (GateConfig initialization and resolution).
 
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams, GateState};
@@ -46,7 +46,7 @@ fn gate_off_never_closes_for_sustained_zero_energy() {
     }
 }
 
-// ── CaptureState::init GateConfig resolution (Sprint 1, Tarefa 1.2) ───────
+// ── CaptureState::init GateConfig resolution ───────
 
 #[test]
 fn capture_state_init_off_configures_zeroed_linear_thresholds() {
@@ -81,7 +81,7 @@ fn capture_state_init_threshold_configures_db_and_quadratic_thresholds() {
     );
 }
 
-// ── Schmitt hysteresis over the whole valid threshold domain (Tarefa 2.2) ────
+// ── Schmitt hysteresis over the whole valid threshold domain ────
 
 /// Drives `blocks` updates with constant energy using the same 512-sample
 /// quantum granularity of the pipeline (per-update `n_samples`); the default

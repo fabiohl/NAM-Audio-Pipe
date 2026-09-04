@@ -236,7 +236,7 @@ fn parse_gate_mode(value: &str) -> Result<GateConfig, String> {
     // Auto-normalize the sign with an informative off-RT log.
     let typed_positive = open_db > 0.0;
     if typed_positive {
-        log::info!("Normalizando limiar do gate de +{open_db} dB para -{open_db} dBFS.");
+        log::info!("Normalizing gate threshold from +{open_db} dB to -{open_db} dBFS.");
         open_db = -open_db;
     }
 

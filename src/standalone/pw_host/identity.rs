@@ -6,6 +6,8 @@
 //! All node, stream, group, and thread loop names must be referenced
 //! exclusively from this module — never as inline string literals.
 
+use std::ffi::CStr;
+
 /// Name of the capture node (Virtual Sink). Visible in patchbays (qpwgraph, Helvum).
 pub const PW_CAPTURE_NODE_NAME: &str = "NAM-Audio-Pipe-input";
 /// Description of the capture node. Visible in patchbays.
@@ -26,3 +28,29 @@ pub const PW_NODE_GROUP: &str = "nam-audio-pipe-dsp";
 pub const PW_LINK_GROUP: &str = "nam-audio-pipe-link-group";
 /// Name of the PipeWire thread loop (internal, not visible to the user).
 pub const PW_THREAD_LOOP_NAME: &str = "nam-audio-pipe-loop";
+
+/// Retrieves the runtime version string reported by the PipeWire client library.
+pub fn pw_library_version() -> String {
+    unsafe {
+        let ptr = pw_get_library_version();
+        if ptr.is_null() {
+            return "unknown".to_string();
+        }
+        CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    }
+}
+
+unsafe extern "C" {
+    fn pw_get_library_version() -> *const std::ffi::c_char;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pw_library_version_non_empty() {
+        let ver = pw_library_version();
+        assert!(!ver.is_empty());
+    }
+}

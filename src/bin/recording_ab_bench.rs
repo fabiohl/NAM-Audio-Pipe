@@ -16,7 +16,7 @@
 //!   aligns the samples by index) — the metric the promotion rule is
 //!   judged on: promote only if the pool's **p99 recording latency** is
 //!   reproducibly **≥ 5 % lower** than inline's across all runs.
-//! * **bytes/ciclos** — copy bytes per cycle on the producer hot path.
+//! * **bytes/cycles** — copy bytes per cycle on the producer hot path.
 //! * **Cache proxy** — the analytical 64 B line footprint per quantum per
 //!   transport plus a measured cold-vs-warm single-pass copy cost on this host
 //!   (hardware counters are collected separately via `sudo perf stat`, see the
@@ -921,7 +921,7 @@ fn emit_size_report(
         ]));
     }
 
-    // bytes/ciclos on the producer hot path (mean across runs).
+    // bytes/cycles on the producer hot path (mean across runs).
     let inl_prod_mean_cyc: f64 = report
         .runs_inline
         .iter()
@@ -935,7 +935,7 @@ fn emit_size_report(
         .sum::<f64>()
         / report.runs_pool.len().max(1) as f64;
     section.push_str(&format!(
-        "  bytes/ciclos (producer): inline={:.2} pool={:.2} (bytes={:.0})\n",
+        "  bytes/cycles (producer): inline={:.2} pool={:.2} (bytes={:.0})\n",
         bytes / inl_prod_mean_cyc,
         bytes / pool_prod_mean_cyc,
         bytes
@@ -943,11 +943,11 @@ fn emit_size_report(
 
     let c = &report.cache;
     section.push_str(&format!(
-        "  cache proxy: linhas 64B/quantum inline={} pool={} | cópia 1-passo p99 warm={} ciclos cold={} ciclos\n",
+        "  cache proxy: 64B/quantum lines inline={} pool={} | 1-step copy p99 warm={} cycles cold={} cycles\n",
         c.lines_per_quantum_inline, c.lines_per_quantum_pool, c.warm_p99_cycles, c.cold_p99_cycles
     ));
     section.push_str(&format!(
-        "  est. custo de miss/quantum: inline≈{} ciclos pool≈{} ciclos (Δ={} ciclos)\n",
+        "  est. miss cost/quantum: inline≈{} cycles pool≈{} cycles (Δ={} cycles)\n",
         c.est_miss_cost_inline_cycles,
         c.est_miss_cost_pool_cycles,
         c.est_miss_cost_inline_cycles
@@ -1053,53 +1053,5 @@ fn parse_args() -> Cfg {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stats_percentiles_are_correct() {
-        let v: Vec<u64> = (0..1000).collect();
-        let s = Stats::of(v);
-        assert_eq!(s.n, 1000);
-        assert_eq!(s.min, 0);
-        // Nearest-rank: p = samples[ceil(n·p) - 1].
-        assert_eq!(s.p50, 499);
-        assert_eq!(s.p99, 989);
-        assert_eq!(s.max, 999);
-    }
-
-    #[test]
-    fn stats_empty_is_default() {
-        assert_eq!(Stats::of(Vec::<u64>::new()), Stats::default());
-    }
-
-    #[test]
-    fn percent_delta_sign_and_magnitude() {
-        assert!((percent_delta(95.0, 100.0) - (-5.0)).abs() < 1e-9);
-        assert!((percent_delta(105.0, 100.0) - 5.0).abs() < 1e-9);
-        assert_eq!(percent_delta(1.0, 0.0), 0.0);
-    }
-
-    #[test]
-    fn cache_proxy_line_counts_match_memory_model() {
-        let frames = 512usize;
-        let bytes = frames * 2 * 4;
-        let lines = bytes.div_ceil(64) as u64;
-        let inline_lines = INLINE_LINE_ACCESSES * lines;
-        let pool_lines = POOL_LINE_ACCESSES * lines;
-        // 512 frames → 4 KiB payload → 64 lines → inline 448, pool 192.
-        assert_eq!(inline_lines, 448);
-        assert_eq!(pool_lines, 192);
-        assert!(inline_lines > pool_lines);
-    }
-
-    #[test]
-    fn json_emitter_escapes_and_renders() {
-        let v = obj(vec![
-            kv("a", JsonValue::Bool(true)),
-            kv("b", JsonValue::Int(42)),
-            kv("c", JsonValue::Str("x\"\n".into())),
-        ]);
-        assert_eq!(v.to_string(), r#"{"a":true,"b":42,"c":"x\"\n"}"#);
-    }
-}
+#[path = "recording_ab_bench_test.rs"]
+mod tests;

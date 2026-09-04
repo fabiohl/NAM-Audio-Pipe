@@ -1594,7 +1594,7 @@ fn capture_datas_less_than_two_sets_contract_violation_flag() {
 #[test]
 #[cfg(feature = "testing")]
 fn gate_custom_threshold_config_runs_without_panic_or_regression() {
-    // Tarefa 2.2 parametric harness entry: an explicit GateConfig::Threshold
+    // Parametric harness entry: an explicit GateConfig::Threshold
     // (open at -50 dBFS, the single-coil hum floor; Schmitt close at -60 dBFS)
     // must build the same RT harness and process real callbacks without panic
     // or discontinuity — the harness-level guarantee behind the FSM property

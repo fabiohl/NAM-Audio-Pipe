@@ -59,8 +59,8 @@ pub(crate) fn collect_child_output_with_watchdog(
                 // recycling. SIGKILL normally terminates immediately, but a
                 // child stuck in an uninterruptible D-state cannot be reaped
                 // until it wakes — bound the reap so the 500 ms watchdog
-                // deadline is preserved even then (review round); the kernel
-                // reaps the abandoned child once it leaves D-state.
+                // deadline is preserved even then; the kernel reaps the
+                // abandoned child once it leaves D-state.
                 let _ = child.kill();
                 let reap_deadline =
                     std::time::Instant::now() + std::time::Duration::from_millis(500);

@@ -2,8 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 //
 // Fix + permanent regression guard for an ELF symbol-interposition hang —
-// see docs/postmortem-libm-symbol-interposition.md and
-// .cargo/hide-libm-shadow.map for the full, GDB-verified root-cause
+// see .cargo/hide-libm-shadow.map for the full, GDB-verified root-cause
 // analysis. Some part of the dependency graph pulls in libm-shaped
 // fallback symbols (`log10f`, `atan2f`, `acosf`, ...) that end up compiled
 // into the final binary with GLOBAL (exported) visibility and the same C

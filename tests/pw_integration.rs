@@ -333,10 +333,10 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
 /// Spawns `pw-play` playing `wav` into the NAM capture sink (silent stream,
 /// volume 0) so the graph deterministically schedules the capture node.
 ///
-/// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
-/// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
-/// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
-/// Não usar com o gate desativado (`cli::GateConfig::Off`).
+/// ⚠️ WARNING: these helpers rely on the noise gate remaining CLOSED to keep the graph
+/// scheduled without opening the DSP path. If any future test reuses them under `--gate off`,
+/// the structural behavior changes (the "silence" would be processed as an active signal).
+/// Do not use with the gate disabled (`cli::GateConfig::Off`).
 fn spawn_silent_tone(wav: &std::path::Path) -> Option<std::process::Child> {
     std::process::Command::new("pw-play")
         .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
@@ -364,10 +364,10 @@ fn kill_tone(mut tone: Option<std::process::Child>) {
 /// with no audible tone reaching the hardware. Re-attachable after a daemon
 /// restart (the tone process dies with the daemon).
 ///
-/// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
-/// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
-/// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
-/// Não usar com o gate desativado (`cli::GateConfig::Off`).
+/// ⚠️ WARNING: these helpers rely on the noise gate remaining CLOSED to keep the graph
+/// scheduled without opening the DSP path. If any future test reuses them under `--gate off`,
+/// the structural behavior changes (the "silence" would be processed as an active signal).
+/// Do not use with the gate disabled (`cli::GateConfig::Off`).
 struct ToneDriver {
     wav_path: std::path::PathBuf,
     child: Option<std::process::Child>,

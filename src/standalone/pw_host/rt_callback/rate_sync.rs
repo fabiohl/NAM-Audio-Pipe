@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! 5.1.3. RATE SYNCHRONIZATION (Clock Tracking)
+//! RATE SYNCHRONIZATION (Clock Tracking)
 //! Checks for frequency discrepancy and sends a request to the Main Thread.
 
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
@@ -9,7 +9,7 @@ use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 
 use std::sync::atomic::Ordering;
 
-/// 5.1.3. RATE SYNCHRONIZATION (Clock Tracking)
+/// RATE SYNCHRONIZATION (Clock Tracking)
 /// Checks for frequency discrepancy and sends a request to the Main Thread.
 #[inline(always)]
 pub fn sync_rate(

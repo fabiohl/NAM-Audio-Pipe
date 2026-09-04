@@ -117,7 +117,7 @@ opt-level = 3
 codegen-units = 1
 panic = "unwind"
 
-# The shipped profile (see the D3 note on `release` above).
+# The shipped profile (see the note on `release` above).
 [profile.dist]
 inherits = "release"
 

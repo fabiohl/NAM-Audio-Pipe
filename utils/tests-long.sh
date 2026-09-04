@@ -542,7 +542,7 @@ run_endurance_phase() {
 # return code (PASS/FAIL/GAP) is consumed by finish_phase immediately after.
 # ═══════════════════════════════════════════════════════════════════════════
 
-run_phase "Phase 1: Soak acelerado (timeline comprimida) & concorrência de swaps" "run_soak_phase" "phase1-soak.log" || true
+run_phase "Phase 1: Accelerated soak (compressed timeline) & swap concurrency" "run_soak_phase" "phase1-soak.log" || true
 finish_phase "PHASE1" "phase1-soak.log" "$PHASE_RC"
 
 run_phase "Phase 2: RT-Safety heap-audit (zero-alloc)" "run_heap_audit_phase" "phase2-heap-audit.log" || true
@@ -557,7 +557,7 @@ finish_phase "PHASE4" "phase4-rt-jitter.log" "$PHASE_RC"
 run_phase "Phase 5: Concurrency interleaving stress & state resilience" "run_concurrency_phase" "phase5-concurrency.log" || true
 finish_phase "PHASE5" "phase5-concurrency.log" "$PHASE_RC"
 
-run_phase "Phase 6: Endurance real & state-machine throughput" "run_endurance_phase" "phase6-endurance.log" || true
+run_phase "Phase 6: Real endurance & state-machine throughput" "run_endurance_phase" "phase6-endurance.log" || true
 finish_phase "PHASE6" "phase6-endurance.log" "$PHASE_RC"
 
 # ── Summary & verdict ──────────────────────────────────────────────────────

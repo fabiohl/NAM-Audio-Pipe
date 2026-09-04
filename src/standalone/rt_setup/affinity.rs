@@ -427,7 +427,7 @@ pub fn select_cpu_with_source<S: SysfsTopologySource>(
             .filter(|&c| c != chosen.logical_id && !chosen.smt_siblings.contains(&c))
             .collect();
         let final_housekeeping = if housekeeping_cpus.is_empty() {
-            allowed_cpus.clone()
+            allowed_cpus
         } else {
             housekeeping_cpus
         };

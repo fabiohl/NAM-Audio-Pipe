@@ -61,12 +61,12 @@ const LONG_RECEIPT_REL: &str = "target/logs/long-receipt.txt";
 const LONG_PHASE_IDS: [&str; 6] = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6"];
 /// Canonical `run_phase` names the runner must declare verbatim.
 const LONG_PHASE_NAMES: [&str; 6] = [
-    "Phase 1: Soak acelerado (timeline comprimida) & concorrência de swaps",
+    "Phase 1: Accelerated soak (compressed timeline) & swap concurrency",
     "Phase 2: RT-Safety heap-audit (zero-alloc)",
     "Phase 3: RT Deadline gate (nanosecond budget)",
     "Phase 4: RT Jitter gate (inter-callback dispersion)",
     "Phase 5: Concurrency interleaving stress & state resilience",
-    "Phase 6: Endurance real & state-machine throughput",
+    "Phase 6: Real endurance & state-machine throughput",
 ];
 
 /// Serializes tests that replace `target/logs/long-receipt.txt` (strict
@@ -1713,8 +1713,8 @@ SUITE: tests-long
 STRICT: 1
 NAM_RT_STRICT: 1
 MODE: full
-SOAK_PURPOSE: accelerated_timeline — timeline comprimida, janelas fail-closed
-ENDURANCE_PURPOSE: real_wall_clock — parede, RSS/faults/threads/FDs periódicos
+SOAK_PURPOSE: accelerated_timeline — compressed timeline, fail-closed validation windows
+ENDURANCE_PURPOSE: real_wall_clock — wall-clock, periodic RSS/faults/threads/FDs
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
 PHASE3: PASS log=target/logs/phase3-rt-deadline.log
@@ -2224,7 +2224,7 @@ SUITE: tests-long
 STRICT: 0
 NAM_RT_STRICT: 0
 MODE: simulate
-SOAK_PURPOSE: accelerated_timeline — timeline comprimida
+SOAK_PURPOSE: accelerated_timeline — compressed timeline
 ENDURANCE_PURPOSE: accelerated_timeline
 PHASE1: SIMULATED log=target/logs/phase1-soak.log
 PHASE2: SIMULATED log=target/logs/phase2-heap-audit.log
@@ -2248,7 +2248,7 @@ STRICT: 1
 NAM_RT_STRICT: 1
 MODE: full
 SOAK_PURPOSE: accelerated_timeline_fake_evidence
-ENDURANCE_PURPOSE: real_wall_clock — parede
+ENDURANCE_PURPOSE: real_wall_clock — wall-clock
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
 PHASE3: PASS log=target/logs/phase3-rt-deadline.log
@@ -2293,7 +2293,7 @@ SUITE: tests-long
 STRICT: 1
 NAM_RT_STRICT: 1
 MODE: full
-SOAK_PURPOSE: accelerated_timeline — timeline comprimida
+SOAK_PURPOSE: accelerated_timeline — compressed timeline
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
 PHASE3: PASS log=target/logs/phase3-rt-deadline.log

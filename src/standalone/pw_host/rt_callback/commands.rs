@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! 5.1.2. COMMAND RECEPTION (SPSC Channel)
+//! COMMAND RECEPTION (SPSC Channel)
 //! Processes commands from the command-line interface or control system (volume, model, noise gate).
 //!
 //! # Command Budgeting
@@ -60,7 +60,7 @@ pub const STRUCTURAL_POPS_PER_CALLBACK: usize = 8;
 /// and flagged via `RT_STATUS_PARAM_QUEUE_BACKLOG`.
 pub const MAX_PARAM_BUDGET: usize = 16;
 
-/// 5.1.2. COMMAND RECEPTION (SPSC Channel)
+/// COMMAND RECEPTION (SPSC Channel)
 /// Processes commands from the command-line interface or control system (volume, model, noise gate).
 ///
 /// Runs under the [`MAX_PARAM_BUDGET`] drain budget: scalar parameters are

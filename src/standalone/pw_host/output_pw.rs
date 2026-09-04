@@ -191,7 +191,7 @@ pub fn playback_dsp_cycle(
     }
 
     // 4. PLAYBACK TOTAL & 5. CAPTURE TO PLAYBACK (END-TO-END)
-    // Medido: overhead TSC=~15ns por amostragem (LFENCE+RDTSC), total < 0.05% do quantum de 333µs
+    // Measured: TSC overhead=~15ns per sample (LFENCE+RDTSC), total < 0.05% of 333µs quantum
     if should_measure && t_pb_start > 0 {
         let t_pb_end = rt_setup::rdtsc_nanos();
         let pb_nanos = t_pb_end.saturating_sub(t_pb_start);
@@ -351,7 +351,7 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
     );
     let (chunk_l, chunk_r) = (data_l.as_raw().chunk, data_r.as_raw().chunk);
 
-    // S5 / E2304: silence quantum = last active frame count (or requested
+    // E2304: silence quantum = last active frame count (or requested
     // quantum, or 128-frame default), expressed in bytes and bounded by both
     // channel capacities and MAX_BRIDGE_BUF × 4. Delivering the shared-memory
     // `maxsize` here would exceed the fail-closed window cap on a 64 KiB

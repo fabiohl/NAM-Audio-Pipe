@@ -50,7 +50,7 @@ pub fn playback_state_changed_handler(
 ///
 /// On a valid renegotiation the negotiated rate is recorded and compared
 /// against the capture stream's negotiated rate; a discrepancy is surfaced as
-/// a warning ("Sincronização de Sample Rate").
+/// a warning ("Sample Rate Synchronization").
 ///
 /// Note: this handler executes on the PipeWire `ThreadLoop` thread (cold
 /// path), never on the RT data thread that runs `playback_dsp_cycle`.

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! 5.1.1. Resampler Draining (Zero-Alloc Swap)
+//! Resampler Draining (Zero-Alloc Swap)
 //! Replaces resamplers without using memory allocation in the critical path.
 //!
 //! Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
@@ -21,7 +21,7 @@ use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use rtrb::Consumer;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// 5.1.1. Resampler Draining (Zero-Alloc Swap)
+/// Resampler Draining (Zero-Alloc Swap)
 /// Replaces resamplers without using memory allocation in the critical path.
 ///
 /// Versioned delivery: each envelope carries the request generation it was
