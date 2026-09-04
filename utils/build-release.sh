@@ -1080,9 +1080,9 @@ fi
 
 if [ -n "${ASM_BIN:-}" ]; then
     if command -v llvm-objdump &>/dev/null; then
-        llvm-objdump -d --no-show-raw-insn "$ASM_BIN" > "$ASM_TARGET" 2>/dev/null || true
+        LC_ALL=C llvm-objdump -d --demangle --no-show-raw-insn "$ASM_BIN" > "$ASM_TARGET" 2>/dev/null || true
     elif command -v objdump &>/dev/null; then
-        objdump -d --no-show-raw-insn "$ASM_BIN" > "$ASM_TARGET" 2>/dev/null || true
+        LC_ALL=C objdump -d --demangle --no-show-raw-insn "$ASM_BIN" > "$ASM_TARGET" 2>/dev/null || true
     fi
 
     if [ -s "$ASM_TARGET" ]; then

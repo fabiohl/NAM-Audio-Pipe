@@ -58,7 +58,7 @@ path = "src/bin/ab_opt_bench.rs"
 required-features = ["testing"]
 
 [dependencies]
-NeuralAmpModeler-rs = "0.7.2"
+NeuralAmpModeler-rs = "0.7.3"
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
