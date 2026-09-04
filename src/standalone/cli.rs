@@ -115,10 +115,10 @@ pub fn print_help() {
     println!(
         "      --activation MODE    Activation precision: standard (default, exact-grade) or fast"
     );
-    println!(
-        "      --gate on|off        Silence gate: 'on' trims silence from monitoring and --record \
-         (default); 'off' passes silence through gracefully [default: on]"
-    );
+    println!(concat!(
+        "      --gate MODE          Silence gate: 'on' (-70 dB default), 'off' (disabled),\n",
+        "                           or explicit threshold in dB (e.g. -60, -45dB) [default: on]"
+    ));
     println!("      --cpu INDEX          Pin RT audio thread to explicit CPU core index");
     println!("      --record             Record raw PipeWire input to a WAV file");
     println!(
@@ -135,28 +135,127 @@ pub fn exit_with_error(msg: impl std::fmt::Display) -> ! {
     std::process::exit(1);
 }
 
-/// Silence gate mode for monitoring and recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GateMode {
-    /// Silence gate enabled (default): trims silence from monitoring and recording.
-    On,
-    /// Silence gate disabled: passes silence through gracefully.
+/// Silence gate configuration for monitoring and recording.
+///
+/// Expressive domain model that supersedes the legacy binary on/off switch:
+/// the gate is either disabled ([`GateConfig::Off`], whose zeroed linear
+/// thresholds are the mathematical equivalent of `-inf dBFS`) or enabled with
+/// an explicit opening threshold in dBFS plus the Schmitt-trigger closing
+/// threshold (opening minus [`GateConfig::DEFAULT_HYSTERESIS_DB`], floored at
+/// [`GateConfig::MIN_THRESHOLD_DB`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GateConfig {
+    /// Gate disabled: linear thresholds `(0.0, 0.0)` keep the FSM permanently
+    /// `Open` — silence passes through gracefully to monitoring and `--record`.
     Off,
+    /// Gate enabled with the configured dBFS thresholds.
+    Threshold {
+        /// Opening threshold (dBFS): energy above it opens the gate.
+        threshold_open_db: f32,
+        /// Closing threshold (dBFS): Schmitt-hysteresis floor that re-engages
+        /// the gate only after a sustained drop below it.
+        threshold_close_db: f32,
+    },
 }
 
-/// Maps a `--gate` value to its [`GateMode`], case-insensitively.
+impl GateConfig {
+    /// Default opening threshold: `-70.0 dBFS`.
+    pub const DEFAULT_OPEN_DB: f32 = -70.0;
+    /// Default hysteresis band between the opening and closing thresholds: `10.0 dB`.
+    pub const DEFAULT_HYSTERESIS_DB: f32 = 10.0;
+    /// Lowest accepted threshold: `-96.0 dBFS`, matching the gain LUT floor
+    /// (`GAIN_MIN_DB` — the PCM-16 quantization noise floor).
+    pub const MIN_THRESHOLD_DB: f32 = GAIN_MIN_DB;
+    /// Highest accepted threshold: `-20.0 dBFS` — safety ceiling that prevents
+    /// the gate from chopping soft-picked musical notes.
+    pub const MAX_THRESHOLD_DB: f32 = -20.0;
+
+    /// The canonical default: open at [`GateConfig::DEFAULT_OPEN_DB`] with the
+    /// standard 10 dB hysteresis (`-80.0 dB` close threshold).
+    pub fn default_on() -> Self {
+        Self::from_open_db(Self::DEFAULT_OPEN_DB)
+    }
+
+    /// Builds an enabled gate from an opening threshold in dBFS, deriving the
+    /// closing threshold via the Schmitt-trigger relation
+    /// `close = max(open - DEFAULT_HYSTERESIS_DB, MIN_THRESHOLD_DB)`.
+    pub fn from_open_db(open_db: f32) -> Self {
+        Self::Threshold {
+            threshold_open_db: open_db,
+            threshold_close_db: (open_db - Self::DEFAULT_HYSTERESIS_DB).max(Self::MIN_THRESHOLD_DB),
+        }
+    }
+}
+
+/// Maps a `--gate` value to its [`GateConfig`], case-insensitively.
+///
+/// Accepted syntax (polymorphic):
+/// - mode literals: `on` / `true` / `default` → [`GateConfig::default_on`];
+///   `off` / `false` / `0` → [`GateConfig::Off`];
+/// - numeric thresholds in dBFS, optionally suffixed with `db`/`dbfs`
+///   (`-60`, `-65.5`, `-45dB`, `-50dbfs`);
+/// - positive finite values (`60`) are auto-normalized to `-60.0 dBFS` with an
+///   informative off-RT [`log::info!`] (the logger is initialized before
+///   parsing in `main`), then validated against `[-96.0, -20.0] dBFS`.
 ///
 /// Returns the exact fatal message [`exit_with_error`] would print for an
 /// invalid value, so the caller owns the exit decision (making the mapping
 /// unit-testable without terminating the test process).
-fn parse_gate_mode(value: &str) -> Result<GateMode, String> {
-    match value.to_lowercase().as_str() {
-        "on" => Ok(GateMode::On),
-        "off" => Ok(GateMode::Off),
-        other => Err(format!(
-            "Invalid gate mode: '{other}'. Expected 'on' or 'off'."
-        )),
+fn parse_gate_mode(value: &str) -> Result<GateConfig, String> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_lowercase();
+    match lower.as_str() {
+        "on" | "true" | "default" => return Ok(GateConfig::default_on()),
+        "off" | "false" | "0" => return Ok(GateConfig::Off),
+        _ => {}
     }
+
+    // Tolerates an optional unit suffix: "-45db" / "-45dbfs" (case-insensitive).
+    let numeric = if let Some(stripped) = lower.strip_suffix("dbfs") {
+        stripped.trim()
+    } else if let Some(stripped) = lower.strip_suffix("db") {
+        stripped.trim()
+    } else {
+        lower.as_str()
+    };
+
+    let parsed = numeric.parse::<f32>();
+    let mut open_db = match parsed {
+        Ok(v) if v.is_finite() => v,
+        _ => {
+            return Err(format!(
+                "Invalid gate mode: '{trimmed}'. Expected 'on', 'off', 'false', '0', \
+                 or a dBFS threshold in [-{min:.0}, -{max:.0}] (e.g. -60, -45dB).",
+                min = GateConfig::MIN_THRESHOLD_DB.abs(),
+                max = GateConfig::MAX_THRESHOLD_DB.abs(),
+            ));
+        }
+    };
+
+    // UX heuristic: guitarists type "--gate 60" meaning 60 dB of attenuation.
+    // Auto-normalize the sign with an informative off-RT log.
+    let typed_positive = open_db > 0.0;
+    if typed_positive {
+        log::info!("Normalizando limiar do gate de +{open_db} dB para -{open_db} dBFS.");
+        open_db = -open_db;
+    }
+
+    if !(GateConfig::MIN_THRESHOLD_DB..=GateConfig::MAX_THRESHOLD_DB).contains(&open_db) {
+        let sign_hint = if typed_positive {
+            " Positive values are read as attenuation and auto-normalized \
+             (e.g. '10' becomes -10.0 dBFS)."
+        } else {
+            ""
+        };
+        return Err(format!(
+            "Invalid gate mode: '{trimmed}'. Threshold {open_db:.1} dBFS is out of the accepted \
+             range [{min:.1}, {max:.1}] dBFS.{sign_hint}",
+            min = GateConfig::MIN_THRESHOLD_DB,
+            max = GateConfig::MAX_THRESHOLD_DB,
+        ));
+    }
+
+    Ok(GateConfig::from_open_db(open_db))
 }
 
 /// Parsed command line arguments.
@@ -192,8 +291,9 @@ pub struct CliArgs {
     /// PipeWire stream failure triggers fail-fast teardown instead of
     /// a bounded reconnection attempt.
     pub fail_fast: bool,
-    /// Noise gate mode (`On` default, or `Off`).
-    pub gate: GateMode,
+    /// Noise gate configuration: `Off`, or `Threshold { open, close }` in dBFS
+    /// (defaults to [`GateConfig::default_on`] = open at `-70.0 dB`).
+    pub gate: GateConfig,
 }
 
 /// Parses command-line arguments.
@@ -216,7 +316,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut cpu = None;
     let mut record = false;
     let mut fail_fast = false;
-    let mut gate = GateMode::On;
+    let mut gate = GateConfig::default_on();
     let mut has_args = false;
 
     while let Some(arg) = parser.next().unwrap_or_else(|e| exit_with_error(e)) {

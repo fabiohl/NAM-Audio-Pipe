@@ -9,6 +9,7 @@
 //! preserving RT safety by avoiding dynamic allocation in the audio thread.
 
 use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
+use crate::standalone::cli::GateConfig;
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
 use neural_amp_modeler_rs::common::spsc::{
@@ -125,7 +126,7 @@ impl CaptureState {
     pub fn init(
         sys: &neural_amp_modeler_rs::common::diagnostics::SystemSnapshot,
         os: OversampleFactor,
-        gate_enabled: bool,
+        gate_config: GateConfig,
     ) -> Self {
         let resampler = NamResampler::new(48_000, 48_000, 2048).unwrap_or_else(|e| {
             NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
@@ -149,15 +150,36 @@ impl CaptureState {
                     .expect("bypass streaming buffer cannot fail")
             });
 
-        let gate_params = GateParams::default();
+        // Resolves the polymorphic `--gate` configuration into the DSP gate
+        // state. Off maps to zeroed linear thresholds (the mathematical
+        // equivalent of `-inf dBFS`, so the FSM never closes); a Threshold
+        // variant configures `gate_params` and converts both dBFS thresholds
+        // through the gain LUT. Runs on the main thread (init), never on the
+        // audio thread — the RT callback only reads the precomputed
+        // `threshold_open_sq` / `threshold_close_sq` squares below, keeping the
+        // zero-allocation invariant.
+        let mut gate_params = GateParams::default();
         let lut = gain_lut::get_gain_lut();
-        let (open_lin, close_lin) = if gate_enabled {
-            (
-                lut.db_to_linear(gate_params.threshold_open_db),
-                lut.db_to_linear(gate_params.threshold_close_db),
-            )
-        } else {
-            (0.0, 0.0)
+        let (open_lin, close_lin) = match gate_config {
+            GateConfig::Off => {
+                log::info!("Noise gate disabled (--gate off) — pass-through mode.");
+                (0.0, 0.0)
+            }
+            GateConfig::Threshold {
+                threshold_open_db,
+                threshold_close_db,
+            } => {
+                gate_params.threshold_open_db = threshold_open_db;
+                gate_params.threshold_close_db = threshold_close_db;
+                log::info!(
+                    "Noise gate thresholds: open {threshold_open_db:.1} dBFS, \
+                     close {threshold_close_db:.1} dBFS (Schmitt hysteresis)."
+                );
+                (
+                    lut.db_to_linear(threshold_open_db),
+                    lut.db_to_linear(threshold_close_db),
+                )
+            }
         };
 
         Self {

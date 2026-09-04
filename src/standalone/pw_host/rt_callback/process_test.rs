@@ -1593,6 +1593,48 @@ fn capture_datas_less_than_two_sets_contract_violation_flag() {
 
 #[test]
 #[cfg(feature = "testing")]
+fn gate_custom_threshold_config_runs_without_panic_or_regression() {
+    // Tarefa 2.2 parametric harness entry: an explicit GateConfig::Threshold
+    // (open at -50 dBFS, the single-coil hum floor; Schmitt close at -60 dBFS)
+    // must build the same RT harness and process real callbacks without panic
+    // or discontinuity — the harness-level guarantee behind the FSM property
+    // battery in gate_property_test.rs.
+    use crate::standalone::cli::GateConfig;
+    use crate::standalone::pw_host::RtSwapHarness;
+
+    let mut h = RtSwapHarness::new_with_gate_config(48000, 48000, GateConfig::from_open_db(-50.0))
+        .expect("harness with custom gate threshold");
+
+    // Sustained signal above the -50 dBFS opening threshold (0.25 amplitude ≈
+    // -12 dBFS): mono detection must engage exactly as with the default gate.
+    let mut in_l = [0.25f32; 64];
+    let mut in_r = [0.25f32; 64];
+    for _ in 0..50 {
+        h.run_callback(&mut in_l, &mut in_r, 64);
+    }
+    assert!(
+        h.process_mono(),
+        "mono detection must engage on identical L/R input with a custom threshold gate"
+    );
+
+    // Sustained absolute digital silence: the FSM may close the gate, but the
+    // callback must never panic or wedge mono detection on the stereo path.
+    let mut sil_l = [0.0f32; 64];
+    let mut sil_r = [0.0f32; 64];
+    for _ in 0..50 {
+        h.run_callback(&mut sil_l, &mut sil_r, 64);
+    }
+
+    // A resumed full-scale signal must reopen the gate and re-engage processing
+    // without discontinuity (no stuck-Closed regression).
+    for _ in 0..50 {
+        h.run_callback(&mut in_l, &mut in_r, 64);
+    }
+    assert!(h.process_mono());
+}
+
+#[test]
+#[cfg(feature = "testing")]
 fn gate_off_does_not_affect_mono_detection() {
     use crate::standalone::pw_host::RtSwapHarness;
     let mut h = RtSwapHarness::new_with_gate(48000, 48000, false).expect("harness with gate off");

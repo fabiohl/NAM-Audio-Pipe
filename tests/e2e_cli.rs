@@ -32,8 +32,12 @@ fn help_flag_exits_zero_and_prints_usage() {
         "--help should list --model option"
     );
     assert!(
-        stdout.contains("--gate on|off"),
-        "--help should list --gate on|off option, got:\n{stdout}"
+        stdout.contains("--gate MODE"),
+        "--help should list --gate MODE option, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("-70 dB default") && stdout.contains("explicit threshold in dB"),
+        "--help should document the polymorphic gate (default on, numeric dBFS), got:\n{stdout}"
     );
     assert!(
         stdout.contains("[default: on]"),
@@ -295,6 +299,73 @@ fn gate_flag_options_accepted_in_diagnose() {
             output.status.success(),
             "expected exit code 0 when passing --gate {mode} with --diagnose, got: {:?}",
             output.status
+        );
+    }
+}
+
+#[test]
+fn gate_numeric_thresholds_accepted_in_diagnose() {
+    // Tarefa 2.1 E2E acceptance: numeric dBFS thresholds (and the positive
+    // auto-normalized alias) must survive CLI parsing and reach --diagnose with
+    // exit code 0 — before any live PipeWire stream is attempted.
+    for value in ["-60", "-65.5", "-50dB", "-45db", "60"] {
+        let output = binary()
+            .args(["--gate", value, "--diagnose"])
+            .output()
+            .expect("failed to execute binary");
+
+        assert!(
+            output.status.success(),
+            "expected exit code 0 when passing --gate {value} with --diagnose, got: {:?}",
+            output.status
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Argument error"),
+            "--gate {value} must not be rejected by the parser, got: {}",
+            stderr
+        );
+    }
+}
+
+#[test]
+fn invalid_gate_threshold_exits_with_error_before_pipewire() {
+    // Out-of-domain thresholds (both as typed negatives and as positive values
+    // auto-normalized past the -20 dBFS safety ceiling) must fail fast with
+    // exit code 1 and a didactic message BEFORE any PipeWire connection.
+    for value in ["-120", "-100", "-10", "10", "15"] {
+        let output = binary()
+            .args(["--gate", value])
+            .output()
+            .expect("failed to execute binary");
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "expected exit code 1 when passing --gate {value}, got: {:?}",
+            output.status
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Argument error"),
+            "stderr should contain 'Argument error', got: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("Invalid gate mode"),
+            "stderr should explain the invalid gate mode, got: {}",
+            stderr
+        );
+        assert!(
+            stderr.contains("out of the accepted range"),
+            "stderr should explain the accepted dBFS range, got: {}",
+            stderr
+        );
+        assert!(
+            !stderr.contains("PipeWire"),
+            "validation must reject before any PipeWire connection, got: {}",
+            stderr
         );
     }
 }

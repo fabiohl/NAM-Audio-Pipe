@@ -13,6 +13,7 @@ use nam_audio_pipe::recording::{
     RecordingStartupError, RecordingStatus, RecordingWorkerGuard, RecordingWorkerOutcome,
     create_recording_transport, spawn_recording_worker, wait_for_recording_init,
 };
+use nam_audio_pipe::standalone::cli;
 use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{self, GcOverflowBuffer, RtStatusFlags, SHUTDOWN};
@@ -344,7 +345,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 requested_cpu: None,
                 // Fail-fast under the deterministic harness (see pw_integration).
                 fail_fast: true,
-                gate_enabled: true,
+                gate_config: cli::GateConfig::default_on(),
             },
             gc_cons,
             sl_cons,

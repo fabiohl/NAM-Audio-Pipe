@@ -40,6 +40,7 @@
 //! gates and for production-SPSC throughput measurement (no global mutex on the
 //! measured path). It is compiled only under `feature = "testing"`.
 
+use crate::standalone::cli::GateConfig;
 use crate::standalone::pw_host::capture::state::CaptureState;
 use crate::standalone::pw_host::rt_callback::{
     drain_cabsims, drain_os_engines, drain_resamplers, drain_slimmable_models, receive_commands,
@@ -868,14 +869,46 @@ pub struct RtSwapHarness {
 impl RtSwapHarness {
     /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
     /// rates already consistent, so the first `run_callback` processes
-    /// immediately without a resampler renegotiation) with custom `gate_enabled`.
+    /// immediately without a resampler renegotiation) with the default gate
+    /// enabled (`-70 dB` open, `-80 dB` Schmitt close).
+    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
+        Self::new_with_gate_config(host_rate, nam_rate, GateConfig::default_on())
+    }
+
+    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
+    /// rates already consistent, so the first `run_callback` processes
+    /// immediately without a resampler renegotiation) with custom
+    /// `gate_enabled`. The boolean is retained as a convenience for existing
+    /// RT tests and maps to [`GateConfig::default_on`] / [`GateConfig::Off`];
+    /// parametric tests should prefer [`RtSwapHarness::new_with_gate_config`]
+    /// to exercise arbitrary [`GateConfig`] variants (custom dBFS thresholds,
+    /// hysteresis floor, disabled).
     pub fn new_with_gate(
         host_rate: u32,
         nam_rate: u32,
         gate_enabled: bool,
     ) -> anyhow::Result<Self> {
+        let gate_config = if gate_enabled {
+            GateConfig::default_on()
+        } else {
+            GateConfig::Off
+        };
+        Self::new_with_gate_config(host_rate, nam_rate, gate_config)
+    }
+
+    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
+    /// rates already consistent, so the first `run_callback` processes
+    /// immediately without a resampler renegotiation) with an explicit
+    /// [`GateConfig`] — the parametric entry point for RT tests that need
+    /// custom threshold variants without re-implementing the construction
+    /// sequence around [`CaptureState::init`].
+    pub fn new_with_gate_config(
+        host_rate: u32,
+        nam_rate: u32,
+        gate_config: GateConfig,
+    ) -> anyhow::Result<Self> {
         let sys = SystemSnapshot::capture();
-        let mut state = CaptureState::init(&sys, OversampleFactor::Off, gate_enabled);
+        let mut state = CaptureState::init(&sys, OversampleFactor::Off, gate_config);
         state.resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
         state.current_nam_rate = nam_rate;
         state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
@@ -922,13 +955,6 @@ impl RtSwapHarness {
         };
 
         Ok(Self { producer, rt })
-    }
-
-    /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
-    /// rates already consistent, so the first `run_callback` processes
-    /// immediately without a resampler renegotiation) with default gate enabled.
-    pub fn new(host_rate: u32, nam_rate: u32) -> anyhow::Result<Self> {
-        Self::new_with_gate(host_rate, nam_rate, true)
     }
 
     /// Splits the harness into its two production faces.

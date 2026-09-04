@@ -121,8 +121,19 @@ fn test_dsp_bridge_concurrent_access() {
     // 4. Performance Check:
     // The test should complete quickly. If it takes too long, it indicates deadlocks
     // or severe starvation (even though the design is lock-free).
+    //
+    // Measured: nominal completion is ~0.07 s on an idle 16-core desktop (writer
+    // cadence = 1000 × 10 µs sleeps). The 500 ms budget was originally calibrated
+    // for that idle regime, but the quick gate runs the whole `--lib` suite in
+    // parallel (16 harness threads) on a shared desktop — under transient CPU
+    // saturation (e.g. a 7-core transcription job, load ~12/16) the two liveness
+    // threads can be starved past 500 ms and trip a false "too long" failure
+    // (observed twice in 2026-09-03 quick-gate runs; identical HEAD lib suite
+    // passed on the next attempt). A 2000 ms window keeps the deadlock/livelock
+    // guard (a real deadlock blocks forever; the writer's spin-wait never
+    // completes) while tolerating scheduler contention on non-isolated hosts.
     assert!(
-        start.elapsed() < Duration::from_millis(500),
+        start.elapsed() < Duration::from_millis(2000),
         "Test took too long to execute"
     );
 }

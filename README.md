@@ -211,7 +211,7 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 | `--oversample <MODE>`    | Half-band oversampling mode (`off`, `2x`, `4x`)                                                                                   | `off`               |
 | `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                               | `standard`          |
 | `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                     | `auto`              |
-| `--gate <MODE>`          | Silence gate: `on` (default) trims silence from monitoring and `--record`; `off` passes silence through gracefully                | `on`                |
+| `--gate <MODE>`          | Polymorphic silence gate: `on` (`-70 dB` default), `off` (disabled), or an explicit dBFS threshold (e.g. `-60`, `-65.5`, `-45dB`; positive values auto-normalized) | `on` (`-70 dB`)       |
 | `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`) | `false`             |
 | `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                                | `false`             |
 | `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                                  | `false`             |
@@ -266,10 +266,32 @@ nam-audio-pipe \
 
 > [!NOTE]
 > **Silence Gate Behavior & Recording Impact**
-> The Silence Gate is configurable via `--gate on|off` (default: `on`) and operates across all operational modes of `NAM-Audio-Pipe` (with or without a `.nam` neural model, with or without a cabinet IR).
+> The Silence Gate is configurable through the polymorphic `--gate MODE` flag and operates across all operational modes of `NAM-Audio-Pipe` (with or without a `.nam` neural model, with or without a cabinet IR).
 >
-> * **Default (`--gate on`):** Eliminates residual background noise (idle hiss and pickup hum) during playing pauses in both real-time monitoring and recording. Audio recorded via `--record` only enqueues blocks processed while the gate is open (`n_pw > 0`), automatically trimming silence in real-time with zero RT thread overhead.
-> * **Pass-Through (`--gate off`):** Explicit opt-in that keeps the gate permanently open (`gate_enabled = false`). All audio — including background noise and silent passages — is passed through gracefully to live hardware output and recorded continuously to WAV without trimming.
+> * **Default (`--gate on` | `--gate default` | `--gate true`):** Opens at `-70.0 dBFS` with a 10 dB Schmitt hysteresis (closes only after the energy stays below `-80.0 dBFS` for `hold_frames`). Eliminates residual background noise (idle hiss and pickup hum) during playing pauses in both real-time monitoring and recording. Audio recorded via `--record` only enqueues blocks processed while the gate is open (`n_pw > 0`), automatically trimming silence in real-time with zero RT thread overhead.
+> * **Pass-Through (`--gate off` | `--gate false` | `--gate 0`):** Explicit opt-in that keeps the gate permanently open (`GateConfig::Off` → linear thresholds `0.0`). All audio — including background noise and silent passages — is passed through gracefully to live hardware output and recorded continuously to WAV without trimming.
+> * **Custom Thresholds (dBFS):** Any number in `[-96.0, -20.0] dBFS` configures the opening threshold; the closing threshold is derived automatically as `max(open − 10 dB, −96 dB)`. Unit suffixes are tolerated (`-45dB`, `-50dbfs`) and positive values are treated as attenuation and auto-normalized with an informational log (`--gate 60` ⇔ `-60.0 dBFS`). Out-of-range values (e.g. `--gate -120`, `--gate 10`) fail fast with a didactic error **before** any PipeWire connection.
+
+#### Taming Noisy Pickups with a Custom Gate Threshold
+
+The default `-70 dB` opening suits humbuckers in a quiet room. Real-world guitars may need to retune the gate to their pickup/room noise floor:
+
+```bash
+# Humbuckers + clean amp in a silent studio: keep the default or nudge it to -75 dB
+nam-audio-pipe --model models/BossWN-standard.nam --gate -75
+
+# Vintage single-coils under fluorescent lights (60 Hz hum + hiss around -55..-45 dB):
+# tighten the gate so it only closes over the pickup noise, never over your playing
+nam-audio-pipe --model models/HighGainDrive.nam --gate -50
+
+# Shorthand: 60 dB of attenuation is auto-normalized to -60 dBFS (logged)
+nam-audio-pipe --gate 60
+
+# Safety validation: -120 dBFS is below the LUT floor (-96 dB) → rejected with exit 1
+nam-audio-pipe --gate -120
+```
+
+> **Rule of thumb:** stay between `-90` and `-30 dBFS`. Below `-30`, soft-picked notes and long delays can be mistakenly gated ("degolamento" of the note). Single-coil hum/hiss typically sits at `-55..-45 dBFS` — a `-50 dB` threshold silences it while preserving every played note.
 
 #### Full Production Command
 

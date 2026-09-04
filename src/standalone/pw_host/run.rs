@@ -107,7 +107,7 @@ pub fn run_pipewire_host(
         oversample,
         requested_cpu,
         fail_fast,
-        gate_enabled,
+        gate_config,
     } = config;
 
     // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
@@ -129,7 +129,7 @@ pub fn run_pipewire_host(
     // it touches them only before `thread_loop.start()` and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
-    let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_enabled));
+    let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
     rt_state.slimmable_rx = Some(slimmable_consumer);

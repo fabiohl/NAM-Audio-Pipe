@@ -11,6 +11,7 @@ use pipewire as pw;
 use std::sync::atomic::Ordering;
 
 use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
+use crate::standalone::cli::GateConfig;
 use crate::standalone::rt_setup;
 
 /// Holds essential PipeWire instances (`StreamBox` and `Listener`).
@@ -59,8 +60,11 @@ pub struct PipewireHostConfig {
     /// `--fail-fast` on the CLI: disables the bounded reconnect cycle —
     /// the first backend failure triggers observable teardown immediately.
     pub fail_fast: bool,
-    /// Noise gate enabled flag from CLI (`--gate on|off`).
-    pub gate_enabled: bool,
+    /// Noise gate configuration from the polymorphic CLI flag `--gate MODE`:
+    /// [`GateConfig::Off`] keeps the gate FSM permanently open (silence passes
+    /// through), while a [`GateConfig::Threshold`] carries the open/close dBFS
+    /// thresholds of the Schmitt trigger (auto hysteresis of 10 dB).
+    pub gate_config: GateConfig,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).

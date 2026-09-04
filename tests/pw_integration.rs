@@ -10,6 +10,7 @@
 //! is skipped by the `#[ignore]` attribute; `utils/tests-quick.sh` Phase 3
 //! auto-detects the daemon via `pw-cli info`.
 
+use nam_audio_pipe::standalone::cli;
 use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{self, GcOverflowBuffer, RtStatusFlags};
@@ -101,7 +102,7 @@ fn test_pipewire_integration() {
                 // the daemon probe already guarantees it is up, so any backend
                 // failure is a defect that must surface immediately.
                 fail_fast: true,
-                gate_enabled: true,
+                gate_config: cli::GateConfig::default_on(),
             },
             gc_cons,
             sl_cons,
@@ -245,7 +246,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
                 requested_cpu: None,
                 // Reconnect ENABLED: this is exactly what the bounce exercises.
                 fail_fast: false,
-                gate_enabled: true,
+                gate_config: cli::GateConfig::default_on(),
             },
             gc_cons,
             sl_cons,
@@ -335,7 +336,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
 /// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
 /// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
 /// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
-/// Não usar com `gate_enabled = false`.
+/// Não usar com o gate desativado (`cli::GateConfig::Off`).
 fn spawn_silent_tone(wav: &std::path::Path) -> Option<std::process::Child> {
     std::process::Command::new("pw-play")
         .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
@@ -366,7 +367,7 @@ fn kill_tone(mut tone: Option<std::process::Child>) {
 /// ⚠️ AVISO: estes helpers dependem do gate permanecer FECHADO para manter o grafo
 /// agendado sem abrir. Se algum teste futuro reusá-los sob `--gate off`, o
 /// comportamento estrutural muda (o "silêncio" passa a ser processado como sinal real).
-/// Não usar com `gate_enabled = false`.
+/// Não usar com o gate desativado (`cli::GateConfig::Off`).
 struct ToneDriver {
     wav_path: std::path::PathBuf,
     child: Option<std::process::Child>,
@@ -547,7 +548,7 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
                 oversample: OversampleFactor::Off,
                 requested_cpu: None,
                 fail_fast: false,
-                gate_enabled: true,
+                gate_config: cli::GateConfig::default_on(),
             },
             gc_cons,
             sl_cons,

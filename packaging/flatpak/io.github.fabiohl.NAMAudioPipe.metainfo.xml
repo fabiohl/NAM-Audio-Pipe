@@ -66,15 +66,13 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="0.7.0" date="2026-08-24" type="stable">
+    <release version="0.7.1" date="2026-09-03" type="stable">
       <description>
-        <p>This release hardens the service lifecycle and the PipeWire boundary:</p>
+        <p>This release makes the silence gate fully configurable:</p>
         <ul>
-          <li>Strict SPA format contract validation (F32P, stereo) with fail-closed behavior and typed contract-violation signals.</li>
-          <li>PipeWire backend state machine with bounded reconnect and observable, fail-fast shutdown.</li>
-          <li>Graceful SIGINT/SIGTERM handling with immediate double-signal termination and bit-exact WAV finalization.</li>
-          <li>Recording hardening: atomic file creation, checked RIFF limits, RAII worker guard and fault-injection test harness.</li>
-          <li>Stereo engine support, real-time drain budgets and deterministic silence/recycling under bridge starvation.</li>
+          <li>Polymorphic --gate MODE: besides the on/off modes, any explicit threshold in [-96.0, -20.0] dBFS is accepted (e.g. -60, -65.5, -45dB), with automatic 10 dB Schmitt hysteresis and off-RT informational normalization of positive attenuation values (60 → -60 dBFS).</li>
+          <li>Out-of-domain or malformed values fail fast with a didactic error and exit code 1 before any PipeWire connection.</li>
+          <li>Expanded CLI unit matrix, E2E black-box coverage and RT harness property tests for the full valid threshold domain.</li>
         </ul>
       </description>
     </release>
