@@ -197,12 +197,12 @@ static TEMP_DIR_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Creates a fresh, exclusive temporary directory for capture files.
 ///
 /// `mkdir(2)` fails with `EEXIST` when the name is already taken (including by
-/// a symlink), so a pre-created `/tmp/nam-rs-test-<pid>-<seq>` entry can never
+/// a symlink), so a pre-created `/tmp/nam-audio-pipe-test-<pid>-<seq>` entry can never
 /// redirect the test's writes — the caller retries on the next sequence value.
 pub fn temp_dir() -> PathBuf {
     loop {
         let dir = std::env::temp_dir().join(format!(
-            "nam-rs-test-{}-{:x}",
+            "nam-audio-pipe-test-{}-{:x}",
             std::process::id(),
             TEMP_DIR_SEQ.fetch_add(1, Ordering::Relaxed),
         ));

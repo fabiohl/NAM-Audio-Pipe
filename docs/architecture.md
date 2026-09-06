@@ -406,7 +406,7 @@ contract violations, deadline overruns) are **latched per episode** (`TelemetryL
 continuous condition warns at most once per episode instead of once per control-loop iteration.
 The full `DiagnosticBundle::render()` output (including the `Recent Log Trace`) is reserved for
 explicit user-triggered dumps (`--diagnose` / `--diagnose-full`), the teardown `BACKEND_FAILURE`
-report, and crash/panic reports (`~/.cache/nam-rs/crash-*.txt`). All runtime `log::*` lines still
+report, and crash/panic reports (`~/.cache/neural-amp-modeler-rs/crash-*.txt`). All runtime `log::*` lines still
 populate the `NamLogger` ring buffer, so they remain part of future support bundles and crash
 reports.
 
