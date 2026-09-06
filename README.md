@@ -166,6 +166,16 @@ The Flatpak package is pre-configured with carefully scoped permissions required
 * `--socket=wayland` and `--socket=fallback-x11` — Windowing system integration.
 * `--socket=pulseaudio` — Fallback audio server connectivity.
 
+Inspect granted sandbox permissions on your system at any time using:
+
+```bash
+flatpak info --show-permissions io.github.fabiohl.NAMAudioPipe
+```
+
+> [!NOTE]
+> **AppStream Metadata in Local Bundles vs. Flathub Repositories:**
+> Single-file `.flatpak` bundles distribute exclusively the application commit; they do not bundle repository-wide AppStream catalog branches (`appstream/x86_64`). As a result, local Flatpak managers (such as Warehouse or GNOME Software) display bundles installed from a local origin with an empty `Versão` column in `flatpak list`. However, desktop menus immediately display the full application name and native hicolor icons via exported XDG files. In production distribution via Flathub, the AppStream catalog is indexed automatically. See [`docs/architecture.md`](docs/architecture.md#105-appstream-catalog-dynamics-bundle-semantics--diagnostic-invariants) for architectural details.
+
 #### Developer Workflow (Building & Testing Flatpak Locally)
 
 1. **Automated Pipeline Build & Install:**
