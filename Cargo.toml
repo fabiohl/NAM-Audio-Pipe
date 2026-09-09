@@ -80,6 +80,10 @@ testing = ["NeuralAmpModeler-rs/testing", "stereo"]
 # Enables the RT heap-audit allocator (CountingAllocator) and the swap
 # zero-allocation gates.
 heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
+# Opt-in AVX-512 kernels and dispatch from the DSP engine. Off by default:
+# standard builds stay on x86-64-v3 (AVX2), preserving PipeWire host
+# compatibility. Enable only for dedicated AVX-512-capable targets.
+avx512 = ["NeuralAmpModeler-rs/avx512"]
 
 [dev-dependencies]
 # Property-based testing for AlignedBlock invariants and future fuzz targets.
