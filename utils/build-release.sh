@@ -1457,28 +1457,24 @@ for name, path in (
     if art is not None:
         artifacts[name] = art
 
-# The agile suite (tests-quick.sh) regenerates quick-phase*.log and
-# quick-receipt.txt on every pass. Pinning them in an UNCERTIFIED chain
-# would make the very next quick run invalidate the provenance — the
-# integrity gate could never go green while a release exists.
+# The agile suite (tests-quick.sh) and long-audit suite (tests-long.sh)
+# regenerate test receipts and phase logs on their runs. Pinning them in an
+# UNCERTIFIED chain would make any subsequent test run invalidate the provenance —
+# the integrity gate could never go green while a release exists.
 # The certified ceremony path still requires them; uncertified chains keep
-# only the stable evidence (long-audit logs, PGO/release receipts).
+# only the stable evidence (PGO and release receipts).
 phase_logs = {}
 target_logs = os.path.join(os.path.dirname(lock_path), "target", "logs")
-if os.path.isdir(target_logs):
+if ceremony_status == "certified_release" and os.path.isdir(target_logs):
     for fname in sorted(os.listdir(target_logs)):
         if fname.endswith(".log"):
-            if ceremony_status != "certified_release" and fname.startswith("quick-phase"):
-                continue
             lpath = os.path.join(target_logs, fname)
             art = artifact(lpath)
             if art:
                 phase_logs[fname] = art
 
-quick_art = artifact(quick_receipt)
-if ceremony_status != "certified_release":
-    quick_art = None
-long_art = artifact(long_receipt)
+quick_art = artifact(quick_receipt) if ceremony_status == "certified_release" else None
+long_art = artifact(long_receipt) if ceremony_status == "certified_release" else None
 pgo_art = artifact(pgo_receipt)
 release_art = artifact(release_receipt)
 

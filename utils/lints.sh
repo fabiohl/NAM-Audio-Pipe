@@ -18,6 +18,7 @@ source "$(dirname "$0")/_lib.sh"
 echo -e "${BLUE}${BOLD}========================================${NC}"
 echo -e "${BLUE}${BOLD} NAM-Audio-Pipe Linting & Quality Suite${NC}"
 echo -e "${BLUE}${BOLD}========================================${NC}"
+SUITE_START=$(date +%s%N)
 
 # ---------------------------------------------------------------------------
 # [1/7] Code formatting check (cargo fmt --check) — strictly read-only: the
@@ -25,6 +26,7 @@ echo -e "${BLUE}${BOLD}========================================${NC}"
 # ---------------------------------------------------------------------------
 phase "Checking code formatting (cargo fmt --all -- --check)..."
 cargo fmt --all -- --check
+ok "Code formatting check passed ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [2/7] Compilation checks (cargo check) — broad feature matrix
@@ -36,6 +38,7 @@ cargo check --all-targets --all-features
 
 echo -e "  ${YELLOW}${BOLD}Checking: All Targets (no default features)...${NC}"
 cargo check --all-targets --no-default-features
+ok "Compilation checks passed ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [3/7] Static analysis (cargo clippy) — strict, broad feature matrix
@@ -47,6 +50,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 echo -e "  ${YELLOW}${BOLD}Clippy: All Targets (no default features)...${NC}"
 cargo clippy --all-targets --no-default-features -- -D warnings
+ok "Static analysis passed cleanly with zero warnings ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [4/7] SPDX license header validation (deterministic, no external tooling)
@@ -85,7 +89,7 @@ if [ -n "$invalid" ]; then
     echo "$invalid" | sed 's/^/    /'
     exit 1
 fi
-ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT)."
+ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT) ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [5/7] Undocumented #[allow(clippy::)] check (enforce allow_attributes policy)
@@ -126,7 +130,7 @@ if [ -n "$undocumented_allows" ]; then
     echo "$undocumented_allows" | sed 's/^/    /'
     exit 1
 fi
-ok "All #[allow(clippy::)] suppressions are documented."
+ok "All #[allow(clippy::)] suppressions are documented ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [6/7] AppStream packaging metadata validation (mandatory, fail-closed)
@@ -186,7 +190,7 @@ fi
 if [ "$meta_name" != "$desktop_name" ]; then
     die "Metainfo <name> ($meta_name) does not match desktop Name= ($desktop_name)."
 fi
-ok "Metainfo id/name/launchable aligned with desktop entry."
+ok "Metainfo id/name/launchable aligned with desktop entry ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [7/7] AppStream release version sync check
@@ -213,8 +217,12 @@ if [ -z "$release_date" ]; then
     echo -e "  ${RED}${BOLD}ERROR: AppStream release $xml_ver is missing the mandatory date attribute!${NC}"
     exit 1
 fi
-ok "AppStream release $xml_ver ($release_date) matches Cargo.toml ($cargo_ver)."
+ok "AppStream release $xml_ver ($release_date) matches Cargo.toml ($cargo_ver) ($(phase_elapsed_str))."
+
+SUITE_END=$(date +%s%N)
+TOTAL_DUR_MS=$(( (SUITE_END - SUITE_START) / 1000000 ))
+TOTAL_DUR_STR=$(format_duration_ms "$TOTAL_DUR_MS")
 
 echo -e "${GREEN}${BOLD}=======================================${NC}"
-echo -e "${GREEN}${BOLD} Quality suite completed successfully!${NC}"
+echo -e "${GREEN}${BOLD} Quality suite completed successfully in ${TOTAL_DUR_STR}!${NC}"
 echo -e "${GREEN}${BOLD}=======================================${NC}"

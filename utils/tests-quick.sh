@@ -66,6 +66,7 @@ echo -e "${BLUE}${BOLD}===============================${NC}"
 
 emit "SUITE: tests-quick"
 emit "STRICT: ${NAM_QUICK_STRICT:-0}"
+SUITE_START=$(date +%s%N)
 
 # Environment capability deviations (daemon, io_uring, release artifacts) are
 # collected as typed GAPs; NAM_QUICK_STRICT=1 promotes any GAP to a hard
@@ -73,6 +74,7 @@ emit "STRICT: ${NAM_QUICK_STRICT:-0}"
 declare -a GAPS=()
 
 # ── Phase 1: Structural unit & integration tests (debug) ─────────────────────
+P1_START=$(date +%s%N)
 phase "Structural: unit & integration tests (debug)..."
 # Use --bin nam-audio-pipe instead of --bins to avoid accidentally triggering
 # pgo_workload (a profiling-only binary) in the standard test path. The
@@ -130,6 +132,9 @@ for t in \
     assert_ran_target target/logs/quick-phase1.log "$t" 0 \
         || die "Phase 1 mandatory target '$t' missing from log."
 done
+P1_DUR_MS=$(( ($(date +%s%N) - P1_START) / 1000000 ))
+P1_DUR_STR=$(format_duration_ms "$P1_DUR_MS")
+ok "Phase 1 passed (${P1_DUR_STR})"
 emit "PHASE1: PASS log=target/logs/quick-phase1.log"
 
 # ── Phase 2: Release verification (release) ──────────────────────────────────
@@ -138,6 +143,7 @@ emit "PHASE1: PASS log=target/logs/quick-phase1.log"
 # validated in Phase 1 debug with assertions ON; their release re-run was
 # purely redundant wall-clock. The live PipeWire integration
 # and the io_uring recording suite remain in Phases 3 and 4 respectively.
+P2_START=$(date +%s%N)
 phase "Release verification: integration tests (release)..."
 # Stereo-fidelity and swap-stress harnesses run in release too
 # (the codegen-sensitive surface, alongside recording/e2e_cli).
@@ -181,9 +187,13 @@ while IFS= read -r marker; do
     GAPS+=("distribution_qa:$marker")
     echo -e "${YELLOW}${BOLD}WARN GAP: distribution_qa:$marker${NC}"
 done < <(grep -oP 'TEST_RESULT\[[a-z_]+\]=SKIP:[^() ]+' target/logs/quick-phase2.log || true)
+P2_DUR_MS=$(( ($(date +%s%N) - P2_START) / 1000000 ))
+P2_DUR_STR=$(format_duration_ms "$P2_DUR_MS")
+ok "Phase 2 passed (${P2_DUR_STR})"
 emit "PHASE2: PASS log=target/logs/quick-phase2.log"
 
 # ── Phase 3: PipeWire Live Integration (release, daemon probe) ───────────────
+P3_START=$(date +%s%N)
 phase "PipeWire Live Integration (release)..."
 echo -e "  Checking PipeWire daemon..."
 if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
@@ -201,11 +211,16 @@ if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
         || die "Phase 3 mandatory target 'tests/pw_integration.rs' failed its execution gate."
     assert_ran_target target/logs/quick-phase3.log "tests/service_resilience.rs" \
         || die "Phase 3 mandatory target 'tests/service_resilience.rs' failed its execution gate."
+    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
+    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
+    ok "Phase 3 passed (${P3_DUR_STR})"
     emit "PHASE3: PASS log=target/logs/quick-phase3.log"
     emit "LIVE_PW=RAN"
 else
+    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
+    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
     GAPS+=("pw_integration:daemon_unavailable")
-    echo -e "${YELLOW}${BOLD}WARN GAP: pw_integration:daemon_unavailable — PipeWire daemon not reachable (pw-cli info 0 timed out or failed); live integration test SKIPPED.${NC}"
+    echo -e "${YELLOW}${BOLD}WARN GAP: pw_integration:daemon_unavailable — PipeWire daemon not reachable (pw-cli info 0 timed out or failed); live integration test SKIPPED (${P3_DUR_STR}).${NC}"
     emit "PHASE3: SKIP reason=daemon_unavailable"
     emit "LIVE_PW=SKIP"
 fi
@@ -235,6 +250,7 @@ io_uring_probe() {
     return "$rc"
 }
 
+P4_START=$(date +%s%N)
 phase "Recording io_uring capability (release, --ignored)..."
 if io_uring_probe; then
     echo -e "  ${GREEN}io_uring available.${NC} Executing recording disk-writer tests..."
@@ -252,6 +268,8 @@ if io_uring_probe; then
         || die "Phase 4 mandatory target 'tests/recording.rs' failed its execution gate."
     assert_ran_target target/logs/quick-phase4.log "tests/recording_fault_injection.rs" \
         || die "Phase 4 mandatory target 'tests/recording_fault_injection.rs' failed its execution gate."
+    P4_DUR_MS=$(( ($(date +%s%N) - P4_START) / 1000000 ))
+    P4_DUR_STR=$(format_duration_ms "$P4_DUR_MS")
     # Skip detection is typed — the E2E record test emits a structured
     # TEST_RESULT[record_e2e]=... marker, never a free-text "SKIP:" probe.
     # If the marker is absent entirely, the test was removed/renamed and the
@@ -261,28 +279,37 @@ if io_uring_probe; then
         # daemon is absent. A skip must never masquerade as RAN — the receipt
         # is SKIP with a GAP instead.
         GAPS+=("record_e2e:daemon_unavailable")
-        echo -e "${YELLOW}${BOLD}WARN GAP: record_e2e:daemon_unavailable — PipeWire daemon not reachable; E2E recording test SKIPPED.${NC}"
+        echo -e "${YELLOW}${BOLD}WARN GAP: record_e2e:daemon_unavailable — PipeWire daemon not reachable; E2E recording test SKIPPED (${P4_DUR_STR}).${NC}"
         emit "PHASE4: SKIP reason=record_e2e_daemon_unavailable"
         emit "RECORDING_IO_URING=SKIP"
     elif grep -qF "TEST_RESULT[record_e2e]=PASS" target/logs/quick-phase4.log; then
+        ok "Phase 4 passed (${P4_DUR_STR})"
         emit "PHASE4: PASS log=target/logs/quick-phase4.log"
         emit "RECORDING_IO_URING=RAN"
     else
         die "Phase 4: record_e2e produced neither TEST_RESULT[record_e2e]=PASS nor TEST_RESULT[record_e2e]=SKIP:daemon_unavailable — test removed, renamed or filtered out?"
     fi
 elif [ "$IO_URING_STATUS" = "kernel_unsupported" ]; then
+    P4_DUR_MS=$(( ($(date +%s%N) - P4_START) / 1000000 ))
+    P4_DUR_STR=$(format_duration_ms "$P4_DUR_MS")
     GAPS+=("recording_io_uring:kernel_unsupported")
-    echo -e "${YELLOW}${BOLD}WARN GAP: recording_io_uring:kernel_unsupported — kernel/io_uring unavailable; recording disk-writer tests SKIPPED.${NC}"
+    echo -e "${YELLOW}${BOLD}WARN GAP: recording_io_uring:kernel_unsupported — kernel/io_uring unavailable; recording disk-writer tests SKIPPED (${P4_DUR_STR}).${NC}"
     emit "PHASE4: SKIP reason=kernel_unsupported"
     emit "RECORDING_IO_URING=SKIP"
 else
+    P4_DUR_MS=$(( ($(date +%s%N) - P4_START) / 1000000 ))
+    P4_DUR_STR=$(format_duration_ms "$P4_DUR_MS")
     GAPS+=("recording_io_uring:probe_tool_missing")
-    echo -e "${YELLOW}${BOLD}WARN GAP: recording_io_uring:probe_tool_missing — native io_uring probe failed unexpectedly; recording disk-writer tests SKIPPED.${NC}"
+    echo -e "${YELLOW}${BOLD}WARN GAP: recording_io_uring:probe_tool_missing — native io_uring probe failed unexpectedly; recording disk-writer tests SKIPPED (${P4_DUR_STR}).${NC}"
     emit "PHASE4: SKIP reason=probe_tool_missing"
     emit "RECORDING_IO_URING=SKIP"
 fi
 
 # ── Receipt & summary ────────────────────────────────────────────────────────
+SUITE_END=$(date +%s%N)
+TOTAL_DUR_MS=$(( (SUITE_END - SUITE_START) / 1000000 ))
+TOTAL_DUR_STR=$(format_duration_ms "$TOTAL_DUR_MS")
+
 if [ ${#GAPS[@]} -gt 0 ]; then
     for g in "${GAPS[@]}"; do
         emit "GAP: $g"
@@ -295,6 +322,12 @@ if [ ${#GAPS[@]} -gt 0 ]; then
     echo -e "    - Phase 2 log: ${CYAN}target/logs/quick-phase2.log${NC}"
     echo -e "    - Phase 3 log: ${CYAN}target/logs/quick-phase3.log${NC}"
     echo -e "    - Phase 4 log: ${CYAN}target/logs/quick-phase4.log${NC}"
+    echo -e "  ${BOLD}Durations:${NC}"
+    echo -e "    - Phase 1:     ${P1_DUR_STR:-N/A}"
+    echo -e "    - Phase 2:     ${P2_DUR_STR:-N/A}"
+    echo -e "    - Phase 3:     ${P3_DUR_STR:-N/A}"
+    echo -e "    - Phase 4:     ${P4_DUR_STR:-N/A}"
+    echo -e "    - Total:       ${TOTAL_DUR_STR}"
     echo -e "${YELLOW}${BOLD}================================================================================${NC}\n"
     if [ "${NAM_QUICK_STRICT:-0}" = "1" ]; then
         echo -e "${RED}${BOLD}OVERALL: FAIL reason=strict_gaps${NC}"
@@ -302,7 +335,7 @@ if [ ${#GAPS[@]} -gt 0 ]; then
         exit 1
     fi
     emit "OVERALL: COMPLETED_WITH_GAPS"
-    echo -e "${YELLOW}${BOLD}OVERALL: COMPLETED_WITH_GAPS${NC}"
+    echo -e "${YELLOW}${BOLD}OVERALL: COMPLETED_WITH_GAPS (${TOTAL_DUR_STR})${NC}"
     exit 0
 fi
 
@@ -314,5 +347,11 @@ echo -e "    - Phase 1 log: ${CYAN}target/logs/quick-phase1.log${NC}"
 echo -e "    - Phase 2 log: ${CYAN}target/logs/quick-phase2.log${NC}"
 echo -e "    - Phase 3 log: ${CYAN}target/logs/quick-phase3.log${NC}"
 echo -e "    - Phase 4 log: ${CYAN}target/logs/quick-phase4.log${NC}"
+echo -e "  ${BOLD}Durations:${NC}"
+echo -e "    - Phase 1:     ${P1_DUR_STR:-N/A}"
+echo -e "    - Phase 2:     ${P2_DUR_STR:-N/A}"
+echo -e "    - Phase 3:     ${P3_DUR_STR:-N/A}"
+echo -e "    - Phase 4:     ${P4_DUR_STR:-N/A}"
+echo -e "    - Total:       ${TOTAL_DUR_STR}"
 echo -e "${GREEN}${BOLD}================================================================================${NC}\n"
 emit "OVERALL: PASSED"

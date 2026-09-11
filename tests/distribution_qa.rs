@@ -1959,9 +1959,11 @@ fn long_suite_receipt_audit() {
 // ---------------------------------------------------------------------------
 
 /// RAII guard that restores the operator's long-audit receipt and phase logs
-/// after a `--simulate` invocation replaced them (the sanctioned CI surface).
+/// after a `--simulate` invocation replaced them (the sanctioned CI surface),
+/// and cleans up any simulated files created if they did not exist prior.
 struct LongSimulateGuard {
     backups: Vec<(PathBuf, PathBuf)>,
+    created_to_remove: Vec<PathBuf>,
 }
 
 impl LongSimulateGuard {
@@ -1979,14 +1981,20 @@ impl LongSimulateGuard {
             files.push(root.join(format!("target/logs/{name}")));
         }
         let mut backups = Vec::new();
+        let mut created_to_remove = Vec::new();
         for f in files {
             if f.is_file() {
                 let bk = f.with_extension("sim-test-backup");
                 let _ = std::fs::copy(&f, &bk);
                 backups.push((f, bk));
+            } else {
+                created_to_remove.push(f);
             }
         }
-        Self { backups }
+        Self {
+            backups,
+            created_to_remove,
+        }
     }
 }
 
@@ -1995,6 +2003,9 @@ impl Drop for LongSimulateGuard {
         for (orig, bk) in &self.backups {
             let _ = std::fs::copy(bk, orig);
             let _ = std::fs::remove_file(bk);
+        }
+        for path in &self.created_to_remove {
+            let _ = std::fs::remove_file(path);
         }
     }
 }

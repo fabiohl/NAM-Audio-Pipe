@@ -66,13 +66,13 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="0.7.1" date="2026-09-03" type="stable">
+    <release version="0.7.2" date="2026-09-10" type="stable">
       <description>
-        <p>This release makes the silence gate fully configurable:</p>
+        <p>This release updates NeuralAmpModeler-rs to 0.7.4 and improves phase duration tracking:</p>
         <ul>
-          <li>Polymorphic --gate MODE: besides the on/off modes, any explicit threshold in [-96.0, -20.0] dBFS is accepted (e.g. -60, -65.5, -45dB), with automatic 10 dB Schmitt hysteresis and off-RT informational normalization of positive attenuation values (60 → -60 dBFS).</li>
-          <li>Out-of-domain or malformed values fail fast with a didactic error and exit code 1 before any PipeWire connection.</li>
-          <li>Expanded CLI unit matrix, E2E black-box coverage and RT harness property tests for the full valid threshold domain.</li>
+          <li>Updated NeuralAmpModeler-rs engine dependency to 0.7.4, adhering to exclusive-access DSP bridge teardown invariants.</li>
+          <li>Added human-readable duration formatting and millisecond tracking for test and lint phases.</li>
+          <li>Supply chain dependency updates and compiler compatibility alignment.</li>
         </ul>
       </description>
     </release>

@@ -69,8 +69,8 @@ use neural_amp_modeler_rs::common::spsc::{RT_STATUS_NEEDS_RESAMPLER_REBUILD, SHU
 use pipewire::stream::StreamState;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Barrier, Mutex};
+use std::time::{Duration, Instant};
 
 /// Number of DSP quantums for the deadline gate (task spec: 10 000).
 const DEADLINE_QUANTUMS: usize = 10_000;
@@ -92,16 +92,14 @@ const MODEL_CHECK_THREADS: usize = 16;
 /// asserts `current_host_rate()` never leaves this set.
 const VALID_RATES: [u32; 4] = [32_000, 44_100, 48_000, 96_000];
 
-/// Rate-renegotiation publish period: each rate worker publishes a new
-/// host rate every N loop iterations. The publish strictly precedes any
-/// resampler delivery — the RT callback must observe it in `sync_rate` first.
-const RATE_PUBLISH_PERIOD: u64 = 8;
+/// Active publishing window for rate workers: rate workers publish new rates
+/// during the first 2 seconds of the 3-second stress window, then spend the final
+/// 1 second exclusively in the constructor role so all pending rebuild requests
+/// are fulfilled and settled before the test completes.
+const RATE_PUBLISH_WINDOW: Duration = Duration::from_millis(2000);
 
-/// Rate-renegotiation publish budget: after this many loop iterations a
-/// rate worker stops publishing and only plays the constructor role — keeping
-/// the resampler build/GC churn bounded while still delivering an envelope for
-/// every request the RT callback already observed (including the final one).
-const RATE_PUBLISH_BUDGET: u64 = 200;
+/// Staggered interval between publications for an individual rate worker.
+const RATE_PUBLISH_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Calibrated micro-yield sleep for the stress workers: 10–50 µs so the
 /// RT driver always wins a scheduling slot on a saturated host instead of
@@ -642,6 +640,7 @@ fn concurrent_state_interleaving_stress_16_threads() {
     };
 
     let mut handles = Vec::with_capacity(MODEL_CHECK_THREADS);
+    let barrier = Arc::new(Barrier::new(MODEL_CHECK_THREADS + 1));
 
     // Shared RT status flags: lock-free observation face for the rate workers'
     // constructor role (the generation/NEEDS checks below never contend on the
@@ -655,7 +654,9 @@ fn concurrent_state_interleaving_stress_16_threads() {
     for w in 0..4 {
         let harness = Arc::clone(&harness);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
             let mut iter = 0u64;
             while iter < 600 && !stop.load(Ordering::Acquire) {
                 match (w + iter as usize) % 4 {
@@ -702,7 +703,9 @@ fn concurrent_state_interleaving_stress_16_threads() {
     for w in 0usize..4 {
         let status = Arc::clone(&status);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
             let mut iter = 0u64;
             while !stop.load(Ordering::Acquire) {
                 let stream = if w.is_multiple_of(2) {
@@ -765,7 +768,8 @@ fn concurrent_state_interleaving_stress_16_threads() {
     // starvation bug: the envelope carries a stale generation, is discarded by
     // `drain_resamplers` without unmuting, and `RESAMP_SWAP_PENDING` stays
     // armed — the fail-open rollback guard skips every callback and
-    // `frame_count` never advances. The publish budget bounds the publisher
+    // `frame_count` never advances. The publishing window bounds the publisher
+    // role so rate workers spend the final second exclusively in the constructor
     // role; the constructor role keeps polling until `stop`, so the final
     // published rate always receives its envelope (both loops
     // yield/sleep so the RT driver wins the harness lock).
@@ -774,18 +778,26 @@ fn concurrent_state_interleaving_stress_16_threads() {
         let rt_status = Arc::clone(&rt_status_flags);
         let stop = Arc::clone(&stop);
         let swaps_requested = Arc::clone(&swaps_requested);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            let start = Instant::now();
+            let mut next_publish = start + Duration::from_millis(6 * w as u64);
+            let mut publish_step = 0usize;
             let mut iter = 0u64;
             let mut last_delivered_gen = 0u64;
             while !stop.load(Ordering::Acquire) {
-                // Publisher role (bounded): publish the desired host rate and
-                // release the lock immediately — the RT callback observes the
-                // publish in its own `sync_rate` run.
-                if iter < RATE_PUBLISH_BUDGET && iter.is_multiple_of(RATE_PUBLISH_PERIOD) {
-                    let rate =
-                        VALID_RATES[(w + (iter as usize % VALID_RATES.len())) % VALID_RATES.len()];
+                // Publisher role (bounded by window): publish the desired host
+                // rate with staggered intervals across workers, and release
+                // the lock immediately — the RT callback observes the publish
+                // in its own `sync_rate` run.
+                let now = Instant::now();
+                if now.duration_since(start) < RATE_PUBLISH_WINDOW && now >= next_publish {
+                    let rate = VALID_RATES[(w + publish_step) % VALID_RATES.len()];
                     let mut h = harness.lock().expect("harness lock");
                     h.publish_host_rate(rate);
+                    publish_step += 1;
+                    next_publish = now + RATE_PUBLISH_INTERVAL;
                 }
                 // Constructor role: only when the RT observed a request for a
                 // generation this worker has not delivered yet (lock-free fast
@@ -831,7 +843,9 @@ fn concurrent_state_interleaving_stress_16_threads() {
     // sleep per toggle keeps the loop from hogging every CPU.
     for _ in 0..2 {
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
             let mut on = false;
             while !stop.load(Ordering::Acquire) {
                 on = !on;
@@ -846,7 +860,9 @@ fn concurrent_state_interleaving_stress_16_threads() {
     {
         let status = Arc::clone(&status);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
             let mut reconnect_attempt = 0u32;
             while !stop.load(Ordering::Acquire) {
                 if SHUTDOWN.load(Ordering::Acquire) {
@@ -866,28 +882,36 @@ fn concurrent_state_interleaving_stress_16_threads() {
     {
         let harness = Arc::clone(&harness);
         let stop = Arc::clone(&stop);
+        let barrier = Arc::clone(&barrier);
         handles.push(std::thread::spawn(move || {
+            barrier.wait();
             let mut iter = 0u64;
             while !stop.load(Ordering::Acquire) {
-                let mut h = harness.lock().expect("harness lock");
-                let mut in_l = [0f32; BLOCK];
-                let mut in_r = [0f32; BLOCK];
-                h.run_callback(&mut in_l, &mut in_r, BLOCK);
-                let rate = h.current_host_rate();
-                assert!(
-                    VALID_RATES.contains(&rate),
-                    "inconsistent sample-rate read: applied {rate} Hz is not a published rate"
-                );
-                if iter.is_multiple_of(32) {
-                    h.consume_gc();
+                {
+                    let mut h = harness.lock().expect("harness lock");
+                    let mut in_l = [0f32; BLOCK];
+                    let mut in_r = [0f32; BLOCK];
+                    h.run_callback(&mut in_l, &mut in_r, BLOCK);
+                    let rate = h.current_host_rate();
+                    assert!(
+                        VALID_RATES.contains(&rate),
+                        "inconsistent sample-rate read: applied {rate} Hz is not a published rate"
+                    );
+                    if iter.is_multiple_of(32) {
+                        h.consume_gc();
+                    }
                 }
                 iter += 1;
+                if iter.is_multiple_of(64) {
+                    std::thread::yield_now();
+                }
             }
         }));
     }
 
     assert_eq!(handles.len(), MODEL_CHECK_THREADS, "worker mix drift");
 
+    barrier.wait();
     std::thread::sleep(STRESS_WINDOW);
     stop.store(true, Ordering::Release);
     for th in handles {

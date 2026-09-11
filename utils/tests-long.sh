@@ -232,12 +232,14 @@ run_phase() {
     status=$?
     PHASE_RC=$status
     PHASE_DUR=$(( ($(date +%s%N) - start_time) / 1000000 ))
+    local dur_str
+    dur_str=$(format_duration_ms "$PHASE_DUR")
 
     case "$status" in
-        0) echo -e "  ${GREEN}✓ phase completed (${PHASE_DUR} ms)${NC}" ;;
-        1) echo -e "  ${RED}❌ phase FAILED (${PHASE_DUR} ms)${NC}" ;;
-        2) echo -e "  ${YELLOW}⚠ phase GAP (${PHASE_DUR} ms)${NC}" ;;
-        *) echo -e "  ${RED}❌ phase failed with status ${status} (${PHASE_DUR} ms)${NC}" ;;
+        0) echo -e "  ${GREEN}✓ phase completed (${dur_str})${NC}" ;;
+        1) echo -e "  ${RED}❌ phase FAILED (${dur_str})${NC}" ;;
+        2) echo -e "  ${YELLOW}⚠ phase GAP (${dur_str})${NC}" ;;
+        *) echo -e "  ${RED}❌ phase failed with status ${status} (${dur_str})${NC}" ;;
     esac
     return 0
 }

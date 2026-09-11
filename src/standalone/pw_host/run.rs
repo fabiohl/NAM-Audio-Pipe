@@ -507,7 +507,7 @@ pub fn run_pipewire_host(
 
         // Invalidates/advances the DSP bridge to zero so a reconnected instance
         // begins strictly in silence.
-        unsafe { &*bridge_ptr.as_ptr() }.reset_to_silence();
+        unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
 
         // R-04: single-owner handoff — the loop thread has stopped, so the RT
         // callback will never touch `rt_parking_lot` again. One canonical

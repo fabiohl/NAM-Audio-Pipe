@@ -29,11 +29,13 @@ NC='\033[0m'
 # Phase counter (global — not safe for concurrent subshells)
 # ---------------------------------------------------------------------------
 PHASE_NUM=0
+PHASE_START_NS=0
 
 # phase <description>
 #   Increments and prints a phase header: [N/TOTAL] description
 phase() {
     PHASE_NUM=$((PHASE_NUM + 1))
+    PHASE_START_NS=$(date +%s%N 2>/dev/null || echo 0)
     echo -e "\n${BLUE}${BOLD}[${PHASE_NUM}/${PHASE_TOTAL:-?}]${NC} $*"
 }
 
@@ -54,6 +56,41 @@ ok() {
 #   Prints an indented yellow informational/warning line.
 warn() {
     echo -e "  ${YELLOW}ⓘ${NC} $*"
+}
+
+# format_duration_ms <milliseconds>
+#   Formats an interval in ms to human-readable scale:
+#   < 1000 ms: "Xms" (e.g. 790ms, 45ms)
+#   < 10000 ms: "X.YYs" (e.g. 1.35s)
+#   >= 10000 ms: "X.Ys" (e.g. 65.2s)
+format_duration_ms() {
+    local ms="${1:-0}"
+    if [ "$ms" -lt 1000 ]; then
+        echo "${ms}ms"
+    elif [ "$ms" -lt 10000 ]; then
+        local sec=$(( ms / 1000 ))
+        local dec=$(( (ms % 1000) / 10 ))
+        printf "%d.%02ds\n" "$sec" "$dec"
+    else
+        local sec=$(( ms / 1000 ))
+        local dec=$(( (ms % 1000) / 100 ))
+        printf "%d.%ds\n" "$sec" "$dec"
+    fi
+}
+
+# phase_elapsed_str
+#   Returns the formatted duration elapsed since the last phase() call.
+phase_elapsed_str() {
+    if [ "${PHASE_START_NS:-0}" -ne 0 ]; then
+        local now_ns dur_ms
+        now_ns=$(date +%s%N 2>/dev/null || echo 0)
+        if [ "$now_ns" -ge "$PHASE_START_NS" ]; then
+            dur_ms=$(( (now_ns - PHASE_START_NS) / 1000000 ))
+            format_duration_ms "$dur_ms"
+            return 0
+        fi
+    fi
+    echo "0ms"
 }
 
 # ---------------------------------------------------------------------------
