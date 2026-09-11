@@ -95,7 +95,8 @@ fn main() -> anyhow::Result<()> {
     log::info!(
         "🎸 {}",
         format!(
-            "NAM-Audio-Pipe v{} [x86-64-v3] — Neural Amp Modeler",
+            "NAM-Audio-Pipe v{} (engine v{}) [x86-64-v3] — Neural Amp Modeler",
+            env!("CARGO_PKG_VERSION"),
             sys.version
         )
         .bright_green()
@@ -306,7 +307,7 @@ fn main() -> anyhow::Result<()> {
         recording_worker,
     );
 
-    log::info!("{} Encerrando NAM-Audio-Pipe...", "🔌".yellow());
+    log::info!("{} Shutting down NAM-Audio-Pipe...", "🔌".yellow());
 
     // Final observable state of the recording worker: Stopped
     // on a clean drain, Failed if a fatal error suspended the recording.
@@ -370,6 +371,6 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(outcome.exit_code());
         }
     }
-    log::info!("{} NAM-Audio-Pipe encerrado. 🎸", "✅".green());
+    log::info!("{} NAM-Audio-Pipe terminated. 🎸", "✅".green());
     std::process::exit(0);
 }
