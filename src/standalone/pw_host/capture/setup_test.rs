@@ -82,6 +82,31 @@ fn rebuild_requested_on_rate_mismatch() {
 }
 
 #[test]
+fn rebuild_suppressed_while_pending_with_active_pair() {
+    // Invariant: while a rebuild request is in flight, an active pair that is
+    // still stale must NOT re-arm the request, regardless of which axis
+    // (partition quantum or host rate) diverges. Re-arming on every callback
+    // bumps `requested_cabsim_generation`, so the envelope produced by the
+    // in-flight rebuild arrives stale and is discarded by the RT swap,
+    // starving the pair in a livelock.
+    let pair = make_pair(64, 48000);
+
+    // Divergent quantum only.
+    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 48000, true));
+    // Divergent host rate only.
+    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 44100, true));
+    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 96000, true));
+    // Both axes divergent.
+    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 44100, true));
+    // Matching pair while pending stays a no-op.
+    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 48000, true));
+
+    // Once the pending request clears, the same divergences request again.
+    assert!(cabsim_rebuild_needed(Some(&pair), true, 128, 48000, false));
+    assert!(cabsim_rebuild_needed(Some(&pair), true, 64, 44100, false));
+}
+
+#[test]
 fn rebuild_not_requested_for_quantum_outside_partition_domain() {
     // A spurious quantum outside the convolution partition domain
     // [16, MAX_RESAMP_BUF] must never drive a rebuild — otherwise the handler's

@@ -488,11 +488,18 @@ pub fn setup_capture_stream<'c>(
 ///
 /// A rebuild is needed when an IR is loaded and any of:
 /// * no pair is active yet — first install, or safe-bypass after a failed
-///   rebuild (`already_pending` suppresses duplicate requests while a
-///   previous rebuild is in flight);
+///   rebuild;
 /// * the host quantum no longer matches the pair's partition size;
 /// * the pair's IR is calibrated for a different rate than the applied host
 ///   output rate (rate calibration).
+///
+/// `already_pending` suppresses duplicate requests while a previous rebuild is
+/// in flight, for both the initial-install and the active-pair branches. Without
+/// it the active-pair branch would re-arm the request on every audio callback
+/// whenever the pair is still stale; each re-arm bumps
+/// `requested_cabsim_generation`, so the envelope produced by the in-flight
+/// rebuild arrives with an outdated generation and is discarded by the RT
+/// swap, starving the active pair forever (livelock).
 fn cabsim_rebuild_needed(
     active: Option<&neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>,
     has_ir: bool,
@@ -510,7 +517,10 @@ fn cabsim_rebuild_needed(
     }
     match active {
         None => !already_pending,
-        Some(pair) => pair.partition_size() != n_samples || pair.sample_rate != host_rate,
+        Some(pair) => {
+            !already_pending
+                && (pair.partition_size() != n_samples || pair.sample_rate != host_rate)
+        }
     }
 }
 
