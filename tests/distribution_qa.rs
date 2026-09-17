@@ -988,7 +988,7 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
         },
         "build": {
             "profile": "dist",
-            "features": ["stereo"],
+            "features": ["dual-mono"],
             "rustflags": "-C target-cpu=x86-64-v3",
             "optimizations": {
                 "status": "PGO+BOLT",

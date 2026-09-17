@@ -495,7 +495,7 @@ fn cabsim_rebuild_resamples_to_requested_host_rate() {
         "same-rate rebuild must keep the 4096-sample IR untouched (4096/64)"
     );
     assert!(
-        p44 > p48 && p96 > p44,
+        p48 > p44 && p96 > p48,
         "resampled IR duration in samples must grow with the target rate (44.1k={p44}, 48k={p48}, 96k={p96})"
     );
 }
