@@ -114,6 +114,10 @@ pub(crate) fn parse_sink_name_from_metadata(raw_stdout: &[u8]) -> Option<String>
 /// Prevents the processor from entering power-saving C-States,
 /// guaranteeing 0ms wake-up latency for RT audio processing.
 ///
+/// Delegates to the engine's `rt_hardening::request_cpu_dma_latency(0)`.
+/// The engine guard is released at return (fd closed); the local `File`
+/// reopen keeps the historical `Option<File>` contract for the caller.
+///
 /// **Warning:** This protection is **system-wide (global)** and affects all CPU cores,
 /// not just the thread executing this function.
 ///
@@ -122,6 +126,10 @@ pub(crate) fn parse_sink_name_from_metadata(raw_stdout: &[u8]) -> Option<String>
 /// RETURN: The `File` handle. It MUST be kept alive in the main scope.
 /// If the file descriptor is closed (drop), the kernel revokes the protection.
 pub fn lock_cpu_c_states() -> Option<std::fs::File> {
+    // Engine equivalent validates the path with log + graceful fallback
+    // (returns Err instead of None); keep the local handle open so the
+    // caller's RAII lifetime still owns the protection.
+    let _ = neural_amp_modeler_rs::rt_hardening::request_cpu_dma_latency(0);
     match std::fs::OpenOptions::new()
         .write(true)
         .open("/dev/cpu_dma_latency")

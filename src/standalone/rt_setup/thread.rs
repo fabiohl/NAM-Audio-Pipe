@@ -11,12 +11,9 @@ use std::ffi::CStr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-/// `PR_THP_DISABLE_EXCEPT_ADVISED` (value 2) — introduced in Linux 7.0.
-/// Not yet available in libc 0.2.186; defined locally for forward compatibility.
-const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 2;
-
 /// Configures the process for real-time operation (process-wide).
 ///
+/// Delegates to the engine's `rt_hardening::{disable_thp, mlockall_current}`.
 /// Must be called from `main()` **after** all major heap allocations and
 /// **before** starting the PipeWire DSP thread. Runs:
 ///
@@ -31,63 +28,10 @@ const PR_THP_DISABLE_EXCEPT_ADVISED: libc::c_ulong = 2;
 /// but were moved here to reduce jitter at the critical moment of the first
 /// audio delivery.
 pub fn configure_process_wide() {
-    // 1. THP disable — tries the modern `PR_THP_DISABLE_EXCEPT_ADVISED`
-    //    (Linux 7.0+) which allows pages explicitly marked with MADV_HUGEPAGE
-    //    to use THP (e.g., hot-swapped models). Falls back gracefully to the
-    //    classic global `PR_SET_THP_DISABLE` on older kernels.
-    unsafe {
-        let ret = libc::prctl(
-            libc::PR_SET_THP_DISABLE,
-            1,
-            PR_THP_DISABLE_EXCEPT_ADVISED,
-            0,
-            0,
-        );
-        if ret == -1 && *libc::__errno_location() == libc::EINVAL {
-            let err = std::io::Error::last_os_error();
-            log::info!(
-                "Kernel does not support PR_THP_DISABLE_EXCEPT_ADVISED (errno={}: {}) — \
-                 falling back to classic PR_SET_THP_DISABLE.",
-                err.raw_os_error().unwrap_or(-1),
-                err,
-            );
-            let classic_ret = libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
-            if classic_ret == -1 {
-                let fallback_err = std::io::Error::last_os_error();
-                log::warn!(
-                    "Classic PR_SET_THP_DISABLE also failed (errno={}: {}). \
-                     THP may remain active — background compaction latencies possible.",
-                    fallback_err.raw_os_error().unwrap_or(-1),
-                    fallback_err,
-                );
-            } else {
-                log::info!(
-                    "Transparent Huge Pages globally disabled (classic fallback). \
-                     Only MADV_HUGEPAGE regions may use THP."
-                );
-            }
-        } else if ret == -1 {
-            let err = std::io::Error::last_os_error();
-            log::warn!(
-                "prctl(PR_SET_THP_DISABLE) failed with unexpected errno={}: {}. \
-                 THP state unknown — background compaction latencies possible.",
-                err.raw_os_error().unwrap_or(-1),
-                err,
-            );
-        }
-    }
-
-    let ret_mlock = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
-
-    if ret_mlock != 0 {
-        let err = std::io::Error::last_os_error();
-        log::warn!(
-            "mlockall() failed ({}). Audio may experience dropouts if the system swaps.\n  Hint: Verify the 'memlock' limit in ulimits.",
-            err
-        );
-    } else {
-        log::info!("🔒 Memory Protection: Locked in physical RAM to prevent dropouts (mlockall).");
-    }
+    // Engine equivalents log + return Result with graceful fallback (no panic
+    // on the setup path); outcome is identical, telemetry unchanged.
+    let _ = neural_amp_modeler_rs::rt_hardening::disable_thp();
+    let _ = neural_amp_modeler_rs::rt_hardening::mlockall_current();
 }
 
 /// Injectable system abstraction for thread real-time configuration.
@@ -177,6 +121,14 @@ impl ThreadConfigurator for SystemThreadConfigurator {
 
 /// Configures the current DSP thread for real-time operation using the provided configurator.
 ///
+/// Delegates to the engine's opt-in `rt_hardening` module
+/// (`neural_amp_modeler_rs::rt_hardening::{set_cpu_affinity, promote_sched_fifo}`)
+/// for affinity + scheduler promotion, then applies the PipeWire-specific
+/// thread name. The engine equivalents return `Result` where this wrapper
+/// historically recorded errno silently — the outcome is identical (errno in
+/// `rt_sched_err` / `rt_affinity_err`, no panic), now with log + graceful
+/// fallback semantics owned by the engine.
+///
 /// Executed off the audio hot-path during PipeWire data-loop state transition before declaring readiness.
 /// Applies:
 ///
@@ -211,53 +163,48 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
 
     pin_thread_affinity_with(thread_id, target_cpu, rt_status, cfg);
 
-    let actual_cpu = cfg.get_current_cpu();
-    rt_status.rt_cpu.store(actual_cpu, Ordering::Relaxed);
-    rt_status.rt_tid.store(thread_id as i64, Ordering::Relaxed);
+    // Scheduler promotion via the engine (same honest-policy semantics:
+    // keep FIFO/RR, elevate OTHER → FIFO 88, record errno without panic).
+    // The engine helper re-reads DAZ/FTZ + CPU/TID (idempotent) and publishes
+    // the identical `rt_status` telemetry, so delegate the policy block to it.
+    let engine_cfg = EngineThreadAdapter { inner: cfg };
+    let _ =
+        neural_amp_modeler_rs::rt_hardening::promote_sched_fifo_with(88, rt_status, &engine_cfg);
+}
 
-    let (actual_policy, actual_param) = match cfg.get_sched_param(thread_id) {
-        Ok((p, param)) => {
-            let base_policy = p & !0x40000000i32;
-            if base_policy == libc::SCHED_FIFO || base_policy == libc::SCHED_RR {
-                (base_policy, param)
-            } else {
-                // Thread is in SCHED_OTHER (or other non-RT). Attempt direct RT elevation to SCHED_FIFO 88.
-                let target_param = libc::sched_param { sched_priority: 88 };
-                let ret_set = cfg.set_sched_param(thread_id, libc::SCHED_FIFO, &target_param);
-                if ret_set == 0 {
-                    (libc::SCHED_FIFO, target_param)
-                } else {
-                    rt_status.rt_sched_err.store(ret_set, Ordering::Relaxed);
-                    (base_policy, param)
-                }
-            }
-        }
-        Err(ret_getsched) => {
-            rt_status
-                .rt_getsched_err
-                .store(ret_getsched, Ordering::Relaxed);
-            (-1, libc::sched_param { sched_priority: -1 })
-        }
-    };
+/// Adapter bridging the local [`ThreadConfigurator`] to the engine's
+/// `rt_hardening::ThreadConfigurator` (identical syscall surface minus the
+/// PipeWire-specific thread naming, which stays local).
+struct EngineThreadAdapter<'a, C: ThreadConfigurator> {
+    inner: &'a C,
+}
 
-    if actual_policy == libc::SCHED_FIFO {
-        rt_status.set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
-    } else {
-        rt_status.clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+impl<C: ThreadConfigurator> neural_amp_modeler_rs::rt_hardening::ThreadConfigurator
+    for EngineThreadAdapter<'_, C>
+{
+    fn set_daz_ftz(&self) {
+        self.inner.set_daz_ftz();
     }
-
-    rt_status.rt_priority.store(
-        if actual_policy == -1 {
-            0
-        } else {
-            actual_param.sched_priority
-        },
-        Ordering::Relaxed,
-    );
-    rt_status
-        .confirmed_priority
-        .store(actual_param.sched_priority, Ordering::Relaxed);
-    rt_status.rt_policy.store(actual_policy, Ordering::Relaxed);
+    fn current_thread_id(&self) -> libc::pthread_t {
+        self.inner.current_thread_id()
+    }
+    fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32 {
+        self.inner.set_thread_affinity(thread_id, cpuset)
+    }
+    fn get_sched_param(&self, thread_id: libc::pthread_t) -> Result<(i32, libc::sched_param), i32> {
+        self.inner.get_sched_param(thread_id)
+    }
+    fn set_sched_param(
+        &self,
+        thread_id: libc::pthread_t,
+        policy: i32,
+        param: &libc::sched_param,
+    ) -> i32 {
+        self.inner.set_sched_param(thread_id, policy, param)
+    }
+    fn get_current_cpu(&self) -> i32 {
+        self.inner.get_current_cpu()
+    }
 }
 
 /// Configures the current DSP thread for real-time operation using the default `SystemThreadConfigurator`.

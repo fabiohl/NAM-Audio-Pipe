@@ -13,7 +13,11 @@ pub mod pm_qos;
 pub mod telemetry;
 pub mod thread;
 pub use neural_amp_modeler_rs::common::tsc;
-
+// Engine RT-hardening equivalents (S4-T6 migration target). Local modules
+// above delegate process/thread/PM-QoS setup to them; the affinity
+// topology/selection API stays local because `PollState`/`telemetry` carry
+// the local `CpuSelectionReceipt` type — engine re-exports are available as
+// `neural_amp_modeler_rs::rt_hardening::*` for new code.
 pub use affinity::*;
 pub use pm_qos::*;
 pub use telemetry::*;
