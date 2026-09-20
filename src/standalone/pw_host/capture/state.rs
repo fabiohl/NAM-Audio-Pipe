@@ -10,15 +10,16 @@
 
 use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use crate::standalone::cli::GateConfig;
+use crate::standalone::pw_host::rt_callback::{
+    CabSimSwapDrain, OsSwapDrain, ResamplerSwapDrain, SlimmableSwapDrain,
+};
 use neural_amp_modeler_rs::common::diagnostics::{NamDiagnostic, NamErrorCode};
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
-use neural_amp_modeler_rs::common::spsc::{
-    CabSimSwapPayload, GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, SlimModelPair,
-};
+use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, ParamPayload};
 use neural_amp_modeler_rs::dsp::adaptive::AdaptiveCompute;
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
-use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
+use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -31,12 +32,14 @@ use std::sync::atomic::AtomicU32;
 ///
 /// Owned (heap-allocated) by `run_pipewire_host` and reached from the RT
 /// callback through a raw pointer — never moved into the stream closures — so
-/// the channels survive a bounded reconnect cycle. The `slimmable` and
-/// `oversample` consumers live in [`CaptureState`] instead (`slimmable_rx` /
-/// `os_rx`); the main thread only touches its own separate `gc_overflow`
-/// handle (an [`Arc`] clone) during the control loop, so there is never
-/// concurrent aliasing of this struct between the RT callback (exclusive
-/// `&mut`) and the main thread.
+/// the channels survive a bounded reconnect cycle. The four dedicated swap
+/// channels live inside [`CaptureState`]'s engine `RtSwapDrain`s
+/// (`resampler_drain` / `cabsim_drain` / `slimmable_drain` / `os_drain`,
+/// T9.5) — each drain owns its ring consumer and its deferred slot; the main
+/// thread only touches its own separate `gc_overflow` handle (an [`Arc`]
+/// clone) during the control loop, so there is never concurrent aliasing of
+/// this struct between the RT callback (exclusive `&mut`) and the main
+/// thread.
 pub struct RtHostChannels {
     /// CLI→DSP parameter channel consumer (gain, model, etc.).
     pub param_consumer: Consumer<ParamPayload>,
@@ -44,14 +47,7 @@ pub struct RtHostChannels {
     pub gc_producer: Producer<GcItem>,
     /// Overflow fallback for GC items (read-only from the RT callback).
     pub gc_overflow: Arc<GcOverflowBuffer>,
-    /// Dedicated channel receiving pre-built resamplers from the main thread.
-    pub resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
-    /// Dedicated channel receiving pre-built cab-sim pairs from the main thread.
-    pub cabsim_consumer: Consumer<Box<CabSimSwapPayload>>,
 }
-
-/// Max oversampled buffer size: MAX_RESAMP_BUF × 4 (for X4 oversampling).
-const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
 
 pub struct CaptureState {
     pub active_model_l: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
@@ -66,16 +62,18 @@ pub struct CaptureState {
     /// the same allocation without RT heap traffic.
     pub active_cabsim: Option<Box<CabSimPair>>,
     pub current_nam_rate: u32,
-    pub resamp_mid_l: Box<[f32; MAX_RESAMP_BUF]>,
     pub resamp_out_l: Box<[f32; MAX_RESAMP_BUF]>,
-    pub resamp_mid_r: Box<[f32; MAX_RESAMP_BUF]>,
     pub resamp_out_r: Box<[f32; MAX_RESAMP_BUF]>,
-    pub model_out_l: Box<[f32; MAX_RESAMP_BUF]>,
-    pub model_out_r: Box<[f32; MAX_RESAMP_BUF]>,
-    pub os_in_l: Box<[f32; MAX_OS_BUF]>,
-    pub os_in_r: Box<[f32; MAX_OS_BUF]>,
-    pub os_model_l: Box<[f32; MAX_OS_BUF]>,
-    pub os_model_r: Box<[f32; MAX_OS_BUF]>,
+    /// Oversampled scratch buffers, sized by
+    /// [`OversampleEngine::required_scratch_len`] (F-PERF-18/T9.4): zero when
+    /// the instance starts with `OversampleFactor::Off`. A runtime oversample
+    /// swap that needs more scratch than allocated is rejected by the
+    /// main-thread rebuild handler (`handle_oversample_rebuild`), so the RT
+    /// pipeline never receives an engine pair the scratch cannot hold.
+    pub os_in_l: Box<[f32]>,
+    pub os_in_r: Box<[f32]>,
+    pub os_model_l: Box<[f32]>,
+    pub os_model_r: Box<[f32]>,
     /// WaveNet crossfade scratch buffers (engine 0.5.0 `DspBuffers`): second
     /// pass output used when processing is chunked (active resampler).
     pub xfd_scratch_l: Box<[f32; MAX_RESAMP_BUF]>,
@@ -104,22 +102,26 @@ pub struct CaptureState {
     /// main-thread rebuild resamples the preserved original IR specifically
     /// for the applied host output rate.
     pub ir_source_rate: u32,
-    pub slimmable_rx: Option<Consumer<Box<neural_amp_modeler_rs::common::spsc::SlimModelPair>>>,
-    pub os_rx: Option<Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>>,
-    /// Deferred structural command slots.
+    /// Dedicated swap channels drained by the engine's generic scheduler
+    /// (T9.5): each `RtSwapDrain` owns its ring consumer AND the single
+    /// deferred slot (formerly the `deferred_*` fields below). Wired in
+    /// `run_pipewire_host` once per process (the rings and parked commands
+    /// survive a bounded reconnect cycle); unwrapped by the RT callback.
+    pub resampler_drain: Option<ResamplerSwapDrain>,
+    pub cabsim_drain: Option<CabSimSwapDrain>,
+    /// Deferred structural command slot for the mixed `Consumer<ParamPayload>`
+    /// ring (contract adoption, T9.5 — the unboxed ring has no `RtSwapDrain`).
     ///
-    /// Each slot parks at most one structural command whose per-callback
-    /// structural budget (`STRUCTURAL_SWAPS_PER_CALLBACK`, shared across all
-    /// swap drains) was exhausted. The parked command is resolved at the start
-    /// of the next callback — applied if still current, superseded by a newer
-    /// same-kind command already queued (latest-wins coalescing), or discarded
-    /// if its request generation advanced while parked. Slots are only touched
-    /// by the RT callback; they never allocate.
-    pub deferred_resampler: Option<Box<ResamplerSwapPayload>>,
-    pub deferred_cabsim: Option<Box<CabSimSwapPayload>>,
+    /// Parks at most one `LoadModel` whose per-callback structural budget
+    /// ([`STRUCTURAL_SWAPS_PER_CALLBACK`], shared across all swap drains) was
+    /// exhausted. The parked command is resolved at the start of the next
+    /// callback — applied if still current, superseded by a newer same-kind
+    /// command already queued (latest-wins coalescing), or re-parked if the
+    /// budget is still exhausted. Touched only by the RT callback; never
+    /// allocates.
     pub deferred_model: Option<ParamPayload>,
-    pub deferred_slimmable: Option<Box<SlimModelPair>>,
-    pub deferred_os: Option<Box<OsEnginePair>>,
+    pub slimmable_drain: Option<SlimmableSwapDrain>,
+    pub os_drain: Option<OsSwapDrain>,
 }
 
 impl CaptureState {
@@ -128,14 +130,14 @@ impl CaptureState {
         os: OversampleFactor,
         gate_config: GateConfig,
     ) -> Self {
-        let resampler = NamResampler::new(48_000, 48_000, 2048).unwrap_or_else(|e| {
+        let resampler = NamResampler::new_simple(48_000, 48_000).unwrap_or_else(|e| {
             NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
                 .message("Failed to create initial NamResampler (using 48k bypass).")
                 .hint("The engine remains in bypass mode. The resampler will be recreated upon receiving the actual rate from PipeWire.")
                 .param("initial_rate", 48_000_u32)
                 .param("detail", &e)
                 .emit_warning();
-            NamResampler::new(48_000, 48_000, 2048).expect("bypass cannot fail")
+            NamResampler::new_simple(48_000, 48_000).expect("bypass cannot fail")
         });
 
         let stream =
@@ -182,6 +184,28 @@ impl CaptureState {
             }
         };
 
+        // Oversample engines resolve first (with the Off fallback) so the
+        // scratch sizing below uses the *effective* factor (F-PERF-18/T9.4):
+        // `required_scratch_len(Off, …) == 0` — with oversampling bypassed the
+        // scratch allocates nothing (previously 512 KiB were allocated even
+        // with Off).
+        let effective_os = {
+            match OversampleEngine::new(os, MAX_RESAMP_BUF) {
+                Ok(_) => os,
+                Err(_) => OversampleFactor::Off,
+            }
+        };
+        let os_scratch_len =
+            neural_amp_modeler_rs::dsp::oversample::OversampleEngine::required_scratch_len(
+                effective_os,
+                MAX_RESAMP_BUF,
+            );
+        let alloc_os_scratch = || -> Box<[f32]> {
+            // `OversampleEngine::new(Off)` never fails and `required_scratch_len(Off) == 0`,
+            // so an empty scratch is a valid layout, not an error path.
+            vec![0.0f32; os_scratch_len].into_boxed_slice()
+        };
+
         Self {
             active_model_l: None,
             active_model_r: None,
@@ -211,16 +235,12 @@ impl CaptureState {
             ),
             active_cabsim: None,
             current_nam_rate: 48_000,
-            resamp_mid_l: Box::new([0.0f32; MAX_RESAMP_BUF]),
             resamp_out_l: Box::new([0.0f32; MAX_RESAMP_BUF]),
-            resamp_mid_r: Box::new([0.0f32; MAX_RESAMP_BUF]),
             resamp_out_r: Box::new([0.0f32; MAX_RESAMP_BUF]),
-            model_out_l: Box::new([0.0f32; MAX_RESAMP_BUF]),
-            model_out_r: Box::new([0.0f32; MAX_RESAMP_BUF]),
-            os_in_l: Box::new([0.0f32; MAX_OS_BUF]),
-            os_in_r: Box::new([0.0f32; MAX_OS_BUF]),
-            os_model_l: Box::new([0.0f32; MAX_OS_BUF]),
-            os_model_r: Box::new([0.0f32; MAX_OS_BUF]),
+            os_in_l: alloc_os_scratch(),
+            os_in_r: alloc_os_scratch(),
+            os_model_l: alloc_os_scratch(),
+            os_model_r: alloc_os_scratch(),
             xfd_scratch_l: Box::new([0.0f32; MAX_RESAMP_BUF]),
             xfd_scratch_r: Box::new([0.0f32; MAX_RESAMP_BUF]),
             user_input_gain_mult: 1.0,
@@ -244,13 +264,11 @@ impl CaptureState {
             thread_configured: false,
             ir_raw_samples: None,
             ir_source_rate: 0,
-            slimmable_rx: None,
-            os_rx: None,
-            deferred_resampler: None,
-            deferred_cabsim: None,
+            resampler_drain: None,
+            cabsim_drain: None,
             deferred_model: None,
-            deferred_slimmable: None,
-            deferred_os: None,
+            slimmable_drain: None,
+            os_drain: None,
         }
     }
 }

@@ -306,7 +306,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
 
     let (recording_sender, recording_receiver) = create_recording_transport();
     let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
-    let io_handle = spawn_recording_worker(recording_receiver, None, init)
+    let io_handle = spawn_recording_worker(recording_receiver, None, init, Vec::new())
         .expect("failed to spawn recording I/O thread");
     wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect("recording worker must confirm readiness");
@@ -342,7 +342,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 slimmable_producer: sl_prod,
                 os_producer: os_prod,
                 oversample: OversampleFactor::Off,
-                requested_cpu: None,
+                cpu_receipt: common::deterministic_cpu_receipt(),
                 // Fail-fast under the deterministic harness (see pw_integration).
                 fail_fast: true,
                 gate_config: cli::GateConfig::default_on(),
@@ -444,7 +444,8 @@ fn disk_writer_loop_fails_fast_on_missing_output_dir() {
 
     let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&missing);
-    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
+    let handle =
+        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a missing output dir must fail the startup handshake");
@@ -485,7 +486,8 @@ fn disk_writer_loop_fails_fast_on_file_as_output_dir() {
 
     let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&file_dir);
-    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
+    let handle =
+        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a file-as-dir must fail the startup handshake");

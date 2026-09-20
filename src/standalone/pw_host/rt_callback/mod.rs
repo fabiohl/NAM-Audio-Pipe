@@ -23,14 +23,16 @@ mod resampler_swap;
 #[cfg(feature = "testing")]
 pub mod harness;
 
-pub use cabsim_swap::drain_cabsims;
+pub use cabsim_swap::{CabSimSwapDrain, cabsim_swap_drain, drain_cabsims};
 pub use commands::{
-    drain_os_engines, drain_slimmable_models, receive_commands, try_slimmable_rebuild,
+    OsSwapDrain, STRUCTURAL_SWAPS_PER_CALLBACK, SlimmableSwapDrain, drain_os_engines,
+    drain_slimmable_models, os_swap_drain, receive_commands, slimmable_swap_drain,
+    try_slimmable_rebuild,
 };
 pub use process::process_dsp_buffer;
 pub(crate) use process::{handle_spa_pair_fail_closed, silence_available_datas};
 pub use rate_sync::sync_rate;
-pub use resampler_swap::drain_resamplers;
+pub use resampler_swap::{ResamplerSwapDrain, drain_resamplers, resampler_swap_drain};
 
 /// RT fatal flag raised when a panic is captured inside an RT callback closure.
 ///

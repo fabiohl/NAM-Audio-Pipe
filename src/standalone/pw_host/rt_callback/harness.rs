@@ -43,21 +43,22 @@
 use crate::standalone::cli::GateConfig;
 use crate::standalone::pw_host::capture::state::CaptureState;
 use crate::standalone::pw_host::rt_callback::{
-    drain_cabsims, drain_os_engines, drain_resamplers, drain_slimmable_models, receive_commands,
-    sync_rate, try_slimmable_rebuild,
+    STRUCTURAL_SWAPS_PER_CALLBACK, cabsim_swap_drain, drain_cabsims, drain_os_engines,
+    drain_resamplers, drain_slimmable_models, os_swap_drain, receive_commands,
+    resampler_swap_drain, slimmable_swap_drain, sync_rate, try_slimmable_rebuild,
 };
 use crate::standalone::rt_setup::compute_gain_multipliers;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
     CabSimSwapPayload, GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags,
-    SlimModelPair, setup_spsc,
+    RtSwapDrain, SlimModelPair, SwapBudget, setup_spsc,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeBuffer, BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspBuffers,
-    DspPipelineContext, MAX_RESAMP_BUF, capture_dsp_pipeline_streaming,
+    BridgeBuffer, BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspPipelineContext,
+    MAX_RESAMP_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -237,7 +238,7 @@ impl SwapProducer {
             .rt_status
             .requested_rate_generation
             .load(Ordering::Acquire);
-        let resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
+        let resampler = Box::new(NamResampler::new_simple(host_rate, nam_rate)?);
         let stream = Box::new(StreamingResampleBuffer::new(
             host_rate,
             nam_rate,
@@ -277,14 +278,12 @@ impl SwapProducer {
 /// consumers and the GC cascade — exclusively owned by the audio thread.
 pub struct SwapRtSide {
     /// The complete RT mutable state (models, resampler, OS, cab-sim, gains,
-    /// gate, hysteresis, adaptive, deferred slots, working buffers).
+    /// gate, hysteresis, adaptive, engine swap drains, working buffers).
     pub state: CaptureState,
     param_consumer: Consumer<ParamPayload>,
     gc_producer: Producer<GcItem>,
     gc_consumer: Consumer<GcItem>,
     gc_overflow: Arc<GcOverflowBuffer>,
-    resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
-    cabsim_consumer: Consumer<Box<CabSimSwapPayload>>,
     parking_lot: [Option<GcItem>; 16],
     parking_lot_dirty: AtomicBool,
     rt_status: Arc<RtStatusFlags>,
@@ -331,39 +330,43 @@ impl SwapRtSide {
             }
         }
 
-        // 2. Command budgeting: shared structural budget.
-        let mut structural_applied = 0usize;
+        // 2. Command budgeting: shared structural budget (engine `SwapBudget`).
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
         // 3. Budgeted drains in production order.
         drain_resamplers(
-            &mut self.resampler_consumer,
-            &mut self.state.deferred_resampler,
-            &mut structural_applied,
+            self.state
+                .resampler_drain
+                .as_mut()
+                .expect("resampler drain wired in the harness constructor"),
+            &mut budget,
             &mut self.state.resampler,
             &mut self.state.stream,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
 
         drain_cabsims(
-            &mut self.cabsim_consumer,
-            &mut self.state.deferred_cabsim,
-            &mut structural_applied,
+            self.state
+                .cabsim_drain
+                .as_mut()
+                .expect("cabsim drain wired in the harness constructor"),
+            &mut budget,
             &mut self.state.active_cabsim,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
 
         let (param_changed, _param_pops) = receive_commands(
             &mut self.param_consumer,
             &mut self.state.deferred_model,
-            &mut structural_applied,
+            &mut budget,
             &mut self.state.model_input_mult_adj,
             &mut self.state.model_output_mult_adj,
             &mut self.state.current_nam_rate,
@@ -386,29 +389,27 @@ impl SwapRtSide {
         try_slimmable_rebuild(&mut self.state.adaptive_compute, &rt_status);
 
         drain_slimmable_models(
-            &mut self.state.slimmable_rx,
-            &mut self.state.deferred_slimmable,
-            &mut structural_applied,
+            &mut self.state.slimmable_drain,
+            &mut budget,
             &mut self.state.active_model_l,
             &mut self.state.active_model_r,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
 
         drain_os_engines(
-            &mut self.state.os_rx,
-            &mut self.state.deferred_os,
-            &mut structural_applied,
+            &mut self.state.os_drain,
+            &mut budget,
             &mut self.state.os_l,
             &mut self.state.os_r,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
 
         // 4. Rate synchronization.
@@ -499,45 +500,66 @@ impl SwapRtSide {
             }
         }
 
-        // 2. Command budgeting: shared structural budget.
-        let mut structural_applied = 0usize;
+        // 2. Command budgeting: shared structural budget (engine `SwapBudget`).
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
         // 3. Budgeted drains in production order. Ring-pop accounting is
-        //    captured through queue-occupancy deltas (single-threaded read of
-        //    the consumers within the quantum).
-        let resamp_before = self.resampler_consumer.slots();
+        //    captured through engine-drain ring-occupancy deltas
+        //    (`RtSwapDrain::ring_occupied`) — single-threaded reads within
+        //    the quantum.
+        let resamp_before = self
+            .state
+            .resampler_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
         drain_resamplers(
-            &mut self.resampler_consumer,
-            &mut self.state.deferred_resampler,
-            &mut structural_applied,
+            self.state
+                .resampler_drain
+                .as_mut()
+                .expect("resampler drain wired in the harness constructor"),
+            &mut budget,
             &mut self.state.resampler,
             &mut self.state.stream,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
-        let resamp_after = self.resampler_consumer.slots();
+        let resamp_after = self
+            .state
+            .resampler_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
 
-        let cabsim_before = self.cabsim_consumer.slots();
+        let cabsim_before = self
+            .state
+            .cabsim_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
         drain_cabsims(
-            &mut self.cabsim_consumer,
-            &mut self.state.deferred_cabsim,
-            &mut structural_applied,
+            self.state
+                .cabsim_drain
+                .as_mut()
+                .expect("cabsim drain wired in the harness constructor"),
+            &mut budget,
             &mut self.state.active_cabsim,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
-        let cabsim_after = self.cabsim_consumer.slots();
+        let cabsim_after = self
+            .state
+            .cabsim_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
 
         let (param_changed, param_pops) = receive_commands(
             &mut self.param_consumer,
             &mut self.state.deferred_model,
-            &mut structural_applied,
+            &mut budget,
             &mut self.state.model_input_mult_adj,
             &mut self.state.model_output_mult_adj,
             &mut self.state.current_nam_rate,
@@ -559,35 +581,53 @@ impl SwapRtSide {
 
         try_slimmable_rebuild(&mut self.state.adaptive_compute, &rt_status);
 
-        let slimmable_before = self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots);
+        let slimmable_before = self
+            .state
+            .slimmable_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
         drain_slimmable_models(
-            &mut self.state.slimmable_rx,
-            &mut self.state.deferred_slimmable,
-            &mut structural_applied,
+            &mut self.state.slimmable_drain,
+            &mut budget,
             &mut self.state.active_model_l,
             &mut self.state.active_model_r,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
-        let slimmable_after = self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots);
+        let slimmable_after = self
+            .state
+            .slimmable_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
 
-        let os_before = self.state.os_rx.as_ref().map_or(0, Consumer::slots);
+        let os_before = self
+            .state
+            .os_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
         drain_os_engines(
-            &mut self.state.os_rx,
-            &mut self.state.deferred_os,
-            &mut structural_applied,
+            &mut self.state.os_drain,
+            &mut budget,
             &mut self.state.os_l,
             &mut self.state.os_r,
+            &rt_status,
             &mut self.gc_producer,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
             &self.gc_overflow,
-            &rt_status,
         );
-        let os_after = self.state.os_rx.as_ref().map_or(0, Consumer::slots);
+        let os_after = self
+            .state
+            .os_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
+
+        // Structural-applied accounting straight from the engine budget
+        // (shared across all five drains of this quantum).
+        let budget_used = budget.used();
 
         // 4. Rate synchronization.
         let current_host_rate = sync_rate(
@@ -635,7 +675,7 @@ impl SwapRtSide {
                 self.last_n_pw = 0;
                 return CallbackAccounting {
                     n_pw: 0,
-                    structural_applied,
+                    structural_applied: budget_used,
                     param_pops,
                     structural_pops: resamp_before
                         .saturating_sub(resamp_after)
@@ -654,7 +694,7 @@ impl SwapRtSide {
 
         CallbackAccounting {
             n_pw,
-            structural_applied,
+            structural_applied: budget_used,
             param_pops,
             structural_pops: resamp_before
                 .saturating_sub(resamp_after)
@@ -700,13 +740,9 @@ impl SwapRtSide {
             conv: None,
             conv_pair,
         };
-        let bufs = DspBuffers {
-            resamp_mid_l: &mut *self.state.resamp_mid_l,
-            resamp_mid_r: &mut *self.state.resamp_mid_r,
+        let bufs = StreamingDspBuffers {
             resamp_out_l: &mut *self.state.resamp_out_l,
             resamp_out_r: &mut *self.state.resamp_out_r,
-            model_out_l: &mut *self.state.model_out_l,
-            model_out_r: &mut *self.state.model_out_r,
             os_in_l: &mut *self.state.os_in_l,
             os_in_r: &mut *self.state.os_in_r,
             os_model_l: &mut *self.state.os_model_l,
@@ -791,19 +827,43 @@ impl SwapRtSide {
     /// the RT callback has not yet finished absorbing the current burst.
     pub fn commands_pending(&self) -> bool {
         !self.param_consumer.is_empty()
-            || !self.resampler_consumer.is_empty()
-            || !self.cabsim_consumer.is_empty()
             || self
                 .state
-                .slimmable_rx
+                .resampler_drain
                 .as_ref()
-                .is_some_and(|c| !c.is_empty())
-            || self.state.os_rx.as_ref().is_some_and(|c| !c.is_empty())
-            || self.state.deferred_resampler.is_some()
-            || self.state.deferred_cabsim.is_some()
+                .is_some_and(|d| !d.is_empty())
+            || self
+                .state
+                .cabsim_drain
+                .as_ref()
+                .is_some_and(|d| !d.is_empty())
+            || self
+                .state
+                .slimmable_drain
+                .as_ref()
+                .is_some_and(|d| !d.is_empty())
+            || self.state.os_drain.as_ref().is_some_and(|d| !d.is_empty())
             || self.state.deferred_model.is_some()
-            || self.state.deferred_slimmable.is_some()
-            || self.state.deferred_os.is_some()
+            || self
+                .state
+                .resampler_drain
+                .as_ref()
+                .is_some_and(RtSwapDrain::has_deferred)
+            || self
+                .state
+                .cabsim_drain
+                .as_ref()
+                .is_some_and(RtSwapDrain::has_deferred)
+            || self
+                .state
+                .slimmable_drain
+                .as_ref()
+                .is_some_and(RtSwapDrain::has_deferred)
+            || self
+                .state
+                .os_drain
+                .as_ref()
+                .is_some_and(RtSwapDrain::has_deferred)
             || self.parking_lot_dirty.load(Ordering::Acquire)
     }
 
@@ -812,15 +872,51 @@ impl SwapRtSide {
     /// plus the parking-lot dirty latch.
     pub fn commands_pending_count(&self) -> usize {
         self.param_consumer.slots()
-            + self.resampler_consumer.slots()
-            + self.cabsim_consumer.slots()
-            + self.state.slimmable_rx.as_ref().map_or(0, Consumer::slots)
-            + self.state.os_rx.as_ref().map_or(0, Consumer::slots)
-            + usize::from(self.state.deferred_resampler.is_some())
-            + usize::from(self.state.deferred_cabsim.is_some())
+            + self
+                .state
+                .resampler_drain
+                .as_ref()
+                .map_or(0, RtSwapDrain::ring_occupied)
+            + self
+                .state
+                .cabsim_drain
+                .as_ref()
+                .map_or(0, RtSwapDrain::ring_occupied)
+            + self
+                .state
+                .slimmable_drain
+                .as_ref()
+                .map_or(0, RtSwapDrain::ring_occupied)
+            + self
+                .state
+                .os_drain
+                .as_ref()
+                .map_or(0, RtSwapDrain::ring_occupied)
             + usize::from(self.state.deferred_model.is_some())
-            + usize::from(self.state.deferred_slimmable.is_some())
-            + usize::from(self.state.deferred_os.is_some())
+            + usize::from(
+                self.state
+                    .resampler_drain
+                    .as_ref()
+                    .is_some_and(RtSwapDrain::has_deferred),
+            )
+            + usize::from(
+                self.state
+                    .cabsim_drain
+                    .as_ref()
+                    .is_some_and(RtSwapDrain::has_deferred),
+            )
+            + usize::from(
+                self.state
+                    .slimmable_drain
+                    .as_ref()
+                    .is_some_and(RtSwapDrain::has_deferred),
+            )
+            + usize::from(
+                self.state
+                    .os_drain
+                    .as_ref()
+                    .is_some_and(RtSwapDrain::has_deferred),
+            )
             + usize::from(self.parking_lot_dirty.load(Ordering::Acquire))
     }
 
@@ -909,13 +1005,16 @@ impl RtSwapHarness {
     ) -> anyhow::Result<Self> {
         let sys = SystemSnapshot::capture();
         let mut state = CaptureState::init(&sys, OversampleFactor::Off, gate_config);
-        state.resampler = Box::new(NamResampler::new(host_rate, nam_rate, 2048)?);
+        state.resampler = Box::new(NamResampler::new_simple(host_rate, nam_rate)?);
         state.current_nam_rate = nam_rate;
         state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
 
         let spsc = setup_spsc(neural_amp_modeler_rs::common::spsc::SPSC_CAPACITY);
-        state.slimmable_rx = Some(spsc.slimmable_consumer);
-        state.os_rx = Some(spsc.os_consumer);
+        // T9.5: the dedicated swap channels live inside the engine `RtSwapDrain`s.
+        state.resampler_drain = Some(resampler_swap_drain(spsc.resampler_consumer));
+        state.cabsim_drain = Some(cabsim_swap_drain(spsc.cabsim_consumer));
+        state.slimmable_drain = Some(slimmable_swap_drain(spsc.slimmable_consumer));
+        state.os_drain = Some(os_swap_drain(spsc.os_consumer));
 
         let bridge = Box::new(DspBridge {
             buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
@@ -943,8 +1042,6 @@ impl RtSwapHarness {
             gc_producer: spsc.gc_producer,
             gc_consumer: spsc.gc_consumer,
             gc_overflow: spsc.gc_overflow,
-            resampler_consumer: spsc.resampler_consumer,
-            cabsim_consumer: spsc.cabsim_consumer,
             parking_lot: Default::default(),
             parking_lot_dirty: AtomicBool::new(false),
             rt_status: spsc.rt_status,

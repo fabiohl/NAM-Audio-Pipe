@@ -68,7 +68,7 @@ mod tests {
     use std::sync::atomic::AtomicU32;
 
     fn make_resampler(pw: u32, nam: u32) -> NamResampler {
-        NamResampler::new(pw, nam, 64).unwrap()
+        NamResampler::new_simple(pw, nam).unwrap()
     }
 
     #[test]

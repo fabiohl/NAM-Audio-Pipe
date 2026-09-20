@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! COMMAND RECEPTION (SPSC Channel)
+//! COMMAND RECEPTION (SPSC Channel) — engine `RtSwapDrain` integration.
 //! Processes commands from the command-line interface or control system (volume, model, noise gate).
 //!
 //! # Command Budgeting
@@ -20,6 +20,25 @@
 //!   `RT_STATUS_PARAM_QUEUE_BACKLOG` flag records the occurrence for the main
 //!   thread (telemetry only; no command is ever lost).
 //!
+//! # T9.5 (F-PERF-20) — canonical structural-swap scheduler
+//!
+//! The hand-rolled 3-phase protocol previously duplicated here (and in the
+//! resampler/cabsim/slimmable/OS drains) was migrated to the engine's
+//! canonical scheduler (`NeuralAmpModeler-rs/common/spsc/swap.rs`):
+//!
+//! - The four dedicated boxed channels (`Consumer<Box<P>>` for resampler /
+//!   cab-sim / slimmable / oversample) instantiate [`RtSwapDrain`] directly
+//!   with per-family [`RtSwapHandler`]s — the ring types match `SwapRing`
+//!   exactly, so no reimplementation remains.
+//! - The mixed `Consumer<ParamPayload>` ring adopts the contract: this module
+//!   implements the canonical 3-phase protocol verbatim (Phase 0
+//!   deferred-resolution → Phase 1 bounded drain with latest-wins coalescing →
+//!   Phase 2 budgeted apply-or-park), preserving the historical tuning (1
+//!   structural swap/callback shared budget, 16-pop scalar window, backlog
+//!   flag). Contract adoption (not direct instantiation) because `ParamPayload`
+//!   is carried unboxed — wrapping pops into `Box` would allocate on the RT
+//!   path.
+//!
 //! ## Empirical Composite Bound
 //!
 //! Measured under continuous simultaneous saturation across all 5 RT drains
@@ -30,9 +49,9 @@
 //! is safe without requiring an additional global shared drain budget.
 
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, GcOverflowBuffer, ParamPayload, RT_STATUS_NEEDS_OS_REBUILD,
+    GcItem, GcOverflowBuffer, GcSink, ParamPayload, RT_STATUS_NEEDS_OS_REBUILD,
     RT_STATUS_PARAM_QUEUE_BACKLOG, RT_STATUS_STRUCTURAL_DEFERRED, RT_STATUS_STRUCTURAL_SUPERSEDED,
-    RtStatusFlags, SlimModelPair, gc_cascade,
+    RtStatusFlags, RtSwapDrain, RtSwapHandler, SlimModelPair, SwapBudget, SwapTunables,
 };
 use neural_amp_modeler_rs::dsp::adaptive::{AdaptiveCompute, SlimOverride};
 use neural_amp_modeler_rs::dsp::gate::GateParams;
@@ -60,13 +79,50 @@ pub const STRUCTURAL_POPS_PER_CALLBACK: usize = 8;
 /// and flagged via `RT_STATUS_PARAM_QUEUE_BACKLOG`.
 pub const MAX_PARAM_BUDGET: usize = 16;
 
+/// Raises `RT_STATUS_STRUCTURAL_DEFERRED` (+ monotonic counter, `Relaxed`) —
+/// pipe-side mirror of the engine scheduler's internal `flag_deferred`.
+#[inline(always)]
+fn flag_structural_deferred(rt_status: &RtStatusFlags) {
+    rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
+    rt_status
+        .structural_deferred_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Raises `RT_STATUS_STRUCTURAL_SUPERSEDED` (+ monotonic counter, `Relaxed`) —
+/// pipe-side mirror of the engine scheduler's internal `flag_superseded`.
+#[inline(always)]
+fn flag_structural_superseded(rt_status: &RtStatusFlags) {
+    rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
+    rt_status
+        .structural_superseded_total
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// [`SwapTunables`] for the four dedicated structural swap drains
+/// (resampler, cab-sim, slimmable, oversample): historical NAM-Audio-Pipe
+/// tuning preserved through the T9.5 migration (1 shared swap/callback,
+/// 8-pop coalescing window, no backlog flag — the pop-cap truncation flag
+/// reports saturation instead).
+pub(crate) const fn structural_swap_tunables() -> SwapTunables {
+    SwapTunables {
+        pops_per_callback: STRUCTURAL_POPS_PER_CALLBACK,
+        swaps_per_callback: STRUCTURAL_SWAPS_PER_CALLBACK,
+        backlog_flag: false,
+    }
+}
+
 /// COMMAND RECEPTION (SPSC Channel)
 /// Processes commands from the command-line interface or control system (volume, model, noise gate).
 ///
-/// Runs under the [`MAX_PARAM_BUDGET`] drain budget: scalar parameters are
-/// coalesced latest-wins inside the budget, `LoadModel` structural swaps obey
-/// the shared [`STRUCTURAL_SWAPS_PER_CALLBACK`] budget and park in `deferred`
-/// when exhausted, and a non-empty channel after the budget raises
+/// T9.5 contract adoption of the engine's canonical 3-phase protocol
+/// ([`RtSwapDrain`], adopted verbatim; see the module docs): scalar parameters
+/// are coalesced latest-wins inside the [`MAX_PARAM_BUDGET`] window (handler
+/// side — the canonical "handler owns scalar-coalescing policy" pattern, with
+/// the flush after the drain), `LoadModel` structural swaps obey the shared
+/// [`STRUCTURAL_SWAPS_PER_CALLBACK`] budget and park in `deferred` when
+/// exhausted (the budget-exhausted structural head stays queued — FIFO
+/// intact), and a non-empty channel after the budget raises
 /// `RT_STATUS_PARAM_QUEUE_BACKLOG`.
 ///
 /// Returns `(param_changed, pops)` — the coalesced-parameter signal plus the
@@ -79,7 +135,7 @@ pub const MAX_PARAM_BUDGET: usize = 16;
 pub fn receive_commands(
     consumer: &mut rtrb::Consumer<ParamPayload>,
     deferred: &mut Option<ParamPayload>,
-    structural_applied: &mut usize,
+    budget: &mut SwapBudget,
     model_input_mult_adj: &mut f32,
     model_output_mult_adj: &mut f32,
     current_nam_rate: &mut u32,
@@ -98,25 +154,35 @@ pub fn receive_commands(
     lut: &neural_amp_modeler_rs::math::dsp::gain_lut::GainLUT,
     adaptive: &mut AdaptiveCompute,
 ) -> (bool, usize) {
+    // Handler-side coalescing locals (canonical "handler owns scalar-coalescing
+    // policy" pattern; flushed after the drain).
+    let mut pending_input_gain: Option<f32> = None;
+    let mut pending_output_gain: Option<f32> = None;
+    let mut pending_gate: Option<GateParams> = None;
+    let mut pending_slim_override: Option<SlimOverride> = None;
     let mut param_changed = false;
+
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow_for_process,
+        rt_status: rt_status_for_process,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
 
     // Phase 0 — resolve a `LoadModel` deferred by the previous callback. It is
     // causally before everything still in the ring, so it applies first; a
     // newer `LoadModel` already queued supersedes it (latest-wins coalescing).
+    // `LoadModel` carries no request generation — it is never stale.
     if let Some(payload) = deferred.take() {
-        let queued_newer = consumer
+        let head_same_key = consumer
             .peek()
             .is_ok_and(|head| matches!(head, ParamPayload::LoadModel { .. }));
-        if queued_newer {
-            discard_load_model(
-                payload,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-        } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
+        if head_same_key {
+            // A newer same-key command is already queued (latest-wins): the
+            // parked command is obsolete and cascades to GC.
+            discard_load_model(payload, &mut gc, rt_status_for_process);
+        } else if budget.can_apply() {
             install_load_model(
                 payload,
                 model_input_mult_adj,
@@ -124,75 +190,122 @@ pub fn receive_commands(
                 current_nam_rate,
                 active_model_l,
                 active_model_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
+                &mut gc,
                 rt_status_for_process,
                 adaptive,
             );
-            *structural_applied += 1;
+            budget.consume();
             param_changed = true;
         } else {
-            // Budget already exhausted by an earlier drain in this callback and
-            // no newer model queued: re-park for the next callback.
+            // Budget exhausted and nothing newer queued: re-park.
             *deferred = Some(payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
+            flag_structural_deferred(rt_status_for_process);
         }
     }
 
-    // Phase 1 — bounded drain with latest-wins coalescing. Scalars accumulate
-    // into pending locals (only the last value of each is applied); structural
-    // `LoadModel` payloads are collapsed to a single candidate.
-    let mut pending_input_gain: Option<f32> = None;
-    let mut pending_output_gain: Option<f32> = None;
-    let mut pending_gate: Option<GateParams> = None;
-    let mut pending_slim_override: Option<SlimOverride> = None;
-    let mut pending_model: Option<ParamPayload> = None;
+    // Phase 1 — bounded drain with latest-wins coalescing (canonical
+    // `bounded_drain` for the mixed ring): light scalars install inline into
+    // handler locals (never parked), `LoadModel` payloads collapse into the
+    // single window candidate (same-key coalescing is free and proceeds even
+    // when the budget is exhausted). The budget-exhausted structural head
+    // stays queued (FIFO intact) and the drain stops — everything behind it is
+    // causally after it.
+    let mut candidate: Option<ParamPayload> = None;
     let mut pops = 0usize;
     while pops < MAX_PARAM_BUDGET {
-        let Some(payload) = consumer.pop().ok() else {
+        // Classify the head without detaching it from the ring (rtrb peek is
+        // `Result`-based; the ring is never empty-mid-loop for a parked
+        // payload — an unresolvable structural head stays queued).
+        let Ok(head) = consumer.peek() else {
             break;
         };
-        pops += 1;
-        match payload {
-            ParamPayload::LoadModel { .. } => {
-                if let Some(older) = pending_model.replace(payload) {
-                    // An intermediate `LoadModel` is obsolete — its boxes are
-                    // discarded to the GC cascade (coalescing, latest-wins).
-                    discard_load_model(
-                        older,
-                        gc_producer,
-                        parking_lot,
-                        parking_lot_dirty,
-                        gc_overflow_for_process,
-                        rt_status_for_process,
-                    );
+        if !matches!(head, ParamPayload::LoadModel { .. }) {
+            // Light scalar: applies inline, never parked, never coalesced by
+            // the scheduler.
+            if let Ok(payload) = consumer.pop() {
+                pops += 1;
+                match payload {
+                    ParamPayload::InputGain(mult) => pending_input_gain = Some(mult),
+                    ParamPayload::OutputGain(mult) => pending_output_gain = Some(mult),
+                    ParamPayload::GateConfig(params) => pending_gate = Some(params),
+                    ParamPayload::SlimOverride(ov) => pending_slim_override = Some(ov),
+                    // Lightweight request (atomics only): the actual engine
+                    // swap is budgeted when the delivered engines are drained
+                    // in `drain_os_engines`. Latest value wins by overwrite.
+                    ParamPayload::SetOversample(factor) => {
+                        rt_status_for_process
+                            .requested_os_factor
+                            .store(factor.to_f32() as u32, Ordering::Relaxed);
+                        rt_status_for_process
+                            .requested_os_generation
+                            .fetch_add(1, Ordering::Release);
+                        rt_status_for_process.set_flag_release(RT_STATUS_NEEDS_OS_REBUILD);
+                    }
+                    ParamPayload::LoadModel { .. } => unreachable!("classified above"),
                 }
             }
-            ParamPayload::InputGain(mult) => pending_input_gain = Some(mult),
-            ParamPayload::OutputGain(mult) => pending_output_gain = Some(mult),
-            ParamPayload::GateConfig(params) => pending_gate = Some(params),
-            ParamPayload::SlimOverride(ov) => pending_slim_override = Some(ov),
-            // Lightweight request (atomics only): the actual engine swap is
-            // budgeted when the delivered engines are drained in
-            // `drain_os_engines`. Latest value wins by overwrite.
-            ParamPayload::SetOversample(factor) => {
-                rt_status_for_process
-                    .requested_os_factor
-                    .store(factor.to_f32() as u32, Ordering::Relaxed);
-                rt_status_for_process
-                    .requested_os_generation
-                    .fetch_add(1, Ordering::Release);
-                rt_status_for_process.set_flag_release(RT_STATUS_NEEDS_OS_REBUILD);
+            continue;
+        }
+        // Structural: same-key coalescing happens even when the budget is
+        // exhausted (free coalescing — no budget, no slot).
+        if candidate.is_some() {
+            if let Ok(payload) = consumer.pop() {
+                pops += 1;
+                // An intermediate current `LoadModel` is obsolete — its boxes
+                // are discarded to the GC cascade (latest-wins).
+                if let Some(older) = candidate.replace(payload) {
+                    discard_load_model(older, &mut gc, rt_status_for_process);
+                }
             }
+            continue;
+        }
+        if !budget.can_apply() {
+            // Budget exhausted with a structural at the head: it is deferred
+            // (stays queued, FIFO intact) and the drain stops.
+            flag_structural_deferred(rt_status_for_process);
+            break;
+        }
+        // Budget available: pop and make this payload the single candidate.
+        // (The canonical flush-install arm for a pending different-key
+        // candidate is unreachable in this single-key family — structurally
+        // faithful rather than special-cased away.)
+        if let Ok(payload) = consumer.pop() {
+            pops += 1;
+            candidate = Some(payload);
         }
     }
 
-    // Apply the coalesced scalar parameters (latest-wins).
+    // End-of-drain telemetry: the channel still held commands after the fixed
+    // budget — the remainder is drained by the next callback.
+    if !consumer.is_empty() {
+        rt_status_for_process.set_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
+    }
+
+    // Phase 2 — resolve the window candidate under the shared budget; a
+    // budget-exhausted candidate parks in the deferred slot for the next
+    // callback (latest-wins against anything queued behind it).
+    if let Some(payload) = candidate {
+        if budget.can_apply() {
+            install_load_model(
+                payload,
+                model_input_mult_adj,
+                model_output_mult_adj,
+                current_nam_rate,
+                active_model_l,
+                active_model_r,
+                &mut gc,
+                rt_status_for_process,
+                adaptive,
+            );
+            budget.consume();
+            param_changed = true;
+        } else {
+            *deferred = Some(payload);
+            flag_structural_deferred(rt_status_for_process);
+        }
+    }
+
+    // after_drain — apply the coalesced scalar parameters (latest-wins).
     if let Some(mult) = pending_input_gain {
         *user_input_gain_mult = mult;
         param_changed = true;
@@ -210,57 +323,6 @@ pub fn receive_commands(
     }
     if let Some(ov) = pending_slim_override {
         adaptive.set_slim_override(ov);
-    }
-
-    // Apply the single coalesced structural command under the shared budget.
-    if let Some(payload) = pending_model {
-        if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_load_model(
-                payload,
-                model_input_mult_adj,
-                model_output_mult_adj,
-                current_nam_rate,
-                active_model_l,
-                active_model_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-                adaptive,
-            );
-            *structural_applied += 1;
-            param_changed = true;
-        } else if deferred.is_none() {
-            *deferred = Some(payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // The deferred slot holds an older model; the popped one is newer
-            // — supersede the parked command and park this one (latest-wins).
-            let older = deferred.take().expect("slot occupied, checked above");
-            discard_load_model(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            *deferred = Some(payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    // Backlog telemetry: the channel still held commands after the fixed
-    // budget — the remainder is drained by the next callback.
-    if !consumer.is_empty() {
-        rt_status_for_process.set_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
     }
 
     (param_changed, pops)
@@ -281,10 +343,7 @@ fn install_load_model(
     current_nam_rate: &mut u32,
     active_model_l: &mut Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
     active_model_r: &mut Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
+    gc: &mut GcSink<'_>,
     rt_status_for_process: &Arc<RtStatusFlags>,
     adaptive: &mut AdaptiveCompute,
 ) {
@@ -328,14 +387,7 @@ fn install_load_model(
 
     for m_opt in &mut old_models {
         if let Some(m) = m_opt.take() {
-            parking_lot_dirty.store(true, Ordering::Release);
-            gc_cascade(
-                Some(GcItem::Model(m)),
-                gc_producer,
-                parking_lot,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
+            gc.retire(GcItem::Model(m));
         }
     }
 }
@@ -346,10 +398,7 @@ fn install_load_model(
 #[cold]
 fn discard_load_model(
     payload: ParamPayload,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
+    gc: &mut GcSink<'_>,
     rt_status_for_process: &Arc<RtStatusFlags>,
 ) {
     let ParamPayload::LoadModel {
@@ -359,19 +408,9 @@ fn discard_load_model(
         unreachable!("only LoadModel reaches discard_load_model");
     };
     for model in [model_l, model_r].into_iter().flatten() {
-        parking_lot_dirty.store(true, Ordering::Release);
-        gc_cascade(
-            Some(GcItem::Model(model)),
-            gc_producer,
-            parking_lot,
-            gc_overflow_for_process,
-            rt_status_for_process,
-        );
+        gc.retire(GcItem::Model(model));
     }
-    rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-    rt_status_for_process
-        .structural_superseded_total
-        .fetch_add(1, Ordering::Relaxed);
+    flag_structural_superseded(rt_status_for_process);
 }
 
 /// Signals the main thread to rebuild WaveNet models with a reduced channel count.
@@ -396,439 +435,251 @@ pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatu
         .set_flag_release(neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
 }
 
-/// Drains slimmable-rebuilt model pairs delivered by the main thread via SPSC.
+/// Dedicated slimmable swap ring drained by [`RtSwapDrain`].
+pub type SlimmableSwapRing = Consumer<Box<SlimModelPair>>;
+/// Engine drain owning the slimmable ring and the deferred slot.
+pub type SlimmableSwapDrain = RtSwapDrain<SlimmableSwapRing>;
+
+/// [`RtSwapHandler`] binding the engine scheduler to the slimmable family.
 ///
-/// Each [`SlimModelPair`] is consumed with a single `pop()` and both channels
-/// are swapped in the same logical block — an all-or-nothing transaction.
-/// Stale pairs (built for an older rebuild generation) are discarded to the GC
-/// cascade without touching the active models, so L/R can never belong to
-/// different generations or channel counts.
-///
-/// Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
-/// structural swap applies per callback (shared budget); current-generation
-/// pairs in the coalescing window collapse to the latest one (intermediate
-/// pairs discarded to GC) and the excess is parked in `deferred` for the next
-/// callback.
+/// All payloads are structural (each pair swaps both active model channels in
+/// one all-or-nothing transaction under the shared budget). Latest-wins
+/// identity is the rebuild generation; the staleness guard compares it with
+/// `requested_slimmable_generation` — a stale pair (built for an older rebuild
+/// generation) is discarded to the GC cascade without touching the active
+/// models, so L/R can never belong to different generations or channel counts.
+pub(crate) struct SlimmableSwapHandler<'a> {
+    active_model_l: &'a mut Option<Box<StaticModel>>,
+    active_model_r: &'a mut Option<Box<StaticModel>>,
+    rt_status: &'a RtStatusFlags,
+}
+
+impl RtSwapHandler for SlimmableSwapHandler<'_> {
+    type Payload = SlimModelPair;
+
+    #[inline]
+    fn is_structural(&self, _payload: &Self::Payload) -> bool {
+        true
+    }
+
+    #[inline]
+    fn coalesce_key(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[inline]
+    fn current_generation(&self) -> Option<u64> {
+        Some(
+            self.rt_status
+                .requested_slimmable_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[inline]
+    fn generation_of(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[cold]
+    fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        install_pair(payload, self.active_model_l, self.active_model_r, gc);
+    }
+
+    #[cold]
+    fn discard(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        discard_pair_whole(payload, gc);
+    }
+}
+
+/// Drains slimmable-rebuilt model pairs delivered by the main thread via SPSC
+/// (engine canonical 3-phase protocol).
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
 pub fn drain_slimmable_models(
-    slimmable_rx: &mut Option<Consumer<Box<SlimModelPair>>>,
-    deferred: &mut Option<Box<SlimModelPair>>,
-    structural_applied: &mut usize,
+    drain: &mut Option<SlimmableSwapDrain>,
+    budget: &mut SwapBudget,
     active_model_l: &mut Option<Box<StaticModel>>,
     active_model_r: &mut Option<Box<StaticModel>>,
+    rt_status: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow: &GcOverflowBuffer,
-    rt_status: &RtStatusFlags,
 ) {
-    let Some(rx) = slimmable_rx.as_mut() else {
+    let Some(drain) = drain.as_mut() else {
         return;
     };
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow,
+        rt_status,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = SlimmableSwapHandler {
+        active_model_l,
+        active_model_r,
+        rt_status,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
 
-    // Phase 0 — resolve a pair deferred by the previous callback.
-    if let Some(pending) = deferred.take() {
-        let current_gen = rt_status
-            .requested_slimmable_generation
-            .load(Ordering::Acquire);
-        let head_is_current = rx.peek().is_ok_and(|head| head.generation == current_gen);
-        if pending.generation != current_gen {
-            // Stale while parked: discard whole to GC — never installed.
-            discard_pair_whole(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-        } else if head_is_current {
-            // A newer same-generation pair is already queued (latest-wins).
-            discard_pair_whole(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_pair(
-                pending,
-                active_model_l,
-                active_model_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            *structural_applied += 1;
-        } else {
-            // Budget exhausted and nothing newer queued: re-park.
-            *deferred = Some(pending);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    // Phase 1 — bounded drain with coalescing.
-    let current_gen = rt_status
-        .requested_slimmable_generation
-        .load(Ordering::Acquire);
-    let mut candidate: Option<Box<SlimModelPair>> = None;
-    let mut pops = 0usize;
-    while pops < STRUCTURAL_POPS_PER_CALLBACK {
-        let Some(pair) = rx.pop().ok() else {
-            break;
-        };
-        pops += 1;
-        if pair.generation != current_gen {
-            // Stale-rebuild guard: the pair is obsolete and is discarded whole
-            // to the GC cascade.
-            discard_pair_whole(
-                pair,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            continue;
-        }
-        if let Some(older) = candidate.replace(pair) {
-            // Coalescing: an intermediate current-generation pair is obsolete.
-            discard_pair_whole(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if let Some(pair) = candidate {
-        if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_pair(
-                pair,
-                active_model_l,
-                active_model_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            *structural_applied += 1;
-        } else if deferred.is_none() {
-            *deferred = Some(pair);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // The deferred slot holds an older pair; the popped one is newer
-            // — supersede the parked pair and park this one (latest-wins).
-            let older = deferred.take().expect("slot occupied, checked above");
-            discard_pair_whole(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-            *deferred = Some(pair);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// Builds the drain for a fresh (re)connection, preserving the historical
+/// tuning (1 structural swap/callback shared budget, 8-pop window).
+pub fn slimmable_swap_drain(ring: SlimmableSwapRing) -> SlimmableSwapDrain {
+    RtSwapDrain::new(ring, structural_swap_tunables())
 }
 
 /// Atomically swaps both active model channels from a pair: the previous L and
 /// R models (if any) are swapped into the envelope and cascade to GC as a single
 /// moved `Box<SlimModelPair>`.
-#[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
-)]
+#[cold]
 fn install_pair(
     mut pair: Box<SlimModelPair>,
     active_model_l: &mut Option<Box<StaticModel>>,
     active_model_r: &mut Option<Box<StaticModel>>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow: &GcOverflowBuffer,
-    rt_status: &RtStatusFlags,
+    gc: &mut GcSink<'_>,
 ) {
     std::mem::swap(&mut pair.l, active_model_l);
     if pair.r.is_some() {
         std::mem::swap(&mut pair.r, active_model_r);
     }
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::SlimModelPair(pair)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
+    gc.retire(GcItem::SlimModelPair(pair));
 }
 
 /// Discards a whole pair to the GC cascade as a single moved `Box<SlimModelPair>`
 /// — never applied.
-#[inline(always)]
-fn discard_pair_whole(
-    pair: Box<SlimModelPair>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow: &GcOverflowBuffer,
-    rt_status: &RtStatusFlags,
-) {
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::SlimModelPair(pair)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
+#[cold]
+fn discard_pair_whole(pair: Box<SlimModelPair>, gc: &mut GcSink<'_>) {
+    gc.retire(GcItem::SlimModelPair(pair));
 }
 
-/// Drains oversampling engines delivered by the main thread via SPSC.
-/// Swaps both L and R engines and sends the obsolete envelope to the GC cascade.
+/// Dedicated oversample swap ring drained by [`RtSwapDrain`].
+pub type OsSwapRing = Consumer<Box<OsEnginePair>>;
+/// Engine drain owning the oversample ring and the deferred slot.
+pub type OsSwapDrain = RtSwapDrain<OsSwapRing>;
+
+/// [`RtSwapHandler`] binding the engine scheduler to the oversample family.
 ///
-/// Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
-/// structural swap applies per callback (shared budget); engine pairs in the
-/// coalescing window collapse to the latest one and the excess is parked in
-/// `deferred` for the next callback.
+/// All payloads are structural (each pair swaps both L and R engines under the
+/// shared budget). Latest-wins identity is the rebuild generation; the
+/// staleness guard compares it with `requested_os_generation` — a stale pair
+/// (a newer oversample change superseded it before delivery) cascades to GC
+/// without touching the active engines.
+pub(crate) struct OsSwapHandler<'a> {
+    os_l: &'a mut Box<OversampleEngine>,
+    os_r: &'a mut Box<OversampleEngine>,
+    rt_status: &'a RtStatusFlags,
+}
+
+impl RtSwapHandler for OsSwapHandler<'_> {
+    type Payload = OsEnginePair;
+
+    #[inline]
+    fn is_structural(&self, _payload: &Self::Payload) -> bool {
+        true
+    }
+
+    #[inline]
+    fn coalesce_key(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[inline]
+    fn current_generation(&self) -> Option<u64> {
+        Some(
+            self.rt_status
+                .requested_os_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[inline]
+    fn generation_of(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[cold]
+    fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        install_os_pair(payload, self.os_l, self.os_r, gc, self.rt_status);
+    }
+
+    #[cold]
+    fn discard(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        discard_os_pair(payload, gc);
+    }
+}
+
+/// Drains oversampling engines delivered by the main thread via SPSC
+/// (engine canonical 3-phase protocol): swaps both L and R engines and sends
+/// the obsolete envelope to the GC cascade.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
 pub fn drain_os_engines(
-    os_rx: &mut Option<Consumer<Box<OsEnginePair>>>,
-    deferred: &mut Option<Box<OsEnginePair>>,
-    structural_applied: &mut usize,
+    drain: &mut Option<OsSwapDrain>,
+    budget: &mut SwapBudget,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
+    rt_status: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow: &GcOverflowBuffer,
-    rt_status: &RtStatusFlags,
 ) {
-    let Some(rx) = os_rx.as_mut() else {
+    let Some(drain) = drain.as_mut() else {
         return;
     };
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow,
+        rt_status,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = OsSwapHandler {
+        os_l,
+        os_r,
+        rt_status,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
 
-    let current_gen = rt_status.requested_os_generation.load(Ordering::Acquire);
-
-    // Phase 0 — resolve an engine pair deferred by the previous callback.
-    if let Some(pending) = deferred.take() {
-        if pending.generation != current_gen {
-            // Superseded while parked in the deferred slot: discard to GC cascade
-            // without applying or clearing the pending bit.
-            discard_os_pair(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-        } else if rx.peek().is_ok_and(|head| head.generation == current_gen) {
-            // A newer pair of the same generation is already queued (latest-wins):
-            // the deferred pair is obsolete and its envelope cascades to GC.
-            discard_os_pair(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_os_pair(
-                pending,
-                os_l,
-                os_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            *structural_applied += 1;
-        } else {
-            // Budget exhausted and nothing newer queued: re-park.
-            *deferred = Some(pending);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    // Phase 1 — bounded drain with coalescing and stale-generation filtering.
-    let mut candidate: Option<Box<OsEnginePair>> = None;
-    let mut pops = 0usize;
-    while pops < STRUCTURAL_POPS_PER_CALLBACK {
-        let Some(pair) = rx.pop().ok() else {
-            break;
-        };
-        pops += 1;
-        if pair.generation != current_gen {
-            // Stale rebuild guard: a newer oversample change superseded this
-            // pair before delivery. Cascade the entire envelope directly to GC
-            // without touching the active engines.
-            discard_os_pair(
-                pair,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            continue;
-        }
-        if let Some(older) = candidate.replace(pair) {
-            discard_os_pair(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if let Some(pair) = candidate {
-        if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_os_pair(
-                pair,
-                os_l,
-                os_r,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            *structural_applied += 1;
-        } else if deferred.is_none() {
-            *deferred = Some(pair);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // The deferred slot holds an older pair; the popped one is newer
-            // — supersede the parked pair and park this one (latest-wins).
-            let older = deferred.take().expect("slot occupied, checked above");
-            discard_os_pair(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow,
-                rt_status,
-            );
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-            *deferred = Some(pair);
-            rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// Builds the drain for a fresh (re)connection, preserving the historical
+/// tuning (1 structural swap/callback shared budget, 8-pop window).
+pub fn os_swap_drain(ring: OsSwapRing) -> OsSwapDrain {
+    RtSwapDrain::new(ring, structural_swap_tunables())
 }
 
 /// Swaps both active OS engines into the envelope and cascades the replaced pair to GC.
-#[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
-)]
+#[cold]
 fn install_os_pair(
     mut pair: Box<OsEnginePair>,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow: &GcOverflowBuffer,
+    gc: &mut GcSink<'_>,
     rt_status: &RtStatusFlags,
 ) {
+    // Applied generation is recorded BEFORE the engines swap (Release) so the
+    // main thread never observes a half-applied generation.
     rt_status
         .applied_os_generation
         .store(pair.generation, Ordering::Release);
     std::mem::swap(&mut pair.l, os_l);
     std::mem::swap(&mut pair.r, os_r);
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::OsEnginePair(pair)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
+    gc.retire(GcItem::OsEnginePair(pair));
 }
 
 /// Discards an obsolete OS engine pair to the GC cascade as a single moved `Box<OsEnginePair>`.
-#[inline(always)]
-fn discard_os_pair(
-    pair: Box<OsEnginePair>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow: &GcOverflowBuffer,
-    rt_status: &RtStatusFlags,
-) {
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::OsEnginePair(pair)),
-        gc_producer,
-        parking_lot,
-        gc_overflow,
-        rt_status,
-    );
+#[cold]
+fn discard_os_pair(pair: Box<OsEnginePair>, gc: &mut GcSink<'_>) {
+    gc.retire(GcItem::OsEnginePair(pair));
 }
 
 #[cfg(test)]

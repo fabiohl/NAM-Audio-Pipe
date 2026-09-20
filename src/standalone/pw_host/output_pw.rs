@@ -55,8 +55,10 @@ pub struct PipewireHostConfig {
     pub os_producer: rtrb::Producer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     /// Initial oversampling factor for the neural stage.
     pub oversample: OversampleFactor,
-    /// Optional explicit CPU core index requested via CLI (`--cpu`).
-    pub requested_cpu: Option<usize>,
+    /// Pre-computed CPU selection receipt (`--cpu` already resolved by the
+    /// caller). Carries the selected RT core for `configure_realtime_thread`
+    /// and the housekeeping set applied to the thread-loop thread (T9.1).
+    pub cpu_receipt: crate::standalone::rt_setup::affinity::CpuSelectionReceipt,
     /// `--fail-fast` on the CLI: disables the bounded reconnect cycle —
     /// the first backend failure triggers observable teardown immediately.
     pub fail_fast: bool,

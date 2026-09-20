@@ -9,6 +9,11 @@
 //! Runs a deterministic, fixed DSP workload (the same cell configuration across
 //! every measured binary) in a tight loop and retains, per run:
 //!
+//! * **Production capture path (T9.3/F-PERF-27):** the cell drives
+//!   [`capture_dsp_pipeline_streaming`] — the exact function the capture
+//!   `process()` callback uses in production — through the
+//!   `StreamingResampleBuffer` adapter, at the production quantum (256 frames).
+//!   The retired block-wise `capture_dsp_pipeline` is never measured.
 //! * **Per-block cycles** (serialized `RDTSC`) — min/mean/p50/p99/p999/max in
 //!   cycles and nanoseconds. The **p99 and max** are the tail latency the
 //!   promotion rule is judged on.
@@ -55,10 +60,11 @@ use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
 use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeBuffer, DspBridge, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_RESAMP_BUF,
-    capture_dsp_pipeline,
+    BridgeBuffer, DspBridge, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF,
+    StreamingDspBuffers, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::loader::dispatcher::build_model;
 use neural_amp_modeler_rs::loader::nam_json::parse_nam_json;
 use neural_amp_modeler_rs::models::{NamModel, StaticModel};
@@ -72,7 +78,10 @@ const DEFAULT_RECEIPT_JSON: &str = "target/logs/ab-opt-receipt.json";
 const RECEIPT_ENV: &str = "NAM_AB_OPT_RECEIPT";
 
 const DEFAULT_RATE: u32 = 48_000;
-const DEFAULT_QUANTUM: usize = 64;
+/// Production capture quantum (PipeWire default in NAM-Audio-Pipe). T9.3: the
+/// bench must measure the same block size the audio thread runs at — a 64-frame
+/// quantum reports a different cost envelope than the deployed 256-frame one.
+const DEFAULT_QUANTUM: usize = 256;
 const DEFAULT_OS: &str = "Off";
 const DEFAULT_BLOCKS: u64 = 20_000;
 const DEFAULT_WARMUP: u64 = 2_000;
@@ -558,10 +567,20 @@ fn run_measured(
         }
     };
 
-    let mut resampler = NamResampler::new(rate, model_sr, quantum).unwrap_or_else(|e| {
+    let mut resampler = NamResampler::new_simple(rate, model_sr).unwrap_or_else(|e| {
         eprintln!("ab_opt_bench: FATAL: resampler {rate}→{model_sr} failed: {e}");
         std::process::exit(1);
     });
+    // T9.3: measure the production pipeline exactly — the capture callback
+    // drives the neural stage through the streaming resampler adapter
+    // (`capture_dsp_pipeline_streaming`), never the retired block-wise
+    // `capture_dsp_pipeline`. The buffer mirrors `CaptureState::init`
+    // (`StreamingResampleBuffer::new(host_rate, model_rate, MAX_RESAMP_BUF)`).
+    let mut stream_resample = StreamingResampleBuffer::new(rate, model_sr, MAX_RESAMP_BUF)
+        .unwrap_or_else(|e| {
+            eprintln!("ab_opt_bench: FATAL: streaming resampler {rate}→{model_sr} failed: {e}");
+            std::process::exit(1);
+        });
     let target_rate = model_sr.max(rate);
     let mut conv = if cabsim_ir {
         Some(build_cabsim_pair(ir_path, target_rate, quantum))
@@ -583,23 +602,31 @@ fn run_measured(
         dropped_frames: AtomicU32::new(0),
     });
 
-    let mut resamp_mid_l = vec![0.0; MAX_RESAMP_BUF];
-    let mut resamp_mid_r = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_l = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_r = vec![0.0; MAX_RESAMP_BUF];
-    let mut model_out_l = vec![0.0; MAX_RESAMP_BUF];
-    let mut model_out_r = vec![0.0; MAX_RESAMP_BUF];
-    let mut os_buf: [f32; MAX_RESAMP_BUF * 6] = [0.0f32; MAX_RESAMP_BUF * 6];
-
-    let (mut os_l, mut os_r) = match os_mode {
-        MODE_OFF => (new_os(OversampleFactor::Off), new_os(OversampleFactor::Off)),
-        MODE_2X => (new_os(OversampleFactor::X2), new_os(OversampleFactor::X2)),
-        MODE_4X => (new_os(OversampleFactor::X4), new_os(OversampleFactor::X4)),
+    // T9.3: resolve the oversample factor before the scratch sizing and size
+    // the oversample scratch exactly like the engine requires
+    // (`required_scratch_len`, F-PERF-18 pattern) — the streaming pipeline
+    // never reads `resamp_mid_l/r` / `model_out_l/r`, so the bench stops
+    // allocating the dead 128 KiB intermediates (F-PERF-17).
+    let os_factor = match os_mode {
+        MODE_OFF => OversampleFactor::Off,
+        MODE_2X => OversampleFactor::X2,
+        MODE_4X => OversampleFactor::X4,
         other => {
             eprintln!("ab_opt_bench: FATAL: unknown oversampling mode {other:?}");
             std::process::exit(1);
         }
     };
+    let os_scratch_len = OversampleEngine::required_scratch_len(os_factor, MAX_RESAMP_BUF);
+    let mut os_in_l = vec![0.0f32; os_scratch_len];
+    let mut os_in_r = vec![0.0f32; os_scratch_len];
+    let mut os_model_l = vec![0.0f32; os_scratch_len];
+    let mut os_model_r = vec![0.0f32; os_scratch_len];
+    let mut xfd_l = vec![0.0f32; MAX_RESAMP_BUF];
+    let mut xfd_r = vec![0.0f32; MAX_RESAMP_BUF];
+
+    let (mut os_l, mut os_r) = (new_os(os_factor), new_os(os_factor));
 
     let threshold_open_sq = (-70.0f32).powf(10.0 / 20.0);
     let threshold_close_sq = (-80.0f32).powf(10.0 / 20.0);
@@ -647,29 +674,31 @@ fn run_measured(
             conv: None,
             conv_pair: conv.as_mut(),
         };
-        let (os_in_l_slice, rest) = os_buf.split_at_mut(MAX_RESAMP_BUF);
-        let (os_in_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let (os_model_l_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let (os_model_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let (xfd_l, xfd_r) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let bufs = DspBuffers {
-            resamp_mid_l: &mut resamp_mid_l,
-            resamp_mid_r: &mut resamp_mid_r,
+        // T9.4: streaming scratch set (`StreamingDspBuffers`) — the production
+        // capture path never reads `resamp_mid_l/r` / `model_out_l/r`
+        // (F-PERF-17), so the bench passes the 8-buffer streaming set and lets
+        // the engine's `Into<DspBuffers>` adapter zero-slice the intermediates.
+        let bufs = StreamingDspBuffers {
             resamp_out_l: &mut resamp_out_l,
             resamp_out_r: &mut resamp_out_r,
-            model_out_l: &mut model_out_l,
-            model_out_r: &mut model_out_r,
-            os_in_l: os_in_l_slice,
-            os_in_r: os_in_r_slice,
-            os_model_l: os_model_l_slice,
-            os_model_r: os_model_r_slice,
-            crossfade_scratch_l: xfd_l,
-            crossfade_scratch_r: xfd_r,
+            os_in_l: &mut os_in_l,
+            os_in_r: &mut os_in_r,
+            os_model_l: &mut os_model_l,
+            os_model_r: &mut os_model_r,
+            crossfade_scratch_l: &mut xfd_l,
+            crossfade_scratch_r: &mut xfd_r,
         };
 
         let t0 = rdtsc_cycles();
-        let n_pw =
-            capture_dsp_pipeline(&mut samples_l, &mut samples_r, quantum, ctx, bufs, model_sr);
+        let n_pw = capture_dsp_pipeline_streaming(
+            &mut samples_l,
+            &mut samples_r,
+            quantum,
+            ctx,
+            &mut stream_resample,
+            bufs,
+            model_sr,
+        );
         let t1 = rdtsc_cycles();
         black_box(&samples_l);
         black_box(&samples_r);

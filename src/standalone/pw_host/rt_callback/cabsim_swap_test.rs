@@ -1,31 +1,40 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+use super::super::STRUCTURAL_SWAPS_PER_CALLBACK;
 use super::*;
+use neural_amp_modeler_rs::common::spsc::{
+    RT_STATUS_STRUCTURAL_DEFERRED, RT_STATUS_STRUCTURAL_SUPERSEDED, SwapBudget,
+};
 use std::assert_matches;
+
+/// T9.5: these tests exercise the engine's canonical `RtSwapDrain` through the
+/// NAM-Audio-Pipe handler wiring (`drain_cabsims`). The protocol semantics are
+/// the engine scheduler's (verified by its own oracle tests); this suite
+/// validates the family-specific handler (install/discard/GC), the shared
+/// `SwapBudget` accounting and the tuning constants.
 
 #[test]
 fn empty_consumer_no_change_and_clean_lot() {
-    let (_prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (_prod, cons) = rtrb::RingBuffer::new(4);
     let mut active = None;
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut drain = cabsim_swap_drain(cons);
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(active.is_none());
@@ -35,7 +44,7 @@ fn empty_consumer_no_change_and_clean_lot() {
 
 #[test]
 fn swap_clears_active_and_sets_dirty() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
     let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -44,8 +53,7 @@ fn swap_clears_active_and_sets_dirty() {
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
     let req_gen = flags.requested_cabsim_generation.load(Ordering::Acquire);
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut drain = cabsim_swap_drain(cons);
 
     // Push None to bypass / clear cabsim
     prod.push(Box::new(CabSimSwapPayload {
@@ -54,16 +62,16 @@ fn swap_clears_active_and_sets_dirty() {
     }))
     .unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(active.is_none());
@@ -80,7 +88,7 @@ fn swap_clears_active_and_sets_dirty() {
 
 #[test]
 fn swap_replaces_active_and_gcs_retired_pair() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
     let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -96,22 +104,21 @@ fn swap_replaces_active_and_gcs_retired_pair() {
     }))
     .unwrap();
 
-    let mut structural_applied = 0usize;
-    let mut deferred: Option<Box<CabSimSwapPayload>> = None;
+    let mut drain = cabsim_swap_drain(cons);
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
-    assert_eq!(structural_applied, 1);
-    assert!(deferred.is_none());
+    assert_eq!(budget.used(), 1);
+    assert!(!drain.has_deferred());
     let installed = active.as_ref().unwrap();
     assert_eq!(installed.partition_size(), 128);
     assert_eq!(
@@ -131,7 +138,7 @@ fn swap_replaces_active_and_gcs_retired_pair() {
 
 #[test]
 fn stale_generation_is_discarded_to_gc_without_applying() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
     let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -151,23 +158,22 @@ fn stale_generation_is_discarded_to_gc_without_applying() {
     }))
     .unwrap();
 
-    let mut structural_applied = 0usize;
-    let mut deferred: Option<Box<CabSimSwapPayload>> = None;
+    let mut drain = cabsim_swap_drain(cons);
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     // Stale payload is not counted against structural budget
-    assert_eq!(structural_applied, 0);
-    assert!(deferred.is_none());
+    assert_eq!(budget.used(), 0);
+    assert!(!drain.has_deferred());
     // Active cab-sim is preserved
     let installed = active.as_ref().unwrap();
     assert_eq!(installed.partition_size(), 64);
@@ -184,7 +190,7 @@ fn stale_generation_is_discarded_to_gc_without_applying() {
 /// commands are coalesced to the GC cascade — the latest command wins.
 #[test]
 fn budget_applies_one_and_coalesces_backlog_latest_wins() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
     let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
@@ -212,30 +218,26 @@ fn budget_applies_one_and_coalesces_backlog_latest_wins() {
     }))
     .unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut drain = cabsim_swap_drain(cons);
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(
         active.is_none(),
         "the latest command (bypass) must win over the queued pairs"
     );
-    assert_eq!(
-        structural_applied, 1,
-        "at most one structural swap per callback"
-    );
-    assert!(deferred.is_none());
-    assert!(cons.is_empty());
+    assert_eq!(budget.used(), 1, "at most one structural swap per callback");
+    assert!(!drain.has_deferred());
+    assert!(drain.is_empty());
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
     // GC: 2 superseded payloads + the replaced active payload = 3 moved Boxes.
@@ -247,11 +249,12 @@ fn budget_applies_one_and_coalesces_backlog_latest_wins() {
     assert_eq!(pairs, 3);
 }
 
-/// When the shared structural budget is exhausted, the cab-sim command is
-/// parked and applied by the next callback (fresh budget).
+/// When the shared structural budget is exhausted, the cab-sim head stays
+/// owned by the ring (FIFO intact — canonical Phase 1) and the drain stops;
+/// the next callback (fresh budget) resolves it.
 #[test]
 fn budget_exhausted_parks_command_resolved_next_callback() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let ir = [1.0f32, 0.5, 0.25];
     let mut active = Some(Box::new(make_pair(&ir, 64, 48000)));
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::new(8);
@@ -267,43 +270,47 @@ fn budget_exhausted_parks_command_resolved_next_callback() {
     }))
     .unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 1usize; // another swap applied earlier
+    let mut drain = cabsim_swap_drain(cons);
+    // Simulate a shared budget already consumed by an earlier drain.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(
         active.as_ref().unwrap().partition_size(),
         64,
         "not installed"
     );
-    assert!(deferred.is_some(), "command must be parked");
+    // Canonical semantics: the head stays queued (zero-loss, FIFO intact) —
+    // no payload is detached into the deferred slot.
+    assert!(!drain.has_deferred());
+    assert_eq!(drain.ring_occupied(), 1);
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
 
-    // Next callback: fresh budget → the parked pair is installed.
-    structural_applied = 0;
+    // Next callback: fresh budget → the queued pair is installed.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(active.as_ref().unwrap().partition_size(), 128);
     assert_eq!(active.as_ref().unwrap().sample_rate, 96000);
-    assert!(deferred.is_none());
+    assert!(!drain.has_deferred());
+    assert!(drain.is_empty());
 }
 
 #[cfg(all(test, feature = "heap-audit"))]
@@ -321,10 +328,8 @@ mod heap_audit_tests {
     /// channel contents are prepared *before* the `TrackingGuard` starts.
     struct DrainHarness {
         prod: rtrb::Producer<Box<CabSimSwapPayload>>,
-        cons: Consumer<Box<CabSimSwapPayload>>,
+        drain: CabSimSwapDrain,
         active: Option<Box<CabSimPair>>,
-        deferred: Option<Box<CabSimSwapPayload>>,
-        structural_applied: usize,
         gc_p: rtrb::Producer<GcItem>,
         gc_c: rtrb::Consumer<GcItem>,
         parking_lot: [Option<GcItem>; 16],
@@ -344,10 +349,8 @@ mod heap_audit_tests {
             let (gc_p, gc_c) = rtrb::RingBuffer::new(gc_cap);
             Self {
                 prod,
-                cons,
+                drain: cabsim_swap_drain(cons),
                 active,
-                deferred: None,
-                structural_applied: 0,
                 gc_p,
                 gc_c,
                 parking_lot: Default::default(),
@@ -379,16 +382,16 @@ mod heap_audit_tests {
         fn run_audited_drain(&mut self, label: &str) {
             let (allocs, deallocs, reallocs) = {
                 let _guard = TrackingGuard::new();
+                let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
                 drain_cabsims(
-                    &mut self.cons,
-                    &mut self.deferred,
-                    &mut self.structural_applied,
+                    &mut self.drain,
+                    &mut budget,
                     &mut self.active,
+                    &self.flags,
                     &mut self.gc_p,
                     &mut self.parking_lot,
                     &self.parking_lot_dirty,
                     &self.gc_overflow,
-                    &self.flags,
                 );
                 (get_alloc_count(), get_dealloc_count(), get_realloc_count())
             };

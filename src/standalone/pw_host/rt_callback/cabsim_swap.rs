@@ -1,197 +1,132 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Cab-sim Convolution Engine Draining (Zero-Alloc Swap)
-//! Replaces the active stereo-decoupled convolution pair without using memory
-//! allocation in the critical path.
+//! Cab-sim Convolution Engine Draining (Zero-Alloc Swap) — engine `RtSwapDrain`
+//! integration. Replaces the active stereo-decoupled convolution pair without
+//! using memory allocation in the critical path.
 //!
-//! Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
-//! structural swap applies per callback (budget shared across every RT swap
-//! drain); pairs in the coalescing window collapse to the latest one
-//! (intermediate pairs discarded to GC) and the excess is parked in the
-//! deferred slot for the next callback.
+//! T9.5 (F-PERF-20): the hand-rolled 3-phase protocol was migrated to the
+//! engine's canonical scheduler ([`RtSwapDrain`] + [`RtSwapHandler`]) for this
+//! dedicated `Consumer<Box<CabSimSwapPayload>>` channel — a direct
+//! instantiation, not a reimplementation. Only the cold handlers
+//! (`install_cabsim`/`discard_cabsim`) remain NAM-Audio-Pipe-specific.
+//!
+//! Budgeting: at most one structural swap applies per callback
+//! (`STRUCTURAL_SWAPS_PER_CALLBACK`, shared across every RT swap drain through
+//! the caller's `SwapBudget`); pairs in the coalescing window collapse to the
+//! latest one (intermediate pairs discarded to GC) and the excess stays queued
+//! / parked in the drain's deferred slot for the next callback. Tuning
+//! preserved: [`STRUCTURAL_POPS_PER_CALLBACK`] pops per callback.
 
-use super::commands::{STRUCTURAL_POPS_PER_CALLBACK, STRUCTURAL_SWAPS_PER_CALLBACK};
 use neural_amp_modeler_rs::common::spsc::{
-    CabSimSwapPayload, GcItem, GcOverflowBuffer, RT_STATUS_STRUCTURAL_DEFERRED,
-    RT_STATUS_STRUCTURAL_SUPERSEDED, RtStatusFlags, gc_cascade,
+    CabSimSwapPayload, GcItem, GcOverflowBuffer, GcSink, RtStatusFlags, RtSwapDrain, RtSwapHandler,
+    SwapBudget,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 
 use rtrb::Consumer;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically.
+/// Dedicated cab-sim swap ring drained by [`RtSwapDrain`].
+pub type CabSimSwapRing = Consumer<Box<CabSimSwapPayload>>;
+/// Engine drain owning the cab-sim ring and the deferred slot.
+pub type CabSimSwapDrain = RtSwapDrain<CabSimSwapRing>;
+
+/// [`RtSwapHandler`] binding the engine scheduler to the cab-sim family.
 ///
-/// Follows the same cascade pattern as `drain_resamplers`:
-/// GC channel → parking_lot → overflow buffer.
-///
-/// Envelopes (`CabSimSwapPayload`) carry a generation timestamp. A payload is
-/// installed only if its generation matches `requested_cabsim_generation`; stale
-/// payloads (from superseded rebuilds) cascade to GC without modifying `active_cabsim`
-/// or `applied_cabsim_generation`.
+/// All payloads are structural (each envelope swaps the active pair under the
+/// shared budget). Latest-wins identity is the build generation; the staleness
+/// guard compares it with `requested_cabsim_generation` — a stale payload
+/// (from a superseded rebuild) cascades to GC without modifying
+/// `active_cabsim` or `applied_cabsim_generation`.
+pub(crate) struct CabSimSwapHandler<'a> {
+    active_cabsim: &'a mut Option<Box<CabSimPair>>,
+    rt_status: &'a RtStatusFlags,
+}
+
+impl RtSwapHandler for CabSimSwapHandler<'_> {
+    type Payload = CabSimSwapPayload;
+
+    #[inline]
+    fn is_structural(&self, _payload: &Self::Payload) -> bool {
+        true
+    }
+
+    #[inline]
+    fn coalesce_key(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[inline]
+    fn current_generation(&self) -> Option<u64> {
+        Some(
+            self.rt_status
+                .requested_cabsim_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[inline]
+    fn generation_of(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[cold]
+    fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        install_cabsim(payload, self.active_cabsim, gc, self.rt_status);
+    }
+
+    #[cold]
+    fn discard(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        discard_cabsim(payload, gc);
+    }
+}
+
+/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically
+/// (engine canonical 3-phase protocol).
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
 pub fn drain_cabsims(
-    cabsim_consumer: &mut Consumer<Box<CabSimSwapPayload>>,
-    deferred: &mut Option<Box<CabSimSwapPayload>>,
-    structural_applied: &mut usize,
+    drain: &mut CabSimSwapDrain,
+    budget: &mut SwapBudget,
     active_cabsim: &mut Option<Box<CabSimPair>>,
+    rt_status_for_process: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
-    rt_status_for_process: &RtStatusFlags,
 ) {
-    let current_req_gen = rt_status_for_process
-        .requested_cabsim_generation
-        .load(Ordering::Acquire);
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow_for_process,
+        rt_status: rt_status_for_process,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = CabSimSwapHandler {
+        active_cabsim,
+        rt_status: rt_status_for_process,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
 
-    // Phase 0 — resolve a payload deferred by the previous callback.
-    if let Some(pending) = deferred.take() {
-        if pending.generation != current_req_gen {
-            // Stale deferred payload: generation changed while parked.
-            discard_cabsim(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-        } else {
-            let head_queued = cabsim_consumer.peek().is_ok();
-            if head_queued {
-                // A newer command is already queued (latest-wins): the deferred
-                // payload is obsolete and cascades to GC.
-                discard_cabsim(
-                    pending,
-                    gc_producer,
-                    parking_lot,
-                    parking_lot_dirty,
-                    gc_overflow_for_process,
-                    rt_status_for_process,
-                );
-                rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-                rt_status_for_process
-                    .structural_superseded_total
-                    .fetch_add(1, Ordering::Relaxed);
-            } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-                install_cabsim(
-                    pending,
-                    active_cabsim,
-                    gc_producer,
-                    parking_lot,
-                    parking_lot_dirty,
-                    gc_overflow_for_process,
-                    rt_status_for_process,
-                );
-                *structural_applied += 1;
-            } else {
-                // Budget exhausted and nothing newer queued: re-park.
-                *deferred = Some(pending);
-                rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-                rt_status_for_process
-                    .structural_deferred_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    // Phase 1 — bounded drain with coalescing.
-    let mut candidate: Option<Box<CabSimSwapPayload>> = None;
-    let mut pops = 0usize;
-    while pops < STRUCTURAL_POPS_PER_CALLBACK {
-        let Some(payload) = cabsim_consumer.pop().ok() else {
-            break;
-        };
-        pops += 1;
-        if payload.generation != current_req_gen {
-            // Stale envelope: generation changed while payload was in transit.
-            discard_cabsim(
-                payload,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            continue;
-        }
-        if let Some(older) = candidate.replace(payload) {
-            // Coalescing: an intermediate command is obsolete — its payload
-            // cascades to GC (latest-wins).
-            discard_cabsim(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status_for_process
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if let Some(new_payload) = candidate {
-        if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_cabsim(
-                new_payload,
-                active_cabsim,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            *structural_applied += 1;
-        } else if deferred.is_none() {
-            *deferred = Some(new_payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // The deferred slot holds an older command; the popped one is newer
-            // — supersede the parked command and park this one (latest-wins).
-            let older = deferred.take().expect("slot occupied, checked above");
-            discard_cabsim(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status_for_process
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-            *deferred = Some(new_payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// Builds the drain for a fresh (re)connection, preserving the historical
+/// tuning (1 structural swap/callback shared budget, 8-pop window).
+pub fn cabsim_swap_drain(ring: CabSimSwapRing) -> CabSimSwapDrain {
+    RtSwapDrain::new(ring, super::commands::structural_swap_tunables())
 }
 
 /// Installs a cab-sim command atomically: the active pair (or bypass) is
 /// swapped into the payload envelope, the applied generation counter is updated,
 /// and the retired envelope cascades to GC as a single moved `Box`.
-#[inline(always)]
+#[cold]
 fn install_cabsim(
     mut payload: Box<CabSimSwapPayload>,
     active_cabsim: &mut Option<Box<CabSimPair>>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
+    gc: &mut GcSink<'_>,
     rt_status_for_process: &RtStatusFlags,
 ) {
     std::mem::swap(&mut payload.pair, active_cabsim);
@@ -199,34 +134,13 @@ fn install_cabsim(
         .applied_cabsim_generation
         .store(payload.generation, Ordering::Release);
 
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::CabSimSwap(payload)),
-        gc_producer,
-        parking_lot,
-        gc_overflow_for_process,
-        rt_status_for_process,
-    );
+    gc.retire(GcItem::CabSimSwap(payload));
 }
 
 /// Discards an obsolete cab-sim command to the GC cascade as a single moved `Box`.
-#[inline(always)]
-fn discard_cabsim(
-    payload: Box<CabSimSwapPayload>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
-    rt_status_for_process: &RtStatusFlags,
-) {
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::CabSimSwap(payload)),
-        gc_producer,
-        parking_lot,
-        gc_overflow_for_process,
-        rt_status_for_process,
-    );
+#[cold]
+fn discard_cabsim(payload: Box<CabSimSwapPayload>, gc: &mut GcSink<'_>) {
+    gc.retire(GcItem::CabSimSwap(payload));
 }
 
 #[cfg(test)]

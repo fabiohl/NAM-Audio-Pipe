@@ -499,7 +499,10 @@ fn spawn_recording_worker_fails_fast_when_io_uring_unavailable() {
     let (mut init, init_rx, status, failed_flag) = test_recording_init(std::env::temp_dir());
     init.io_uring_probe = Some(|| IoUringSupport::KernelUnsupported);
 
-    let handle = spawn_recording_worker(receiver, None, init).expect("spawn must succeed");
+    // Empty housekeeping set = documented no-op (no affinity syscall under
+    // the test runner).
+    let handle =
+        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn must succeed");
 
     let err = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect_err("unavailable io_uring must fail the startup handshake");

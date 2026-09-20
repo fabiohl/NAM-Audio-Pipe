@@ -967,8 +967,8 @@ fn concurrent_workers_same_dir_atomic_creation_no_clobber() {
             scope.spawn(move || {
                 let (mut sender, receiver) = create_recording_transport();
                 let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
-                let handle =
-                    spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
+                let handle = spawn_recording_worker(receiver, None, init, Vec::new())
+                    .expect("spawn recording worker");
 
                 // Align all instances so the atomic create attempts collide in
                 // the same instant (same-second timestamps → suffix races).

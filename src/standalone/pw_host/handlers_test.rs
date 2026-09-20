@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
-use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, SlimModelPair};
+use crate::standalone::pw_host::rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK;
+use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, SlimModelPair, SwapBudget};
 use neural_amp_modeler_rs::loader;
 use neural_amp_modeler_rs::math::common::AlignedVec;
 use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
@@ -235,15 +236,13 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     let full = load_slimmable_full_model().expect("fixture model");
 
     let (mut sl_prod, sl_cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(4);
-    let mut sl_rx = Some(sl_cons);
+    let mut sl_drain = Some(crate::standalone::pw_host::rt_callback::slimmable_swap_drain(sl_cons));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
     let gc_overflow = GcOverflowBuffer::default();
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let mut model_l: Option<Box<StaticModel>> = Some(fake_wavenet(7));
     let mut model_r: Option<Box<StaticModel>> = Some(fake_wavenet(7));
-    let mut deferred_slimmable = None;
-    let mut structural_applied = 0usize;
     let mut failures = RebuildFailureTracker::default();
 
     // RT requests A (gen 1, ch 4); main builds and pushes pair A.
@@ -263,17 +262,17 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     request_slimmable_rebuild(&flags, 4);
 
     // RT drain: A (gen 1 < 2) is stale → discarded whole to GC, not installed.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut sl_rx,
-        &mut deferred_slimmable,
-        &mut structural_applied,
+        &mut sl_drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(
         model_l.as_ref().unwrap().channels(),
@@ -295,17 +294,17 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD));
 
     // RT drain: B matches the current generation → applied atomically.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut sl_rx,
-        &mut deferred_slimmable,
-        &mut structural_applied,
+        &mut sl_drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(model_l.as_ref().unwrap().channels(), 4);
     assert_eq!(
@@ -327,7 +326,7 @@ fn slimmable_full_protocol_discards_stale_applies_latest() {
 }
 
 fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
-    Box::new(NamResampler::new(pw, nam, 64).unwrap())
+    Box::new(NamResampler::new_simple(pw, nam).unwrap())
 }
 
 fn make_stream(
@@ -607,29 +606,30 @@ fn cabsim_full_protocol_installs_latest_and_gcs_retired_pair() {
     let sys = SystemSnapshot::capture();
     let ir: Vec<f32> = (0..128).map(|i| (-i as f32 / 32.0).exp()).collect();
 
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
     let gc_overflow = GcOverflowBuffer::default();
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
 
     let mut active = Some(Box::new(test_pair(&ir, 64, 48000)));
-    let mut deferred_cabsim = None;
-    let mut structural_applied = 0usize;
+    let mut cabsim_drain = Some(crate::standalone::pw_host::rt_callback::cabsim_swap_drain(
+        cons,
+    ));
 
     request_cabsim_rebuild(&flags, 64, 96000);
     handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(
-        &mut cons,
-        &mut deferred_cabsim,
-        &mut structural_applied,
+        cabsim_drain.as_mut().unwrap(),
+        &mut budget,
         &mut active,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     let installed = active.as_deref().expect("pair installed");
@@ -702,7 +702,7 @@ fn resampler_failure_preserves_newer_generation() {
     let _serial = RESAMPLER_FAULT_TEST_LOCK.lock().unwrap();
     let flags = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
-    let (mut prod, mut cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
 
     // RT publishes request A (generation 1) and the main thread starts
     // rebuilding it; the fault is armed for generation 1.
@@ -753,20 +753,19 @@ fn resampler_failure_preserves_newer_generation() {
     let gc_overflow = GcOverflowBuffer::default();
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut res_drain = Some(crate::standalone::pw_host::rt_callback::resampler_swap_drain(cons));
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        res_drain.as_mut().unwrap(),
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(
@@ -835,7 +834,8 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
 
     let flags = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut res_drain = Some(crate::standalone::pw_host::rt_callback::resampler_swap_drain(cons));
 
     // (1) RT requests A (gen 1); main delivers A (captured generation 1).
     request_rebuild(&flags, 44100, 48000);
@@ -856,20 +856,18 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
     let parking_lot_dirty = AtomicBool::new(false);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
-    let mut deferred_resampler = None;
-    let mut structural_applied = 0usize;
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred_resampler,
-        &mut structural_applied,
+        res_drain.as_mut().unwrap(),
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(
@@ -909,15 +907,15 @@ fn full_protocol_discards_stale_and_applies_latest() {
 
     let flags = RtStatusFlags::new();
     let sys = SystemSnapshot::capture();
-    let (mut res_prod, mut res_cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
+    let (mut res_prod, res_cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(4);
     let (mut gc_prod, mut gc_cons) = rtrb::RingBuffer::<GcItem>::new(8);
     let gc_overflow = GcOverflowBuffer::default();
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
     let parking_lot_dirty = AtomicBool::new(false);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
-    let mut deferred_resampler = None;
-    let mut structural_applied = 0usize;
+    let mut res_drain =
+        Some(crate::standalone::pw_host::rt_callback::resampler_swap_drain(res_cons));
 
     // RT requests A (gen 1).
     request_rebuild(&flags, 44100, 48000);
@@ -929,17 +927,17 @@ fn full_protocol_discards_stale_and_applies_latest() {
     request_rebuild(&flags, 96000, 48000);
 
     // RT drain: A is stale (1 < 2) → GC without unmute; PENDING stays set.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut res_cons,
-        &mut deferred_resampler,
-        &mut structural_applied,
+        res_drain.as_mut().unwrap(),
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(active.host_rate(), 48000);
     assert!(flags.check_flag(spsc::RT_STATUS_RESAMP_SWAP_PENDING));
@@ -949,17 +947,17 @@ fn full_protocol_discards_stale_and_applies_latest() {
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD));
 
     // RT drain: B matches → applied, generation recorded, unmuted.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut res_cons,
-        &mut deferred_resampler,
-        &mut structural_applied,
+        res_drain.as_mut().unwrap(),
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(active.host_rate(), 96000);
     assert_eq!(
@@ -1023,11 +1021,10 @@ fn lost_wakeup_stress_invariant() {
     let stop_rt = Arc::clone(&stop);
     let gc_overflow_rt = Arc::clone(&gc_overflow);
     let rt_worker = std::thread::spawn(move || {
-        let mut cons = res_cons;
+        let mut res_drain =
+            Some(crate::standalone::pw_host::rt_callback::resampler_swap_drain(res_cons));
         let mut active = make_rs(48000, 48000);
         let mut active_stream = make_stream(48000, 48000);
-        let mut deferred_resampler = None;
-        let mut structural_applied;
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
         let rate_for_process = std::sync::atomic::AtomicU32::new(0);
@@ -1035,9 +1032,6 @@ fn lost_wakeup_stress_invariant() {
         let mut i = 0usize;
 
         while !stop_rt.load(Ordering::Acquire) {
-            // Each loop iteration is one audio callback: the per-quantum
-            // structural budget resets to zero.
-            structural_applied = 0;
             // Host clock renegotiation: advertise the next rate whenever the
             // DSP has not yet caught up — an adversarial renegotiation storm.
             let rate = host_rates[i % host_rates.len()];
@@ -1046,17 +1040,19 @@ fn lost_wakeup_stress_invariant() {
             }
             sync_rate(&rate_for_process, &active, 48000, &flags_rt);
 
+            // Each loop iteration is one audio callback: the per-quantum
+            // structural budget resets to zero.
+            let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
             drain_resamplers(
-                &mut cons,
-                &mut deferred_resampler,
-                &mut structural_applied,
+                res_drain.as_mut().unwrap(),
+                &mut budget,
                 &mut active,
                 &mut active_stream,
+                &flags_rt,
                 &mut gc_prod,
                 &mut parking_lot,
                 &parking_lot_dirty,
                 &gc_overflow_rt,
-                &flags_rt,
             );
 
             // Mute invariant: unmuted ⇔ applied == requested; a muted callback
@@ -1129,7 +1125,7 @@ fn oversample_pair_built_stamped_and_pushed_atomically() {
     flags.requested_os_generation.store(7, Ordering::Release);
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
 
-    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures, MAX_RESAMP_BUF * 4);
 
     assert!(
         !flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
@@ -1198,7 +1194,7 @@ fn oversample_channel_full_keeps_flag_for_retry() {
     flags.requested_os_generation.store(1, Ordering::Release);
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
 
-    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures, MAX_RESAMP_BUF * 4);
 
     assert!(
         flags.check_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD),
@@ -1244,7 +1240,7 @@ fn oversample_build_failure_stops_retry_storm_until_newer_generation() {
 
     // N control-loop ticks with the same generation: exactly one build attempt.
     for _ in 0..16 {
-        handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+        handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures, MAX_RESAMP_BUF * 4);
     }
     assert_eq!(
         super::os_fault::attempts(&flags, 1),
@@ -1268,7 +1264,7 @@ fn oversample_build_failure_stops_retry_storm_until_newer_generation() {
     // (a path that today does not exist), the failed-generation latch must
     // suppress the rebuild rather than storm.
     flags.set_flag(spsc::RT_STATUS_NEEDS_OS_REBUILD);
-    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures, MAX_RESAMP_BUF * 4);
     assert_eq!(
         super::os_fault::attempts(&flags, 1),
         1,
@@ -1279,7 +1275,7 @@ fn oversample_build_failure_stops_retry_storm_until_newer_generation() {
     // more latch.
     super::os_fault::arm_fail(&flags, 2);
     request_os_rebuild(&flags, OversampleFactor::X4);
-    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures);
+    handle_oversample_rebuild(&flags, &sys, &mut prod, &mut failures, MAX_RESAMP_BUF * 4);
     assert_eq!(
         super::os_fault::attempts(&flags, 2),
         1,

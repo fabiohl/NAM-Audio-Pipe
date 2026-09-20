@@ -69,6 +69,10 @@ pub struct TelemetryLatches {
     pub slimmable_reset_failed: LatchedSignal,
     /// Digital clipping (`RT_STATUS_HAS_CLIPPED`).
     pub clipping: LatchedSignal,
+    /// Non-finite input containment (`RT_STATUS_NON_FINITE_INPUT_DETECTED`,
+    /// T9.4/F-PERF-16): the engine detected NaN/Inf entering the pipeline and
+    /// sanitized both the inputs and the delivered outputs.
+    pub non_finite_input: LatchedSignal,
     /// SPA format contract violation (`RT_STATUS_HOST_CONTRACT_VIOLATION`).
     pub contract_violation: LatchedSignal,
     /// DSP CPU overload counter (`dsp_overloads`).
@@ -258,6 +262,25 @@ pub fn poll_rt_status(
         );
     }
 
+    // 3.25 NON-FINITE INPUT CONTAINMENT (T9.4/F-PERF-16):
+    // The engine's energy/gain passes detected a NaN/Inf entering the
+    // pipeline (e.g. a buggy or malicious PipeWire client feeding corrupt
+    // floats) and sanitized the inputs in place; the output stage keeps
+    // sanitizing the delivered buffers while the flag is set, so no corrupted
+    // float escapes to the DAC or downstream mixer. Surfaced here because the
+    // RT callback is silent — the flag is sticky (never cleared by the
+    // engine), so the latch warns exactly once per session.
+    let non_finite_input = rt_status
+        .check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_NON_FINITE_INPUT_DETECTED);
+    if state.latches.non_finite_input.observe(non_finite_input) {
+        log::error!(
+            "[E2305 | NON_FINITE_INPUT_CONTAINED] Non-finite audio (NaN/Inf) detected on the \
+             capture path — inputs were sanitized and the output is being sanitized until the \
+             signal recovers (engine containment barrier). Check the PipeWire graph for a \
+             source emitting corrupt floats."
+        );
+    }
+
     // 3.5 HUGE PAGE STATUS:
     // Sync from mirror buffer global and log once.
     if !state.hugepage_synced {
@@ -278,8 +301,12 @@ pub fn poll_rt_status(
     }
 
     // 4. REAL-TIME PRIORITY & ATOMIC ERRORS:
-    // Reads error flags set atomically by configure_realtime_thread during stream
-    // state transition before readiness and emits the corresponding
+    // Reads error flags set atomically by configure_realtime_thread during the
+    // first quantum of the fresh RT data thread (see
+    // `rt_setup/thread.rs::configure_realtime_thread` for the T9.2 correction:
+    // PipeWire listeners dispatch on the thread-loop thread, so the first
+    // `process()` invocation is the only consumer-owned hook on the data
+    // thread) and emits the corresponding
     // diagnostic messages from the main thread. On full success, prints the classic
     // thread optimization confirmation.
 

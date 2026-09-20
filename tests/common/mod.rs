@@ -28,10 +28,35 @@ use nam_audio_pipe::recording::{
     RecordingInit, RecordingStatus, SharedRecordingStatus, spawn_recording_worker,
     wait_for_recording_init,
 };
+use nam_audio_pipe::standalone::rt_setup::affinity::{CpuSelectionReason, CpuSelectionReceipt};
 use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+/// Deterministic CPU selection receipt for integration tests: core 0 with a
+/// one-element housekeeping set, no topology scan. Only used to satisfy the
+/// [`PipewireHostConfig`] contract — integration harnesses never rely on the
+/// affinity telemetry.
+pub fn deterministic_cpu_receipt() -> CpuSelectionReceipt {
+    CpuSelectionReceipt {
+        selected_cpu: 0,
+        is_dedicated: false,
+        package_id: None,
+        core_id: None,
+        smt_siblings: vec![0],
+        is_isolated: false,
+        is_nohz_full: false,
+        reason: CpuSelectionReason::ConservativeHeuristic {
+            cpu: 0,
+            capacity: 1024,
+            irq_count: 0,
+            explanation: "deterministic integration harness receipt",
+        },
+        housekeeping_cpus: vec![0],
+        topology: Vec::new(),
+    }
+}
 
 /// Probes for a reachable PipeWire daemon via `pw-cli info 0`.
 ///
@@ -282,7 +307,8 @@ pub fn spawn_ready_worker(
     Arc<AtomicBool>,
 ) {
     let (init, init_rx, status, failed_flag) = recording_init_for(dir);
-    let handle = spawn_recording_worker(receiver, None, init).expect("spawn recording worker");
+    let handle =
+        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
     let ready_dir = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect("recording worker must confirm readiness via the startup handshake");
     assert_eq!(

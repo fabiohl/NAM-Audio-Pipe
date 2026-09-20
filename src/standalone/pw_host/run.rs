@@ -47,7 +47,7 @@ use pipewire as pw;
 /// - `resampler_consumer`: Dedicated channel for receiving pre-built resamplers
 ///   from the main thread — **zero allocations in the RT callback**.
 /// - `resampler_producer`: Producer of the resampler channel — the main thread
-///   builds `NamResampler::new().expect("construction should succeed for test-sized buffers")` here (allocation outside RT) and sends to the callback.
+///   builds `NamResampler::new_simple().expect("construction should succeed for test-sized buffers")` here (allocation outside RT) and sends to the callback.
 /// - `rt_status`: Atomic flags for silent RT→Main communication.
 /// - `recording_worker`: RAII custody of the recording I/O thread and its ring
 ///   producer. The guard keeps the worker alive across every early `?` return
@@ -105,7 +105,7 @@ pub fn run_pipewire_host(
         mut slimmable_producer,
         mut os_producer,
         oversample,
-        requested_cpu,
+        cpu_receipt,
         fail_fast,
         gate_config,
     } = config;
@@ -132,16 +132,24 @@ pub fn run_pipewire_host(
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
-    rt_state.slimmable_rx = Some(slimmable_consumer);
-    rt_state.os_rx = Some(os_consumer);
+    // T9.5: the four dedicated swap channels live inside the engine
+    // `RtSwapDrain`s (each owns its ring consumer and deferred slot); the
+    // mixed param ring stays in `RtHostChannels`.
+    rt_state.resampler_drain = Some(super::rt_callback::resampler_swap_drain(resampler_consumer));
+    rt_state.cabsim_drain = Some(super::rt_callback::cabsim_swap_drain(cabsim_consumer));
+    rt_state.slimmable_drain = Some(super::rt_callback::slimmable_swap_drain(slimmable_consumer));
+    rt_state.os_drain = Some(super::rt_callback::os_swap_drain(os_consumer));
+    // T9.4/F-PERF-18: the main-thread oversample rebuild handler gates runtime
+    // factor upgrades against the scratch capacity sized in `init` (the DSP
+    // state becomes RT-owned after this point — the length is captured here,
+    // before the raw-pointer handoff).
+    let os_scratch_len = rt_state.os_in_l.len();
     let state_ptr: *mut CaptureState = &raw mut *rt_state;
 
     let mut rt_channels = Box::new(RtHostChannels {
         param_consumer: consumer,
         gc_producer,
         gc_overflow: gc_overflow.clone(),
-        resampler_consumer,
-        cabsim_consumer,
     });
     let channels_ptr: *mut RtHostChannels = &raw mut *rt_channels;
 
@@ -184,10 +192,9 @@ pub fn run_pipewire_host(
         &raw const rt_parking_lot_dirty;
 
     // =========================================================
-    // 2. CORE OPTIMIZATION (CPU Affinity)
+    // 2. CORE OPTIMIZATION (CPU Affinity — receipt computed once by the caller)
     // =========================================================
-    let cpu_receipt = rt_setup::select_optimal_cpu_with_receipt(requested_cpu);
-    let target_cpu = cpu_receipt.as_ref().map_or(0, |r| r.selected_cpu);
+    let target_cpu = cpu_receipt.selected_cpu;
 
     // =========================================================
     // 3. PROTECTED CONFIGURATION SCOPE (RAII)
@@ -234,8 +241,13 @@ pub fn run_pipewire_host(
     // =========================================================
     'host: loop {
         // Each instance spawns a fresh PipeWire RT data thread: real-time
-        // setup (DAZ/FTZ, SCHED_FIFO, CPU affinity) must re-run during its
-        // `state_changed` transition before stream readiness.
+        // setup (DAZ/FTZ, SCHED_FIFO, CPU affinity) must re-run on that fresh
+        // thread during the first quantum of the new instance — the first
+        // `process()` invocation is the only consumer-owned hook on the data
+        // thread, because PipeWire's `state_changed`/`param_changed` listeners
+        // dispatch on the thread-loop (main-loop) thread, never on the data
+        // thread (verified against PipeWire 1.6.2; see
+        // `rt_setup/thread.rs::configure_realtime_thread`).
         // The previous instance (if any) already stopped its loop, so the main
         // thread is the sole owner of the DSP state here.
         rt_state.thread_configured = false;
@@ -368,14 +380,29 @@ pub fn run_pipewire_host(
         sys.emit_irq_advisory(target_cpu);
 
         // 4.2 RT THREAD START (Background)
+        //
+        // T9.1(c): pin the PipeWire thread-loop thread to the housekeeping set
+        // via a one-shot event source. The ThreadLoop runs its own internal
+        // thread that dispatches the cold-path listeners (`param_changed`,
+        // `state_changed`, proxy events) — scheduler noise on that thread must
+        // stay off the selected RT core, exactly like the main control-loop
+        // thread (T9.1(a)) and the recording worker (T9.1(b)). The event is
+        // signalled once right after `start()` so its callback executes on the
+        // thread-loop thread itself; an `eventfd` signal is cross-thread safe
+        // (the same mechanism `pipewire::channel` uses).
+        let housekeeping_for_thread_loop = cpu_receipt.housekeeping_cpus.clone();
+        let thread_loop_pin = thread_loop.loop_().add_event(move || {
+            let _ = rt_setup::apply_housekeeping_affinity(&housekeeping_for_thread_loop);
+        });
         thread_loop.start();
+        thread_loop_pin.signal();
 
         // =========================================================
         // 5. MAIN CONTROL LOOP (Main Thread, Non-RT)
         // =========================================================
         let mut was_silent = false;
         let mut was_fading = false;
-        let mut poll_state = rt_setup::PollState::with_cpu_receipt(cpu_receipt.clone());
+        let mut poll_state = rt_setup::PollState::with_cpu_receipt(Some(cpu_receipt.clone()));
         // Set when the control loop observes a fatal backend failure for this
         // instance. Drives either the bounded reconnect or the fail-fast
         // teardown + `Err` return below.
@@ -444,6 +471,7 @@ pub fn run_pipewire_host(
                 &sys,
                 &mut os_producer,
                 &mut rebuild_failures,
+                os_scratch_len,
             );
 
             (was_silent, was_fading) = rt_setup::poll_rt_status(

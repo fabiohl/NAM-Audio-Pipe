@@ -129,7 +129,24 @@ impl ThreadConfigurator for SystemThreadConfigurator {
 /// `rt_sched_err` / `rt_affinity_err`, no panic), now with log + graceful
 /// fallback semantics owned by the engine.
 ///
-/// Executed off the audio hot-path during PipeWire data-loop state transition before declaring readiness.
+/// Executed on the RT data thread, inside its **first** `process()` quantum
+/// (one-time, `#[cold]`). Sprint 9 (T9.2/F-PERF-26 correction): an earlier
+/// revision of this doc claimed the setup runs "during the PipeWire
+/// `state_changed` transition, off the hot path" — that claim is **wrong** for
+/// remote PipeWire client streams. Empirically verified against PipeWire 1.6.2
+/// (probe recording `gettid`/thread names per event) and confirmed by the
+/// PipeWire source (`client_node_command` → `pw_impl_node_set_state` →
+/// `start_node` → `spa_node_send_command`, all dispatched on the client's main
+/// loop): the `state_changed` (every transition, including Paused→Streaming)
+/// and `param_changed` listeners execute on the PipeWire **thread-loop**
+/// (main-loop) thread, while `process()` executes on a dedicated data thread
+/// ("data-loop.0"). Via `pipewire-rs`, the first `process()` invocation is the
+/// **only** consumer-owned hook on the RT data thread, so the one-time setup
+/// must stay there — moving it to `state_changed` would configure the wrong
+/// thread (regression). The setup cost is bounded, one-time and already hoisted
+/// off the RT path wherever the target is not the data thread
+/// (`configure_process_wide` runs in `main()`).
+///
 /// Applies:
 ///
 /// 1. **DAZ/FTZ** — Enables Denormals-Are-Zero and Flush-To-Zero in the MXCSR register
@@ -239,6 +256,100 @@ pub(crate) fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set
     }
 
     Some(cpuset)
+}
+
+/// Builds the `cpu_set_t` affinity mask covering every CPU in `housekeeping_cpus`.
+///
+/// Returns `None` when the set is empty (nothing to apply — callers treat this
+/// as a documented no-op used by tests) or when any index falls outside the
+/// `[0, CPU_SETSIZE)` range supported by `pthread_setaffinity_np`.
+pub(crate) fn build_housekeeping_affinity_mask(
+    housekeeping_cpus: &[usize],
+) -> Option<libc::cpu_set_t> {
+    if housekeeping_cpus.is_empty() {
+        return None;
+    }
+
+    // SAFETY: zero-initialized `cpu_set_t` is a fully valid empty C bitmask on
+    // the supported Linux targets (see `build_cpu_affinity_mask`).
+    let mut cpuset: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `CPU_ZERO`/`CPU_SET` only mutate the already-initialized bitmask
+    // in place; out-of-range CPUs are rejected by the bounds check below, so
+    // libc's bit index always stays within `cpu_set_t`'s `[u64; 16]` storage.
+    unsafe {
+        libc::CPU_ZERO(&mut cpuset);
+        for &cpu in housekeeping_cpus {
+            if cpu >= libc::CPU_SETSIZE as usize {
+                return None;
+            }
+            libc::CPU_SET(cpu, &mut cpuset);
+        }
+    }
+
+    Some(cpuset)
+}
+
+/// Pins the **current** thread to the housekeeping CPU set (Sprint 9, T9.1).
+///
+/// Housekeeping threads (the main control loop, the `nam-recording-io` worker
+/// and the PipeWire thread-loop thread) are pinned to every cpuset-allowed CPU
+/// *except* the selected RT core and its SMT siblings (the receipt's
+/// `housekeeping_cpus`), keeping scheduler noise,
+/// IRQ handling and I/O off the real-time core. This is the application side of
+/// the affinity receipt: the set is computed in
+/// [`super::affinity::select_optimal_cpu_with_receipt`] but — before T9.1 — was
+/// never applied to any thread.
+///
+/// An empty list is a documented no-op (`Ok(())` without syscalls) so tests can
+/// spawn workers without disturbing the test-runner scheduling. A kernel
+/// rejection is reported as `Err(errno)` and logged by the caller: unlike the
+/// RT-thread pinning, a housekeeping affinity failure is an optimization loss,
+/// not a correctness gate — the affected thread keeps running unpinned.
+pub fn apply_housekeeping_affinity(housekeeping_cpus: &[usize]) -> std::io::Result<()> {
+    let Some(cpuset) = build_housekeeping_affinity_mask(housekeeping_cpus) else {
+        return Ok(());
+    };
+
+    // SAFETY: `0` selects the calling thread; `cpuset` was built by
+    // `build_housekeeping_affinity_mask` with every index bounds-checked
+    // against `CPU_SETSIZE` and `size` is `size_of::<cpu_set_t>()` as the
+    // kernel requires.
+    let ret =
+        unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &cpuset) };
+    if ret != 0 {
+        let errno = std::io::Error::last_os_error();
+        log::error!(
+            "🧵 Housekeeping affinity FAILED for thread '{}' (tid={}): {errno} — \
+             continuing unpinned (non-fatal optimization loss).",
+            thread_name(),
+            current_tid(),
+        );
+        return Err(errno);
+    }
+
+    log::info!(
+        "🧵 Housekeeping affinity applied: thread '{}' (tid={}) pinned to {:?} — \
+         RT core excluded from scheduler noise (T9.1).",
+        thread_name(),
+        current_tid(),
+        housekeeping_cpus,
+    );
+    Ok(())
+}
+
+/// Current thread name for affinity logs (falls back to `<unnamed>`).
+fn thread_name() -> String {
+    std::thread::current()
+        .name()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "<unnamed>".to_owned())
+}
+
+/// Current kernel TID for affinity logs.
+fn current_tid() -> i32 {
+    // SAFETY: `gettid` has no preconditions and cannot fail.
+    unsafe { libc::gettid() }
 }
 
 /// Pins `thread_id` to `target_cpu` using `cfg`, recording the outcome atomically in

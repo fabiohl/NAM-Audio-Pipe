@@ -13,7 +13,7 @@ use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod}
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeRef, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_RESAMP_BUF,
+    BridgeRef, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF, StreamingDspBuffers,
 };
 
 use pipewire as pw;
@@ -204,40 +204,47 @@ pub fn setup_capture_stream<'c>(
 
                     // Command Budgeting: at most one structural swap (resampler,
                     // cab-sim, model pair, oversampling) applies per callback.
-                    // The counter is shared across every drain below; the excess
-                    // is parked in the per-channel deferred slots of `CaptureState`
-                    // and resolved at the start of the next callback.
-                    let mut structural_applied = 0usize;
+                    // The engine `SwapBudget` is shared across every drain
+                    // below; the excess is parked in the drains' deferred slots
+                    // (T9.5: owned by each `RtSwapDrain`) and resolved at the
+                    // start of the next callback.
+                    let mut budget = neural_amp_modeler_rs::common::spsc::SwapBudget::new(
+                        rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK,
+                    );
 
                     rt_callback::drain_resamplers(
-                        &mut channels.resampler_consumer,
-                        &mut state.deferred_resampler,
-                        &mut structural_applied,
+                        state
+                            .resampler_drain
+                            .as_mut()
+                            .expect("resampler drain wired in run_pipewire_host"),
+                        &mut budget,
                         &mut state.resampler,
                         &mut state.stream,
+                        &rt_status_for_process,
                         &mut channels.gc_producer,
                         parking_lot,
                         parking_lot_dirty,
                         &channels.gc_overflow,
-                        &rt_status_for_process,
                     );
 
                     rt_callback::drain_cabsims(
-                        &mut channels.cabsim_consumer,
-                        &mut state.deferred_cabsim,
-                        &mut structural_applied,
+                        state
+                            .cabsim_drain
+                            .as_mut()
+                            .expect("cabsim drain wired in run_pipewire_host"),
+                        &mut budget,
                         &mut state.active_cabsim,
+                        &rt_status_for_process,
                         &mut channels.gc_producer,
                         parking_lot,
                         parking_lot_dirty,
                         &channels.gc_overflow,
-                        &rt_status_for_process,
                     );
 
                     let (param_changed, _param_pops) = rt_callback::receive_commands(
                         &mut channels.param_consumer,
                         &mut state.deferred_model,
-                        &mut structural_applied,
+                        &mut budget,
                         &mut state.model_input_mult_adj,
                         &mut state.model_output_mult_adj,
                         &mut state.current_nam_rate,
@@ -263,29 +270,27 @@ pub fn setup_capture_stream<'c>(
                     );
 
                     rt_callback::drain_slimmable_models(
-                        &mut state.slimmable_rx,
-                        &mut state.deferred_slimmable,
-                        &mut structural_applied,
+                        &mut state.slimmable_drain,
+                        &mut budget,
                         &mut state.active_model_l,
                         &mut state.active_model_r,
+                        &rt_status_for_process,
                         &mut channels.gc_producer,
                         parking_lot,
                         parking_lot_dirty,
                         &channels.gc_overflow,
-                        &rt_status_for_process,
                     );
 
                     rt_callback::drain_os_engines(
-                        &mut state.os_rx,
-                        &mut state.deferred_os,
-                        &mut structural_applied,
+                        &mut state.os_drain,
+                        &mut budget,
                         &mut state.os_l,
                         &mut state.os_r,
+                        &rt_status_for_process,
                         &mut channels.gc_producer,
                         parking_lot,
                         parking_lot_dirty,
                         &channels.gc_overflow,
-                        &rt_status_for_process,
                     );
 
                     let current_host_rate = rt_callback::sync_rate(
@@ -367,17 +372,16 @@ pub fn setup_capture_stream<'c>(
                             conv_pair,
                         },
                         &mut state.stream,
-                        DspBuffers {
-                            resamp_mid_l: &mut *state.resamp_mid_l,
-                            resamp_mid_r: &mut *state.resamp_mid_r,
+                        // T9.4/F-PERF-17: streaming working set only — the
+                        // dead `resamp_mid_l/r` / `model_out_l/r` intermediates
+                        // no longer exist in `CaptureState` (128 KiB saved).
+                        StreamingDspBuffers {
                             resamp_out_l: &mut *state.resamp_out_l,
                             resamp_out_r: &mut *state.resamp_out_r,
-                            model_out_l: &mut *state.model_out_l,
-                            model_out_r: &mut *state.model_out_r,
-                            os_in_l: &mut *state.os_in_l,
-                            os_in_r: &mut *state.os_in_r,
-                            os_model_l: &mut *state.os_model_l,
-                            os_model_r: &mut *state.os_model_r,
+                            os_in_l: &mut state.os_in_l,
+                            os_in_r: &mut state.os_in_r,
+                            os_model_l: &mut state.os_model_l,
+                            os_model_r: &mut state.os_model_r,
                             crossfade_scratch_l: &mut *state.xfd_scratch_l,
                             crossfade_scratch_r: &mut *state.xfd_scratch_r,
                         },

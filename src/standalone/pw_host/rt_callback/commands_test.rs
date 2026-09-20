@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+use super::super::{cabsim_swap_drain, resampler_swap_drain};
 use super::*;
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
@@ -60,7 +61,7 @@ fn load_model_payload(
 fn run_receive_commands(
     consumer: &mut rtrb::Consumer<ParamPayload>,
     deferred: &mut Option<ParamPayload>,
-    structural_applied: &mut usize,
+    budget: &mut SwapBudget,
     flags: &Arc<RtStatusFlags>,
 ) -> (
     f32,
@@ -70,7 +71,7 @@ fn run_receive_commands(
     Option<Box<StaticModel>>,
 ) {
     let (in_g, out_g, slim, ml, mr, _) =
-        run_receive_commands_full(consumer, deferred, structural_applied, flags);
+        run_receive_commands_full(consumer, deferred, budget, flags);
     (in_g, out_g, slim, ml, mr)
 }
 
@@ -81,7 +82,7 @@ fn run_receive_commands(
 fn run_receive_commands_full(
     consumer: &mut rtrb::Consumer<ParamPayload>,
     deferred: &mut Option<ParamPayload>,
-    structural_applied: &mut usize,
+    budget: &mut SwapBudget,
     flags: &Arc<RtStatusFlags>,
 ) -> (
     f32,
@@ -111,7 +112,7 @@ fn run_receive_commands_full(
     let (_param_changed, param_pops) = receive_commands(
         consumer,
         deferred,
-        structural_applied,
+        budget,
         &mut in_adj,
         &mut out_adj,
         &mut nam_rate,
@@ -142,7 +143,7 @@ fn run_receive_commands_full(
 
 #[test]
 fn drain_slimmable_empty_no_change() {
-    let mut rx = None;
+    let mut drain: Option<SlimmableSwapDrain> = None;
     let mut model_l = None;
     let mut model_r = None;
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -150,20 +151,18 @@ fn drain_slimmable_empty_no_change() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(!parking_lot_dirty.load(Ordering::Acquire));
@@ -173,7 +172,7 @@ fn drain_slimmable_empty_no_change() {
 #[test]
 fn drain_os_engines_swaps_and_sets_dirty() {
     let (mut prod, cons) = rtrb::RingBuffer::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(os_swap_drain(cons));
     let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -181,8 +180,6 @@ fn drain_os_engines_swaps_and_sets_dirty() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     let pair = Box::new(OsEnginePair {
         generation: 0,
@@ -191,17 +188,17 @@ fn drain_os_engines_swaps_and_sets_dirty() {
     });
     prod.push(pair).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(parking_lot_dirty.load(Ordering::Acquire));
@@ -217,7 +214,7 @@ fn drain_os_engines_swaps_and_sets_dirty() {
 #[test]
 fn drain_slimmable_pair_swaps_both_atomically() {
     let (mut prod, cons) = rtrb::RingBuffer::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(4));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
@@ -225,25 +222,23 @@ fn drain_slimmable_pair_swaps_both_atomically() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
     flags
         .requested_slimmable_generation
         .store(1, Ordering::Release);
 
     prod.push(make_pair(1, 8, true)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert!(parking_lot_dirty.load(Ordering::Acquire));
@@ -271,7 +266,7 @@ fn drain_slimmable_pair_swaps_both_atomically() {
 #[test]
 fn drain_slimmable_mono_pair_leaves_r_untouched() {
     let (mut prod, cons) = rtrb::RingBuffer::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(8));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
@@ -279,25 +274,23 @@ fn drain_slimmable_mono_pair_leaves_r_untouched() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
     flags
         .requested_slimmable_generation
         .store(1, Ordering::Release);
 
     prod.push(make_pair(1, 8, false)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(model_l.as_ref().unwrap().channels(), 8);
@@ -324,7 +317,7 @@ fn drain_slimmable_mono_pair_leaves_r_untouched() {
 #[test]
 fn drain_slimmable_discards_stale_pair_latest_wins() {
     let (mut prod, cons) = rtrb::RingBuffer::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(4));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
@@ -332,8 +325,6 @@ fn drain_slimmable_discards_stale_pair_latest_wins() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     // A stale pair (gen 1) is in the channel while the request advances to 2.
     prod.push(make_pair(1, 8, true)).unwrap();
@@ -342,17 +333,17 @@ fn drain_slimmable_discards_stale_pair_latest_wins() {
         .store(2, Ordering::Release);
     prod.push(make_pair(2, 4, true)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     // The stale pair was discarded whole to GC (never installed).
@@ -388,7 +379,7 @@ fn drain_slimmable_flood_never_desyncs() {
     const PRODUCERS: usize = 3;
 
     let (prod, cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(CAPACITY);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(4));
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::<GcItem>::new(4096);
@@ -396,8 +387,6 @@ fn drain_slimmable_flood_never_desyncs() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied;
 
     // All pairs share generation 0 so the drain installs every one; the
     // producers alternate channel counts (8/4) per pair.
@@ -427,19 +416,18 @@ fn drain_slimmable_flood_never_desyncs() {
     // drain until all pairs have been installed and the channel is empty.
     // Each loop iteration is one audio callback: the per-quantum structural
     // budget resets to zero.
-    while pushed.load(Ordering::Acquire) < TOTAL || !rx.as_ref().unwrap().is_empty() {
-        structural_applied = 0;
+    while pushed.load(Ordering::Acquire) < TOTAL || !drain.as_ref().unwrap().is_empty() {
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
         drain_slimmable_models(
-            &mut rx,
-            &mut deferred,
-            &mut structural_applied,
+            &mut drain,
+            &mut budget,
             &mut model_l,
             &mut model_r,
+            &flags,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
             &gc_overflow,
-            &flags,
         );
         let (l, r) = (model_l.as_ref().unwrap(), model_r.as_ref().unwrap());
         assert_eq!(
@@ -452,22 +440,21 @@ fn drain_slimmable_flood_never_desyncs() {
         h.join().unwrap();
     }
     // Final drain to consume any tail.
-    structural_applied = 0;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     let (l, r) = (model_l.as_ref().unwrap(), model_r.as_ref().unwrap());
     assert_eq!(l.channels(), r.channels());
-    assert!(rx.as_ref().unwrap().is_empty());
+    assert!(drain.as_ref().unwrap().is_empty());
 }
 
 // ── Command Budgeting & Coalescing ──────────────────────────────────────────
@@ -481,7 +468,7 @@ fn receive_commands_param_budget_bounds_pops_and_flags_backlog() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(64);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
     // 40 scalar commands: 16 are consumed by the first callback.
     for i in 0..40u32 {
@@ -490,7 +477,7 @@ fn receive_commands_param_budget_bounds_pops_and_flags_backlog() {
     }
 
     let (input_gain, _, _, _, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+        run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
 
     // The 16th command is the last one seen → latest-wins within the budget.
     assert!((input_gain - (0.1 + 15.0 * 0.01)).abs() < f32::EPSILON);
@@ -499,22 +486,23 @@ fn receive_commands_param_budget_bounds_pops_and_flags_backlog() {
         flags.check_flag(RT_STATUS_PARAM_QUEUE_BACKLOG),
         "backlog flag must be raised when the budget is exhausted"
     );
-    assert_eq!(structural_applied, 0);
+    assert_eq!(budget.used(), 0);
 
     // Drain again: the rest is consumed across the next callbacks. The
     // backlog flag is sticky (cleared by the main thread), so the third
     // callback must NOT re-raise it once the channel is empty.
     flags.clear_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
-    run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
     assert_eq!(cons.slots(), 8);
 
     flags.clear_flag(RT_STATUS_PARAM_QUEUE_BACKLOG);
-    run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
     assert!(cons.is_empty(), "all commands eventually consumed");
     assert!(
         !flags.check_flag(RT_STATUS_PARAM_QUEUE_BACKLOG),
         "an empty channel must not raise the backlog flag"
     );
+    assert_eq!(budget.used(), 0);
 }
 
 /// Repeated scalar commands inside one quantum are coalesced latest-wins:
@@ -524,7 +512,7 @@ fn receive_commands_scalar_latest_wins() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
     prod.push(ParamPayload::InputGain(0.5)).unwrap();
     prod.push(ParamPayload::OutputGain(0.7)).unwrap();
@@ -536,7 +524,7 @@ fn receive_commands_scalar_latest_wins() {
         .unwrap();
 
     let (input_gain, output_gain, slim_override, _, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+        run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
 
     assert_eq!(input_gain, 0.9);
     assert_eq!(output_gain, 1.3);
@@ -553,7 +541,7 @@ fn receive_commands_load_model_coalesces_obsolete_to_gc() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
     prod.push(load_model_payload(Some(fake_wavenet(4)), None))
         .unwrap();
@@ -562,15 +550,14 @@ fn receive_commands_load_model_coalesces_obsolete_to_gc() {
     prod.push(load_model_payload(Some(fake_wavenet(16)), None))
         .unwrap();
 
-    let (_, _, _, model_l, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    let (_, _, _, model_l, _) = run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
 
     assert_eq!(
         model_l.as_ref().unwrap().channels(),
         16,
         "latest LoadModel must win"
     );
-    assert_eq!(structural_applied, 1, "one structural apply per callback");
+    assert_eq!(budget.used(), 1, "one structural apply per callback");
     assert!(deferred.is_none());
     assert!(cons.is_empty());
     assert!(
@@ -580,50 +567,59 @@ fn receive_commands_load_model_coalesces_obsolete_to_gc() {
 }
 
 /// A `LoadModel` drained after the shared structural budget was exhausted
-/// by another swap earlier in the callback is parked (deferred) — never
-/// applied out of budget and never lost.
+/// by another swap earlier in the callback stays owned by the ring (canonical
+/// Phase 1, FIFO intact) — never applied out of budget and never lost.
 #[test]
-fn receive_commands_load_model_parked_when_budget_exhausted() {
+fn receive_commands_load_model_stays_queued_when_budget_exhausted() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 1usize; // a resampler swap applied earlier
 
     prod.push(load_model_payload(Some(fake_wavenet(8)), None))
         .unwrap();
 
-    let (_, _, _, model_l, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    // Simulate a shared budget already consumed by an earlier drain.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
+    let (_, _, _, model_l, _) = run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
 
     assert!(model_l.is_none(), "must not apply out of budget");
     assert!(
-        deferred.is_some(),
-        "the model must be parked for the next callback"
+        deferred.is_none(),
+        "canonical: the structural head stays queued, not detached"
+    );
+    assert_eq!(
+        cons.slots(),
+        1,
+        "the model stays queued for the next callback"
     );
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
-    assert!(cons.is_empty());
 }
 
-/// A parked `LoadModel` is resolved at the start of the next callback when
-/// the budget is fresh.
+/// A queued `LoadModel` from a budget-exhausted callback is resolved by the
+/// next callback when the budget is fresh.
 #[test]
-fn receive_commands_deferred_model_resolved_next_callback() {
+fn receive_commands_queued_model_resolved_next_callback() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 1usize;
 
     prod.push(load_model_payload(Some(fake_wavenet(8)), None))
         .unwrap();
-    run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
-    assert!(deferred.is_some());
 
-    // Next callback: fresh budget → the parked model is installed first.
-    structural_applied = 0;
-    let (_, _, _, model_l, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    // First callback: budget exhausted → the model stays queued.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
+    run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
+    assert!(deferred.is_none());
+    assert_eq!(cons.slots(), 1);
+
+    // Next callback: fresh budget → the queued model is installed.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    let (_, _, _, model_l, _) = run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
     assert_eq!(model_l.as_ref().unwrap().channels(), 8);
     assert!(deferred.is_none());
+    assert!(cons.is_empty());
 }
 
 /// A parked `LoadModel` superseded by a newer queued model is discarded to
@@ -633,28 +629,28 @@ fn receive_commands_deferred_model_superseded_by_queued() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<ParamPayload>::new(8);
     let flags = Arc::new(RtStatusFlags::new());
     let mut deferred = None;
-    let mut structural_applied = 1usize;
-
-    // Park an 8-ch model from the previous callback.
+    // Park an 8-ch model from the previous callback (exhausted budget).
     prod.push(load_model_payload(Some(fake_wavenet(8)), None))
         .unwrap();
-    run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
-    assert!(deferred.is_some());
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
+    run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
+    assert!(deferred.is_none());
+    assert_eq!(cons.slots(), 1);
 
-    // A newer 4-ch model is queued → the parked one is superseded.
+    // A newer 4-ch model is queued → the parked one is superseded next drain.
     prod.push(load_model_payload(Some(fake_wavenet(4)), None))
         .unwrap();
-    structural_applied = 0;
-    let (_, _, _, model_l, _) =
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    let (_, _, _, model_l, _) = run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
     assert_eq!(
         model_l.as_ref().unwrap().channels(),
         4,
         "the queued latest model must win"
     );
     assert!(deferred.is_none());
+    assert!(cons.is_empty());
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
-    assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
 }
 
 /// A closed-loop producer thread (push without
@@ -688,13 +684,12 @@ fn receive_commands_soak_aggressive_producer_no_starvation() {
         }
     });
 
-    let mut deferred = None;
-    let mut structural_applied;
     let mut cons = cons;
+    let mut deferred = None;
     let mut callbacks_ran = 0usize;
     while callbacks_ran < CALLBACKS {
-        structural_applied = 0;
-        run_receive_commands(&mut cons, &mut deferred, &mut structural_applied, &flags);
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+        run_receive_commands(&mut cons, &mut deferred, &mut budget, &flags);
         callbacks_ran += 1;
     }
     let mut consumer = cons;
@@ -703,13 +698,9 @@ fn receive_commands_soak_aggressive_producer_no_starvation() {
     let mut pops_total = 0usize;
 
     for _ in 0..CALLBACKS {
-        let mut structural_applied = 0usize;
-        let (_, _, _, _, _, pops) = run_receive_commands_full(
-            &mut consumer,
-            &mut deferred,
-            &mut structural_applied,
-            &flags,
-        );
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+        let (_, _, _, _, _, pops) =
+            run_receive_commands_full(&mut consumer, &mut deferred, &mut budget, &flags);
         assert!(
             pops <= MAX_PARAM_BUDGET,
             "callback exceeded scalar budget ({pops} > {MAX_PARAM_BUDGET})"
@@ -736,7 +727,7 @@ fn receive_commands_soak_aggressive_producer_no_starvation() {
 #[test]
 fn drain_slimmable_budget_applies_one_and_coalesces_backlog() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(4));
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(64);
@@ -753,30 +744,25 @@ fn drain_slimmable_budget_applies_one_and_coalesces_backlog() {
     prod.push(make_pair(1, 4, true)).unwrap();
     prod.push(make_pair(1, 16, true)).unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     // Only the latest pair was installed atomically.
     assert_eq!(model_l.as_ref().unwrap().channels(), 16);
     assert_eq!(model_r.as_ref().unwrap().channels(), 16);
-    assert_eq!(
-        structural_applied, 1,
-        "at most one structural swap per callback"
-    );
-    assert!(deferred.is_none());
-    assert!(rx.as_ref().unwrap().is_empty());
+    assert_eq!(budget.used(), 1, "at most one structural swap per callback");
+    assert!(!drain.as_ref().unwrap().has_deferred());
+    assert!(drain.as_ref().unwrap().is_empty());
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
     // GC: 2 superseded pairs + the replaced active pair = 3 SlimModelPair envelopes.
@@ -788,12 +774,12 @@ fn drain_slimmable_budget_applies_one_and_coalesces_backlog() {
     assert_eq!(envelopes, 3);
 }
 
-/// When the shared structural budget is exhausted, the slimmable pair is
-/// parked and installed by the next callback (fresh budget).
+/// When the shared structural budget is exhausted, the slimmable head stays
+/// queued (canonical Phase 1, FIFO intact) and the next callback resolves it.
 #[test]
-fn drain_slimmable_parked_when_budget_exhausted_resolved_next_callback() {
+fn drain_slimmable_queued_when_budget_exhausted_resolved_next_callback() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(slimmable_swap_drain(cons));
     let mut model_l = Some(fake_wavenet(4));
     let mut model_r = Some(fake_wavenet(4));
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::<GcItem>::new(16);
@@ -807,41 +793,42 @@ fn drain_slimmable_parked_when_budget_exhausted_resolved_next_callback() {
 
     prod.push(make_pair(1, 8, true)).unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 1usize; // another swap applied earlier
+    // Simulate a shared budget already consumed by an earlier drain.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(model_l.as_ref().unwrap().channels(), 4, "not installed");
-    assert!(deferred.is_some(), "pair must be parked");
+    // Canonical: the head stays owned by the ring (zero-loss).
+    assert!(!drain.as_ref().unwrap().has_deferred());
+    assert_eq!(drain.as_ref().unwrap().ring_occupied(), 1);
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
 
-    // Next callback: fresh budget → the parked pair is installed.
-    structural_applied = 0;
+    // Next callback: fresh budget → the queued pair is installed.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_slimmable_models(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut model_l,
         &mut model_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(model_l.as_ref().unwrap().channels(), 8);
     assert_eq!(model_r.as_ref().unwrap().channels(), 8);
-    assert!(deferred.is_none());
+    assert!(drain.as_ref().unwrap().is_empty());
 }
 
 /// Structural budget for OS engines: one pair applied per callback,
@@ -849,7 +836,7 @@ fn drain_slimmable_parked_when_budget_exhausted_resolved_next_callback() {
 #[test]
 fn drain_os_budget_applies_one_and_coalesces_backlog() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(os_swap_drain(cons));
     let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(64);
@@ -868,26 +855,24 @@ fn drain_os_budget_applies_one_and_coalesces_backlog() {
     prod.push(pair(OversampleFactor::X2)).unwrap();
     prod.push(pair(OversampleFactor::X4)).unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(os_l.factor(), OversampleFactor::X4);
     assert_eq!(os_r.factor(), OversampleFactor::X4);
-    assert_eq!(structural_applied, 1);
-    assert!(deferred.is_none());
-    assert!(rx.as_ref().unwrap().is_empty());
+    assert_eq!(budget.used(), 1);
+    assert!(!drain.as_ref().unwrap().has_deferred());
+    assert!(drain.as_ref().unwrap().is_empty());
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
 
     // GC: 1 superseded pair + 1 replaced active pair = 2 OsEnginePair envelopes.
@@ -899,12 +884,12 @@ fn drain_os_budget_applies_one_and_coalesces_backlog() {
     assert_eq!(envelopes, 2);
 }
 
-/// OS engine pairs respect the shared structural budget: the excess is
-/// parked and applied by the next callback.
+/// OS engine pairs respect the shared structural budget: the head stays
+/// queued (canonical Phase 1) and the next callback resolves it.
 #[test]
-fn drain_os_parked_when_budget_exhausted_resolved_next_callback() {
+fn drain_os_queued_when_budget_exhausted_resolved_next_callback() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(os_swap_drain(cons));
     let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::<GcItem>::new(16);
@@ -920,40 +905,41 @@ fn drain_os_parked_when_budget_exhausted_resolved_next_callback() {
     }))
     .unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 1usize;
+    // Simulate a shared budget already consumed by an earlier drain.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(os_l.factor(), OversampleFactor::Off, "not installed");
-    assert!(deferred.is_some());
+    // Canonical: the head stays owned by the ring (zero-loss).
+    assert!(!drain.as_ref().unwrap().has_deferred());
+    assert_eq!(drain.as_ref().unwrap().ring_occupied(), 1);
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
 
-    structural_applied = 0;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(os_l.factor(), OversampleFactor::X2);
     assert_eq!(os_r.factor(), OversampleFactor::X2);
-    assert!(deferred.is_none());
+    assert!(drain.as_ref().unwrap().is_empty());
 }
 
 /// Stale oversample pair discard.
@@ -965,7 +951,7 @@ fn drain_os_parked_when_budget_exhausted_resolved_next_callback() {
 #[test]
 fn drain_os_discards_stale_pair_latest_wins() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(4);
-    let mut rx = Some(cons);
+    let mut drain = Some(os_swap_drain(cons));
     let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(16);
@@ -993,27 +979,25 @@ fn drain_os_discards_stale_pair_latest_wins() {
     // RT status reflects requested generation 2
     flags.requested_os_generation.store(2, Ordering::Release);
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     // Generation 2 is active
     assert_eq!(os_l.factor(), OversampleFactor::X4);
     assert_eq!(os_r.factor(), OversampleFactor::X4);
     assert_eq!(flags.applied_os_generation.load(Ordering::Acquire), 2);
-    assert_eq!(structural_applied, 1);
-    assert!(deferred.is_none());
+    assert_eq!(budget.used(), 1);
+    assert!(!drain.as_ref().unwrap().has_deferred());
 
     // GC queue received: 1 stale pair (gen 1) + 1 replaced active pair (Off) = 2 envelopes.
     let mut envelopes = 0usize;
@@ -1031,7 +1015,7 @@ fn drain_os_discards_stale_pair_latest_wins() {
 #[test]
 fn drain_os_interleaving_off_2x_4x() {
     let (mut prod, cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(8);
-    let mut rx = Some(cons);
+    let mut drain = Some(os_swap_drain(cons));
     let mut os_l = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let mut os_r = Box::new(OversampleEngine::new(OversampleFactor::Off, 64).unwrap());
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(32);
@@ -1058,19 +1042,17 @@ fn drain_os_interleaving_off_2x_4x() {
     }))
     .unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_os_engines(
-        &mut rx,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut os_l,
         &mut os_r,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(os_l.factor(), OversampleFactor::X4);
@@ -1109,14 +1091,15 @@ fn composite_structural_saturation_bound_measurement() {
     let mut total_installed = 0usize;
     let mut total_deferred = 0usize;
 
-    // Set up all 5 SPSC channels
-    let (mut resamp_prod, mut resamp_cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(8);
-    let (mut cabsim_prod, mut cabsim_cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(8);
+    // Set up all 5 SPSC channels (T9.5: four dedicated channels live inside
+    // the engine `RtSwapDrain`s; the param ring stays a raw consumer).
+    let (mut resamp_prod, resamp_cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(8);
+    let (mut cabsim_prod, cabsim_cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(8);
     let (mut param_prod, mut param_cons) = rtrb::RingBuffer::<ParamPayload>::new(32);
     let (mut slim_prod, slim_cons) = rtrb::RingBuffer::<Box<SlimModelPair>>::new(8);
-    let mut slim_rx = Some(slim_cons);
+    let mut slim_drain = Some(slimmable_swap_drain(slim_cons));
     let (mut os_prod, os_cons) = rtrb::RingBuffer::<Box<OsEnginePair>>::new(8);
-    let mut os_rx = Some(os_cons);
+    let mut os_drain = Some(os_swap_drain(os_cons));
 
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::<GcItem>::new(4096);
     let mut parking_lot: [Option<GcItem>; 16] = Default::default();
@@ -1131,13 +1114,11 @@ fn composite_structural_saturation_bound_measurement() {
         .requested_slimmable_generation
         .store(1, Ordering::Release);
 
-    let mut deferred_resampler: Option<Box<ResamplerSwapPayload>> = None;
-    let mut deferred_cabsim: Option<Box<CabSimSwapPayload>> = None;
+    let mut resamp_drain = Some(resampler_swap_drain(resamp_cons));
+    let mut cabsim_drain = Some(cabsim_swap_drain(cabsim_cons));
     let mut deferred_model: Option<ParamPayload> = None;
-    let mut deferred_slimmable: Option<Box<SlimModelPair>> = None;
-    let mut deferred_os: Option<Box<OsEnginePair>> = None;
 
-    let mut resampler = Box::new(NamResampler::new(48000, 48000, 2048).unwrap());
+    let mut resampler = Box::new(NamResampler::new_simple(48000, 48000).unwrap());
     let mut stream = Box::new(
         neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(48000, 48000, 2048)
             .unwrap(),
@@ -1182,7 +1163,7 @@ fn composite_structural_saturation_bound_measurement() {
         for _ in 0..4 {
             let _ = resamp_prod.push(Box::new(ResamplerSwapPayload {
                 generation: generation_num,
-                resampler: Box::new(NamResampler::new(48000, 48000, 2048).unwrap()),
+                resampler: Box::new(NamResampler::new_simple(48000, 48000).unwrap()),
                 stream: Box::new(
                     neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer::new(
                         48000, 48000, 2048,
@@ -1239,46 +1220,44 @@ fn composite_structural_saturation_bound_measurement() {
             }
         }
 
-        // 2. Composite structural swap counter
-        let mut structural_applied = 0usize;
+        // 2. Composite structural budget (engine `SwapBudget`, shared).
+        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
-        // Track queue lengths before drain to count pops
-        let resamp_before = resamp_cons.slots();
-        let cabsim_before = cabsim_cons.slots();
+        // Track ring occupancy before drain to count pops
+        let resamp_before = resamp_drain.as_ref().unwrap().ring_occupied();
+        let cabsim_before = cabsim_drain.as_ref().unwrap().ring_occupied();
         let param_before = param_cons.slots();
-        let slim_before = slim_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
-        let os_before = os_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+        let slim_before = slim_drain.as_ref().unwrap().ring_occupied();
+        let os_before = os_drain.as_ref().unwrap().ring_occupied();
 
         // 3. Execute all drains in production order
         drain_resamplers(
-            &mut resamp_cons,
-            &mut deferred_resampler,
-            &mut structural_applied,
+            resamp_drain.as_mut().unwrap(),
+            &mut budget,
             &mut resampler,
             &mut stream,
+            &flags,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
             &gc_overflow,
-            &flags,
         );
 
         drain_cabsims(
-            &mut cabsim_cons,
-            &mut deferred_cabsim,
-            &mut structural_applied,
+            cabsim_drain.as_mut().unwrap(),
+            &mut budget,
             &mut active_cabsim,
+            &flags,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
             &gc_overflow,
-            &flags,
         );
 
         let _param_changed = receive_commands(
             &mut param_cons,
             &mut deferred_model,
-            &mut structural_applied,
+            &mut budget,
             &mut in_adj,
             &mut out_adj,
             &mut nam_rate,
@@ -1301,52 +1280,51 @@ fn composite_structural_saturation_bound_measurement() {
         try_slimmable_rebuild(&mut adaptive, &flags);
 
         drain_slimmable_models(
-            &mut slim_rx,
-            &mut deferred_slimmable,
-            &mut structural_applied,
+            &mut slim_drain,
+            &mut budget,
             &mut active_model_l,
             &mut active_model_r,
+            &flags,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
             &gc_overflow,
-            &flags,
         );
 
         drain_os_engines(
-            &mut os_rx,
-            &mut deferred_os,
-            &mut structural_applied,
+            &mut os_drain,
+            &mut budget,
             &mut os_l,
             &mut os_r,
+            &flags,
             &mut gc_p,
             &mut parking_lot,
             &parking_lot_dirty,
             &gc_overflow,
-            &flags,
         );
 
         let elapsed_nanos = start.elapsed().as_nanos() as u64;
         duration_nanos_samples.push(elapsed_nanos);
 
-        let resamp_pops = resamp_before - resamp_cons.slots();
-        let cabsim_pops = cabsim_before - cabsim_cons.slots();
+        let resamp_pops = resamp_before - resamp_drain.as_ref().unwrap().ring_occupied();
+        let cabsim_pops = cabsim_before - cabsim_drain.as_ref().unwrap().ring_occupied();
         let param_pops = param_before - param_cons.slots();
-        let slim_pops = slim_before - slim_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
-        let os_pops = os_before - os_rx.as_ref().map(|c| c.slots()).unwrap_or(0);
+        let slim_pops = slim_before - slim_drain.as_ref().unwrap().ring_occupied();
+        let os_pops = os_before - os_drain.as_ref().unwrap().ring_occupied();
         let callback_pops = resamp_pops + cabsim_pops + param_pops + slim_pops + os_pops;
 
         total_pops_samples.push(callback_pops);
         assert!(
-            structural_applied <= STRUCTURAL_SWAPS_PER_CALLBACK,
-            "invariant violated: structural_applied={structural_applied} > {STRUCTURAL_SWAPS_PER_CALLBACK}"
+            budget.used() <= STRUCTURAL_SWAPS_PER_CALLBACK,
+            "invariant violated: structural_applied={} > {STRUCTURAL_SWAPS_PER_CALLBACK}",
+            budget.used()
         );
         assert!(
             callback_pops <= 48,
             "composite pops {callback_pops} exceeded theoretical bound of 48"
         );
 
-        if structural_applied > 0 {
+        if budget.used() > 0 {
             total_installed += 1;
         }
         if flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED) {
@@ -1355,6 +1333,8 @@ fn composite_structural_saturation_bound_measurement() {
         if flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED) {
             total_deferred += 1;
         }
+        flags.clear_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
+        flags.clear_flag(RT_STATUS_STRUCTURAL_DEFERRED);
     }
 
     total_pops_samples.sort_unstable();

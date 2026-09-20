@@ -1,19 +1,28 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Resampler Draining (Zero-Alloc Swap)
+//! Resampler Draining (Zero-Alloc Swap) — engine `RtSwapDrain` integration.
 //! Replaces resamplers without using memory allocation in the critical path.
 //!
-//! Budgeting: at most [`STRUCTURAL_SWAPS_PER_CALLBACK`]
-//! structural swap applies per callback (budget shared across every RT swap
-//! drain); current-generation envelopes in the coalescing window collapse to
-//! the latest one (intermediate envelopes discarded to GC) and the excess is
-//! parked in the deferred slot for the next callback.
+//! T9.5 (F-PERF-20): the hand-rolled 3-phase protocol was migrated to the
+//! engine's canonical scheduler
+//! ([`RtSwapDrain`] + [`RtSwapHandler`], `NeuralAmpModeler-rs/common/spsc/swap.rs`)
+//! for this dedicated `Consumer<Box<ResamplerSwapPayload>>` channel — the ring
+//! types match `SwapRing` exactly, so this is a direct instantiation, not a
+//! reimplementation. Only the cold handlers
+//! (`install_resampler`/`discard_resampler`) remain NAM-Audio-Pipe-specific.
+//!
+//! Budgeting: at most one structural swap applies per callback
+//! (`STRUCTURAL_SWAPS_PER_CALLBACK`, shared across every RT swap drain through
+//! the caller's `SwapBudget`); current-generation envelopes in the coalescing
+//! window collapse to the latest one (intermediate envelopes discarded to GC)
+//! and the excess stays queued / parked in the drain's deferred slot for the
+//! next callback (canonical latest-wins protocol). Tuning preserved:
+//! [`STRUCTURAL_POPS_PER_CALLBACK`] pops per callback.
 
-use super::commands::{STRUCTURAL_POPS_PER_CALLBACK, STRUCTURAL_SWAPS_PER_CALLBACK};
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, GcOverflowBuffer, RT_STATUS_STRUCTURAL_DEFERRED, RT_STATUS_STRUCTURAL_SUPERSEDED,
-    ResamplerSwapPayload, RtStatusFlags, gc_cascade,
+    GcItem, GcOverflowBuffer, GcSink, ResamplerSwapPayload, RtStatusFlags, RtSwapDrain,
+    RtSwapHandler,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -21,193 +30,112 @@ use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use rtrb::Consumer;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Resampler Draining (Zero-Alloc Swap)
-/// Replaces resamplers without using memory allocation in the critical path.
+/// Dedicated resampler swap ring drained by [`RtSwapDrain`].
+pub type ResamplerSwapRing = Consumer<Box<ResamplerSwapPayload>>;
+/// Engine drain owning the resampler ring and the deferred slot.
+pub type ResamplerSwapDrain = RtSwapDrain<ResamplerSwapRing>;
+
+/// [`RtSwapHandler`] binding the engine scheduler to the resampler family.
 ///
-/// Versioned delivery: each envelope carries the request generation it was
-/// built for. An envelope whose generation still equals
-/// `requested_rate_generation` is current and is installed (the previous
-/// resampler cascades to GC). An envelope whose generation is older has been
-/// superseded by a newer host renegotiation — it goes straight to the GC
-/// cascade **without** unmuting and **without** clearing
-/// `RT_STATUS_RESAMP_SWAP_PENDING`, so the callback keeps waiting for the build
-/// that matches the most recent request.
+/// All payloads are structural (each envelope swaps the active resampler +
+/// streaming adapter under the shared budget). Latest-wins identity is the
+/// build generation; the staleness guard compares it with
+/// `requested_rate_generation` — an envelope built for an older request is
+/// discarded to GC **without** unmuting and **without** clearing
+/// `RT_STATUS_RESAMP_SWAP_PENDING`, so the callback keeps waiting for the
+/// build that matches the most recent request.
+pub(crate) struct ResamplerSwapHandler<'a> {
+    resampler: &'a mut Box<NamResampler>,
+    stream: &'a mut Box<StreamingResampleBuffer>,
+    rt_status: &'a RtStatusFlags,
+}
+
+impl RtSwapHandler for ResamplerSwapHandler<'_> {
+    type Payload = ResamplerSwapPayload;
+
+    #[inline]
+    fn is_structural(&self, _payload: &Self::Payload) -> bool {
+        true
+    }
+
+    #[inline]
+    fn coalesce_key(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[inline]
+    fn current_generation(&self) -> Option<u64> {
+        Some(
+            self.rt_status
+                .requested_rate_generation
+                .load(Ordering::Acquire),
+        )
+    }
+
+    #[inline]
+    fn generation_of(&self, payload: &Self::Payload) -> Option<u64> {
+        Some(payload.generation)
+    }
+
+    #[cold]
+    fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        install_resampler(payload, self.resampler, self.stream, gc, self.rt_status);
+    }
+
+    #[cold]
+    fn discard(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
+        discard_resampler(payload, gc);
+    }
+}
+
+/// Runs one callback drain of the resampler swap ring (engine protocol).
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Real-time callback signature with SPSC queues, parking lot, and dirty flag"
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
 pub fn drain_resamplers(
-    resampler_consumer: &mut Consumer<Box<ResamplerSwapPayload>>,
-    deferred: &mut Option<Box<ResamplerSwapPayload>>,
-    structural_applied: &mut usize,
+    drain: &mut ResamplerSwapDrain,
+    budget: &mut neural_amp_modeler_rs::common::spsc::SwapBudget,
     resampler: &mut Box<NamResampler>,
     stream: &mut Box<StreamingResampleBuffer>,
+    rt_status_for_process: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
     gc_overflow_for_process: &GcOverflowBuffer,
-    rt_status_for_process: &RtStatusFlags,
 ) {
-    // Phase 0 — resolve a resampler deferred by the previous callback.
-    if let Some(pending) = deferred.take() {
-        let current_req_gen = rt_status_for_process
-            .requested_rate_generation
-            .load(Ordering::Acquire);
-        let head_is_current = resampler_consumer
-            .peek()
-            .is_ok_and(|head| head.generation == current_req_gen);
-        if pending.generation != current_req_gen {
-            // Stale while parked: discard to GC without unmuting and without
-            // clearing RESAMP_SWAP_PENDING.
-            discard_resampler(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-        } else if head_is_current {
-            // A newer same-generation build is already queued (latest-wins).
-            discard_resampler(
-                pending,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status_for_process
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_resampler(
-                pending,
-                resampler,
-                stream,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            *structural_applied += 1;
-        } else {
-            // Budget exhausted and nothing newer queued: re-park.
-            *deferred = Some(pending);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow_for_process,
+        rt_status: rt_status_for_process,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = ResamplerSwapHandler {
+        resampler,
+        stream,
+        rt_status: rt_status_for_process,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
 
-    // Phase 1 — bounded drain with coalescing.
-    let current_req_gen = rt_status_for_process
-        .requested_rate_generation
-        .load(Ordering::Acquire);
-    let mut candidate: Option<Box<ResamplerSwapPayload>> = None;
-    let mut pops = 0usize;
-    while pops < STRUCTURAL_POPS_PER_CALLBACK {
-        let Some(payload) = resampler_consumer.pop().ok() else {
-            break;
-        };
-        pops += 1;
-        if payload.generation != current_req_gen {
-            // Stale envelope: the host renegotiated the clock while this
-            // resampler was being built. Discard it for GC without unmuting and
-            // without clearing RESAMP_SWAP_PENDING.
-            discard_resampler(
-                payload,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            continue;
-        }
-        if let Some(older) = candidate.replace(payload) {
-            // Coalescing: an intermediate current-generation envelope is
-            // obsolete — its resampler cascades to GC (latest-wins).
-            discard_resampler(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status_for_process
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    if let Some(payload) = candidate {
-        if *structural_applied < STRUCTURAL_SWAPS_PER_CALLBACK {
-            install_resampler(
-                payload,
-                resampler,
-                stream,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            *structural_applied += 1;
-        } else if deferred.is_none() {
-            *deferred = Some(payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            // The deferred slot holds an older envelope; the popped one is
-            // newer — supersede the parked envelope and park this one
-            // (latest-wins).
-            let older = deferred.take().expect("slot occupied, checked above");
-            discard_resampler(
-                older,
-                gc_producer,
-                parking_lot,
-                parking_lot_dirty,
-                gc_overflow_for_process,
-                rt_status_for_process,
-            );
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
-            rt_status_for_process
-                .structural_superseded_total
-                .fetch_add(1, Ordering::Relaxed);
-            *deferred = Some(payload);
-            rt_status_for_process.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
-            rt_status_for_process
-                .structural_deferred_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
+/// Builds the drain for a fresh (re)connection, preserving the historical
+/// tuning (1 structural swap/callback shared budget, 8-pop window).
+pub fn resampler_swap_drain(ring: ResamplerSwapRing) -> ResamplerSwapDrain {
+    RtSwapDrain::new(ring, super::commands::structural_swap_tunables())
 }
 
 /// Installs a current-generation resampler envelope: swaps the active
 /// resampler and streaming adapter, records the applied generation and active rates,
 /// unmutes (clears `RT_STATUS_RESAMP_SWAP_PENDING`) and cascades the retired
 /// resampler envelope to GC.
-#[inline(always)]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "Real-time swap helper receiving active resources, queues, parking lot, and flags"
-)]
+#[cold]
 fn install_resampler(
     mut payload: Box<ResamplerSwapPayload>,
     resampler: &mut Box<NamResampler>,
     stream: &mut Box<StreamingResampleBuffer>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
+    gc: &mut GcSink<'_>,
     rt_status_for_process: &RtStatusFlags,
 ) {
     std::mem::swap(&mut payload.resampler, resampler);
@@ -226,36 +154,15 @@ fn install_resampler(
     rt_status_for_process
         .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
 
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::ResamplerSwap(payload)),
-        gc_producer,
-        parking_lot,
-        gc_overflow_for_process,
-        rt_status_for_process,
-    );
+    gc.retire(GcItem::ResamplerSwap(payload));
 }
 
 /// Discards a resampler envelope to the GC cascade **without** unmuting and
 /// **without** clearing `RT_STATUS_RESAMP_SWAP_PENDING` (stale or superseded
 /// builds never substitute the most recent request).
-#[inline(always)]
-fn discard_resampler(
-    payload: Box<ResamplerSwapPayload>,
-    gc_producer: &mut rtrb::Producer<GcItem>,
-    parking_lot: &mut [Option<GcItem>; 16],
-    parking_lot_dirty: &AtomicBool,
-    gc_overflow_for_process: &GcOverflowBuffer,
-    rt_status_for_process: &RtStatusFlags,
-) {
-    parking_lot_dirty.store(true, Ordering::Release);
-    gc_cascade(
-        Some(GcItem::ResamplerSwap(payload)),
-        gc_producer,
-        parking_lot,
-        gc_overflow_for_process,
-        rt_status_for_process,
-    );
+#[cold]
+fn discard_resampler(payload: Box<ResamplerSwapPayload>, gc: &mut GcSink<'_>) {
+    gc.retire(GcItem::ResamplerSwap(payload));
 }
 
 #[cfg(test)]

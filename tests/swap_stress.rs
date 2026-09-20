@@ -796,7 +796,6 @@ fn swap_composite_structural_saturation_bound_measurement() {
 
     let mut total_installed = 0usize;
     let mut total_deferred = 0usize;
-    let mut total_coalesced = 0usize;
 
     for block in 0..CALLBACKS {
         in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
@@ -825,9 +824,6 @@ fn swap_composite_structural_saturation_bound_measurement() {
         assert!(n > 0, "callback stalled at block {block}");
 
         let rt = h.rt_status();
-        if rt.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED) {
-            total_coalesced += 1;
-        }
         if rt.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED) {
             total_deferred += 1;
         }
@@ -843,6 +839,18 @@ fn swap_composite_structural_saturation_bound_measurement() {
         total_installed > 0,
         "structural swaps must be retired to GC"
     );
-    assert!(total_coalesced > 0, "intermediate swaps must be coalesced");
-    assert!(total_deferred > 0, "excess swaps must be deferred");
+    // T9.5 canonical semantics (engine `RtSwapDrain`): under perpetual
+    // saturation every channel receives one command per callback while the
+    // shared budget allows one structural swap per callback. The earliest
+    // drain with a pending command (here: cab-sim, the resampler channel
+    // being idle) wins the budget every callback; the later drains'
+    // budget-exhausted structural heads stay queued (Phase 1 break, FIFO
+    // intact — zero loss) and raise `RT_STATUS_STRUCTURAL_DEFERRED` instead
+    // of being popped-and-parked, so no coalescing occurs. Producer pushes
+    // beyond the ring capacity are counted as drops by the harness (the
+    // budget is the intended back-pressure).
+    assert!(
+        total_deferred > 0,
+        "budget-exhausted structural heads must raise the deferred flag"
+    );
 }

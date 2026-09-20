@@ -89,6 +89,20 @@ fn main() -> anyhow::Result<()> {
 
     rt_setup::calibrate_tsc();
 
+    // 2.5 CPU AFFINITY RECEIPT (single computation, shared by every consumer).
+    // Selects the RT core (or honors `--cpu`) and derives the housekeeping set.
+    // T9.1: the receipt is applied de facto from here on — the main control
+    // loop thread is pinned to the housekeeping set below, the recording
+    // worker pins itself at spawn, the PipeWire thread-loop thread pins via
+    // its event source and the RT data thread keeps `configure_realtime_thread`.
+    let cpu_receipt = rt_setup::select_optimal_cpu_with_receipt(args.cpu)
+        .expect("CPU selection receipt is always produced by the system source");
+    // T9.1(a): the main thread runs the control loop, GC drains, handlers and
+    // telemetry — pure housekeeping work. Pin it away from the RT core so the
+    // DSP data thread stays exclusive. A kernel rejection is logged inside the
+    // helper and is a non-fatal optimization loss.
+    let _ = rt_setup::apply_housekeeping_affinity(&cpu_receipt.housekeeping_cpus);
+
     // 3. KNOW THE COMPUTER: Captures a "snapshot" of your processor's capabilities.
     // This helps NAM-Audio-Pipe choose the fastest way to process the audio math.
     let sys = SystemSnapshot::capture();
@@ -227,20 +241,27 @@ fn main() -> anyhow::Result<()> {
         // The JoinHandle is retained by the guard and formally joined (bounded)
         // during shutdown so the WAV header is finalized before PipeWire is
         // deinitialized and recording failures surface as a non-zero exit.
-        let io_handle =
-            match recording::spawn_recording_worker(receiver, Some(flag_for_thread), init) {
-                Ok(h) => h,
-                Err(e) => {
-                    log::error!("🛑 Failed to spawn recording worker: {e}");
-                    eprintln!(
-                        "{}",
-                        format!("Failed to spawn recording worker: {e}")
-                            .bright_red()
-                            .bold()
-                    );
-                    std::process::exit(1);
-                }
-            };
+        // T9.1(b): the worker pins itself to the housekeeping set at spawn
+        // (empty set = documented no-op for tests).
+        let housekeeping_for_worker = cpu_receipt.housekeeping_cpus.clone();
+        let io_handle = match recording::spawn_recording_worker(
+            receiver,
+            Some(flag_for_thread),
+            init,
+            housekeeping_for_worker,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("🛑 Failed to spawn recording worker: {e}");
+                eprintln!(
+                    "{}",
+                    format!("Failed to spawn recording worker: {e}")
+                        .bright_red()
+                        .bold()
+                );
+                std::process::exit(1);
+            }
+        };
 
         // Fail-fast handshake: never start PipeWire with `--record` until the worker
         // confirms readiness (io_uring + writable output dir). On failure or timeout,
@@ -296,7 +317,7 @@ fn main() -> anyhow::Result<()> {
             slimmable_producer,
             os_producer,
             oversample: args.oversample,
-            requested_cpu: args.cpu,
+            cpu_receipt,
             fail_fast: args.fail_fast,
             gate_config: args.gate,
         },

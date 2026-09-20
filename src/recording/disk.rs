@@ -850,6 +850,10 @@ fn report_overruns() {
 /// control ring, or the inline ring) produced by
 /// [`crate::recording::transport::create_recording_transport`].
 ///
+/// `housekeeping_cpus` is the CPU selection receipt's housekeeping set: the
+/// worker pins itself to it at spawn (T9.1(b)), keeping disk I/O and fsync off
+/// the selected RT core. An empty set is a documented no-op used by tests.
+///
 /// Returns the thread handle. The worker communicates its startup outcome
 /// through `init.handshake` (consumed by
 /// [`crate::recording::status::wait_for_recording_init`]) and, on any later
@@ -863,10 +867,17 @@ pub fn spawn_recording_worker(
     receiver: RecordingReceiver,
     recording_data_available: Option<Arc<AtomicBool>>,
     init: RecordingInit,
+    housekeeping_cpus: Vec<usize>,
 ) -> std::io::Result<std::thread::JoinHandle<anyhow::Result<()>>> {
     std::thread::Builder::new()
         .name("nam-recording-io".into())
         .spawn(move || {
+            // T9.1(b): the disk-I/O worker is pure housekeeping (io_uring
+            // submission, WAV encoding, fsync) — pin it to the housekeeping
+            // CPU set before any I/O runtime setup so it never migrates onto
+            // the selected RT core. An empty set is a documented no-op (tests);
+            // a kernel rejection is logged inside the helper and non-fatal.
+            let _ = crate::standalone::rt_setup::apply_housekeeping_affinity(&housekeeping_cpus);
             let probe = init.io_uring_probe.unwrap_or(probe_io_uring);
             let verdict = probe();
             if verdict != IoUringSupport::Available {

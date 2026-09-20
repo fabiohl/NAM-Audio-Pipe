@@ -355,7 +355,7 @@ fn run_cell(
     let quantum = cfg.quantum;
     let blocks = cfg.blocks;
 
-    let mut resampler = match NamResampler::new(cfg.rate, model_sr, quantum) {
+    let mut resampler = match NamResampler::new_simple(cfg.rate, model_sr) {
         Ok(r) => r,
         Err(e) => {
             eprintln!(

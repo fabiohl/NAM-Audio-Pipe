@@ -11,7 +11,7 @@ use crate::recording::transport::RecordingSender;
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    DspBuffers, DspPipelineContext, MAX_BRIDGE_BUF, capture_dsp_pipeline_streaming,
+    DspPipelineContext, MAX_BRIDGE_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 
@@ -551,7 +551,7 @@ pub fn process_dsp_buffer(
     stream: &pw::stream::Stream,
     context: DspPipelineContext,
     stream_resample: &mut StreamingResampleBuffer,
-    buffers: DspBuffers,
+    buffers: StreamingDspBuffers,
     current_host_rate: u32,
     frame_count: &mut u32,
     rt_status_for_process: &RtStatusFlags,
@@ -696,19 +696,20 @@ pub fn process_dsp_buffer(
             0
         };
 
+        // T9.4/F-PERF-17: the streaming pipeline never reads
+        // `resamp_mid_l/r` / `model_out_l/r` — pass the `StreamingDspBuffers`
+        // working set (8 buffers) and let the engine's `Into<DspBuffers>`
+        // adapter zero-slice the intermediates, removing 128 KiB of dead
+        // per-instance allocations from `CaptureState`.
         let n_pw = capture_dsp_pipeline_streaming(
             samples_l,
             samples_r,
             n_samples,
             context,
             stream_resample,
-            DspBuffers {
-                resamp_mid_l: &mut *buffers.resamp_mid_l,
-                resamp_mid_r: &mut *buffers.resamp_mid_r,
+            StreamingDspBuffers {
                 resamp_out_l: &mut *buffers.resamp_out_l,
                 resamp_out_r: &mut *buffers.resamp_out_r,
-                model_out_l: &mut *buffers.model_out_l,
-                model_out_r: &mut *buffers.model_out_r,
                 os_in_l: &mut *buffers.os_in_l,
                 os_in_r: &mut *buffers.os_in_r,
                 os_model_l: &mut *buffers.os_model_l,

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+use super::super::STRUCTURAL_SWAPS_PER_CALLBACK;
 use super::*;
 use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING;
+use neural_amp_modeler_rs::common::spsc::{
+    RT_STATUS_STRUCTURAL_DEFERRED, RT_STATUS_STRUCTURAL_SUPERSEDED, SwapBudget,
+};
 use std::assert_matches;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 
 fn make_rs(pw: u32, nam: u32) -> Box<NamResampler> {
-    Box::new(NamResampler::new(pw, nam, 64).unwrap())
+    Box::new(NamResampler::new_simple(pw, nam).unwrap())
 }
 
 fn make_stream(pw: u32, nam: u32) -> Box<StreamingResampleBuffer> {
@@ -26,7 +30,8 @@ fn make_payload(generation: u64, pw: u32, nam: u32) -> Box<ResamplerSwapPayload>
 
 #[test]
 fn empty_consumer_no_change() {
-    let (_prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (_prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -34,20 +39,18 @@ fn empty_consumer_no_change() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 48000);
@@ -58,7 +61,8 @@ fn empty_consumer_no_change() {
 
 #[test]
 fn single_swap_updates_active_and_clears_flag() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -66,24 +70,22 @@ fn single_swap_updates_active_and_clears_flag() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     // RT requested generation 1 and the main thread delivered a matching payload.
     flags.requested_rate_generation.store(1, Ordering::Release);
     prod.push(make_payload(1, 44100, 48000)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 44100);
@@ -104,7 +106,8 @@ fn single_swap_updates_active_and_clears_flag() {
 
 #[test]
 fn multiple_swaps_keep_last() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -112,8 +115,6 @@ fn multiple_swaps_keep_last() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     // Two payloads in flight; the request already moved to generation 2, so
     // the generation-1 envelope is stale and only generation 2 is applied.
@@ -121,17 +122,17 @@ fn multiple_swaps_keep_last() {
     prod.push(make_payload(1, 44100, 48000)).unwrap();
     prod.push(make_payload(2, 96000, 48000)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 96000);
@@ -156,7 +157,8 @@ fn multiple_swaps_keep_last() {
 
 #[test]
 fn swap_cascades_old_resampler_to_gc() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -164,23 +166,21 @@ fn swap_cascades_old_resampler_to_gc() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     flags.requested_rate_generation.store(1, Ordering::Release);
     prod.push(make_payload(1, 44100, 48000)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     let gc_item = gc_c.pop().unwrap();
@@ -203,7 +203,8 @@ fn swap_cascades_old_resampler_to_gc() {
 ///    audio unmuted.
 #[test]
 fn stale_generation_is_gc_discarded_without_unmute() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -211,8 +212,6 @@ fn stale_generation_is_gc_discarded_without_unmute() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     // (1) RT requests A: generation 1.
     flags.requested_rate_generation.store(1, Ordering::Release);
@@ -226,17 +225,17 @@ fn stale_generation_is_gc_discarded_without_unmute() {
     flags.set_flag(RT_STATUS_RESAMP_SWAP_PENDING);
 
     // (4) Drain delivers A: stale → GC, no unmute, no install.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 48000, "stale A must not be installed");
@@ -254,17 +253,17 @@ fn stale_generation_is_gc_discarded_without_unmute() {
 
     // (5) Main delivers B (generation 2) → applied and unmuted.
     prod.push(make_payload(2, 96000, 48000)).unwrap();
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 96000, "matching B must be installed");
@@ -285,7 +284,8 @@ fn stale_generation_is_gc_discarded_without_unmute() {
 /// never be applied once a request exists: it is stale by definition.
 #[test]
 fn unversioned_payload_never_applied_when_request_exists() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(4);
@@ -293,24 +293,22 @@ fn unversioned_payload_never_applied_when_request_exists() {
     let parking_lot_dirty = AtomicBool::new(false);
     let gc_overflow = GcOverflowBuffer::default();
     let flags = RtStatusFlags::new();
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
 
     flags.requested_rate_generation.store(3, Ordering::Release);
     flags.set_flag(RT_STATUS_RESAMP_SWAP_PENDING);
     prod.push(make_payload(0, 44100, 48000)).unwrap();
 
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 48000);
@@ -331,7 +329,8 @@ fn unversioned_payload_never_applied_when_request_exists() {
 /// once, for the newest build.
 #[test]
 fn budget_applies_one_and_coalesces_backlog() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut gc_c) = rtrb::RingBuffer::new(8);
@@ -347,19 +346,17 @@ fn budget_applies_one_and_coalesces_backlog() {
     prod.push(make_payload(1, 96000, 48000)).unwrap();
     prod.push(make_payload(1, 192000, 48000)).unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 0usize;
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
 
     assert_eq!(active.host_rate(), 192000, "latest build must win");
@@ -368,12 +365,9 @@ fn budget_applies_one_and_coalesces_backlog() {
         1,
         "applied generation recorded on install"
     );
-    assert_eq!(
-        structural_applied, 1,
-        "at most one structural swap per callback"
-    );
-    assert!(deferred.is_none());
-    assert!(cons.is_empty());
+    assert_eq!(budget.used(), 1, "at most one structural swap per callback");
+    assert!(!drain.has_deferred());
+    assert!(drain.is_empty());
     assert!(
         !flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING),
         "the latest install unmutes exactly once"
@@ -390,11 +384,13 @@ fn budget_applies_one_and_coalesces_backlog() {
 }
 
 /// When the shared structural budget was consumed by another drain earlier
-/// in the callback, the current-generation envelope is parked (deferred) —
-/// the callback stays muted — and installed by the next callback.
+/// in the callback, the current-generation head stays queued (FIFO intact,
+/// canonical Phase 1) — the callback stays muted — and the next callback
+/// resolves it.
 #[test]
 fn budget_exhausted_parks_envelope_resolved_next_callback() {
-    let (mut prod, mut cons) = rtrb::RingBuffer::new(4);
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
     let mut active = make_rs(48000, 48000);
     let mut active_stream = make_stream(48000, 48000);
     let (mut gc_p, mut _gc_c) = rtrb::RingBuffer::new(8);
@@ -407,43 +403,46 @@ fn budget_exhausted_parks_envelope_resolved_next_callback() {
     flags.set_flag(RT_STATUS_RESAMP_SWAP_PENDING);
     prod.push(make_payload(1, 44100, 48000)).unwrap();
 
-    let mut deferred = None;
-    let mut structural_applied = 1usize; // another swap applied earlier
+    // Simulate a shared budget already consumed by an earlier drain.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    budget.consume();
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(active.host_rate(), 48000, "not installed out of budget");
-    assert!(deferred.is_some(), "envelope must be parked");
+    // Canonical semantics: the head stays owned by the ring (zero-loss) —
+    // no payload is detached into the deferred slot.
+    assert!(!drain.has_deferred());
+    assert_eq!(drain.ring_occupied(), 1);
     assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
     assert!(
         flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING),
-        "callback stays muted until the parked envelope is applied"
+        "callback stays muted until the queued envelope is applied"
     );
 
-    // Next callback: fresh budget → parked envelope installed and unmuted.
-    structural_applied = 0;
+    // Next callback: fresh budget → queued envelope installed and unmuted.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_resamplers(
-        &mut cons,
-        &mut deferred,
-        &mut structural_applied,
+        &mut drain,
+        &mut budget,
         &mut active,
         &mut active_stream,
+        &flags,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
         &gc_overflow,
-        &flags,
     );
     assert_eq!(active.host_rate(), 44100);
-    assert!(deferred.is_none());
+    assert!(!drain.has_deferred());
+    assert!(drain.is_empty());
     assert!(!flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
 }

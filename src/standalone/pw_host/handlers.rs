@@ -300,7 +300,7 @@ fn build_resampler_pair(
         );
     }
     (
-        NamResampler::new(host_rate, nam_rate, 2048),
+        NamResampler::new_simple(host_rate, nam_rate),
         StreamingResampleBuffer::new(host_rate, nam_rate, MAX_RESAMP_BUF),
     )
 }
@@ -826,11 +826,22 @@ fn build_os_pair(
 /// through the same lost-wakeup guard as the success arm — at most one
 /// allocation attempt and one `log::error!` per request generation, while a
 /// newer request (higher generation) always survives.
+///
+/// T9.4/F-PERF-18 capacity gate: the RT-side oversample scratch is sized by
+/// `required_scratch_len` for the *initial* factor (zero when Off). A runtime
+/// swap requesting a factor whose scratch (`required_scratch_len(factor,
+/// MAX_RESAMP_BUF)`) exceeds that capacity is rejected here — on the cold main
+/// thread, where logging is free — so an engine pair the RT pipeline cannot
+/// hold is never built, shipped or installed. The previous factor keeps
+/// running and the request generation is recorded as failed (no retry spin);
+/// the message tells the user a restart with the new `--oversample` applies
+/// it.
 pub(super) fn handle_oversample_rebuild(
     rt_status: &RtStatusFlags,
     _sys: &SystemSnapshot,
     os_producer: &mut rtrb::Producer<Box<OsEnginePair>>,
     failures: &mut RebuildFailureTracker,
+    os_scratch_len: usize,
 ) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_OS_REBUILD) {
         return;
@@ -844,6 +855,26 @@ pub(super) fn handle_oversample_rebuild(
     }
     let factor_val = rt_status.requested_os_factor.load(Ordering::Relaxed);
     let factor = OversampleFactor::from_f32(factor_val as f32);
+    // T9.4/F-PERF-18 capacity gate (see fn doc).
+    let required = OversampleEngine::required_scratch_len(factor, MAX_RESAMP_BUF);
+    if required > os_scratch_len {
+        log::error!(
+            "[E2004 | OS_SCRATCH_CAPACITY] Oversample swap to {factor:?} rejected: the scratch \
+             buffers were sized for the initial factor at startup \
+             (allocated={os_scratch_len}, required={required}). Audio continues with the \
+             previous factor — restart NAM-Audio-Pipe with the new --oversample to apply it.",
+            factor = factor,
+            os_scratch_len = os_scratch_len,
+        );
+        failures.os_failed_generation = generation;
+        // Lost-wakeup guard identical to the failure arm: clear the flag so the
+        // RT does not re-request the rejected generation (a newer request always
+        // re-arms before the flag).
+        if rt_status.requested_os_generation.load(Ordering::Acquire) == generation {
+            rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_OS_REBUILD);
+        }
+        return;
+    }
     match build_os_pair(factor, generation, rt_status) {
         (Ok(os_l), Ok(os_r)) => {
             failures.os_failed_generation = 0;
