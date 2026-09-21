@@ -10,6 +10,7 @@ use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
+use super::stream_status::StreamStatusFlags;
 use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
 use crate::standalone::cli::GateConfig;
 use crate::standalone::rt_setup;
@@ -67,6 +68,8 @@ pub struct PipewireHostConfig {
     /// through), while a [`GateConfig::Threshold`] carries the open/close dBFS
     /// thresholds of the Schmitt trigger (auto hysteresis of 10 dB).
     pub gate_config: GateConfig,
+    /// Optional externally-owned stream status flags (for integration testing).
+    pub stream_status: Option<std::sync::Arc<StreamStatusFlags>>,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).
@@ -76,6 +79,7 @@ pub fn playback_dsp_cycle(
     bridge: DspBridgeReader,
     last_bridge_gen: &mut u64,
     rt_status: &RtStatusFlags,
+    stream_status: &StreamStatusFlags,
     pb_frame_count: u32,
 ) {
     let should_measure = (pb_frame_count & 0xF) == 0;
@@ -90,8 +94,8 @@ pub fn playback_dsp_cycle(
     // no processed audio may reach the hardware. Deterministic silence is
     // delivered instead, reusing the starvation silence policy — the DAC never
     // repeats stale audio and never plays garbled wrong-format data.
-    if !rt_status.is_audio_unmuted() {
-        deliver_silence_block(stream, rt_status);
+    if !stream_status.is_audio_unmuted() {
+        deliver_silence_block(stream, rt_status, stream_status);
         return;
     }
 
@@ -116,7 +120,7 @@ pub fn playback_dsp_cycle(
         // still dequeue, validate fail-closed, fill 100% of the output
         // extension with analytical silence and recycle the buffer — the
         // hardware never repeats stale audio left in the previous buffer.
-        deliver_silence_block(stream, rt_status);
+        deliver_silence_block(stream, rt_status, stream_status);
         return;
     };
 
@@ -197,16 +201,16 @@ pub fn playback_dsp_cycle(
     if should_measure && t_pb_start > 0 {
         let t_pb_end = rt_setup::rdtsc_nanos();
         let pb_nanos = t_pb_end.saturating_sub(t_pb_start);
-        rt_status
+        stream_status
             .playback_cycle_time
             .store(pb_nanos, Ordering::Relaxed);
-        rt_status.playback_hist.record(pb_nanos);
+        stream_status.playback_hist.record(pb_nanos);
 
-        let cap_start = rt_status.capture_start_tsc.load(Ordering::Relaxed);
+        let cap_start = stream_status.capture_start_tsc.load(Ordering::Relaxed);
         if cap_start > 0 && t_pb_end > cap_start {
             let e2e_nanos = t_pb_end.saturating_sub(cap_start);
-            rt_status.e2e_cycle_time.store(e2e_nanos, Ordering::Relaxed);
-            rt_status.e2e_hist.record(e2e_nanos);
+            stream_status.e2e_cycle_time.store(e2e_nanos, Ordering::Relaxed);
+            stream_status.e2e_hist.record(e2e_nanos);
         }
     }
 }
@@ -262,6 +266,7 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     chunk_r: *mut pw::spa::sys::spa_chunk,
     silence_bytes: usize,
     rt_status: &RtStatusFlags,
+    stream_status: &StreamStatusFlags,
 ) -> Option<usize> {
     let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
         ptr_l,
@@ -300,7 +305,7 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     }
 
     // Telemetry: one deterministic silence block delivered to the graph.
-    rt_status
+    stream_status
         .playback_bridge_starvation
         .fetch_add(1, Ordering::Relaxed);
 
@@ -322,7 +327,11 @@ pub unsafe fn deliver_silence_pair_fail_closed(
 /// contract violation or missing buffer) recycles or counts the miss, so the
 /// output node never starves for buffers.
 #[inline(always)]
-fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags) {
+fn deliver_silence_block(
+    stream: &pw::stream::Stream,
+    rt_status: &RtStatusFlags,
+    stream_status: &StreamStatusFlags,
+) {
     let mut buf = match stream.dequeue_buffer() {
         Some(b) => b,
         None => {
@@ -394,6 +403,7 @@ fn deliver_silence_block(stream: &pw::stream::Stream, rt_status: &RtStatusFlags)
             chunk_r,
             silence_bytes,
             rt_status,
+            stream_status,
         )
     };
 }
@@ -585,25 +595,26 @@ pub fn validate_audio_raw_format(param: &pw::spa::pod::Pod) -> Result<u32, Contr
 /// Called from the `param_changed` listeners (PipeWire ThreadLoop thread,
 /// non-RT): raises `RT_STATUS_HOST_CONTRACT_VIOLATION` on `rt_status` so the
 /// backend state machine (main control loop) observes the degraded/error
-/// state, latches the audio-level mute guard ([`RtStatusFlags::format_contract_ok`])
+/// state, latches the audio-level mute guard ([`StreamStatusFlags::format_contract_ok`])
 /// and emits a structured diagnostic error naming the offending stream and the
 /// exact violation.
 #[cold]
 pub fn reject_negotiated_format_violation(
     rt_status: &RtStatusFlags,
+    stream_status: &StreamStatusFlags,
     stream_name: &str,
     violation: ContractViolation,
 ) {
     rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
     if stream_name == "capture" {
-        rt_status.capture_format_ok.store(0, Ordering::Relaxed);
+        stream_status.capture_format_ok.store(0, Ordering::Relaxed);
     } else if stream_name == "playback" {
-        rt_status.playback_format_ok.store(0, Ordering::Relaxed);
+        stream_status.playback_format_ok.store(0, Ordering::Relaxed);
     }
-    rt_status.format_contract_ok.store(0, Ordering::Relaxed);
+    stream_status.format_contract_ok.store(0, Ordering::Relaxed);
     log::error!(
         "Audio host renegotiated an incompatible SPA format on the {stream_name} stream — \
-         strict contract violated. [E2304 | SPA_FORMAT_CONTRACT_VIOLATION] stream={stream_name} violation={violation}"
+         strict contract violated. [E2304 | HOST_FORMAT_CONTRACT_VIOLATION] stream={stream_name} violation={violation}"
     );
 }
 
@@ -613,31 +624,31 @@ pub fn reject_negotiated_format_violation(
 /// Called by the `param_changed` listeners on the successful path; re-arms the
 /// RT mute guard so audio processing resumes automatically.
 #[inline]
-pub fn mark_format_contract_ok(rt_status: &RtStatusFlags, stream_name: &str) {
+pub fn mark_format_contract_ok(stream_status: &StreamStatusFlags, stream_name: &str) {
     if stream_name == "capture" {
-        rt_status.capture_format_ok.store(1, Ordering::Relaxed);
+        stream_status.capture_format_ok.store(1, Ordering::Relaxed);
     } else if stream_name == "playback" {
-        rt_status.playback_format_ok.store(1, Ordering::Relaxed);
+        stream_status.playback_format_ok.store(1, Ordering::Relaxed);
     }
-    let cap = rt_status.capture_format_ok.load(Ordering::Relaxed);
-    let pb = rt_status.playback_format_ok.load(Ordering::Relaxed);
-    rt_status
+    let cap = stream_status.capture_format_ok.load(Ordering::Relaxed);
+    let pb = stream_status.playback_format_ok.load(Ordering::Relaxed);
+    stream_status
         .format_contract_ok
         .store(if cap != 0 && pb != 0 { 1 } else { 0 }, Ordering::Relaxed);
 }
 
-/// Updates the stream active latch on `RtStatusFlags`.
+/// Updates the stream active latch on `StreamStatusFlags`.
 ///
 /// When a stream enters `Streaming`, `active` is `true` (latches `1`).
 /// When a stream is `Paused`, `Unconnected` or in `Error`, `active` is `false` (latches `0`),
-/// causing [`RtStatusFlags::is_audio_unmuted`] to fail-closed mute audio on the RT thread.
+/// causing [`StreamStatusFlags::is_audio_unmuted`] to fail-closed mute audio on the RT thread.
 #[inline]
-pub fn mark_stream_active(rt_status: &RtStatusFlags, stream_name: &str, active: bool) {
+pub fn mark_stream_active(stream_status: &StreamStatusFlags, stream_name: &str, active: bool) {
     let val = if active { 1 } else { 0 };
     if stream_name == "capture" {
-        rt_status.capture_active.store(val, Ordering::Release);
+        stream_status.capture_active.store(val, Ordering::Release);
     } else if stream_name == "playback" {
-        rt_status.playback_active.store(val, Ordering::Release);
+        stream_status.playback_active.store(val, Ordering::Release);
     }
 }
 
@@ -648,9 +659,9 @@ pub fn mark_stream_active(rt_status: &RtStatusFlags, stream_name: &str, active: 
 /// path). A `None` result means at least one stream never negotiated or the
 /// rates agree.
 #[inline]
-pub fn negotiated_rate_mismatch(rt_status: &RtStatusFlags) -> Option<(u32, u32)> {
-    let capture = rt_status.capture_negotiated_rate.load(Ordering::Acquire);
-    let playback = rt_status.playback_negotiated_rate.load(Ordering::Acquire);
+pub fn negotiated_rate_mismatch(stream_status: &StreamStatusFlags) -> Option<(u32, u32)> {
+    let capture = stream_status.capture_negotiated_rate.load(Ordering::Acquire);
+    let playback = stream_status.playback_negotiated_rate.load(Ordering::Acquire);
     (capture != 0 && playback != 0 && capture != playback).then_some((capture, playback))
 }
 
@@ -661,8 +672,8 @@ pub fn negotiated_rate_mismatch(rt_status: &RtStatusFlags) -> Option<(u32, u32)>
 /// currently negotiated rate, the mismatch is surfaced as a warning so the
 /// operator knows the streams drift (resampler pressure / clock skew).
 #[cold]
-pub fn check_negotiated_rate_mismatch(rt_status: &RtStatusFlags) {
-    if let Some((capture, playback)) = negotiated_rate_mismatch(rt_status) {
+pub fn check_negotiated_rate_mismatch(stream_status: &StreamStatusFlags) {
+    if let Some((capture, playback)) = negotiated_rate_mismatch(stream_status) {
         log::warn!(
             "Audio streams operate at discrepant negotiated sample rates — clock drift and \
              resampler pressure expected. [E2305 | RATE_MISMATCH] capture={capture} playback={playback}"

@@ -38,7 +38,7 @@ use nam_audio_pipe::standalone::pw_host::output_pw::{
     mark_format_contract_ok, reject_negotiated_format_violation, validate_audio_raw_format,
 };
 use nam_audio_pipe::standalone::pw_host::{
-    BackendState, SharedBackendStatus, observe_stream_state,
+    BackendState, SharedBackendStatus, StreamStatusFlags, observe_stream_state,
 };
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use pipewire as pw;
@@ -632,6 +632,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     let mut chunk_l = spa_chunk(7, 4, 0);
     let mut chunk_r = spa_chunk(3, 8, 2);
     let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
 
     let started = Instant::now();
     for cycle in 0..CYCLES {
@@ -654,6 +655,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
                 &mut chunk_r,
                 FRAMES * 4,
                 &rt,
+                &stream_status,
             )
         };
         assert_eq!(
@@ -693,7 +695,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     let elapsed = started.elapsed();
 
     assert_eq!(
-        rt.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
         CYCLES as u32,
         "every starvation quantum must be telemetrized (xrun telemetry)"
     );
@@ -724,6 +726,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     let mut big_chunk_l = spa_chunk(7, 4, 0);
     let mut big_chunk_r = spa_chunk(3, 8, 2);
     let rt_big = RtStatusFlags::default();
+    let stream_status_big = StreamStatusFlags::new();
 
     for cycle in 0..CYCLES {
         big_l.fill(0.5f32);
@@ -740,6 +743,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
                 &mut big_chunk_r,
                 FRAMES * 4,
                 &rt_big,
+                &stream_status_big,
             )
         };
         assert_eq!(
@@ -784,7 +788,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     }
 
     assert_eq!(
-        rt_big.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status_big.playback_bridge_starvation.load(Ordering::Relaxed),
         CYCLES as u32,
         "every large-buffer starvation quantum must be telemetrized"
     );
@@ -843,9 +847,9 @@ fn spa_format_rejection_signals_contract_violation_fail_closed() {
 
     // Baseline: the valid contract is accepted and the mute guard is armed.
     {
-        let rt = RtStatusFlags::default();
+        let stream_status = StreamStatusFlags::new();
         assert_eq!(
-            rt.format_contract_ok.load(Ordering::Relaxed),
+            stream_status.format_contract_ok.load(Ordering::Relaxed),
             1,
             "latch defaults to contract-ok"
         );
@@ -895,6 +899,7 @@ fn spa_format_rejection_signals_contract_violation_fail_closed() {
     ];
     for (format, channels, expected, label) in cases {
         let rt = RtStatusFlags::default();
+        let stream_status = StreamStatusFlags::new();
         let info = raw_audio_info(*format, *channels);
         let mut storage = SpaPodStorage::new();
         let pod = build_raw_format_pod(&info, &mut storage);
@@ -903,19 +908,19 @@ fn spa_format_rejection_signals_contract_violation_fail_closed() {
             Err(*expected),
             "{label} must be rejected with the typed violation"
         );
-        reject_negotiated_format_violation(&rt, "capture", *expected);
+        reject_negotiated_format_violation(&rt, &stream_status, "capture", *expected);
         assert!(
             rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
             "{label}: the host must signal the contract violation"
         );
         assert_eq!(
-            rt.format_contract_ok.load(Ordering::Relaxed),
+            stream_status.format_contract_ok.load(Ordering::Relaxed),
             0,
             "{label}: the RT mute guard must be latched (fail-closed)"
         );
-        mark_format_contract_ok(&rt, "capture");
+        mark_format_contract_ok(&stream_status, "capture");
         assert_eq!(
-            rt.format_contract_ok.load(Ordering::Relaxed),
+            stream_status.format_contract_ok.load(Ordering::Relaxed),
             1,
             "{label}: a later valid F32P stereo renegotiation must re-arm audio"
         );

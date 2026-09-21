@@ -86,6 +86,7 @@ mod reconnect;
 mod rt_callback;
 mod run;
 pub mod status;
+pub mod stream_status;
 mod wakeup;
 
 pub use output_pw::PipewireHostConfig;
@@ -94,6 +95,7 @@ pub use status::{
     BackendState, BackendStatusSnapshot, SharedBackendStatus, observe_rt_panic,
     observe_stream_state,
 };
+pub use stream_status::StreamStatusFlags;
 pub use wakeup::ControlPlaneWakeup;
 
 /// Offline RT swap-stress harness — full capture-callback drain

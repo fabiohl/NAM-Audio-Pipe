@@ -15,6 +15,7 @@
 //! episode instead of once per control-loop iteration.
 
 use crate::standalone::colors::Colorize;
+use crate::standalone::pw_host::StreamStatusFlags;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use std::sync::atomic::Ordering;
@@ -129,6 +130,7 @@ impl PollState {
 /// runtime telemetry is intentionally bundle-free.
 pub fn poll_rt_status(
     rt_status: &RtStatusFlags,
+    stream_status: Option<&StreamStatusFlags>,
     _sys: &SystemSnapshot,
     was_silent: bool,
     was_fading: bool,
@@ -487,9 +489,9 @@ pub fn poll_rt_status(
     // stale audio — expected behavior, surfaced as info telemetry.
     // Latched: sustained starvation (e.g. paused capture) informs once
     // per episode instead of every control-loop iteration.
-    let playback_bridge_starvation = rt_status
-        .playback_bridge_starvation
-        .swap(0, Ordering::Relaxed);
+    let playback_bridge_starvation = stream_status
+        .map(|s| s.playback_bridge_starvation.swap(0, Ordering::Relaxed))
+        .unwrap_or(0);
     if state
         .latches
         .playback_starvation
@@ -526,11 +528,16 @@ pub fn poll_rt_status(
         let duration = Duration::from_nanos(nanos);
         state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
         if state.telemetry_throttle.wrapping_rem(100) == 0 {
-            let cap_min = rt_status.capture_hist.get_exact_min() / 1000;
-            let cap_mean = rt_status.capture_hist.get_mean() / 1000;
-            let cap_p50 = rt_status.capture_hist.get_percentile(0.50) / 1000;
-            let cap_p99 = rt_status.capture_hist.get_percentile(0.99) / 1000;
-            let cap_max = rt_status.capture_hist.take_exact_max() / 1000;
+            let (cap_min, cap_mean, cap_p50, cap_p99, cap_max) = match stream_status {
+                Some(ss) => (
+                    ss.capture_hist.get_exact_min() / 1000,
+                    ss.capture_hist.get_mean() / 1000,
+                    ss.capture_hist.get_percentile(0.50) / 1000,
+                    ss.capture_hist.get_percentile(0.99) / 1000,
+                    ss.capture_hist.take_exact_max() / 1000,
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
 
             let dsp_min = rt_status.latency_hist.get_exact_min() / 1000;
             let dsp_mean = rt_status.latency_hist.get_mean() / 1000;
@@ -538,23 +545,38 @@ pub fn poll_rt_status(
             let dsp_p99 = rt_status.latency_hist.get_percentile(0.99) / 1000;
             let dsp_max = rt_status.latency_hist.take_exact_max() / 1000;
 
-            let rec_min = rt_status.record_hist.get_exact_min() / 1000;
-            let rec_mean = rt_status.record_hist.get_mean() / 1000;
-            let rec_p50 = rt_status.record_hist.get_percentile(0.50) / 1000;
-            let rec_p99 = rt_status.record_hist.get_percentile(0.99) / 1000;
-            let rec_max = rt_status.record_hist.take_exact_max() / 1000;
+            let (rec_min, rec_mean, rec_p50, rec_p99, rec_max) = match stream_status {
+                Some(ss) => (
+                    ss.record_hist.get_exact_min() / 1000,
+                    ss.record_hist.get_mean() / 1000,
+                    ss.record_hist.get_percentile(0.50) / 1000,
+                    ss.record_hist.get_percentile(0.99) / 1000,
+                    ss.record_hist.take_exact_max() / 1000,
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
 
-            let pb_min = rt_status.playback_hist.get_exact_min() / 1000;
-            let pb_mean = rt_status.playback_hist.get_mean() / 1000;
-            let pb_p50 = rt_status.playback_hist.get_percentile(0.50) / 1000;
-            let pb_p99 = rt_status.playback_hist.get_percentile(0.99) / 1000;
-            let pb_max = rt_status.playback_hist.take_exact_max() / 1000;
+            let (pb_min, pb_mean, pb_p50, pb_p99, pb_max) = match stream_status {
+                Some(ss) => (
+                    ss.playback_hist.get_exact_min() / 1000,
+                    ss.playback_hist.get_mean() / 1000,
+                    ss.playback_hist.get_percentile(0.50) / 1000,
+                    ss.playback_hist.get_percentile(0.99) / 1000,
+                    ss.playback_hist.take_exact_max() / 1000,
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
 
-            let e2e_min = rt_status.e2e_hist.get_exact_min() / 1000;
-            let e2e_mean = rt_status.e2e_hist.get_mean() / 1000;
-            let e2e_p50 = rt_status.e2e_hist.get_percentile(0.50) / 1000;
-            let e2e_p99 = rt_status.e2e_hist.get_percentile(0.99) / 1000;
-            let e2e_max = rt_status.e2e_hist.take_exact_max() / 1000;
+            let (e2e_min, e2e_mean, e2e_p50, e2e_p99, e2e_max) = match stream_status {
+                Some(ss) => (
+                    ss.e2e_hist.get_exact_min() / 1000,
+                    ss.e2e_hist.get_mean() / 1000,
+                    ss.e2e_hist.get_percentile(0.50) / 1000,
+                    ss.e2e_hist.get_percentile(0.99) / 1000,
+                    ss.e2e_hist.take_exact_max() / 1000,
+                ),
+                None => (0, 0, 0, 0, 0),
+            };
 
             let total_calls = rt_status.latency_hist.total_count();
 
@@ -594,18 +616,25 @@ pub fn poll_rt_status(
                 e2e_max,
             );
 
-            rt_status.capture_hist.reset();
+            if let Some(ss) = stream_status {
+                ss.capture_hist.reset();
+                ss.record_hist.reset();
+                ss.playback_hist.reset();
+                ss.e2e_hist.reset();
+            }
             rt_status.latency_hist.reset();
-            rt_status.record_hist.reset();
-            rt_status.playback_hist.reset();
-            rt_status.e2e_hist.reset();
 
-            let cap_ticks = rt_status.capture_host_ticks.load(Ordering::Relaxed);
-            let pb_ticks = rt_status.playback_host_ticks.load(Ordering::Relaxed);
-            let cap_now = rt_status.capture_host_now.load(Ordering::Relaxed);
-            let pb_now = rt_status.playback_host_now.load(Ordering::Relaxed);
-            let cap_delay = rt_status.capture_host_delay.load(Ordering::Relaxed);
-            let pb_delay = rt_status.playback_host_delay.load(Ordering::Relaxed);
+            let (cap_ticks, pb_ticks, cap_now, pb_now, cap_delay, pb_delay) = match stream_status {
+                Some(ss) => (
+                    ss.capture_host_ticks.load(Ordering::Relaxed),
+                    ss.playback_host_ticks.load(Ordering::Relaxed),
+                    ss.capture_host_now.load(Ordering::Relaxed),
+                    ss.playback_host_now.load(Ordering::Relaxed),
+                    ss.capture_host_delay.load(Ordering::Relaxed),
+                    ss.playback_host_delay.load(Ordering::Relaxed),
+                ),
+                None => (0, 0, 0, 0, 0, 0),
+            };
 
             if cap_ticks > 0 && pb_ticks > 0 {
                 let tick_delta = pb_ticks.wrapping_sub(cap_ticks);

@@ -107,6 +107,7 @@ pub fn setup_capture_stream<'c>(
     let rate_for_process = rate_for_param.clone();
     let rt_status_for_listener = rt_status.clone();
     let rt_status_for_process = rt_status;
+    let stream_status_for_process = backend_status.stream_status().clone();
     let backend_for_state = backend_status.clone();
     let backend_for_params = backend_status;
 
@@ -388,6 +389,7 @@ pub fn setup_capture_stream<'c>(
                         current_host_rate,
                         &mut state.frame_count,
                         &rt_status_for_process,
+                        &stream_status_for_process,
                         recording_sender,
                         &mut state.recording_meta_sent,
                         &mut state.recording_meta_rate,
@@ -401,13 +403,13 @@ pub fn setup_capture_stream<'c>(
                     if (state.frame_count.wrapping_sub(1) & 0x3F) == 0
                         && let Ok(pw_time) = stream.time()
                     {
-                        rt_status_for_process
+                        stream_status_for_process
                             .capture_host_now
                             .store(pw_time.now(), Ordering::Relaxed);
-                        rt_status_for_process
+                        stream_status_for_process
                             .capture_host_ticks
                             .store(pw_time.ticks(), Ordering::Relaxed);
-                        rt_status_for_process
+                        stream_status_for_process
                             .capture_host_delay
                             .store(pw_time.delay(), Ordering::Relaxed);
                     }

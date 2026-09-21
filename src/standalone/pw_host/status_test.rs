@@ -538,34 +538,36 @@ fn concurrent_transitions_never_leak_incoherent_snapshots() {
 #[test]
 fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
     let rt = Arc::new(RtStatusFlags::default());
-    rt.capture_format_ok.store(0, Ordering::Relaxed);
-    rt.playback_format_ok.store(0, Ordering::Relaxed);
     let backend = SharedBackendStatus::with_rt_status(rt.clone());
+    let stream_status = backend.stream_status();
+    stream_status.capture_format_ok.store(0, Ordering::Relaxed);
+    stream_status.playback_format_ok.store(0, Ordering::Relaxed);
 
     // Case 1: Capture valid format, playback not-yet-ok
-    output_pw::mark_format_contract_ok(&rt, "capture");
+    output_pw::mark_format_contract_ok(stream_status, "capture");
     backend.set_stream_active("capture", true);
 
     // Audio MUST remain muted until all 4 conditions (capture_format_ok, playback_format_ok, capture_active, playback_active) are met
-    assert!(!rt.is_audio_unmuted());
+    assert!(!stream_status.is_audio_unmuted());
     assert_ne!(backend.state(), BackendState::Running);
 
     // Case 2: Playback valid format, capture not-yet-ok
     let rt2 = Arc::new(RtStatusFlags::default());
-    rt2.capture_format_ok.store(0, Ordering::Relaxed);
-    rt2.playback_format_ok.store(0, Ordering::Relaxed);
     let backend2 = SharedBackendStatus::with_rt_status(rt2.clone());
-    output_pw::mark_format_contract_ok(&rt2, "playback");
+    let stream_status2 = backend2.stream_status();
+    stream_status2.capture_format_ok.store(0, Ordering::Relaxed);
+    stream_status2.playback_format_ok.store(0, Ordering::Relaxed);
+    output_pw::mark_format_contract_ok(stream_status2, "playback");
     backend2.set_stream_active("playback", true);
 
-    assert!(!rt2.is_audio_unmuted());
+    assert!(!stream_status2.is_audio_unmuted());
     assert_ne!(backend2.state(), BackendState::Running);
 
     // Case 3: Both format contracts ok AND both streams active -> is_audio_unmuted becomes true and state becomes Running
-    output_pw::mark_format_contract_ok(&rt, "playback");
+    output_pw::mark_format_contract_ok(stream_status, "playback");
     backend.set_stream_active("playback", true);
 
-    assert!(rt.is_audio_unmuted());
+    assert!(stream_status.is_audio_unmuted());
     assert_eq!(backend.state(), BackendState::Running);
 }
 
@@ -573,51 +575,56 @@ fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
 fn invalid_stream_format_rejection_prevents_unmute() {
     let rt = Arc::new(RtStatusFlags::default());
     let backend = SharedBackendStatus::with_rt_status(rt.clone());
+    let stream_status = backend.stream_status();
 
     // Valid capture format & active stream
-    output_pw::mark_format_contract_ok(&rt, "capture");
+    output_pw::mark_format_contract_ok(stream_status, "capture");
     backend.set_stream_active("capture", true);
 
     // Rejected/invalid playback format
     output_pw::reject_negotiated_format_violation(
         &rt,
+        stream_status,
         "playback",
         output_pw::ContractViolation::NotStereo(1),
     );
     backend.set_stream_active("playback", true);
 
     // Audio must stay muted if playback format is invalid
-    assert!(!rt.is_audio_unmuted());
+    assert!(!stream_status.is_audio_unmuted());
 
     // Inverse: valid playback format & active stream, rejected capture format
     let rt2 = Arc::new(RtStatusFlags::default());
     let backend2 = SharedBackendStatus::with_rt_status(rt2.clone());
+    let stream_status2 = backend2.stream_status();
 
-    output_pw::mark_format_contract_ok(&rt2, "playback");
+    output_pw::mark_format_contract_ok(stream_status2, "playback");
     backend2.set_stream_active("playback", true);
     output_pw::reject_negotiated_format_violation(
         &rt2,
+        stream_status2,
         "capture",
         output_pw::ContractViolation::NotStereo(1),
     );
     backend2.set_stream_active("capture", true);
 
-    assert!(!rt2.is_audio_unmuted());
+    assert!(!stream_status2.is_audio_unmuted());
 }
 
 #[test]
 fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
     let rt = Arc::new(RtStatusFlags::default());
     let backend = SharedBackendStatus::with_rt_status(rt.clone());
+    let stream_status = backend.stream_status();
 
     // Formats negotiated as valid F32P planar stereo
-    output_pw::mark_format_contract_ok(&rt, "capture");
-    output_pw::mark_format_contract_ok(&rt, "playback");
+    output_pw::mark_format_contract_ok(stream_status, "capture");
+    output_pw::mark_format_contract_ok(stream_status, "playback");
 
     // Initially streams are not streaming yet -> muted
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
-    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
-    assert!(!rt.is_audio_unmuted());
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 0);
+    assert_eq!(stream_status.playback_active.load(Ordering::Acquire), 0);
+    assert!(!stream_status.is_audio_unmuted());
 
     // Condition 1: Connect / Stream (Streaming)
     observe_stream_state(
@@ -626,9 +633,9 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         StreamState::Streaming,
         &backend,
     );
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
-    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
-    assert!(!rt.is_audio_unmuted()); // Still muted because playback not streaming yet
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 1);
+    assert_eq!(stream_status.playback_active.load(Ordering::Acquire), 0);
+    assert!(!stream_status.is_audio_unmuted()); // Still muted because playback not streaming yet
 
     observe_stream_state(
         "playback",
@@ -636,10 +643,10 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         StreamState::Streaming,
         &backend,
     );
-    assert_eq!(rt.playback_active.load(Ordering::Acquire), 1);
+    assert_eq!(stream_status.playback_active.load(Ordering::Acquire), 1);
     assert_eq!(backend.state(), BackendState::Running);
     assert!(
-        rt.is_audio_unmuted(),
+        stream_status.is_audio_unmuted(),
         "Both streams streaming + format ok -> unmuted"
     );
 
@@ -651,12 +658,12 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         &backend,
     );
     assert_eq!(
-        rt.capture_active.load(Ordering::Acquire),
+        stream_status.capture_active.load(Ordering::Acquire),
         0,
         "Capture pause sets latch to 0"
     );
     assert!(
-        !rt.is_audio_unmuted(),
+        !stream_status.is_audio_unmuted(),
         "Stream pause immediately mutes RT audio"
     );
     assert_eq!(backend.state(), BackendState::Starting);
@@ -668,8 +675,8 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         StreamState::Streaming,
         &backend,
     );
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
-    assert!(rt.is_audio_unmuted(), "Resume restores unmuted audio");
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 1);
+    assert!(stream_status.is_audio_unmuted(), "Resume restores unmuted audio");
     assert_eq!(backend.state(), BackendState::Running);
 
     // Condition 3: Disconnect & Bounded Reconnect Cycle
@@ -679,15 +686,15 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         StreamState::Unconnected,
         &backend,
     );
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
-    assert!(!rt.is_audio_unmuted());
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 0);
+    assert!(!stream_status.is_audio_unmuted());
     assert!(backend.is_failed());
 
     backend.begin_reconnect(1, 3, Duration::from_millis(100));
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 0);
-    assert_eq!(rt.playback_active.load(Ordering::Acquire), 0);
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 0);
+    assert_eq!(stream_status.playback_active.load(Ordering::Acquire), 0);
     assert!(
-        !rt.is_audio_unmuted(),
+        !stream_status.is_audio_unmuted(),
         "Audio stays muted while reconnecting"
     );
 
@@ -704,10 +711,10 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         StreamState::Streaming,
         &backend,
     );
-    assert_eq!(rt.capture_active.load(Ordering::Acquire), 1);
-    assert_eq!(rt.playback_active.load(Ordering::Acquire), 1);
+    assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 1);
+    assert_eq!(stream_status.playback_active.load(Ordering::Acquire), 1);
     assert!(
-        rt.is_audio_unmuted(),
+        stream_status.is_audio_unmuted(),
         "Reconnected streams restore unmuted audio"
     );
     assert_eq!(backend.state(), BackendState::Running);
@@ -720,11 +727,11 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         &backend,
     );
     assert_eq!(
-        rt.playback_active.load(Ordering::Acquire),
+        stream_status.playback_active.load(Ordering::Acquire),
         0,
         "Error sets playback latch to 0"
     );
-    assert!(!rt.is_audio_unmuted(), "Error mutes audio immediately");
+    assert!(!stream_status.is_audio_unmuted(), "Error mutes audio immediately");
     assert!(backend.is_failed());
 }
 

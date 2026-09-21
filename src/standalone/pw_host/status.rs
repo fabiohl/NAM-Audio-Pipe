@@ -22,6 +22,7 @@
 
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::wakeup::ControlPlaneWakeup;
+use super::StreamStatusFlags;
 use neural_amp_modeler_rs::common::spsc::{RtStatusFlags, SHUTDOWN};
 use pipewire as pw;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,7 +131,6 @@ impl BackendStatusSnapshot {
 /// handlers run on the PipeWire `ThreadLoop` thread, never on the RT data
 /// thread), while an [`AtomicBool`] gives the main loop a lock-free fast-path
 /// [`SharedBackendStatus::is_failed`] poll every control iteration.
-#[derive(Default)]
 pub struct SharedBackendStatus {
     failed: AtomicBool,
     capture_active: AtomicBool,
@@ -138,7 +138,23 @@ pub struct SharedBackendStatus {
     state: Mutex<BackendState>,
     failure_detail: Mutex<Option<BackendFailureDetail>>,
     rt_status: Option<Arc<RtStatusFlags>>,
+    stream_status: Arc<StreamStatusFlags>,
     wakeup: Option<ControlPlaneWakeup>,
+}
+
+impl Default for SharedBackendStatus {
+    fn default() -> Self {
+        Self {
+            failed: AtomicBool::new(false),
+            capture_active: AtomicBool::new(false),
+            playback_active: AtomicBool::new(false),
+            state: Mutex::new(BackendState::Starting),
+            failure_detail: Mutex::new(None),
+            rt_status: None,
+            stream_status: Arc::new(StreamStatusFlags::new()),
+            wakeup: None,
+        }
+    }
 }
 
 impl std::fmt::Debug for SharedBackendStatus {
@@ -162,28 +178,40 @@ impl SharedBackendStatus {
 
     /// Creates a new status in the [`BackendState::Starting`] state bound to an RT status latch.
     pub fn with_rt_status(rt_status: Arc<RtStatusFlags>) -> Self {
-        // Initial state before PipeWire streams reach `Streaming` is inactive (muted).
-        crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "capture", false);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&rt_status, "playback", false);
-        Self {
+        let this = Self {
             rt_status: Some(rt_status),
             ..Self::default()
-        }
+        };
+        // Initial state before PipeWire streams reach `Streaming` is inactive (muted).
+        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "capture", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "playback", false);
+        this
+    }
+
+    /// Creates a new status in the [`BackendState::Starting`] state bound to both
+    /// an engine RT status latch and host stream status flags.
+    pub fn with_rt_and_stream_status(
+        rt_status: Arc<RtStatusFlags>,
+        stream_status: Arc<StreamStatusFlags>,
+    ) -> Self {
+        let this = Self {
+            rt_status: Some(rt_status),
+            stream_status,
+            ..Self::default()
+        };
+        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "capture", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "playback", false);
+        this
     }
 
     /// Binds an RT status latch to an existing backend status instance.
     pub fn bind_rt_status(&mut self, rt_status: Arc<RtStatusFlags>) {
-        crate::standalone::pw_host::output_pw::mark_stream_active(
-            &rt_status,
-            "capture",
-            self.capture_active.load(Ordering::Acquire),
-        );
-        crate::standalone::pw_host::output_pw::mark_stream_active(
-            &rt_status,
-            "playback",
-            self.playback_active.load(Ordering::Acquire),
-        );
         self.rt_status = Some(rt_status);
+    }
+
+    /// Returns a reference to the stream status flags.
+    pub fn stream_status(&self) -> &Arc<StreamStatusFlags> {
+        &self.stream_status
     }
 
     /// Binds an event-driven wakeup mechanism for the main control plane.
@@ -254,9 +282,7 @@ impl SharedBackendStatus {
         } else if stream == "playback" {
             self.playback_active.store(active, Ordering::Release);
         }
-        if let Some(ref rt) = self.rt_status {
-            crate::standalone::pw_host::output_pw::mark_stream_active(rt, stream, active);
-        }
+        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, stream, active);
         let cap = self.capture_active.load(Ordering::Acquire);
         let pb = self.playback_active.load(Ordering::Acquire);
         let mut guard = self.lock_state();
@@ -327,10 +353,8 @@ impl SharedBackendStatus {
         *self.lock_state() = BackendState::Terminated;
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
-        if let Some(ref rt) = self.rt_status {
-            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "capture", false);
-            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "playback", false);
-        }
+        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "capture", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "playback", false);
         self.notify_wakeup();
     }
 
@@ -340,10 +364,8 @@ impl SharedBackendStatus {
         self.failed.store(false, Ordering::Release);
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
-        if let Some(ref rt) = self.rt_status {
-            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "capture", false);
-            crate::standalone::pw_host::output_pw::mark_stream_active(rt, "playback", false);
-        }
+        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "capture", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "playback", false);
         *self.lock_failure_detail() = None;
         *guard = BackendState::Reconnecting {
             attempt,

@@ -320,6 +320,7 @@ fn main() -> anyhow::Result<()> {
             cpu_receipt,
             fail_fast: args.fail_fast,
             gate_config: args.gate,
+            stream_status: None,
         },
         gc_consumer,
         slimmable_consumer,

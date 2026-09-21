@@ -69,16 +69,22 @@ pub fn playback_param_changed_handler(
 
     match validate_audio_raw_format(param) {
         Ok(rate) => {
-            rt_status
+            backend
+                .stream_status()
                 .playback_negotiated_rate
                 .store(rate, Ordering::Release);
-            mark_format_contract_ok(rt_status, "playback");
-            check_negotiated_rate_mismatch(rt_status);
+            mark_format_contract_ok(backend.stream_status(), "playback");
+            check_negotiated_rate_mismatch(backend.stream_status());
             backend.notify_wakeup();
         }
         Err(violation) => {
             let violation_msg = violation.to_string();
-            reject_negotiated_format_violation(rt_status, "playback", violation);
+            reject_negotiated_format_violation(
+                rt_status,
+                backend.stream_status(),
+                "playback",
+                violation,
+            );
             backend.mark_degraded(format!(
                 "SPA format contract violated on the playback stream: {violation_msg}"
             ));
@@ -100,6 +106,7 @@ pub fn setup_playback_stream<'c>(
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let bridge_ptr_playback = unsafe { DspBridgeReader::new(bridge_ptr.as_ptr()) };
     let rt_status_playback = rt_status;
+    let stream_status_playback = backend_status.stream_status().clone();
 
     let mut playback_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -153,13 +160,13 @@ pub fn setup_playback_stream<'c>(
                     if (pb_frame_count & 0x3F) == 0
                         && let Ok(pw_time) = stream.time()
                     {
-                        rt_status_playback
+                        stream_status_playback
                             .playback_host_now
                             .store(pw_time.now(), Ordering::Relaxed);
-                        rt_status_playback
+                        stream_status_playback
                             .playback_host_ticks
                             .store(pw_time.ticks(), Ordering::Relaxed);
-                        rt_status_playback
+                        stream_status_playback
                             .playback_host_delay
                             .store(pw_time.delay(), Ordering::Relaxed);
                     }
@@ -170,6 +177,7 @@ pub fn setup_playback_stream<'c>(
                         bridge_ptr_playback,
                         &mut last_bridge_gen,
                         &rt_status_playback,
+                        &stream_status_playback,
                         pb_frame_count,
                     );
                 }),

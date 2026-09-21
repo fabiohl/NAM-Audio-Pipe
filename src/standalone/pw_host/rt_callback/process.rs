@@ -8,6 +8,7 @@ use crate::recording::buffer::{
     AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT, RingPayload,
 };
 use crate::recording::transport::RecordingSender;
+use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
@@ -555,6 +556,7 @@ pub fn process_dsp_buffer(
     current_host_rate: u32,
     frame_count: &mut u32,
     rt_status_for_process: &RtStatusFlags,
+    stream_status: &StreamStatusFlags,
     recording_sender: &mut RecordingSender,
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
@@ -578,7 +580,7 @@ pub fn process_dsp_buffer(
     // the DSP pipeline must not run on potentially wrong-format input. The
     // dequeued buffer is recycled via drop and the bridge publishes no new
     // block — the playback side delivers deterministic silence.
-    if rt_status_for_process
+    if stream_status
         .format_contract_ok
         .load(Ordering::Relaxed)
         == 0
@@ -674,11 +676,11 @@ pub fn process_dsp_buffer(
         if should_measure && t_cap_start > 0 {
             let t_spa_valid = rt_setup::rdtsc_nanos();
             let cap_nanos = t_spa_valid.saturating_sub(t_cap_start);
-            rt_status_for_process
+            stream_status
                 .capture_cycle_time
                 .store(cap_nanos, Ordering::Relaxed);
-            rt_status_for_process.capture_hist.record(cap_nanos);
-            rt_status_for_process
+            stream_status.capture_hist.record(cap_nanos);
+            stream_status
                 .capture_start_tsc
                 .store(t_cap_start, Ordering::Relaxed);
         }
@@ -771,10 +773,10 @@ pub fn process_dsp_buffer(
 
             if should_measure && t_rec_start > 0 {
                 let rec_nanos = rt_setup::rdtsc_nanos().saturating_sub(t_rec_start);
-                rt_status_for_process
+                stream_status
                     .record_cycle_time
                     .store(rec_nanos, Ordering::Relaxed);
-                rt_status_for_process.record_hist.record(rec_nanos);
+                stream_status.record_hist.record(rec_nanos);
             }
         }
 

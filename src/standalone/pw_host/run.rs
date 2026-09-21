@@ -108,6 +108,7 @@ pub fn run_pipewire_host(
         cpu_receipt,
         fail_fast,
         gate_config,
+        stream_status,
     } = config;
 
     // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
@@ -210,7 +211,9 @@ pub fn run_pipewire_host(
     // the control loop immediately on rate renegotiations and stream state
     // changes without waiting for the 100 ms health poll timer.
     let wakeup = ControlPlaneWakeup::new();
-    let mut backend_init = SharedBackendStatus::with_rt_status(rt_status.clone());
+    let stream_status = stream_status.unwrap_or_else(|| Arc::new(super::StreamStatusFlags::new()));
+    let mut backend_init =
+        SharedBackendStatus::with_rt_and_stream_status(rt_status.clone(), stream_status);
     backend_init.bind_wakeup(wakeup.clone());
     let backend_status = Arc::new(backend_init);
     let backend_for_capture = backend_status.clone();
@@ -476,6 +479,7 @@ pub fn run_pipewire_host(
 
             (was_silent, was_fading) = rt_setup::poll_rt_status(
                 &rt_status,
+                Some(backend_status.stream_status()),
                 &sys,
                 was_silent,
                 was_fading,

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::rt_setup::affinity::{CpuSelectionReason, CpuSelectionReceipt};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
@@ -97,7 +98,7 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
 
     assert!(!state.hugepage_synced);
 
-    let (silent, fading) = poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     assert!(!silent);
     assert!(!fading);
@@ -107,7 +108,7 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
     );
 
     // Second poll retains true without re-syncing
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert!(state.hugepage_synced);
 }
 
@@ -120,25 +121,25 @@ fn test_poll_rt_status_silence_and_fading_transitions() {
     let mut state = PollState::default();
 
     // Initially active
-    let (silent, fading) = poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert!(!silent);
     assert!(!fading);
 
     // Set silent flag
     rt_status.set_flag(RT_STATUS_IS_SILENT);
-    let (silent, fading) = poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert!(silent);
     assert!(!fading);
 
     // Set fading flag as well
     rt_status.set_flag(RT_STATUS_IS_FADING);
-    let (silent, fading) = poll_rt_status(&rt_status, &sys, true, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, true, false, &bridge, &mut state);
     assert!(silent);
     assert!(fading);
 
     // Clear silent flag
     rt_status.clear_flag(RT_STATUS_IS_SILENT);
-    let (silent, fading) = poll_rt_status(&rt_status, &sys, true, true, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, true, true, &bridge, &mut state);
     assert!(!silent);
     assert!(fading);
 }
@@ -159,7 +160,7 @@ fn test_poll_rt_status_telemetry_throttle_advances() {
     assert_eq!(state.telemetry_throttle, 0);
 
     for i in 1..=105 {
-        poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
         assert_eq!(state.telemetry_throttle, i as u32);
     }
 }
@@ -181,7 +182,7 @@ fn test_poll_rt_status_clears_diagnostic_flags() {
     rt_status.set_flag(RT_STATUS_HUGEPAGE_OK);
     rt_status.set_flag(RT_STATUS_THP_ACTIVE);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     assert!(!rt_status.check_flag(RT_STATUS_GC_OVERFLOW));
     assert!(!rt_status.check_flag(RT_STATUS_GC_TIER3));
@@ -215,7 +216,7 @@ fn test_latched_flag_emits_once_per_episode() {
 
     // Episode 1: the RT producer keeps re-arming the flag across polls.
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         e3101_count() - base,
         1,
@@ -223,7 +224,7 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         e3101_count() - base,
         1,
@@ -231,7 +232,7 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         e3101_count() - base,
         1,
@@ -239,12 +240,12 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     // Producer stops re-arming: the latch releases without emitting.
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(e3101_count() - base, 1, "no flag set -> nothing emitted");
 
     // Episode 2: a new episode after the clear emits exactly once.
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         e3101_count() - base,
         2,
@@ -273,11 +274,11 @@ fn test_latched_counter_emits_once_per_episode() {
     let base = overload_count();
 
     rt_status.dsp_overloads.store(3, Ordering::Relaxed);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(overload_count() - base, 1, "first overload poll must emit");
 
     rt_status.dsp_overloads.store(2, Ordering::Relaxed);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         overload_count() - base,
         1,
@@ -285,7 +286,7 @@ fn test_latched_counter_emits_once_per_episode() {
     );
 
     rt_status.dsp_overloads.store(0, Ordering::Relaxed);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         overload_count() - base,
         1,
@@ -293,7 +294,7 @@ fn test_latched_counter_emits_once_per_episode() {
     );
 
     rt_status.dsp_overloads.store(5, Ordering::Relaxed);
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert_eq!(
         overload_count() - base,
         2,
@@ -315,7 +316,7 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
     rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
     rt_status.set_flag(RT_STATUS_HAS_CLIPPED);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -369,60 +370,61 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
 fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
+    let stream_status = StreamStatusFlags::new();
     let sys = SystemSnapshot::capture();
     let bridge = create_test_bridge();
     let mut state = PollState::default();
 
     // 1. Record samples across all 5 metrics
-    rt_status.capture_hist.record(1_500);
-    rt_status.capture_hist.record(2_500);
-    rt_status.capture_cycle_time.store(2_500, Ordering::Relaxed);
+    stream_status.capture_hist.record(1_500);
+    stream_status.capture_hist.record(2_500);
+    stream_status.capture_cycle_time.store(2_500, Ordering::Relaxed);
 
     rt_status.latency_hist.record(10_000);
     rt_status.latency_hist.record(20_000);
     rt_status.dsp_cycle_time.store(20_000, Ordering::Relaxed);
 
-    rt_status.record_hist.record(300);
-    rt_status.record_hist.record(700);
-    rt_status.record_cycle_time.store(700, Ordering::Relaxed);
+    stream_status.record_hist.record(300);
+    stream_status.record_hist.record(700);
+    stream_status.record_cycle_time.store(700, Ordering::Relaxed);
 
-    rt_status.playback_hist.record(1_200);
-    rt_status.playback_hist.record(1_800);
-    rt_status
+    stream_status.playback_hist.record(1_200);
+    stream_status.playback_hist.record(1_800);
+    stream_status
         .playback_cycle_time
         .store(1_800, Ordering::Relaxed);
 
-    rt_status.e2e_hist.record(25_000);
-    rt_status.e2e_hist.record(35_000);
-    rt_status.e2e_cycle_time.store(35_000, Ordering::Relaxed);
+    stream_status.e2e_hist.record(25_000);
+    stream_status.e2e_hist.record(35_000);
+    stream_status.e2e_cycle_time.store(35_000, Ordering::Relaxed);
 
-    assert_eq!(rt_status.capture_hist.total_count(), 2);
+    assert_eq!(stream_status.capture_hist.total_count(), 2);
     assert_eq!(rt_status.latency_hist.total_count(), 2);
-    assert_eq!(rt_status.record_hist.total_count(), 2);
-    assert_eq!(rt_status.playback_hist.total_count(), 2);
-    assert_eq!(rt_status.e2e_hist.total_count(), 2);
+    assert_eq!(stream_status.record_hist.total_count(), 2);
+    assert_eq!(stream_status.playback_hist.total_count(), 2);
+    assert_eq!(stream_status.e2e_hist.total_count(), 2);
 
-    assert_eq!(rt_status.capture_hist.get_exact_min(), 1_500);
-    assert_eq!(rt_status.capture_hist.get_mean(), 2_000);
+    assert_eq!(stream_status.capture_hist.get_exact_min(), 1_500);
+    assert_eq!(stream_status.capture_hist.get_mean(), 2_000);
     assert_eq!(rt_status.latency_hist.get_mean(), 15_000);
-    assert_eq!(rt_status.record_hist.get_mean(), 500);
-    assert_eq!(rt_status.playback_hist.get_mean(), 1_500);
-    assert_eq!(rt_status.e2e_hist.get_mean(), 30_000);
+    assert_eq!(stream_status.record_hist.get_mean(), 500);
+    assert_eq!(stream_status.playback_hist.get_mean(), 1_500);
+    assert_eq!(stream_status.e2e_hist.get_mean(), 30_000);
 
     // Set throttle to 99 so the next poll triggers the 100-cycle log & reset block
     state.telemetry_throttle = 99;
     rt_status.active_rate.store(48_000, Ordering::Relaxed);
     rt_status.last_n_samples.store(64, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, Some(&stream_status), &sys, false, false, &bridge, &mut state);
 
     assert_eq!(state.telemetry_throttle, 100);
     // After logging at throttle = 100, all 5 histograms are reset
-    assert_eq!(rt_status.capture_hist.total_count(), 0);
+    assert_eq!(stream_status.capture_hist.total_count(), 0);
     assert_eq!(rt_status.latency_hist.total_count(), 0);
-    assert_eq!(rt_status.record_hist.total_count(), 0);
-    assert_eq!(rt_status.playback_hist.total_count(), 0);
-    assert_eq!(rt_status.e2e_hist.total_count(), 0);
+    assert_eq!(stream_status.record_hist.total_count(), 0);
+    assert_eq!(stream_status.playback_hist.total_count(), 0);
+    assert_eq!(stream_status.e2e_hist.total_count(), 0);
 }
 
 #[test]
@@ -460,7 +462,7 @@ fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
     rt_status.rt_cpu.store(3, Ordering::Relaxed);
     rt_status.rt_tid.store(12345, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -511,7 +513,7 @@ fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12346, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -543,7 +545,7 @@ fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
     rt_status.rt_cpu.store(2, Ordering::Relaxed);
     rt_status.rt_tid.store(12347, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -575,7 +577,7 @@ fn test_poll_rt_status_sched_rr_is_rt_and_suppresses_denied() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12348, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -615,7 +617,7 @@ fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12349, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -663,7 +665,7 @@ fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12350, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");

@@ -30,6 +30,8 @@ use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 #[cfg(feature = "heap-audit")]
 use nam_audio_pipe::standalone::pw_host::output_pw::deliver_silence_pair_fail_closed;
 #[cfg(feature = "heap-audit")]
+use nam_audio_pipe::standalone::pw_host::StreamStatusFlags;
+#[cfg(feature = "heap-audit")]
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 #[cfg(feature = "heap-audit")]
 use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
@@ -603,6 +605,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
         flags: 0,
     };
     let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
 
     let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
@@ -619,6 +622,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
                 &mut chunk_r,
                 BLOCK * std::mem::size_of::<f32>(),
                 &rt,
+                &stream_status,
             )
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
@@ -636,7 +640,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
     assert_eq!(chunk_l.size, (BLOCK * std::mem::size_of::<f32>()) as u32);
     assert_eq!(chunk_l.stride, std::mem::size_of::<f32>() as i32);
     assert_eq!(
-        rt.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
         1,
         "starvation occurrence must be counted"
     );
@@ -663,6 +667,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
         flags: 0,
     };
     let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
     let m = buf.len() * std::mem::size_of::<f32>();
 
     let (allocs, deallocs, reallocs) = {
@@ -680,6 +685,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
                 &mut chunk,
                 m,
                 &rt,
+                &stream_status,
             )
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
@@ -700,7 +706,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
         "violation must silence output"
     );
     assert_eq!(
-        rt.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
         0,
         "contract violation is not a starvation event"
     );
@@ -731,6 +737,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         flags: 0,
     };
     let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
 
     let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
@@ -746,6 +753,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
                 &mut chunk_r,
                 size,
                 &rt,
+                &stream_status,
             )
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
@@ -775,7 +783,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         "memory past MAX_BRIDGE_BUF must not be touched"
     );
     assert_eq!(
-        rt.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
         0,
         "contract violation is not a starvation event"
     );

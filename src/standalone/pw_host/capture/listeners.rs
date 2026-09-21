@@ -64,16 +64,22 @@ pub fn param_changed_handler(
     match validate_audio_raw_format(param) {
         Ok(rate) => {
             rate_for_param.store(rate, Ordering::Release); // Pairs with Acquire swap in sync_rate (rt_callback/rate_sync.rs)
-            rt_status
+            backend
+                .stream_status()
                 .capture_negotiated_rate
                 .store(rate, Ordering::Release);
-            mark_format_contract_ok(rt_status, "capture");
-            check_negotiated_rate_mismatch(rt_status);
+            mark_format_contract_ok(backend.stream_status(), "capture");
+            check_negotiated_rate_mismatch(backend.stream_status());
             backend.notify_wakeup();
         }
         Err(violation) => {
             let violation_msg = violation.to_string();
-            reject_negotiated_format_violation(rt_status, "capture", violation);
+            reject_negotiated_format_violation(
+                rt_status,
+                backend.stream_status(),
+                "capture",
+                violation,
+            );
             backend.mark_degraded(format!(
                 "SPA format contract violated on the capture stream: {violation_msg}"
             ));

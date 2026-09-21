@@ -11,7 +11,7 @@
 //! auto-detects the daemon via `pw-cli info`.
 
 use nam_audio_pipe::standalone::cli;
-use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig};
+use nam_audio_pipe::standalone::pw_host::{self, PipewireHostConfig, StreamStatusFlags};
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{self, GcOverflowBuffer, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
@@ -103,6 +103,7 @@ fn test_pipewire_integration() {
                 // failure is a defect that must surface immediately.
                 fail_fast: true,
                 gate_config: cli::GateConfig::default_on(),
+                stream_status: None,
             },
             gc_cons,
             sl_cons,
@@ -221,6 +222,8 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
     let rt_clone = rt_status.clone();
     let gc_overflow_clone = gc_overflow.clone();
     let sys = SystemSnapshot::capture();
+    let stream_status = Arc::new(StreamStatusFlags::new());
+    let stream_status_clone = stream_status.clone();
 
     let pw_thread = thread::spawn(move || {
         pw_host::run_pipewire_host(
@@ -247,6 +250,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
                 // Reconnect ENABLED: this is exactly what the bounce exercises.
                 fail_fast: false,
                 gate_config: cli::GateConfig::default_on(),
+                stream_status: Some(stream_status_clone),
             },
             gc_cons,
             sl_cons,
@@ -265,7 +269,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut baseline_ticks = 0u64;
     while std::time::Instant::now() < deadline {
-        baseline_ticks = rt_status.capture_host_ticks.load(Ordering::Relaxed);
+        baseline_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
         if baseline_ticks > 0 {
             break;
         }
@@ -299,10 +303,10 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
         "host never re-registered its capture sink after the daemon bounce"
     );
     let resumption_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut last_ticks = rt_status.capture_host_ticks.load(Ordering::Relaxed);
+    let mut last_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
     loop {
         tone.attach();
-        let now_ticks = rt_status.capture_host_ticks.load(Ordering::Relaxed);
+        let now_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
         if now_ticks != last_ticks && now_ticks > 0 {
             // The fresh stream's clock changed to a positive value: real DSP
             // resumed with the internal state (models/IRs/recording) intact.
@@ -549,6 +553,7 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
                 cpu_receipt: common::deterministic_cpu_receipt(),
                 fail_fast: false,
                 gate_config: cli::GateConfig::default_on(),
+                stream_status: None,
             },
             gc_cons,
             sl_cons,
