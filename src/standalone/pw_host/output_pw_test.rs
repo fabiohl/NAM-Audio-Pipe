@@ -479,7 +479,9 @@ fn playback_bridge_starvation_zeroes_full_extension_and_stamps_chunks() {
     assert_eq!(chunk_r.size, 32 * 4);
     assert_eq!(chunk_r.stride, 4);
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         1,
         "the starvation occurrence must be registered on stream_status"
     );
@@ -503,8 +505,9 @@ fn playback_bridge_starvation_rejects_aliased_channels_fail_closed() {
 
     // SAFETY: `buf` is a local, aligned, writable `[f32; 32]` and `chunk`
     // is a local non-null struct; the kernel rejects the aliasing fail-closed.
-    let frames =
-        unsafe { deliver_silence_pair_fail_closed(p, m, &mut chunk, p, m, &mut chunk, m, &rt, &stream_status) };
+    let frames = unsafe {
+        deliver_silence_pair_fail_closed(p, m, &mut chunk, p, m, &mut chunk, m, &rt, &stream_status)
+    };
 
     assert_eq!(frames, None);
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
@@ -513,7 +516,9 @@ fn playback_bridge_starvation_rejects_aliased_channels_fail_closed() {
         "aliased channels must be silenced fail-closed"
     );
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         0,
         "a host contract violation is not a starvation event"
     );
@@ -552,7 +557,12 @@ fn playback_bridge_starvation_rejects_asymmetric_extensions() {
         l.iter().all(|&s| s == 0.0) && r.iter().all(|&s| s == 0.0),
         "asymmetric extensions must silence both channels fail-closed"
     );
-    assert_eq!(stream_status.playback_bridge_starvation.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]
@@ -589,7 +599,9 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
     assert_eq!(frames, Some(MAX_BRIDGE_BUF));
     assert!(!rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         1,
         "bounded silence delivery is a starvation event"
     );
@@ -663,7 +675,12 @@ fn playback_bridge_starvation_rejects_oversized_silence_window() {
 
     assert_eq!(frames, None);
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
-    assert_eq!(stream_status.playback_bridge_starvation.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
+        0
+    );
     assert!(
         l[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0)
             && r[..MAX_BRIDGE_BUF].iter().all(|&s| s == 0.0),
@@ -844,7 +861,12 @@ fn reject_negotiated_format_violation_raises_host_contract_flag_and_latches() {
         1,
         "the latch defaults to contract-ok"
     );
-    reject_negotiated_format_violation(&rt, &stream_status, "capture", ContractViolation::NotStereo(1));
+    reject_negotiated_format_violation(
+        &rt,
+        &stream_status,
+        "capture",
+        ContractViolation::NotStereo(1),
+    );
     assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
     assert_eq!(
         stream_status.format_contract_ok.load(Ordering::Relaxed),
@@ -883,21 +905,27 @@ fn negotiated_rate_mismatch_detects_discrepant_streams() {
     let stream_status = StreamStatusFlags::new();
     assert_eq!(negotiated_rate_mismatch(&stream_status), None);
 
-    stream_status.capture_negotiated_rate.store(48_000, Ordering::Release);
+    stream_status
+        .capture_negotiated_rate
+        .store(48_000, Ordering::Release);
     assert_eq!(
         negotiated_rate_mismatch(&stream_status),
         None,
         "single negotiated stream is not a mismatch"
     );
 
-    stream_status.playback_negotiated_rate.store(48_000, Ordering::Release);
+    stream_status
+        .playback_negotiated_rate
+        .store(48_000, Ordering::Release);
     assert_eq!(
         negotiated_rate_mismatch(&stream_status),
         None,
         "equal negotiated rates are not a mismatch"
     );
 
-    stream_status.playback_negotiated_rate.store(44_100, Ordering::Release);
+    stream_status
+        .playback_negotiated_rate
+        .store(44_100, Ordering::Release);
     assert_eq!(
         negotiated_rate_mismatch(&stream_status),
         Some((48_000, 44_100)),

@@ -105,7 +105,7 @@ pub use rt_callback::harness::RtSwapHarness;
 
 // Re-exports for test module compatibility (pw_host_test.rs).
 #[cfg(test)]
-pub(crate) use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, DspBridge};
+pub(crate) use neural_amp_modeler_rs::dsp::pipeline::DspBridge;
 
 #[cfg(test)]
 #[path = "pw_host_test.rs"]

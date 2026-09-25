@@ -10,8 +10,8 @@ use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
 
-use super::stream_status::StreamStatusFlags;
 use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
+use super::stream_status::StreamStatusFlags;
 use crate::standalone::cli::GateConfig;
 use crate::standalone::rt_setup;
 
@@ -209,7 +209,9 @@ pub fn playback_dsp_cycle(
         let cap_start = stream_status.capture_start_tsc.load(Ordering::Relaxed);
         if cap_start > 0 && t_pb_end > cap_start {
             let e2e_nanos = t_pb_end.saturating_sub(cap_start);
-            stream_status.e2e_cycle_time.store(e2e_nanos, Ordering::Relaxed);
+            stream_status
+                .e2e_cycle_time
+                .store(e2e_nanos, Ordering::Relaxed);
             stream_status.e2e_hist.record(e2e_nanos);
         }
     }
@@ -660,8 +662,12 @@ pub fn mark_stream_active(stream_status: &StreamStatusFlags, stream_name: &str, 
 /// rates agree.
 #[inline]
 pub fn negotiated_rate_mismatch(stream_status: &StreamStatusFlags) -> Option<(u32, u32)> {
-    let capture = stream_status.capture_negotiated_rate.load(Ordering::Acquire);
-    let playback = stream_status.playback_negotiated_rate.load(Ordering::Acquire);
+    let capture = stream_status
+        .capture_negotiated_rate
+        .load(Ordering::Acquire);
+    let playback = stream_status
+        .playback_negotiated_rate
+        .load(Ordering::Acquire);
     (capture != 0 && playback != 0 && capture != playback).then_some((capture, playback))
 }
 

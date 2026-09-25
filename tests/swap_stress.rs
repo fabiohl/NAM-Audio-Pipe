@@ -28,9 +28,9 @@ mod common;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 
 #[cfg(feature = "heap-audit")]
-use nam_audio_pipe::standalone::pw_host::output_pw::deliver_silence_pair_fail_closed;
-#[cfg(feature = "heap-audit")]
 use nam_audio_pipe::standalone::pw_host::StreamStatusFlags;
+#[cfg(feature = "heap-audit")]
+use nam_audio_pipe::standalone::pw_host::output_pw::deliver_silence_pair_fail_closed;
 #[cfg(feature = "heap-audit")]
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 #[cfg(feature = "heap-audit")]
@@ -640,7 +640,9 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
     assert_eq!(chunk_l.size, (BLOCK * std::mem::size_of::<f32>()) as u32);
     assert_eq!(chunk_l.stride, std::mem::size_of::<f32>() as i32);
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         1,
         "starvation occurrence must be counted"
     );
@@ -706,7 +708,9 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
         "violation must silence output"
     );
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         0,
         "contract violation is not a starvation event"
     );
@@ -783,7 +787,9 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         "memory past MAX_BRIDGE_BUF must not be touched"
     );
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         0,
         "contract violation is not a starvation event"
     );

@@ -57,8 +57,8 @@ use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeBuffer, BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspPipelineContext,
-    MAX_RESAMP_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
+    BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF,
+    StreamingDspBuffers, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -743,10 +743,10 @@ impl SwapRtSide {
         let bufs = StreamingDspBuffers {
             resamp_out_l: &mut *self.state.resamp_out_l,
             resamp_out_r: &mut *self.state.resamp_out_r,
-            os_in_l: &mut *self.state.os_in_l,
-            os_in_r: &mut *self.state.os_in_r,
-            os_model_l: &mut *self.state.os_model_l,
-            os_model_r: &mut *self.state.os_model_r,
+            os_in_l: &mut self.state.os_in_l,
+            os_in_r: &mut self.state.os_in_r,
+            os_model_l: &mut self.state.os_model_l,
+            os_model_r: &mut self.state.os_model_r,
             crossfade_scratch_l: &mut *self.state.xfd_scratch_l,
             crossfade_scratch_r: &mut *self.state.xfd_scratch_r,
         };
@@ -1016,13 +1016,7 @@ impl RtSwapHarness {
         state.slimmable_drain = Some(slimmable_swap_drain(spsc.slimmable_consumer));
         state.os_drain = Some(os_swap_drain(spsc.os_consumer));
 
-        let bridge = Box::new(DspBridge {
-            buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
-            active_read_idx: Default::default(),
-            generation: Default::default(),
-            consumed_gen: Default::default(),
-            dropped_frames: Default::default(),
-        });
+        let bridge = DspBridge::new_boxed();
 
         let producer = SwapProducer {
             param_producer: spsc.param_producer,

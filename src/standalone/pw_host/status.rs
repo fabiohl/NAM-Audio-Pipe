@@ -20,9 +20,9 @@
 //! and does **not** transition the backend to `Failed`, so a graceful termination
 //! never raises a false "daemon crash" alarm.
 
+use super::StreamStatusFlags;
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::wakeup::ControlPlaneWakeup;
-use super::StreamStatusFlags;
 use neural_amp_modeler_rs::common::spsc::{RtStatusFlags, SHUTDOWN};
 use pipewire as pw;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -183,8 +183,16 @@ impl SharedBackendStatus {
             ..Self::default()
         };
         // Initial state before PipeWire streams reach `Streaming` is inactive (muted).
-        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "capture", false);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "playback", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &this.stream_status,
+            "capture",
+            false,
+        );
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &this.stream_status,
+            "playback",
+            false,
+        );
         this
     }
 
@@ -199,8 +207,16 @@ impl SharedBackendStatus {
             stream_status,
             ..Self::default()
         };
-        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "capture", false);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&this.stream_status, "playback", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &this.stream_status,
+            "capture",
+            false,
+        );
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &this.stream_status,
+            "playback",
+            false,
+        );
         this
     }
 
@@ -282,7 +298,11 @@ impl SharedBackendStatus {
         } else if stream == "playback" {
             self.playback_active.store(active, Ordering::Release);
         }
-        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, stream, active);
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &self.stream_status,
+            stream,
+            active,
+        );
         let cap = self.capture_active.load(Ordering::Acquire);
         let pb = self.playback_active.load(Ordering::Acquire);
         let mut guard = self.lock_state();
@@ -353,8 +373,16 @@ impl SharedBackendStatus {
         *self.lock_state() = BackendState::Terminated;
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "capture", false);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "playback", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &self.stream_status,
+            "capture",
+            false,
+        );
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &self.stream_status,
+            "playback",
+            false,
+        );
         self.notify_wakeup();
     }
 
@@ -364,8 +392,16 @@ impl SharedBackendStatus {
         self.failed.store(false, Ordering::Release);
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "capture", false);
-        crate::standalone::pw_host::output_pw::mark_stream_active(&self.stream_status, "playback", false);
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &self.stream_status,
+            "capture",
+            false,
+        );
+        crate::standalone::pw_host::output_pw::mark_stream_active(
+            &self.stream_status,
+            "playback",
+            false,
+        );
         *self.lock_failure_detail() = None;
         *guard = BackendState::Reconnecting {
             attempt,

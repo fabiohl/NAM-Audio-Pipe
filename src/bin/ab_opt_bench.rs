@@ -48,7 +48,6 @@ use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
@@ -60,8 +59,8 @@ use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
 use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeBuffer, DspBridge, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF,
-    StreamingDspBuffers, capture_dsp_pipeline_streaming,
+    DspBridge, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF, StreamingDspBuffers,
+    capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -594,13 +593,7 @@ fn run_measured(
     let mut process_mono = false;
     let rt_status = RtStatusFlags::default();
     let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Off);
-    let mut bridge = Box::new(DspBridge {
-        buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
-        active_read_idx: AtomicUsize::new(0),
-        generation: AtomicU64::new(0),
-        consumed_gen: AtomicU64::new(0),
-        dropped_frames: AtomicU32::new(0),
-    });
+    let mut bridge = DspBridge::new_boxed();
 
     let mut resamp_out_l = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_r = vec![0.0; MAX_RESAMP_BUF];

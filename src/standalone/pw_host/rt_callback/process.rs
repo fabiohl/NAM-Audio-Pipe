@@ -580,11 +580,7 @@ pub fn process_dsp_buffer(
     // the DSP pipeline must not run on potentially wrong-format input. The
     // dequeued buffer is recycled via drop and the bridge publishes no new
     // block — the playback side delivers deterministic silence.
-    if stream_status
-        .format_contract_ok
-        .load(Ordering::Relaxed)
-        == 0
-    {
+    if stream_status.format_contract_ok.load(Ordering::Relaxed) == 0 {
         return;
     }
 

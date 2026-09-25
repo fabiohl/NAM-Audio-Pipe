@@ -190,8 +190,8 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
 }
 
 /// Adapter bridging the local [`ThreadConfigurator`] to the engine's
-/// `rt_hardening::ThreadConfigurator` (identical syscall surface minus the
-/// PipeWire-specific thread naming, which stays local).
+/// `rt_hardening::ThreadConfigurator` (sched methods are current-thread only
+/// on the engine side; PipeWire thread naming stays local).
 struct EngineThreadAdapter<'a, C: ThreadConfigurator> {
     inner: &'a C,
 }
@@ -208,16 +208,12 @@ impl<C: ThreadConfigurator> neural_amp_modeler_rs::rt_hardening::ThreadConfigura
     fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32 {
         self.inner.set_thread_affinity(thread_id, cpuset)
     }
-    fn get_sched_param(&self, thread_id: libc::pthread_t) -> Result<(i32, libc::sched_param), i32> {
-        self.inner.get_sched_param(thread_id)
+    fn get_current_sched_param(&self) -> Result<(i32, libc::sched_param), i32> {
+        self.inner.get_sched_param(self.inner.current_thread_id())
     }
-    fn set_sched_param(
-        &self,
-        thread_id: libc::pthread_t,
-        policy: i32,
-        param: &libc::sched_param,
-    ) -> i32 {
-        self.inner.set_sched_param(thread_id, policy, param)
+    fn set_current_sched_param(&self, policy: i32, param: &libc::sched_param) -> i32 {
+        self.inner
+            .set_sched_param(self.inner.current_thread_id(), policy, param)
     }
     fn get_current_cpu(&self) -> i32 {
         self.inner.get_current_cpu()

@@ -8,8 +8,8 @@
 //! belong strictly to the audio streaming host (`NAM-Audio-Pipe`), keeping the core
 //! DSP engine host-agnostic.
 
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use neural_amp_modeler_rs::dsp::telemetry::LatencyHistogram;
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Host audio streaming telemetry, format latches, and clock synchronization.
 ///

@@ -556,7 +556,9 @@ fn single_stream_format_ok_does_not_unmute_or_mark_both_active() {
     let backend2 = SharedBackendStatus::with_rt_status(rt2.clone());
     let stream_status2 = backend2.stream_status();
     stream_status2.capture_format_ok.store(0, Ordering::Relaxed);
-    stream_status2.playback_format_ok.store(0, Ordering::Relaxed);
+    stream_status2
+        .playback_format_ok
+        .store(0, Ordering::Relaxed);
     output_pw::mark_format_contract_ok(stream_status2, "playback");
     backend2.set_stream_active("playback", true);
 
@@ -676,7 +678,10 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         &backend,
     );
     assert_eq!(stream_status.capture_active.load(Ordering::Acquire), 1);
-    assert!(stream_status.is_audio_unmuted(), "Resume restores unmuted audio");
+    assert!(
+        stream_status.is_audio_unmuted(),
+        "Resume restores unmuted audio"
+    );
     assert_eq!(backend.state(), BackendState::Running);
 
     // Condition 3: Disconnect & Bounded Reconnect Cycle
@@ -731,7 +736,10 @@ fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
         0,
         "Error sets playback latch to 0"
     );
-    assert!(!stream_status.is_audio_unmuted(), "Error mutes audio immediately");
+    assert!(
+        !stream_status.is_audio_unmuted(),
+        "Error mutes audio immediately"
+    );
     assert!(backend.is_failed());
 }
 

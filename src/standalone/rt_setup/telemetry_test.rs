@@ -11,17 +11,11 @@ use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_IS_SILENT, RT_STATUS_PARAM_QUEUE_BACKLOG, RT_STATUS_SLIMMABLE_RESET_FAILED,
     RT_STATUS_SLIMMABLE_SLICE_FAILED, RT_STATUS_THP_ACTIVE, RtStatusFlags,
 };
-use neural_amp_modeler_rs::dsp::pipeline::{BridgeBuffer, DspBridge};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use neural_amp_modeler_rs::dsp::pipeline::DspBridge;
+use std::sync::atomic::Ordering;
 
-fn create_test_bridge() -> DspBridge {
-    DspBridge {
-        buffers: [BridgeBuffer::new(), BridgeBuffer::new()],
-        active_read_idx: AtomicUsize::new(0),
-        generation: AtomicU64::new(0),
-        consumed_gen: AtomicU64::new(0),
-        dropped_frames: AtomicU32::new(0),
-    }
+fn create_test_bridge() -> Box<DspBridge> {
+    DspBridge::new_boxed()
 }
 
 static TEST_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -98,7 +92,8 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
 
     assert!(!state.hugepage_synced);
 
-    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) =
+        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
 
     assert!(!silent);
     assert!(!fading);
@@ -121,13 +116,15 @@ fn test_poll_rt_status_silence_and_fading_transitions() {
     let mut state = PollState::default();
 
     // Initially active
-    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) =
+        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert!(!silent);
     assert!(!fading);
 
     // Set silent flag
     rt_status.set_flag(RT_STATUS_IS_SILENT);
-    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) =
+        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
     assert!(silent);
     assert!(!fading);
 
@@ -378,7 +375,9 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     // 1. Record samples across all 5 metrics
     stream_status.capture_hist.record(1_500);
     stream_status.capture_hist.record(2_500);
-    stream_status.capture_cycle_time.store(2_500, Ordering::Relaxed);
+    stream_status
+        .capture_cycle_time
+        .store(2_500, Ordering::Relaxed);
 
     rt_status.latency_hist.record(10_000);
     rt_status.latency_hist.record(20_000);
@@ -386,7 +385,9 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
 
     stream_status.record_hist.record(300);
     stream_status.record_hist.record(700);
-    stream_status.record_cycle_time.store(700, Ordering::Relaxed);
+    stream_status
+        .record_cycle_time
+        .store(700, Ordering::Relaxed);
 
     stream_status.playback_hist.record(1_200);
     stream_status.playback_hist.record(1_800);
@@ -396,7 +397,9 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
 
     stream_status.e2e_hist.record(25_000);
     stream_status.e2e_hist.record(35_000);
-    stream_status.e2e_cycle_time.store(35_000, Ordering::Relaxed);
+    stream_status
+        .e2e_cycle_time
+        .store(35_000, Ordering::Relaxed);
 
     assert_eq!(stream_status.capture_hist.total_count(), 2);
     assert_eq!(rt_status.latency_hist.total_count(), 2);
@@ -416,7 +419,15 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     rt_status.active_rate.store(48_000, Ordering::Relaxed);
     rt_status.last_n_samples.store(64, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, Some(&stream_status), &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
 
     assert_eq!(state.telemetry_throttle, 100);
     // After logging at throttle = 100, all 5 histograms are reset

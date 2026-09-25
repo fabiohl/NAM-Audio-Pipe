@@ -104,6 +104,7 @@ timeout 420 cargo test --features testing \
     --test e2e_cli \
     --test service_resilience \
     --test distribution_qa \
+    --test rt_metrics \
     2>&1 | tee target/logs/quick-phase1.log
 assert_ran_tests target/logs/quick-phase1.log 1
 # Every mandatory target must have executed individually — a removed/renamed
@@ -117,7 +118,8 @@ for t in \
     "tests/recording_fault_injection.rs" \
     "tests/e2e_cli.rs" \
     "tests/service_resilience.rs" \
-    "tests/distribution_qa.rs"; do
+    "tests/distribution_qa.rs" \
+    "tests/rt_metrics.rs"; do
     assert_ran_target target/logs/quick-phase1.log "$t" \
         || die "Phase 1 mandatory target '$t' failed its execution gate."
 done
@@ -159,6 +161,7 @@ timeout 420 cargo test --features testing \
     --test e2e_cli \
     --test service_resilience \
     --test distribution_qa \
+    --test rt_metrics \
     --release \
     -- --test-threads=1 --nocapture \
     2>&1 | tee target/logs/quick-phase2.log
@@ -171,7 +174,8 @@ for t in \
     "tests/recording_fault_injection.rs" \
     "tests/e2e_cli.rs" \
     "tests/service_resilience.rs" \
-    "tests/distribution_qa.rs"; do
+    "tests/distribution_qa.rs" \
+    "tests/rt_metrics.rs"; do
     assert_ran_target target/logs/quick-phase2.log "$t" \
         || die "Phase 2 mandatory target '$t' failed its execution gate."
 done

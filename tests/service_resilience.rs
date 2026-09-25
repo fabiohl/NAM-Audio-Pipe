@@ -695,7 +695,9 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     let elapsed = started.elapsed();
 
     assert_eq!(
-        stream_status.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         CYCLES as u32,
         "every starvation quantum must be telemetrized (xrun telemetry)"
     );
@@ -788,7 +790,9 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     }
 
     assert_eq!(
-        stream_status_big.playback_bridge_starvation.load(Ordering::Relaxed),
+        stream_status_big
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
         CYCLES as u32,
         "every large-buffer starvation quantum must be telemetrized"
     );
