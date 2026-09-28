@@ -333,6 +333,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
             rt_clone,
             PipewireHostConfig {
                 buffer_size: 0,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
                 sys,
                 ir_raw_samples: None,
                 ir_source_rate: 0,

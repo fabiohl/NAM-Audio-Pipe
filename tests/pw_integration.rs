@@ -88,6 +88,7 @@ fn test_pipewire_integration() {
             rt_clone,
             PipewireHostConfig {
                 buffer_size: 0,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
                 sys,
                 ir_raw_samples: None,
                 ir_source_rate: 0,
@@ -237,6 +238,7 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
             rt_clone,
             PipewireHostConfig {
                 buffer_size: 0,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
                 sys,
                 ir_raw_samples: None,
                 ir_source_rate: 0,
@@ -541,6 +543,7 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
             rt_clone,
             PipewireHostConfig {
                 buffer_size: 0,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
                 sys,
                 ir_raw_samples: None,
                 ir_source_rate: 0,

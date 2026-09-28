@@ -444,14 +444,17 @@ pub(super) fn handle_quantum_log(rt_status: &RtStatusFlags) {
     rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_QUANTUM_LOG);
 }
 
-/// Handles CabSim IR dynamic rebuild (quantum and rate calibration).
+/// Handles CabSim IR dynamic rebuild (partition policy and rate calibration).
 ///
 /// The cab-sim stage runs at the applied host output rate, so the preserved
 /// original IR (`ir_raw_samples` at `ir_source_rate`) is resampled
 /// specifically for the requested host rate before building a
 /// stereo-decoupled [`CabSimPair`] (independent L/R adapters, identical IR).
 /// The pair is stamped with the host rate it was calibrated for so the RT
-/// can detect drift again.
+/// can detect drift again. The partition comes from the RT request, which
+/// carries the `--cabsim-partition` policy on every install — the exact
+/// algorithmic latency (partition samples) is published in the log below for
+/// telemetry and downstream delay compensation.
 ///
 /// Lost-wakeup guard: the request generation is captured with Acquire before
 /// building; the flag is only cleared via [`rearm_cabsim_if_superseded`] if no
@@ -505,13 +508,23 @@ pub(super) fn handle_cabsim_rebuild(
         partition_size,
     ) {
         Ok(pair) => {
+            // Publish the exact real latency of the cab-sim stage at the
+            // applied host rate: the UPOLS partition is causal, so the pair
+            // stays silent for exactly `partition_size` samples after each
+            // fresh signal edge (`CabSimAdapter::latency_samples`).
+            let latency_samples = pair.l.latency_samples();
+            // target_host_rate is guaranteed non-zero by the early return above.
+            let latency_ms = latency_samples as f64 * 1000.0 / f64::from(target_host_rate);
             log::info!(
-                "{} Cab-sim IR rebuilt: rate={} Hz, partition_size={} ({} partitions, FFT={})",
+                "{} Cab-sim IR rebuilt: rate={} Hz, partition_size={} ({} partitions, FFT={}, \
+                 latency={} samples = {:.2} ms)",
                 "🔄".cyan(),
                 target_host_rate,
                 partition_size,
                 pair.l.num_partitions(),
                 pair.l.engine().fft_size(),
+                latency_samples,
+                latency_ms,
             );
             // Box::new runs exclusively on this (non-RT) main thread: the RT
             // swap then moves the same allocation into the GC.

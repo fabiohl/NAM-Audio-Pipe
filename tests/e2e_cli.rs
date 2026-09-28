@@ -262,6 +262,58 @@ fn buffer_size_above_max_exits_with_error_before_pipewire() {
     );
 }
 
+// --cabsim-partition domain contract ---------------------------------------
+// The UPOLS partition policy accepts only the documented latency/CPU set;
+// anything else must fail fast with a non-zero exit BEFORE any PipeWire
+// connection is attempted.
+
+#[test]
+fn cabsim_partition_out_of_domain_exits_with_error_before_pipewire() {
+    let output = binary()
+        .args(["--cabsim-partition", "100"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(
+        !output.status.success(),
+        "expected non-zero exit code for out-of-domain cabsim partition"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("Cab-sim partition must be one of"),
+        "stderr should explain the allowed set, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("PipeWire"),
+        "validation must reject before any PipeWire connection, got: {}",
+        stderr
+    );
+}
+
+#[test]
+fn cabsim_partition_accepted_values_in_help() {
+    let output = binary()
+        .arg("-h")
+        .output()
+        .expect("failed to execute binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--cabsim-partition"),
+        "help must document --cabsim-partition, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("128"),
+        "help must document the 128 default, got: {stdout}"
+    );
+}
+
 #[test]
 fn invalid_gate_mode_exits_with_error() {
     let output = binary()

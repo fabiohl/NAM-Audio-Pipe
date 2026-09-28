@@ -435,9 +435,12 @@ pub fn setup_capture_stream<'c>(
                         }
                     }
 
-                    // Detect cabsim partition/rate mismatch and signal rebuild:
-                    // the IR must match both the host quantum (partition size)
-                    // and the applied host output rate.
+                    // Detect cabsim rate mismatch and signal rebuild:
+                    // the IR must match the applied host output rate only.
+                    // The partition is decoupled from the host quantum — the
+                    // block-size-agnostic driver (`process_block`) chunks
+                    // arbitrary host blocks internally, so a quantum
+                    // renegotiation alone never forces a heavy FFT rebuild.
                     let last_n_samples =
                         rt_status_for_process.last_n_samples.load(Ordering::Relaxed) as usize;
                     if cabsim_rebuild_needed(
@@ -451,9 +454,19 @@ pub fn setup_capture_stream<'c>(
                     ) {
                         // Write data BEFORE raising the flag (Release barrier must cover
                         // the preceding stores so the consumer sees the correct values).
+                        // The `--cabsim-partition` policy sizes EVERY install (initial
+                        // load, first RT install and rate recalibration): the quantum
+                        // never sizes the pair — it only gates the first install below
+                        // (a real quantum proves the host rate was negotiated, which
+                        // the rebuild needs). Rate-only rebuilds preserve the active
+                        // partition.
+                        let partition_to_request = cabsim_partition_to_request(
+                            state.active_cabsim.as_deref(),
+                            state.cabsim_partition_policy,
+                        );
                         rt_status_for_process
                             .requested_cabsim_partition_size
-                            .store(last_n_samples as u32, Ordering::Relaxed);
+                            .store(partition_to_request as u32, Ordering::Relaxed);
                         rt_status_for_process
                             .requested_cabsim_host_rate
                             .store(current_host_rate, Ordering::Relaxed);
@@ -490,14 +503,38 @@ pub fn setup_capture_stream<'c>(
     Ok((capture_stream, capture_listener))
 }
 
+/// Partition carried by a cab-sim rebuild request.
+///
+/// * Active pair present (rate-only recalibration): preserve its current
+///   partition — a quantum/rate renegotiation must never change the installed
+///   latency.
+/// * No active pair (first install): the `--cabsim-partition` policy
+///   (`CaptureState::cabsim_partition_policy`) — never the host quantum.
+#[inline]
+fn cabsim_partition_to_request(
+    active: Option<&neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>,
+    policy: usize,
+) -> usize {
+    active
+        .map(|pair| pair.partition_size())
+        .unwrap_or(policy)
+}
+
 /// Decides whether a cab-sim rebuild must be requested.
 ///
 /// A rebuild is needed when an IR is loaded and any of:
 /// * no pair is active yet — first install, or safe-bypass after a failed
-///   rebuild;
-/// * the host quantum no longer matches the pair's partition size;
+///   rebuild (fired once a real host quantum is observed, which proves the
+///   host rate was negotiated; the partition itself comes from the
+///   `--cabsim-partition` policy, never from the quantum);
 /// * the pair's IR is calibrated for a different rate than the applied host
 ///   output rate (rate calibration).
+///
+/// The host quantum no longer drives a rebuild. The block-size-agnostic
+/// driver (`process_block`) chunks arbitrary host blocks internally against
+/// the fixed partition, so a PipeWire quantum renegotiation alone (e.g. 128
+/// to 256 samples at constant rate) keeps the existing pair active with zero
+/// audio interruption and zero FFT rebuild.
 ///
 /// `already_pending` suppresses duplicate requests while a previous rebuild is
 /// in flight, for both the initial-install and the active-pair branches. Without
@@ -513,20 +550,19 @@ fn cabsim_rebuild_needed(
     host_rate: u32,
     already_pending: bool,
 ) -> bool {
-    // Only quantums inside the convolution partition domain [16, MAX_RESAMP_BUF]
-    // may drive a rebuild. A spurious quantum above the ceiling (or below the
-    // floor) must never trigger successive rebuilds — the handler would clamp it,
-    // producing a pair whose partition never matches the anomalous quantum and
-    // re-requesting forever.
-    if !has_ir || !(16..=MAX_RESAMP_BUF).contains(&n_samples) {
+    // The quantum only gates the first install (a real quantum proves the
+    // host rate was negotiated and lies inside the convolution partition
+    // domain [16, MAX_RESAMP_BUF]). An active pair never rebuilds on quantum
+    // drift — the block-size-agnostic driver chunks any host block
+    // internally — so an anomalous quantum can never trigger successive
+    // rebuilds of a healthy pair (the first-install branch keeps the domain
+    // defense-in-depth).
+    if !has_ir {
         return false;
     }
     match active {
-        None => !already_pending,
-        Some(pair) => {
-            !already_pending
-                && (pair.partition_size() != n_samples || pair.sample_rate != host_rate)
-        }
+        None => !already_pending && (16..=MAX_RESAMP_BUF).contains(&n_samples),
+        Some(pair) => !already_pending && pair.sample_rate != host_rate,
     }
 }
 

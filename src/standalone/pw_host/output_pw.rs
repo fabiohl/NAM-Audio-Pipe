@@ -36,6 +36,10 @@ pub struct AppState<S1, L1, S2, L2> {
 pub struct PipewireHostConfig {
     /// Requested audio buffer size.
     pub buffer_size: u32,
+    /// Cab-sim UPOLS partition policy in samples (`--cabsim-partition`):
+    /// fixes the cab-sim algorithmic latency (exactly N samples) and is used
+    /// for every pair installation, decoupled from `buffer_size`.
+    pub cabsim_partition: u32,
     /// System snapshot for diagnostics.
     pub sys: SystemSnapshot,
     /// Raw IR samples for adaptive partition rebuild (None if no IR loaded).

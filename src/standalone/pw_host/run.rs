@@ -96,6 +96,7 @@ pub fn run_pipewire_host(
 ) -> anyhow::Result<Option<RecordingWorkerOutcome>> {
     let PipewireHostConfig {
         buffer_size,
+        cabsim_partition,
         sys,
         ir_raw_samples,
         ir_source_rate,
@@ -133,6 +134,11 @@ pub fn run_pipewire_host(
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
+    // The cab-sim partition policy (--cabsim-partition) sizes every pair
+    // installation; the RT callback publishes it on the first-install
+    // request instead of inheriting the host quantum. Read-only after this
+    // store (same exclusivity contract as `ir_source_rate`).
+    rt_state.cabsim_partition_policy = cabsim_partition as usize;
     // T9.5: the four dedicated swap channels live inside the engine
     // `RtSwapDrain`s (each owns its ring consumer and deferred slot); the
     // mixed param ring stays in `RtHostChannels`.

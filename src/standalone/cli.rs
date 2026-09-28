@@ -30,6 +30,56 @@ pub const BUFFER_SIZE_AUTO: u32 = 0;
 pub const BUFFER_SIZE_MIN: u32 = 16;
 pub const BUFFER_SIZE_MAX: u32 = 8192;
 
+// Domain contract for `--cabsim-partition`.
+//
+// The UPOLS partition is an installation-time policy that fixes the cab-sim
+// algorithmic latency (exactly `partition_size` samples) and the RFFT event
+// rate (`sample_rate / partition_size` events per second). The accepted set
+// is `{32, 64, 128, 256}`:
+// - `32`/`64`: live monitoring (lowest IR latency, highest steady-state CPU);
+// - `128`: the safe default (live/session balance, the CPU-safe fallback of
+//   the risk matrix);
+// - `256`: headroom for CPU-constrained machines (offline/mastering bias).
+//
+// The policy is decoupled from the host quantum (`--buffer-size`): the
+// block-agnostic `process_block` driver chunks any quantum against the fixed
+// partition, so the latency no longer tracks the PipeWire buffer size.
+pub const CABSIM_PARTITION_DEFAULT: u32 = 128;
+pub const CABSIM_PARTITION_ALLOWED: [u32; 4] = [32, 64, 128, 256];
+
+/// Structured rejection reason for an out-of-domain `--cabsim-partition`
+/// value (the accepted set is the exact [`CABSIM_PARTITION_ALLOWED`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CabSimPartitionError {
+    /// The rejected value.
+    pub value: u32,
+}
+
+impl std::fmt::Display for CabSimPartitionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Cab-sim partition must be one of {:?} samples (latency = partition size), got {}",
+            CABSIM_PARTITION_ALLOWED, self.value
+        )
+    }
+}
+
+impl std::error::Error for CabSimPartitionError {}
+
+/// Validates a parsed `--cabsim-partition` value against the documented
+/// domain (exact membership in [`CABSIM_PARTITION_ALLOWED`]).
+///
+/// The check is pure and runs before any PipeWire connection or allocation,
+/// so malformed input fails fast with a typed, explainable error.
+pub fn validate_cabsim_partition(partition: u32) -> Result<u32, CabSimPartitionError> {
+    if CABSIM_PARTITION_ALLOWED.contains(&partition) {
+        Ok(partition)
+    } else {
+        Err(CabSimPartitionError { value: partition })
+    }
+}
+
 /// Structured rejection reason for an out-of-domain `--buffer-size` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferSizeError {
@@ -104,6 +154,11 @@ pub fn print_help() {
     println!(
         "  -b, --buffer-size <SAMPLES> Fixed block size: 0 for auto, or a power of two in [16, 8192] (e.g. 64, 256, 512) [default: 256]"
     );
+    println!(concat!(
+        "      --cabsim-partition <N> Cab-sim UPOLS partition: 32, 64, 128 or 256 samples —\n",
+        "                           fixes the IR latency (N samples; lower = less latency,\n",
+        "                           more CPU) [default: 128]"
+    ));
     println!("      --diagnose          Print technical support block and exit");
     println!("      --diagnose-full     Print technical support block with raw paths and exit");
     println!(
@@ -271,6 +326,10 @@ pub struct CliArgs {
     pub output_gain: f32,
     /// Desired buffer size.
     pub buffer_size: u32,
+    /// Cab-sim UPOLS partition policy in samples (from `--cabsim-partition`):
+    /// the exact algorithmic latency of the cab-sim stage, decoupled from the
+    /// host quantum. Defaults to [`CABSIM_PARTITION_DEFAULT`].
+    pub cabsim_partition: u32,
     /// Immediate diagnostic flag.
     pub diagnose: bool,
     /// Immediate diagnostic flag with full (unredacted) paths.
@@ -308,6 +367,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut input_gain = 0.0;
     let mut output_gain = 0.0;
     let mut buffer_size = 256;
+    let mut cabsim_partition = CABSIM_PARTITION_DEFAULT;
     let mut diagnose = false;
     let mut diagnose_full = false;
     let mut slim_override = SlimOverride::Auto;
@@ -488,6 +548,20 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                 });
                 validate_buffer_size(buffer_size).unwrap_or_else(|e| exit_with_error(e));
             }
+            Long("cabsim-partition") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid cabsim partition value."));
+                let parsed = val_str.parse::<u32>().unwrap_or_else(|_| {
+                    exit_with_error(format!(
+                        "Invalid cabsim partition: '{}'. Must be an integer.",
+                        val_str
+                    ))
+                });
+                cabsim_partition =
+                    validate_cabsim_partition(parsed).unwrap_or_else(|e| exit_with_error(e));
+            }
             _ => exit_with_error(arg.unexpected()),
         }
     }
@@ -503,6 +577,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         input_gain,
         output_gain,
         buffer_size,
+        cabsim_partition,
         diagnose,
         diagnose_full,
         slim_override,

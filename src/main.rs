@@ -152,9 +152,11 @@ fn main() -> anyhow::Result<()> {
 
     // 7. LOAD THE CAB-SIM IR: If you said "use cabinet X",
     // this is where the computer opens that WAV file and builds the convolution engine.
+    // The UPOLS partition comes from `--cabsim-partition` (never from the
+    // quantum), fixing the published cab-sim latency in samples.
     let (ir_raw_samples, ir_source_rate) = match setup::load_initial_cabsim(
         args.cab_path.as_deref(),
-        buffer_size,
+        args.cabsim_partition,
         &mut cabsim_producer,
     )? {
         Some(ir) => (Some(ir.raw_samples), ir.source_rate),
@@ -308,6 +310,7 @@ fn main() -> anyhow::Result<()> {
         rt_status,
         pw_host::PipewireHostConfig {
             buffer_size,
+            cabsim_partition: args.cabsim_partition,
             sys,
             ir_raw_samples,
             ir_source_rate,

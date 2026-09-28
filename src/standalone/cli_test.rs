@@ -375,6 +375,102 @@ fn parse_args_accepts_buffer_size_max_boundary() {
     assert_eq!(cli_args.buffer_size, 8192);
 }
 
+// --cabsim-partition domain contract --------------------------------------
+
+#[test]
+fn cabsim_partition_domain_constants_document_the_contract() {
+    // The allowed set is the exact latency/CPU trade-off matrix; 128 is the
+    // CPU-safe default of the risk matrix.
+    assert_eq!(CABSIM_PARTITION_ALLOWED, [32, 64, 128, 256]);
+    assert_eq!(CABSIM_PARTITION_DEFAULT, 128);
+}
+
+#[test]
+fn validate_cabsim_partition_accepts_only_the_allowed_set() {
+    for size in CABSIM_PARTITION_ALLOWED {
+        assert_eq!(
+            validate_cabsim_partition(size),
+            Ok(size),
+            "partition {size} must be accepted"
+        );
+    }
+}
+
+#[test]
+fn validate_cabsim_partition_rejects_out_of_domain_values() {
+    for size in [0u32, 1, 8, 16, 48, 100, 127, 512, 1024, 8192, u32::MAX] {
+        assert!(
+            validate_cabsim_partition(size).is_err(),
+            "partition {size} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn validate_cabsim_partition_errors_are_explanatory_and_implement_std_error() {
+    fn assert_std_error<E: std::error::Error>() {}
+    assert_std_error::<CabSimPartitionError>();
+
+    assert_eq!(
+        validate_cabsim_partition(100).unwrap_err().to_string(),
+        "Cab-sim partition must be one of [32, 64, 128, 256] samples (latency = partition size), got 100"
+    );
+}
+
+#[test]
+fn parse_args_cabsim_partition_defaults_to_128() {
+    let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.cabsim_partition, CABSIM_PARTITION_DEFAULT);
+}
+
+#[test]
+fn parse_args_accepts_all_allowed_cabsim_partitions() {
+    for size in CABSIM_PARTITION_ALLOWED {
+        let size_str = size.to_string();
+        let args = vec![
+            "nam-audio-pipe",
+            "--buffer-size",
+            "256",
+            "--cabsim-partition",
+            &size_str,
+        ];
+        let parser = lexopt::Parser::from_iter(args);
+        let cli_args = parse_args_from(parser);
+        assert_eq!(cli_args.cabsim_partition, size);
+    }
+}
+
+#[test]
+fn parse_args_cabsim_partition_is_independent_of_buffer_size() {
+    // The partition policy is decoupled from the host quantum: a small
+    // partition under a large quantum (and vice versa) must both parse.
+    let args = vec![
+        "nam-audio-pipe",
+        "--buffer-size",
+        "8192",
+        "--cabsim-partition",
+        "32",
+    ];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.buffer_size, 8192);
+    assert_eq!(cli_args.cabsim_partition, 32);
+
+    let args = vec![
+        "nam-audio-pipe",
+        "--buffer-size",
+        "0",
+        "--cabsim-partition",
+        "256",
+    ];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.buffer_size, 0);
+    assert_eq!(cli_args.cabsim_partition, 256);
+}
+
 #[test]
 fn parse_args_accepts_cpu_flag() {
     let args = vec!["nam-audio-pipe", "--cpu", "3"];

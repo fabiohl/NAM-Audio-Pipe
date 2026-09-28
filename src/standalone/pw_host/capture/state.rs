@@ -102,6 +102,13 @@ pub struct CaptureState {
     /// main-thread rebuild resamples the preserved original IR specifically
     /// for the applied host output rate.
     pub ir_source_rate: u32,
+    /// Cab-sim UPOLS partition policy in samples (`--cabsim-partition`,
+    /// exact set `{32, 64, 128, 256}`, default `128`). Sizes every pair
+    /// installation: the RT callback publishes it in the first-install
+    /// rebuild request instead of inheriting the host quantum, and the
+    /// rate-only rebuilds preserve the active partition. Written once by the
+    /// main thread before the RT handoff, read-only afterwards.
+    pub cabsim_partition_policy: usize,
     /// Dedicated swap channels drained by the engine's generic scheduler
     /// (T9.5): each `RtSwapDrain` owns its ring consumer AND the single
     /// deferred slot (formerly the `deferred_*` fields below). Wired in
@@ -264,6 +271,7 @@ impl CaptureState {
             thread_configured: false,
             ir_raw_samples: None,
             ir_source_rate: 0,
+            cabsim_partition_policy: crate::standalone::cli::CABSIM_PARTITION_DEFAULT as usize,
             resampler_drain: None,
             cabsim_drain: None,
             deferred_model: None,

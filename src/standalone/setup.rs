@@ -118,22 +118,19 @@ pub struct InitialCabSimIr {
     pub source_rate: u32,
 }
 
-/// Derives the initial CabSim convolution partition size from the requested
-/// buffer size.
+/// Derives the CabSim convolution partition from the `--cabsim-partition`
+/// policy.
 ///
-/// The partition is clamped to the safe domain `[16, MAX_RESAMP_BUF]` and
-/// rounded up to a power of two before any `ConvEngine` is instantiated, so a
-/// spurious `--buffer-size` (or any out-of-domain value) can never allocate an
-/// oversized FFT structure off-RT. `0` (auto) falls back to a 256-sample
-/// partition.
-pub(crate) fn initial_cabsim_partition_size(buffer_size: u32) -> usize {
-    if buffer_size > 0 {
-        (buffer_size as usize)
-            .clamp(16, MAX_RESAMP_BUF)
-            .next_power_of_two()
-    } else {
-        256
-    }
+/// The policy (exact set `{32, 64, 128, 256}`, default `128`) is an
+/// installation-time choice that fixes the cab-sim algorithmic latency at
+/// exactly `partition_size` samples — decoupled from the host quantum, which
+/// only flows through the block-agnostic `process_block` driver. The value
+/// is clamped to the safe domain `[16, MAX_RESAMP_BUF]` before any
+/// `ConvEngine` is instantiated, so an out-of-domain request can never
+/// allocate an oversized FFT structure off-RT (defense-in-depth: the CLI
+/// already fails fast on out-of-set values).
+pub(crate) fn initial_cabsim_partition_size(cabsim_partition: u32) -> usize {
+    (cabsim_partition as usize).clamp(16, MAX_RESAMP_BUF)
 }
 
 /// Encapsulates impulse response (Cab-Sim) loading, convolution pair assembly,
@@ -144,17 +141,19 @@ pub(crate) fn initial_cabsim_partition_size(buffer_size: u32) -> usize {
 /// and dispatched. The original samples and source rate are preserved: the
 /// pair is recalibrated for the applied host output rate on the first rebuild
 /// — never at the model rate, since the cab-sim stage runs after the return
-/// to host rate.
+/// to host rate. The partition comes from the `--cabsim-partition` policy
+/// (never from the host quantum), so the published algorithmic latency is a
+/// startup-stable choice of the user.
 pub fn load_initial_cabsim(
     cab_path: Option<&Path>,
-    buffer_size: u32,
+    cabsim_partition: u32,
     cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
 ) -> anyhow::Result<Option<InitialCabSimIr>> {
     let Some(cab_path) = cab_path else {
         return Ok(None);
     };
 
-    let partition_size = initial_cabsim_partition_size(buffer_size);
+    let partition_size = initial_cabsim_partition_size(cabsim_partition);
 
     match CabSimIr::load(cab_path, 0, true) {
         Ok(cabsim) => {
@@ -169,13 +168,24 @@ pub fn load_initial_cabsim(
             };
             let l = build_adapter()?;
             let r = build_adapter()?;
+            // Publish the exact real latency of the cab-sim stage: the UPOLS
+            // partition is causal, so the adapter stays silent for exactly
+            // `partition_size` samples (`CabSimAdapter::latency_samples`).
+            // The milliseconds figure uses the IR native rate as the
+            // reference; the pair is recalibrated to the host rate on the
+            // first rebuild, where the handler republishes the latency at the
+            // applied rate.
             log::info!(
-                "{} Cab-sim IR loaded: {} ({} Hz, {} partitions, FFT={})",
+                "{} Cab-sim IR loaded: {} ({} Hz, {} partitions, FFT={}, \
+                 latency={} samples = {:.2} ms @ {} Hz)",
                 "🎛️".cyan(),
                 cab_path.display(),
                 source_rate,
                 l.num_partitions(),
                 l.engine().fft_size(),
+                l.latency_samples(),
+                l.latency_samples() as f64 * 1000.0 / f64::from(source_rate.max(1)),
+                source_rate,
             );
             let pair = CabSimPair {
                 l: Box::new(l),
@@ -227,25 +237,23 @@ mod tests {
     #[test]
     fn test_load_initial_cabsim_none() {
         let mut channels = setup_communication_channels();
-        let result = load_initial_cabsim(None, 256, &mut channels.cabsim_producer).unwrap();
+        let result = load_initial_cabsim(None, 128, &mut channels.cabsim_producer).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn initial_cabsim_partition_size_domain_and_pow2() {
-        // The initial partition is clamped to [16, MAX_RESAMP_BUF]
-        // and rounded up to a power of two; 0 means auto (256).
-        assert_eq!(initial_cabsim_partition_size(0), 256);
-        assert_eq!(initial_cabsim_partition_size(16), 16);
+    fn initial_cabsim_partition_size_follows_policy_and_clamps_domain() {
+        // The policy set {32, 64, 128, 256} maps identically — the latency is
+        // exactly the chosen partition, never derived from the quantum.
+        assert_eq!(initial_cabsim_partition_size(32), 32);
+        assert_eq!(initial_cabsim_partition_size(64), 64);
+        assert_eq!(initial_cabsim_partition_size(128), 128);
         assert_eq!(initial_cabsim_partition_size(256), 256);
-        assert_eq!(initial_cabsim_partition_size(512), 512);
-        assert_eq!(initial_cabsim_partition_size(8192), 8192);
-        // Out-of-domain requests are fail-closed: clamped to the ceiling.
+        // Defense-in-depth clamp (the CLI already rejects out-of-set values):
+        // the partition can never leave the engine's safe domain.
+        assert_eq!(initial_cabsim_partition_size(0), 16);
+        assert_eq!(initial_cabsim_partition_size(1), 16);
         assert_eq!(initial_cabsim_partition_size(16384), MAX_RESAMP_BUF);
         assert_eq!(initial_cabsim_partition_size(u32::MAX), MAX_RESAMP_BUF);
-        // Below the floor and non-power-of-two values are rounded up safely.
-        assert_eq!(initial_cabsim_partition_size(1), 16);
-        assert_eq!(initial_cabsim_partition_size(100), 128);
-        assert_eq!(initial_cabsim_partition_size(300), 512);
     }
 }
