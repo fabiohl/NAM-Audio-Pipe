@@ -16,6 +16,14 @@
 //!   or `=GAP:uncalibrated_environment` when a miss happens on a noisy dev
 //!   host (a calibrated isolated-core + `SCHED_FIFO` machine turns the miss
 //!   into a hard failure).
+//! - `rt_deadline_full` (filter `deadline`, Phase 3): 10 000 consecutive
+//!   complete audio pipeline cycles covering all 4 production stages (capture SPA
+//!   validation, DSP core, recording pool enqueue, playback SPA delivery) timed
+//!   with `CLOCK_MONOTONIC_RAW` under an 85% nanosecond budget. Emits
+//!   per-stage telemetry (`cap_p99_ns`, `dsp_p99_ns`, `rec_p99_ns`, `pb_p99_ns`,
+//!   `total_p99_ns`, `max_ns`, `budget_ns`, `margin_pct`) and typed result marker:
+//!   `TEST_RESULT[rt_deadline_full]=PASS max_ns=... budget_ns=... margin_pct=...`,
+//!   or `=GAP:uncalibrated_environment`.
 //! - `rt_jitter_gate_10k_callbacks` (filter `jitter`, Phase 4): 10 000
 //!   callback dispatches at the nominal period while background I/O, cache
 //!   thrash and syscall-storm threads perturb the shared CPU. Measures the
@@ -62,10 +70,17 @@
 mod common;
 
 use common::swap::*;
-use nam_audio_pipe::standalone::pw_host::{
-    RtSwapHarness, SharedBackendStatus, observe_stream_state,
+use nam_audio_pipe::recording::{
+    AlignedBlock, MAX_BLOCK_SIZE, RecordingReceiver, create_recording_transport,
 };
-use neural_amp_modeler_rs::common::spsc::{RT_STATUS_NEEDS_RESAMPLER_REBUILD, SHUTDOWN};
+use nam_audio_pipe::standalone::pw_host::output_pw::deliver_playback_pair_fail_closed;
+use nam_audio_pipe::standalone::pw_host::{
+    RtSwapHarness, SharedBackendStatus, handle_spa_pair_fail_closed, observe_stream_state,
+    resolve_capture_chunk_window, send_recording_audio,
+};
+use neural_amp_modeler_rs::common::spsc::{
+    RT_STATUS_NEEDS_RESAMPLER_REBUILD, RtStatusFlags, SHUTDOWN,
+};
 use pipewire::stream::StreamState;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -194,23 +209,40 @@ struct RtEnvironment {
     strict: bool,
     /// The process is pinned to exactly one CPU (`Cpus_allowed_list`).
     pinned_single_cpu: bool,
+    /// The pinned CPU id, if pinned to a single core.
+    pinned_cpu: Option<u32>,
     /// The pinned CPU is in the kernel's isolcpus set.
     cpu_isolated: bool,
     /// `sched_getscheduler` reports `SCHED_FIFO`.
     sched_fifo: bool,
+    /// Scaling governor of the pinned CPU or system.
+    governor: String,
+    /// Whether CPU 9 is offline (SMT pair offline).
+    cpu9_offline: bool,
 }
 
 impl RtEnvironment {
     fn probe() -> Self {
         let allowed = cpus_allowed_list();
         let pinned_single_cpu = allowed.len() == 1;
-        let cpu_isolated =
-            pinned_single_cpu && allowed.first().is_some_and(|c| isolated_cpus().contains(c));
+        let pinned_cpu = if pinned_single_cpu {
+            allowed.first().copied()
+        } else {
+            None
+        };
+        let isolated = isolated_cpus();
+        let cpu_isolated = pinned_cpu.is_some_and(|c| isolated.contains(&c));
+        let sched_fifo = unsafe { libc::sched_getscheduler(0) } == libc::SCHED_FIFO;
+        let governor = read_cpu_governor(pinned_cpu);
+        let cpu9_offline = is_cpu9_offline();
         Self {
             strict: std::env::var("NAM_RT_STRICT").as_deref() == Ok("1"),
             pinned_single_cpu,
+            pinned_cpu,
             cpu_isolated,
-            sched_fifo: unsafe { libc::sched_getscheduler(0) } == libc::SCHED_FIFO,
+            sched_fifo,
+            governor,
+            cpu9_offline,
         }
     }
 
@@ -218,6 +250,56 @@ impl RtEnvironment {
     /// isolated core plus a FIFO scheduler (task spec §1).
     fn calibrated(&self) -> bool {
         self.pinned_single_cpu && self.cpu_isolated && self.sched_fifo
+    }
+
+    /// Formats the calibration environment evidence string for `TEST_RESULT[...]`.
+    fn format_env(&self) -> String {
+        let pinned = if self.pinned_single_cpu { 1 } else { 0 };
+        let isolated = if self.cpu_isolated { 1 } else { 0 };
+        let fifo = if self.sched_fifo { 1 } else { 0 };
+        let cpu_str = match self.pinned_cpu {
+            Some(id) => id.to_string(),
+            None => "none".to_string(),
+        };
+        let cpu9_str = if self.cpu9_offline {
+            "offline"
+        } else {
+            "online"
+        };
+        format!(
+            "env=pinned:{pinned},isolated:{isolated},fifo:{fifo},governor:{},cpu:{cpu_str},cpu9:{cpu9_str}",
+            self.governor
+        )
+    }
+}
+
+/// Tries to set SCHED_FIFO with the given priority on the current thread.
+fn try_promote_sched_fifo(priority: i32) -> bool {
+    let param = libc::sched_param {
+        sched_priority: priority,
+    };
+    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
+    rc == 0
+}
+
+/// Reads the cpufreq scaling_governor for the given CPU or cpu0.
+fn read_cpu_governor(cpu: Option<u32>) -> String {
+    let path = match cpu {
+        Some(id) => format!("/sys/devices/system/cpu/cpu{id}/cpufreq/scaling_governor"),
+        None => "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor".to_string(),
+    };
+    std::fs::read_to_string(&path)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Detects if CPU 9 is offline (SMT pair intentional offline).
+fn is_cpu9_offline() -> bool {
+    let path = "/sys/devices/system/cpu/cpu9/online";
+    if let Ok(s) = std::fs::read_to_string(path) {
+        s.trim() == "0"
+    } else {
+        false
     }
 }
 
@@ -292,7 +374,15 @@ fn rt_deadline_gate_10k_quantums() {
         eprintln!("TEST_RESULT[rt_deadline]=GAP:debug_build_measurement_invalid");
         return;
     }
+    let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
+    if !env.sched_fifo {
+        if env.strict {
+            panic!("RT deadline gate FAILED: NAM_RT_STRICT=1 and SCHED_FIFO is unavailable");
+        }
+        eprintln!("TEST_RESULT[rt_deadline]=GAP:sched_fifo_unavailable");
+        return;
+    }
     let mut h = real_load_harness();
     let budget_ns = ((BLOCK as f64 / SAMPLE_RATE as f64) * 1e9 * BUDGET_FACTOR) as u64;
 
@@ -342,6 +432,7 @@ fn rt_deadline_gate_10k_quantums() {
          p99_ns={p99_ns} max_ns={max_ns} (block {max_block}) budget_ns={budget_ns} margin_pct={margin_pct:.1}"
     );
 
+    let env_str = env.format_env();
     if max_ns <= budget_ns {
         // Under NAM_RT_STRICT=1 a PASS is only certifiable on a
         // calibrated RT environment — numbers below the budget on an
@@ -355,7 +446,7 @@ fn rt_deadline_gate_10k_quantums() {
             );
         }
         eprintln!(
-            "TEST_RESULT[rt_deadline]=PASS max_ns={max_ns} budget_ns={budget_ns} margin_pct={margin_pct:.1}"
+            "TEST_RESULT[rt_deadline]=PASS max_ns={max_ns} budget_ns={budget_ns} margin_pct={margin_pct:.1} {env_str}"
         );
         return;
     }
@@ -382,6 +473,328 @@ fn rt_deadline_gate_10k_quantums() {
     );
 }
 
+/// 10 000 consecutive complete audio pipeline cycles (capture SPA validation,
+/// DSP core, recording pool enqueue, playback SPA delivery) timed with
+/// `CLOCK_MONOTONIC_RAW` under an 85% nanosecond budget.
+///
+/// Emits per-stage telemetry:
+/// `RT_METRICS rt_deadline_full quantums=10000 cap_p99_ns=... cap_max_ns=... dsp_p99_ns=... dsp_max_ns=... rec_p99_ns=... rec_max_ns=... pb_p99_ns=... pb_max_ns=... total_p99_ns=... max_ns=... budget_ns=... margin_pct=...`
+///
+/// Fails closed against the budget:
+/// `TEST_RESULT[rt_deadline_full]=PASS max_ns=... budget_ns=... margin_pct=... {env_str}`
+/// or typed GAP on uncalibrated environment / missing SCHED_FIFO.
+#[test]
+#[ignore = "RT deadline gate (full quantum): 10k complete pipeline cycles (capture + DSP + recording + playback) under 85% budget — long suite only (tests-long.sh Phase 3)"]
+fn rt_deadline_full() {
+    if cfg!(debug_assertions) {
+        eprintln!("TEST_RESULT[rt_deadline_full]=GAP:debug_build_measurement_invalid");
+        return;
+    }
+    let _ = try_promote_sched_fifo(80);
+    let env = RtEnvironment::probe();
+    if !env.sched_fifo {
+        if env.strict {
+            panic!("RT deadline gate (full) FAILED: NAM_RT_STRICT=1 and SCHED_FIFO is unavailable");
+        }
+        eprintln!("TEST_RESULT[rt_deadline_full]=GAP:sched_fifo_unavailable");
+        return;
+    }
+
+    let mut h = real_load_harness();
+    let bridge_reader = h.bridge_reader();
+    let (mut recording_sender, mut recording_receiver) = create_recording_transport();
+    let mut recording_block = AlignedBlock::<MAX_BLOCK_SIZE>::default();
+    let recording_data_available = AtomicBool::new(false);
+    let rt_status = RtStatusFlags::default();
+
+    let budget_ns = ((BLOCK as f64 / SAMPLE_RATE as f64) * 1e9 * BUDGET_FACTOR) as u64;
+    let n_bytes = BLOCK * std::mem::size_of::<f32>();
+    let max_bytes = n_bytes;
+
+    let (sig_l, sig_r) = test_signal_blocks(DEADLINE_QUANTUMS);
+
+    // Capture and playback working buffers.
+    let mut cap_l = [0f32; BLOCK];
+    let mut cap_r = [0f32; BLOCK];
+    let mut pb_l = [0f32; BLOCK];
+    let mut pb_r = [0f32; BLOCK];
+
+    let mut cap_chunk_l = pipewire::spa::sys::spa_chunk {
+        offset: 0,
+        size: n_bytes as u32,
+        stride: std::mem::size_of::<f32>() as i32,
+        flags: 0,
+    };
+    let mut cap_chunk_r = cap_chunk_l;
+    let mut pb_chunk_l = cap_chunk_l;
+    let mut pb_chunk_r = cap_chunk_l;
+
+    let cap_ptr_l = cap_l.as_mut_ptr() as usize;
+    let cap_ptr_r = cap_r.as_mut_ptr() as usize;
+    let pb_ptr_l = pb_l.as_mut_ptr() as usize;
+    let pb_ptr_r = pb_r.as_mut_ptr() as usize;
+
+    let mut last_bridge_gen = 0u64;
+
+    // Warm up the complete pipeline (16 iterations).
+    for block in 0..16 {
+        cap_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+        cap_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+
+        let cap_chunk_l_ptr = &mut cap_chunk_l as *mut pipewire::spa::sys::spa_chunk;
+        let cap_chunk_r_ptr = &mut cap_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+
+        let win_l = resolve_capture_chunk_window(
+            cap_chunk_l_ptr,
+            cap_ptr_l,
+            max_bytes,
+            cap_ptr_r,
+            max_bytes,
+            &rt_status,
+        );
+        let win_r = resolve_capture_chunk_window(
+            cap_chunk_r_ptr,
+            cap_ptr_l,
+            max_bytes,
+            cap_ptr_r,
+            max_bytes,
+            &rt_status,
+        );
+        if let (Some((off_l, sz_l)), Some((off_r, sz_r))) = (win_l, win_r) {
+            let _ = handle_spa_pair_fail_closed(
+                cap_ptr_l,
+                max_bytes,
+                cap_chunk_l_ptr,
+                off_l,
+                sz_l,
+                cap_ptr_r,
+                max_bytes,
+                cap_chunk_r_ptr,
+                off_r,
+                sz_r,
+                &rt_status,
+            );
+        }
+
+        h.run_callback(&mut cap_l, &mut cap_r, BLOCK);
+
+        send_recording_audio(
+            &mut recording_sender,
+            BLOCK,
+            &cap_l,
+            &cap_r,
+            &mut recording_block,
+            Some(&recording_data_available),
+            None,
+        );
+
+        let pb_chunk_l_ptr = &mut pb_chunk_l as *mut pipewire::spa::sys::spa_chunk;
+        let pb_chunk_r_ptr = &mut pb_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        bridge_reader.read_block(&mut last_bridge_gen, |src_l, src_r| unsafe {
+            let _ = deliver_playback_pair_fail_closed(
+                pb_ptr_l,
+                max_bytes,
+                pb_chunk_l_ptr,
+                pb_ptr_r,
+                max_bytes,
+                pb_chunk_r_ptr,
+                src_l.as_ptr(),
+                src_r.as_ptr(),
+                n_bytes,
+                &rt_status,
+            );
+        });
+
+        if let RecordingReceiver::Pool { ref mut pool, .. } = recording_receiver {
+            while let Some(in_flight) = pool.try_pop() {
+                let _ = in_flight.release();
+            }
+        }
+    }
+
+    let mut cap_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
+    let mut dsp_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
+    let mut rec_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
+    let mut pb_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
+    let mut total_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
+
+    let mut min_total_ns = u64::MAX;
+    let mut max_total_ns = 0u64;
+    let mut max_block = 0usize;
+    let mut sum_total_ns = 0u128;
+
+    for block in 0..DEADLINE_QUANTUMS {
+        cap_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+        cap_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+
+        let cap_chunk_l_ptr = &mut cap_chunk_l as *mut pipewire::spa::sys::spa_chunk;
+        let cap_chunk_r_ptr = &mut cap_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+
+        // Stage 1: Capture / SPA validation
+        let t0 = now_ns();
+        let win_l = resolve_capture_chunk_window(
+            cap_chunk_l_ptr,
+            cap_ptr_l,
+            max_bytes,
+            cap_ptr_r,
+            max_bytes,
+            &rt_status,
+        );
+        let win_r = resolve_capture_chunk_window(
+            cap_chunk_r_ptr,
+            cap_ptr_l,
+            max_bytes,
+            cap_ptr_r,
+            max_bytes,
+            &rt_status,
+        );
+        let spa_pair = if let (Some((off_l, sz_l)), Some((off_r, sz_r))) = (win_l, win_r) {
+            handle_spa_pair_fail_closed(
+                cap_ptr_l,
+                max_bytes,
+                cap_chunk_l_ptr,
+                off_l,
+                sz_l,
+                cap_ptr_r,
+                max_bytes,
+                cap_chunk_r_ptr,
+                off_r,
+                sz_r,
+                &rt_status,
+            )
+        } else {
+            None
+        };
+        let t1 = now_ns();
+        let dur_cap = t1 - t0;
+        assert!(
+            spa_pair.is_some(),
+            "capture validation failed during deadline measurement"
+        );
+
+        // Stage 2: DSP processing core
+        h.run_callback(&mut cap_l, &mut cap_r, BLOCK);
+        let t2 = now_ns();
+        let dur_dsp = t2 - t1;
+
+        // Stage 3: Recording pool enqueue
+        send_recording_audio(
+            &mut recording_sender,
+            BLOCK,
+            &cap_l,
+            &cap_r,
+            &mut recording_block,
+            Some(&recording_data_available),
+            None,
+        );
+        let t3 = now_ns();
+        let dur_rec = t3 - t2;
+
+        // Stage 4: Playback delivery
+        let pb_chunk_l_ptr = &mut pb_chunk_l as *mut pipewire::spa::sys::spa_chunk;
+        let pb_chunk_r_ptr = &mut pb_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        bridge_reader.read_block(&mut last_bridge_gen, |src_l, src_r| unsafe {
+            let delivered = deliver_playback_pair_fail_closed(
+                pb_ptr_l,
+                max_bytes,
+                pb_chunk_l_ptr,
+                pb_ptr_r,
+                max_bytes,
+                pb_chunk_r_ptr,
+                src_l.as_ptr(),
+                src_r.as_ptr(),
+                n_bytes,
+                &rt_status,
+            );
+            assert_eq!(delivered, Some(BLOCK));
+        });
+        let t4 = now_ns();
+        let dur_pb = t4 - t3;
+
+        let dur_total = t4 - t0;
+
+        // Recycle recording slot off the critical path
+        if let RecordingReceiver::Pool { ref mut pool, .. } = recording_receiver {
+            while let Some(in_flight) = pool.try_pop() {
+                let _ = in_flight.release();
+            }
+        }
+
+        cap_samples.push(dur_cap);
+        dsp_samples.push(dur_dsp);
+        rec_samples.push(dur_rec);
+        pb_samples.push(dur_pb);
+        total_samples.push(dur_total);
+
+        min_total_ns = min_total_ns.min(dur_total);
+        if dur_total > max_total_ns {
+            max_total_ns = dur_total;
+            max_block = block;
+        }
+        sum_total_ns += dur_total as u128;
+    }
+    h.consume_gc();
+
+    let cap_p99_ns = percentile_ns(cap_samples.clone(), 0.99);
+    let cap_max_ns = cap_samples.into_iter().max().unwrap_or(0);
+
+    let dsp_p99_ns = percentile_ns(dsp_samples.clone(), 0.99);
+    let dsp_max_ns = dsp_samples.into_iter().max().unwrap_or(0);
+
+    let rec_p99_ns = percentile_ns(rec_samples.clone(), 0.99);
+    let rec_max_ns = rec_samples.into_iter().max().unwrap_or(0);
+
+    let pb_p99_ns = percentile_ns(pb_samples.clone(), 0.99);
+    let pb_max_ns = pb_samples.into_iter().max().unwrap_or(0);
+
+    let mean_total_ns = (sum_total_ns / DEADLINE_QUANTUMS as u128) as u64;
+    let total_p99_ns = percentile_ns(total_samples.clone(), 0.99);
+    let margin_pct = (budget_ns.saturating_sub(max_total_ns) as f64 / budget_ns as f64) * 100.0;
+
+    eprintln!(
+        "RT_METRICS rt_deadline_full quantums={DEADLINE_QUANTUMS} \
+         cap_p99_ns={cap_p99_ns} cap_max_ns={cap_max_ns} \
+         dsp_p99_ns={dsp_p99_ns} dsp_max_ns={dsp_max_ns} \
+         rec_p99_ns={rec_p99_ns} rec_max_ns={rec_max_ns} \
+         pb_p99_ns={pb_p99_ns} pb_max_ns={pb_max_ns} \
+         total_p99_ns={total_p99_ns} max_ns={max_total_ns} (block {max_block}) \
+         budget_ns={budget_ns} margin_pct={margin_pct:.1}"
+    );
+
+    let env_str = env.format_env();
+    if max_total_ns <= budget_ns {
+        if env.strict && !env.calibrated() {
+            panic!(
+                "RT deadline gate (full) FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
+                 environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
+                 current environment is not calibrated — refusing a silent pass on an \
+                 uncalibrated host"
+            );
+        }
+        eprintln!(
+            "TEST_RESULT[rt_deadline_full]=PASS max_ns={max_total_ns} budget_ns={budget_ns} margin_pct={margin_pct:.1} {env_str}"
+        );
+        return;
+    }
+
+    if env.calibrated() {
+        panic!(
+            "RT deadline gate (full) FAILED: max quantum {max_total_ns} ns exceeds the {budget_ns} ns budget \
+             (mean {mean_total_ns} ns, p99 {total_p99_ns} ns) on a calibrated/RT environment — real xrun risk"
+        );
+    } else if env.strict {
+        panic!(
+            "RT deadline gate (full) FAILED: max quantum {max_total_ns} ns exceeds the {budget_ns} ns budget \
+             (mean {mean_total_ns} ns, p99 {total_p99_ns} ns) — NAM_RT_STRICT=1 promoted this GAP to a hard \
+             failure (environment is not calibrated: CPU not isolated/pinned or no SCHED_FIFO); \
+             re-run on the calibrated RT host"
+        );
+    }
+    eprintln!(
+        "TEST_RESULT[rt_deadline_full]=GAP:uncalibrated_environment max_ns={max_total_ns} budget_ns={budget_ns}"
+    );
+}
+
 // ── 2. RT Jitter Gate (Phase 4 of tests-long.sh) ────────────────────────────
 
 /// 10 000 callback dispatches at the nominal period under background
@@ -395,12 +808,20 @@ fn rt_jitter_gate_10k_callbacks() {
         eprintln!("TEST_RESULT[rt_jitter]=GAP:debug_build_measurement_invalid");
         return;
     }
+    let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.pinned_single_cpu {
         if env.strict {
             panic!("RT jitter gate: NAM_RT_STRICT=1 and the process is not pinned to a single CPU");
         }
         eprintln!("TEST_RESULT[rt_jitter]=GAP:cpu_not_isolated");
+        return;
+    }
+    if !env.sched_fifo {
+        if env.strict {
+            panic!("RT jitter gate: NAM_RT_STRICT=1 and SCHED_FIFO is unavailable");
+        }
+        eprintln!("TEST_RESULT[rt_jitter]=GAP:sched_fifo_unavailable");
         return;
     }
 
@@ -491,8 +912,9 @@ fn rt_jitter_gate_10k_callbacks() {
                  uncalibrated host"
             );
         }
+        let env_str = env.format_env();
         eprintln!(
-            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1} std_dev_us={:.1}",
+            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1} std_dev_us={:.1} {env_str}",
             std_dev / 1e3,
         );
         return;

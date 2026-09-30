@@ -1810,3 +1810,263 @@ fn recording_audio_pushed_when_gate_off_and_energy_zero() {
     );
     in_flight.release();
 }
+
+// ── Canonical RT Quantum Prologue Tests ──────────────────────────────────────
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_contract_violation_when_resampler_drain_missing() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::RT_STATUS_HOST_CONTRACT_VIOLATION;
+
+    let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
+        .expect("harness creation")
+        .into_parts();
+
+    rt_side.state.resampler_drain = None;
+    let outcome = rt_side.run_prologue();
+
+    assert!(
+        matches!(
+            outcome,
+            PrologueOutcome::Skip {
+                current_host_rate: 0,
+                ..
+            }
+        ),
+        "must skip with current_host_rate=0 on contract violation"
+    );
+    assert!(
+        rt_side
+            .rt_status
+            .check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
+        "RT_STATUS_HOST_CONTRACT_VIOLATION must be raised"
+    );
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_contract_violation_when_cabsim_drain_missing() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::RT_STATUS_HOST_CONTRACT_VIOLATION;
+
+    let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
+        .expect("harness creation")
+        .into_parts();
+
+    rt_side.state.cabsim_drain = None;
+    let outcome = rt_side.run_prologue();
+
+    assert!(
+        matches!(
+            outcome,
+            PrologueOutcome::Skip {
+                current_host_rate: 0,
+                ..
+            }
+        ),
+        "must skip with current_host_rate=0 on contract violation"
+    );
+    assert!(
+        rt_side
+            .rt_status
+            .check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
+        "RT_STATUS_HOST_CONTRACT_VIOLATION must be raised"
+    );
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_normal_proceed() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::RT_STATUS_HOST_CONTRACT_VIOLATION;
+
+    let mut h = RtSwapHarness::new(48000, 48000).expect("harness creation");
+    let outcome = h.run_prologue();
+
+    assert_eq!(outcome.current_host_rate(), 48000);
+    assert!(
+        matches!(
+            outcome,
+            PrologueOutcome::Proceed {
+                current_host_rate: 48000,
+                ..
+            }
+        ),
+        "normal prologue must proceed"
+    );
+    let (_producer, rt_side) = h.into_parts();
+    assert!(
+        !rt_side
+            .rt_status
+            .check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
+        "no contract violation in normal operation"
+    );
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_skips_when_resampler_swap_pending() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING;
+
+    let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
+        .expect("harness creation")
+        .into_parts();
+
+    rt_side.rt_status.set_flag(RT_STATUS_RESAMP_SWAP_PENDING);
+    let outcome = rt_side.run_prologue();
+
+    assert!(
+        matches!(
+            outcome,
+            PrologueOutcome::Skip {
+                current_host_rate: 48000,
+                ..
+            }
+        ),
+        "pending resampler swap must skip the quantum"
+    );
+    assert!(
+        rt_side.rt_status.check_flag(RT_STATUS_RESAMP_SWAP_PENDING),
+        "flag must remain raised while rebuild is pending"
+    );
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_fail_open_rollback() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING;
+
+    let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
+        .expect("harness creation")
+        .into_parts();
+
+    // Simulate an in-flight rebuild that failed:
+    rt_side.rt_status.set_flag(RT_STATUS_RESAMP_SWAP_PENDING);
+    rt_side
+        .rt_status
+        .requested_rate_generation
+        .store(2, Ordering::Release);
+    rt_side
+        .rt_status
+        .resampler_failed_generation
+        .store(2, Ordering::Release);
+
+    let outcome = rt_side.run_prologue();
+
+    assert!(
+        matches!(
+            outcome,
+            PrologueOutcome::Proceed {
+                current_host_rate: 48000,
+                ..
+            }
+        ),
+        "fail-open rollback must clear skip condition and allow quantum to proceed"
+    );
+    assert!(
+        !rt_side.rt_status.check_flag(RT_STATUS_RESAMP_SWAP_PENDING),
+        "fail-open rollback must disarm RT_STATUS_RESAMP_SWAP_PENDING"
+    );
+    assert_eq!(
+        rt_side
+            .rt_status
+            .applied_rate_generation
+            .load(Ordering::Relaxed),
+        2,
+        "generation must be advanced to prevent repeated rollback"
+    );
+    assert_eq!(
+        rt_side
+            .rt_status
+            .resampler_failed_generation
+            .load(Ordering::Relaxed),
+        0,
+        "failed generation must be reset to 0"
+    );
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn rt_quantum_prologue_parking_lot_flushed() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::spsc::GcItem;
+    use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+
+    let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
+        .expect("harness creation")
+        .into_parts();
+
+    // Park a retired resampler in slot 0 and mark the parking lot dirty
+    let resampler = Box::new(NamResampler::new_simple(48000, 48000).expect("resampler"));
+    rt_side.parking_lot[0] = Some(GcItem::Resampler(resampler));
+    rt_side.parking_lot_dirty.store(true, Ordering::Release);
+
+    let outcome = rt_side.run_prologue();
+    assert!(matches!(outcome, PrologueOutcome::Proceed { .. }));
+
+    // Parking lot slot must be drained and dirty latch cleared
+    assert!(
+        rt_side.parking_lot[0].is_none(),
+        "parking lot slot 0 must be None after flush"
+    );
+    assert!(
+        !rt_side.parking_lot_dirty.load(Ordering::Relaxed),
+        "parking lot dirty latch must be cleared"
+    );
+
+    // The GC item must have been pushed to gc_producer and observable at gc_consumer
+    let popped = rt_side.gc_consumer.pop();
+    assert!(popped.is_ok(), "gc_consumer must receive flushed GC item");
+}
+
+#[test]
+#[cfg(all(feature = "testing", feature = "heap-audit"))]
+fn rt_quantum_prologue_zero_alloc() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    let mut h = RtSwapHarness::new(48000, 48000).expect("harness creation");
+
+    // Warm up one prologue invocation
+    let _ = h.run_prologue();
+
+    // 1000 prologue executions under TrackingGuard
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        for _ in 0..1000 {
+            let _ = h.run_prologue();
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+
+    assert_eq!(allocs, 0, "prologue allocated on RT thread: {allocs}");
+    assert_eq!(deallocs, 0, "prologue deallocated on RT thread: {deallocs}");
+    assert_eq!(reallocs, 0, "prologue reallocated on RT thread: {reallocs}");
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn prologue_outcome_accessors() {
+    let p = PrologueOutcome::Proceed {
+        current_host_rate: 48000,
+        structural_applied: 2,
+        param_pops: 3,
+    };
+    assert_eq!(p.current_host_rate(), 48000);
+    assert_eq!(p.structural_applied(), 2);
+    assert_eq!(p.param_pops(), 3);
+
+    let s = PrologueOutcome::Skip {
+        current_host_rate: 44100,
+        structural_applied: 1,
+        param_pops: 0,
+    };
+    assert_eq!(s.current_host_rate(), 44100);
+    assert_eq!(s.structural_applied(), 1);
+    assert_eq!(s.param_pops(), 0);
+}

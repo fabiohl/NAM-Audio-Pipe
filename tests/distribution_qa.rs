@@ -1738,14 +1738,99 @@ SOAK_PURPOSE: accelerated_timeline — compressed timeline, fail-closed validati
 ENDURANCE_PURPOSE: real_wall_clock — wall-clock, periodic RSS/faults/threads/FDs
 PHASE1: PASS log=target/logs/phase1-soak.log
 PHASE2: PASS log=target/logs/phase2-heap-audit.log
-PHASE3: PASS log=target/logs/phase3-rt-deadline.log
-PHASE4: PASS log=target/logs/phase4-rt-jitter.log
+PHASE3: PASS log=target/logs/phase3-rt-deadline.log env=pinned:1,isolated:1,fifo:1,governor:performance,cpu:8,cpu9:offline
+PHASE4: PASS log=target/logs/phase4-rt-jitter.log env=pinned:1,isolated:1,fifo:1,governor:performance,cpu:8,cpu9:offline
 PHASE5: PASS log=target/logs/phase5-concurrency.log
 PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000
 OVERALL: PASSED
 ";
     let receipt = parse_long_receipt(RECEIPT).unwrap();
     receipt.verify_release_certification().unwrap();
+}
+
+/// (e) Negative: release certification requires RT phases (3 and 4) to carry calibrated `env=...` evidence.
+#[test]
+fn long_receipt_certification_rejects_missing_env_on_rt_phases() {
+    for missing_on in ["PHASE3", "PHASE4"] {
+        let p3 = if missing_on == "PHASE3" {
+            "PHASE3: PASS log=target/logs/phase3-rt-deadline.log"
+        } else {
+            "PHASE3: PASS log=target/logs/phase3-rt-deadline.log env=pinned:1,isolated:1,fifo:1,cpu:8"
+        };
+        let p4 = if missing_on == "PHASE4" {
+            "PHASE4: PASS log=target/logs/phase4-rt-jitter.log"
+        } else {
+            "PHASE4: PASS log=target/logs/phase4-rt-jitter.log env=pinned:1,isolated:1,fifo:1,cpu:8"
+        };
+        let receipt_text = format!(
+            "SUITE: tests-long\nSTRICT: 1\nNAM_RT_STRICT: 1\nMODE: full\n\
+             SOAK_PURPOSE: accelerated_timeline\nENDURANCE_PURPOSE: real_wall_clock\n\
+             PHASE1: PASS log=target/logs/phase1-soak.log\n\
+             PHASE2: PASS log=target/logs/phase2-heap-audit.log\n\
+             {p3}\n{p4}\n\
+             PHASE5: PASS log=target/logs/phase5-concurrency.log\n\
+             PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000\n\
+             OVERALL: PASSED\n"
+        );
+        let receipt = parse_long_receipt(&receipt_text).unwrap();
+        let err = receipt.verify_release_certification().unwrap_err();
+        assert!(
+            err.contains(missing_on) && err.contains("env= evidence"),
+            "missing env on {missing_on} must be rejected for release certification, got: {err}"
+        );
+    }
+}
+
+/// (e) Negative: release certification rejects uncalibrated environments in RT phases.
+#[test]
+fn long_receipt_certification_rejects_uncalibrated_env_on_rt_phases() {
+    for uncalibrated_env in [
+        "env=pinned:0,isolated:1,fifo:1,cpu:8",
+        "env=pinned:1,isolated:0,fifo:1,cpu:8",
+        "env=pinned:1,isolated:1,fifo:0,cpu:8",
+    ] {
+        let receipt_text = format!(
+            "SUITE: tests-long\nSTRICT: 1\nNAM_RT_STRICT: 1\nMODE: full\n\
+             SOAK_PURPOSE: accelerated_timeline\nENDURANCE_PURPOSE: real_wall_clock\n\
+             PHASE1: PASS log=target/logs/phase1-soak.log\n\
+             PHASE2: PASS log=target/logs/phase2-heap-audit.log\n\
+             PHASE3: PASS log=target/logs/phase3-rt-deadline.log {uncalibrated_env}\n\
+             PHASE4: PASS log=target/logs/phase4-rt-jitter.log env=pinned:1,isolated:1,fifo:1,cpu:8\n\
+             PHASE5: PASS log=target/logs/phase5-concurrency.log\n\
+             PHASE6: PASS log=target/logs/phase6-endurance.log duration_ms=30000\n\
+             OVERALL: PASSED\n"
+        );
+        let receipt = parse_long_receipt(&receipt_text).unwrap();
+        let err = receipt.verify_release_certification().unwrap_err();
+        assert!(
+            err.contains("PHASE3") && err.contains("calibrated RT environment"),
+            "uncalibrated env '{uncalibrated_env}' must be rejected for release certification, got: {err}"
+        );
+    }
+}
+
+/// (e) Positive: typed RT gaps (`GAP:sched_fifo_unavailable`, `GAP:cpu_not_isolated`)
+/// are parsed structurally and accepted by audit under COMPLETED_WITH_GAPS.
+#[test]
+fn long_receipt_audit_accepts_typed_rt_gaps() {
+    const RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: full
+PHASE1: PASS log=target/logs/phase1-soak.log duration_ms=120000
+PHASE2: PASS log=target/logs/phase2-heap-audit.log duration_ms=90000
+PHASE3: GAP log=target/logs/phase3-rt-deadline.log
+PHASE4: GAP log=target/logs/phase4-rt-jitter.log
+PHASE5: PASS log=target/logs/phase5-concurrency.log duration_ms=60000
+GAP: PHASE3 rt_deadline sched_fifo_unavailable
+GAP: PHASE4 rt_jitter cpu_not_isolated
+OVERALL: COMPLETED_WITH_GAPS
+";
+    let receipt = parse_long_receipt(RECEIPT).unwrap();
+    assert_eq!(receipt.gaps.len(), 2);
+    assert_eq!(receipt.overall, "COMPLETED_WITH_GAPS");
+    receipt.audit().unwrap();
 }
 
 /// (e) Positive: the `--simulate` receipt format (the sanctioned CI structural

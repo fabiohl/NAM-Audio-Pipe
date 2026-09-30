@@ -80,3 +80,69 @@ impl TelemetrySample {
         }
     }
 }
+
+/// Thread resource usage counters from `getrusage(RUSAGE_THREAD)`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThreadRusage {
+    pub minflt: u64,
+    pub majflt: u64,
+    pub nvcsw: u64,
+    pub nivcsw: u64,
+}
+
+/// Reads resource usage counters for the calling thread via `getrusage(RUSAGE_THREAD)`.
+///
+/// Returns an error if the kernel/libc does not support `RUSAGE_THREAD`, allowing
+/// callers to fall back to `/proc/thread-self` with a declared gap marker.
+pub fn read_thread_rusage() -> Result<ThreadRusage, std::io::Error> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    // SAFETY: `getrusage` writes up to `size_of::<libc::rusage>()` into the provided pointer.
+    let ret = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+    if ret == 0 {
+        let usage = unsafe { usage.assume_init() };
+        return Ok(ThreadRusage {
+            minflt: usage.ru_minflt as u64,
+            majflt: usage.ru_majflt as u64,
+            nvcsw: usage.ru_nvcsw as u64,
+            nivcsw: usage.ru_nivcsw as u64,
+        });
+    }
+
+    eprintln!("GAP:thread_rusage_unavailable");
+    read_thread_rusage_proc()
+}
+
+/// Fallback reader for thread resource usage using `/proc/thread-self/stat` and `/proc/thread-self/status`.
+pub fn read_thread_rusage_proc() -> Result<ThreadRusage, std::io::Error> {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat")?;
+    let tail = stat.rfind(')').ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid stat format")
+    })?;
+    let fields: Vec<&str> = stat[tail + 1..].split_whitespace().collect();
+    let minflt = fields
+        .get(7)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let majflt = fields
+        .get(9)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+
+    let status = std::fs::read_to_string("/proc/thread-self/status").unwrap_or_default();
+    let mut nvcsw = 0u64;
+    let mut nivcsw = 0u64;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("voluntary_ctxt_switches:") {
+            nvcsw = rest.trim().parse::<u64>().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("nonvoluntary_ctxt_switches:") {
+            nivcsw = rest.trim().parse::<u64>().unwrap_or(0);
+        }
+    }
+
+    Ok(ThreadRusage {
+        minflt,
+        majflt,
+        nvcsw,
+        nivcsw,
+    })
+}

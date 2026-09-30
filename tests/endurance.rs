@@ -26,9 +26,11 @@ mod common;
 
 use common::proc::{
     TelemetrySample, read_fd_count, read_page_faults, read_rss_kb, read_thread_count,
+    read_thread_rusage,
 };
 use common::swap::*;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
+use nam_audio_pipe::standalone::rt_setup::thread::configure_process_wide;
 
 use std::time::{Duration, Instant};
 
@@ -64,10 +66,6 @@ const MAX_VALIDATION_ATTEMPTS: usize = 64;
 /// RSS shrinkage is never a failure (reported as a negative delta).
 const MAX_RSS_DRIFT_KB: usize = 256;
 
-/// Maximum allowed major page faults over the whole endurance (registered and
-/// bounded; fresh allocator pages fault minor, never major).
-const MAX_MAJOR_FAULTS: u64 = 8;
-
 /// Default wall-clock window in seconds (overridable via `NAM_ENDURANCE_SECONDS`).
 const DEFAULT_WINDOW_SECS: u64 = 30;
 
@@ -93,6 +91,8 @@ fn endurance_window_seconds() -> u64 {
 #[test]
 #[ignore = "Real wall-clock endurance: fail-closed validation windows + periodic RSS/faults/threads/FD telemetry — long suite only (tests-long.sh Phase 6)"]
 fn test_endurance_real_wall_clock_windows_fail_closed() {
+    configure_process_wide();
+
     let window_secs = endurance_window_seconds();
     let window = Duration::from_secs(window_secs);
     assert!(
@@ -112,8 +112,8 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     // Pre-warm every model kind the swap batches build so the timed window
     // starts from a resident working set (the baseline RSS sample includes the
     // preallocated signal buffers).
-    for _ in 0..4 {
-        apply_swap_batch(&mut h, 0);
+    for step in 0..8 {
+        apply_swap_batch(&mut h, step * SWAP_INTERVAL);
         let (sig_l, sig_r) = test_signal_blocks(8);
         let mut in_l = [0f32; BLOCK];
         let mut in_r = [0f32; BLOCK];
@@ -124,16 +124,78 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         }
         h.consume_gc();
     }
+    validate_linear_window(&mut h);
+    h.consume_gc();
 
     let max_blocks = (window.as_secs() * SAMPLE_RATE as u64 / BLOCK as u64) as usize + BLOCK;
     let (sig_l, sig_r) = test_signal_blocks(max_blocks);
-    let mut in_l = [0f32; BLOCK];
-    let mut in_r = [0f32; BLOCK];
+
+    let harness = std::sync::Arc::new(std::sync::Mutex::new(h));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel();
+
+    let harness_rt = std::sync::Arc::clone(&harness);
+    let stop_rt = std::sync::Arc::clone(&stop);
+    let sig_l_rt = sig_l.clone();
+    let sig_r_rt = sig_r.clone();
+
+    let rt_handle = std::thread::Builder::new()
+        .name("nam_pipe_dsp".into())
+        .spawn(move || {
+            let mut in_l = [0f32; BLOCK];
+            let mut in_r = [0f32; BLOCK];
+            for _ in 0..16 {
+                let mut h = harness_rt.lock().expect("harness lock");
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+            tx_ready.send(()).expect("notify ready");
+
+            let rusage_before = read_thread_rusage().expect("initial thread rusage");
+
+            let mut blocks = 0usize;
+            let mut undue_silence = 0usize;
+            let mut skipped_blocks = 0usize;
+
+            while !stop_rt.load(std::sync::atomic::Ordering::Relaxed) {
+                let sig_block = blocks % max_blocks;
+                in_l.copy_from_slice(&sig_l_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                in_r.copy_from_slice(&sig_r_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                let (frames_diff, is_silent) = {
+                    let mut h = harness_rt.lock().expect("harness lock");
+                    let frames_before = h.frame_count();
+                    let n_pw = h.run_callback(&mut in_l, &mut in_r, BLOCK);
+                    let frames_diff = h.frame_count() == frames_before;
+                    let is_silent = n_pw > 0
+                        && in_l.iter().any(|&s| s != 0.0)
+                        && h.out_l().iter().all(|&s| s == 0.0)
+                        && h.out_r().iter().all(|&s| s == 0.0);
+                    (frames_diff, is_silent)
+                };
+                blocks += 1;
+                if frames_diff {
+                    skipped_blocks += 1;
+                }
+                if is_silent {
+                    undue_silence += 1;
+                }
+                std::thread::yield_now();
+            }
+
+            let rusage_after = read_thread_rusage().expect("final thread rusage");
+            (
+                rusage_before,
+                rusage_after,
+                blocks,
+                undue_silence,
+                skipped_blocks,
+            )
+        })
+        .expect("spawn RT thread");
+
+    rx_ready.recv().expect("wait RT thread ready");
 
     let start = Instant::now();
     let mut blocks = 0usize;
-    let mut undue_silence = 0usize;
-    let mut skipped_blocks = 0usize;
     let mut windows_completed = 0usize;
     let mut windows_deferred = 0usize;
     let mut window_needed_retry = false;
@@ -146,32 +208,8 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     while start.elapsed() < window {
         let block = blocks;
         if block.is_multiple_of(SWAP_INTERVAL) {
+            let mut h = harness.lock().expect("harness lock");
             apply_swap_batch(&mut h, block);
-        }
-
-        // The offline harness processes far faster than real-time, so the
-        // deterministic signal is cycled (the nominal timeline is virtual —
-        // the wall-clock requirement is the loop window, not the sample rate).
-        let sig_block = block % max_blocks;
-        in_l.copy_from_slice(&sig_l[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
-        in_r.copy_from_slice(&sig_r[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
-        let frames_before = h.frame_count();
-        let n_pw = h.run_callback(&mut in_l, &mut in_r, BLOCK);
-        blocks += 1;
-
-        if h.frame_count() == frames_before {
-            skipped_blocks += 1;
-        }
-
-        // Exact-silence accounting: non-zero input, bit-exact zero output on
-        // both channels (undue silence is a real integrity failure, not
-        // float-noise).
-        if n_pw > 0
-            && in_l.iter().any(|&s| s != 0.0)
-            && h.out_l().iter().all(|&s| s == 0.0)
-            && h.out_r().iter().all(|&s| s == 0.0)
-        {
-            undue_silence += 1;
         }
 
         // Mandatory validation windows (fail-closed).
@@ -180,6 +218,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
             retry_budget = MAX_VALIDATION_ATTEMPTS;
         }
         if validation_pending {
+            let mut h = harness.lock().expect("harness lock");
             if validate_linear_window(&mut h) {
                 validation_pending = false;
                 windows_completed += 1;
@@ -208,14 +247,19 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         }
 
         if block.is_multiple_of(50) {
+            let mut h = harness.lock().expect("harness lock");
             h.consume_gc();
         }
+
+        blocks += 1;
+        std::thread::yield_now();
     }
 
     // Resolve a validation window that started before the clock stopped —
     // fail-closed: it must complete within the budget or the suite fails.
     let mut final_attempts = 0usize;
     while validation_pending {
+        let mut h = harness.lock().expect("harness lock");
         if validate_linear_window(&mut h) {
             validation_pending = false;
             windows_completed += 1;
@@ -234,7 +278,17 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         }
     }
     let elapsed = start.elapsed();
-    h.consume_gc();
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (rusage_before, rusage_after, rt_blocks, undue_silence, skipped_blocks) =
+        rt_handle.join().expect("join RT thread");
+    {
+        let mut h = harness.lock().expect("harness lock");
+        h.consume_gc();
+    }
+    let minflt_thread_delta = rusage_after.minflt.saturating_sub(rusage_before.minflt);
+    let majflt_thread_delta = rusage_after.majflt.saturating_sub(rusage_before.majflt);
+    let nvcsw_thread_delta = rusage_after.nvcsw.saturating_sub(rusage_before.nvcsw);
+    let nivcsw_thread_delta = rusage_after.nivcsw.saturating_sub(rusage_before.nivcsw);
 
     // Windows trigger at every VALIDATION_INTERVAL boundary processed inside
     // the wall-clock loop; the boundary at `blocks` itself is exclusive, so
@@ -285,9 +339,15 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         first.rss_kb,
         last.rss_kb,
     );
-    assert!(
-        majflt_delta <= MAX_MAJOR_FAULTS,
-        "major page faults {majflt_delta} exceed the {MAX_MAJOR_FAULTS} bound"
+    // Invariant: Process-wide page fault counters (/proc/self/stat) must never
+    // again be used to judge the RT thread. We assert thread-level faults directly.
+    assert_eq!(
+        minflt_thread_delta, 0,
+        "minor page faults on RT callback thread ({minflt_thread_delta}) violate zero-fault invariant"
+    );
+    assert_eq!(
+        majflt_thread_delta, 0,
+        "major page faults on RT callback thread ({majflt_thread_delta}) violate zero-fault invariant"
     );
     assert!(
         threads_delta <= 2,
@@ -304,10 +364,13 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
 
     eprintln!(
         "TEST_RESULT[endurance_real]=PASS profile=release+testing window_secs={window_secs} \
-         elapsed_ms={} dsp_quantums={blocks} blocks={blocks} windows_completed={windows_completed} \
+         elapsed_ms={} dsp_quantums={rt_blocks} blocks={blocks} windows_completed={windows_completed} \
          windows_deferred={windows_deferred} rss_first_kb={} rss_last_kb={} rss_delta_kb={rss_delta_kb} \
-         minflt_delta={minflt_delta} majflt_delta={majflt_delta} threads_first={} threads_last={} \
-         threads_delta={threads_delta} fds_first={} fds_last={} fds_delta={fds_delta} \
+         minflt_delta={minflt_delta} majflt_delta={majflt_delta} \
+         minflt_thread={minflt_thread_delta} majflt_thread={majflt_thread_delta} \
+         nvcsw_thread={nvcsw_thread_delta} nivcsw_thread={nivcsw_thread_delta} \
+         threads_first={} threads_last={} threads_delta={threads_delta} \
+         fds_first={} fds_last={} fds_delta={fds_delta} \
          undue_silence={undue_silence} skipped_blocks={skipped_blocks} telemetry_samples={}",
         elapsed.as_millis(),
         first.rss_kb,
@@ -329,6 +392,7 @@ fn endurance_telemetry_proc_parsers() {
     let rss = read_rss_kb();
     assert!(rss > 0, "VmRSS unavailable on this platform");
     let (minflt0, majflt0) = read_page_faults();
+    let thread_ru0 = read_thread_rusage().expect("thread rusage initial");
     let threads = read_thread_count();
     let fds = read_fd_count();
     assert!(threads >= 1, "thread count parser failed: {threads}");
@@ -348,9 +412,16 @@ fn endurance_telemetry_proc_parsers() {
     h.consume_gc();
 
     let (minflt1, majflt1) = read_page_faults();
+    let thread_ru1 = read_thread_rusage().expect("thread rusage after dsp");
     assert!(
         minflt1 >= minflt0 && majflt1 >= majflt0,
         "page-fault counters must be monotonic: {minflt0}/{majflt0} → {minflt1}/{majflt1}"
+    );
+    assert!(
+        thread_ru1.minflt >= thread_ru0.minflt && thread_ru1.majflt >= thread_ru0.majflt,
+        "thread rusage page faults must be monotonic: {:?} → {:?}",
+        thread_ru0,
+        thread_ru1
     );
     assert!(
         read_thread_count() >= threads && read_fd_count() >= fds,

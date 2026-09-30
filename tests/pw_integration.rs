@@ -44,7 +44,188 @@ fn assert_daemon_probe_consistent() {
 /// 1. Creation of SPSC RingBuffers for commands and telemetry.
 /// 2. Spawning the audio thread (host).
 /// 3. Sending gain parameters via the control channel.
-/// 4. Shutdown signaled via atomic flag.
+///
+/// Measures end-to-end metrics for a given buffer size.
+fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
+    let (mut param_prod, param_cons) = RingBuffer::new(4);
+    let (gc_prod, gc_cons) = RingBuffer::new(4);
+    let (res_prod, res_cons) = RingBuffer::new(2);
+    let (cs_prod, cs_cons) = RingBuffer::new(2);
+    let (sl_prod, sl_cons) = RingBuffer::new(2);
+    let (os_prod, os_cons) = RingBuffer::new(2);
+
+    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
+    let rt_status = Arc::new(RtStatusFlags::default());
+
+    let rt_clone = rt_status.clone();
+    let gc_overflow_clone = gc_overflow.clone();
+    let sys = SystemSnapshot::capture();
+    let stream_status = Arc::new(StreamStatusFlags::new());
+    let stream_status_clone = stream_status.clone();
+
+    spsc::SHUTDOWN.store(false, Ordering::Relaxed);
+
+    let pw_thread = thread::spawn(move || {
+        pw_host::run_pipewire_host(
+            param_cons,
+            gc_prod,
+            gc_overflow_clone,
+            res_cons,
+            res_prod,
+            cs_cons,
+            cs_prod,
+            rt_clone,
+            PipewireHostConfig {
+                buffer_size,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
+                sys,
+                ir_raw_samples: None,
+                ir_source_rate: 0,
+                full_wavenet_model_l: None,
+                full_wavenet_model_r: None,
+                has_model_r: false,
+                slimmable_producer: sl_prod,
+                os_producer: os_prod,
+                oversample: OversampleFactor::Off,
+                cpu_receipt: common::deterministic_cpu_receipt(),
+                fail_fast: true,
+                gate_config: cli::GateConfig::Off,
+                stream_status: Some(stream_status_clone),
+            },
+            gc_cons,
+            sl_cons,
+            os_cons,
+            None,
+            None,
+        )
+    });
+
+    thread::sleep(Duration::from_millis(50));
+    let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::InputGain(2.5));
+    let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::OutputGain(-1.0));
+
+    let dir = common::temp_dir();
+    let _dir_guard = common::DirGuard::new(dir.clone());
+    let mut tone = ToneDriver::new(&dir);
+    let attached = tone.wait_for_sink_and_attach(Duration::from_secs(5));
+    assert!(
+        attached,
+        "ToneDriver could not attach to NAM capture sink for buffer_size={}",
+        buffer_size
+    );
+
+    // Wait for the pipeline to reach steady streaming state (at least 2 E2E cycles recorded)
+    let warmup_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < warmup_deadline {
+        if stream_status.e2e_hist.total_count() >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        stream_status.e2e_hist.total_count() >= 2,
+        "pipeline did not reach steady streaming state for buffer_size={buffer_size}"
+    );
+
+    // Baseline snapshot at steady state: reset histogram and baseline starvation/drops
+    let base_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed);
+    let base_drops = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
+    stream_status.e2e_hist.reset();
+
+    // Measurement window: wait for at least 8 e2e measurements (~128 quantums)
+    let measure_deadline = std::time::Instant::now() + Duration::from_secs(4);
+    while std::time::Instant::now() < measure_deadline {
+        if stream_status.e2e_hist.total_count() >= 8 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    // Sample steady-state metrics while audio is actively streaming
+    let last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
+    let current_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed);
+    let current_drops = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
+    let starvation = current_starvation.saturating_sub(base_starvation);
+    let dropped_frames = current_drops.saturating_sub(base_drops);
+
+    let p50_ns = stream_status.e2e_hist.get_percentile(0.50);
+    let p99_ns = stream_status.e2e_hist.get_percentile(0.99);
+    let max_ns = stream_status.e2e_hist.get_exact_max();
+
+    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
+
+    let host_result = match pw_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            panic!("The PipeWire thread suffered a fatal panic for buffer_size={buffer_size}!")
+        }
+    };
+
+    if let Err(e) = host_result {
+        panic!(
+            "run_pipewire_host failed while the PipeWire daemon is up for buffer_size={buffer_size}: {e:#}"
+        );
+    }
+
+    assert!(
+        last_n_samples > 0,
+        "no audio quantum was processed (last_n_samples == 0) for buffer_size={buffer_size}; \
+         LIVE_PW must reflect real DSP execution, not merely daemon presence"
+    );
+
+    let mut rate = stream_status
+        .playback_negotiated_rate
+        .load(Ordering::Relaxed);
+    if rate == 0 {
+        rate = stream_status
+            .capture_negotiated_rate
+            .load(Ordering::Relaxed);
+    }
+    if rate == 0 {
+        rate = 48000;
+    }
+
+    let quantum = last_n_samples;
+
+    println!(
+        "E2E_METRICS buffer_size={buffer_size} p50_ns={p50_ns} p99_ns={p99_ns} max_ns={max_ns} starvation={starvation} dropped_frames={dropped_frames} quantum={quantum} rate={rate}"
+    );
+
+    // G-RB-001 & T2.3 Acceptance Criteria:
+    assert_eq!(
+        starvation, 0,
+        "zero starvation expected under live smoke for buffer_size={buffer_size}"
+    );
+    assert!(
+        dropped_frames <= 2,
+        "excessive dropped frames ({dropped_frames}) under live smoke for buffer_size={buffer_size}"
+    );
+
+    // p99 e2e <= 2 quantums + hardware/scheduling overhead (15ms budget)
+    let quantum_ns = (quantum as u64) * 1_000_000_000 / (rate as u64);
+    let max_allowed_p99 = 2 * quantum_ns + 15_000_000;
+    assert!(
+        p99_ns <= max_allowed_p99,
+        "p99 e2e ({p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
+    );
+
+    (
+        p50_ns,
+        p99_ns,
+        max_ns,
+        starvation,
+        dropped_frames,
+        quantum,
+        rate,
+    )
+}
+
+/// Tests the basic initialization and communication of the PipeWire pipeline across
+/// multiple buffer sizes (64, 128, 256), asserting zero starvation and emitting E2E_METRICS.
 #[test]
 #[ignore = "requires a running PipeWire daemon (session or system); auto-detected by utils/tests-quick.sh Phase 3"]
 fn test_pipewire_integration() {
@@ -62,107 +243,11 @@ fn test_pipewire_integration() {
     pipewire::init();
     println!("PipeWire initialized successfully.");
 
-    let (mut param_prod, param_cons) = RingBuffer::new(4);
-    let (gc_prod, gc_cons) = RingBuffer::new(4);
-    let (res_prod, res_cons) = RingBuffer::new(2);
-    let (cs_prod, cs_cons) = RingBuffer::new(2);
-    let (sl_prod, sl_cons) = RingBuffer::new(2);
-    let (os_prod, os_cons) = RingBuffer::new(2);
-
-    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
-    let rt_status = Arc::new(RtStatusFlags::default());
-
-    let rt_clone = rt_status.clone();
-    let gc_overflow_clone = gc_overflow.clone();
-    let sys = SystemSnapshot::capture();
-
-    let pw_thread = thread::spawn(move || {
-        pw_host::run_pipewire_host(
-            param_cons,
-            gc_prod,
-            gc_overflow_clone,
-            res_cons,
-            res_prod,
-            cs_cons,
-            cs_prod,
-            rt_clone,
-            PipewireHostConfig {
-                buffer_size: 0,
-                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
-                sys,
-                ir_raw_samples: None,
-                ir_source_rate: 0,
-                full_wavenet_model_l: None,
-                full_wavenet_model_r: None,
-                has_model_r: false,
-                slimmable_producer: sl_prod,
-                os_producer: os_prod,
-                oversample: OversampleFactor::Off,
-                cpu_receipt: common::deterministic_cpu_receipt(),
-                // Reconnect disabled in the deterministic integration harness:
-                // the daemon probe already guarantees it is up, so any backend
-                // failure is a defect that must surface immediately.
-                fail_fast: true,
-                gate_config: cli::GateConfig::default_on(),
-                stream_status: None,
-            },
-            gc_cons,
-            sl_cons,
-            os_cons,
-            None,
-            None,
-        )
-    });
-
-    thread::sleep(Duration::from_millis(50));
-    let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::InputGain(2.5));
-    let _ = param_prod.push(neural_amp_modeler_rs::common::spsc::ParamPayload::OutputGain(-1.0));
-
-    // Drive the graph deterministically when `pw-play` is available: a silent
-    // tone into the NAM capture sink keeps the capture node scheduled (a sink
-    // without an active stream may never process a quantum). Without pw-play
-    // the wait below falls back to the graph's own scheduling.
-    let dir = common::temp_dir();
-    let _dir_guard = common::DirGuard::new(dir.clone());
-    let mut tone = ToneDriver::new(&dir);
-    let _ = tone.wait_for_sink_and_attach(Duration::from_secs(5));
-
-    // Wait (bounded) for the RT callback to observe at least one audio quantum.
-    // `last_n_samples > 0` proves the capture stream actually processed a buffer
-    // — the daemon probe alone is not evidence of DSP execution.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut last_n_samples = 0u32;
-    while std::time::Instant::now() < deadline {
-        last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
-        if last_n_samples > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
+    for &buf_size in &[64, 128, 256] {
+        run_smoke_session(buf_size);
+        // Bounded graph settling delay between consecutive sessions
+        thread::sleep(Duration::from_millis(100));
     }
-
-    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
-
-    let host_result = match pw_thread.join() {
-        Ok(result) => result,
-        Err(_) => panic!("The PipeWire thread suffered a fatal panic!"),
-    };
-
-    // Fail-closed: the daemon probe confirmed PipeWire is up, so an `Err` from
-    // the host is a defect — never a benign "possible daemon absence".
-    if let Err(e) = host_result {
-        panic!("run_pipewire_host failed while the PipeWire daemon is up: {e:#}");
-    }
-
-    assert!(
-        last_n_samples > 0,
-        "no audio quantum was processed (last_n_samples == 0); \
-         LIVE_PW must reflect real DSP execution, not merely daemon presence"
-    );
-
-    println!(
-        "Integration test completed: host ran, {} samples processed in the last quantum.",
-        last_n_samples
-    )
 }
 
 /// Opt-in acceptance: a momentary PipeWire daemon restart

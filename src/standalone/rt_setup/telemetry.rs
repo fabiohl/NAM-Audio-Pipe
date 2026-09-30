@@ -99,6 +99,8 @@ pub struct PollState {
     pub cpu_receipt: Option<super::affinity::CpuSelectionReceipt>,
     /// Per-signal episode latches.
     pub latches: TelemetryLatches,
+    /// Last observed cumulative starvation count.
+    pub last_starvation: u32,
 }
 
 impl PollState {
@@ -114,6 +116,7 @@ impl PollState {
             telemetry_throttle: 0,
             cpu_receipt: receipt,
             latches: TelemetryLatches::default(),
+            last_starvation: 0,
         }
     }
 }
@@ -495,18 +498,27 @@ pub fn poll_rt_status(
     // stale audio — expected behavior, surfaced as info telemetry.
     // Latched: sustained starvation (e.g. paused capture) informs once
     // per episode instead of every control-loop iteration.
-    let playback_bridge_starvation = stream_status
-        .map(|s| s.playback_bridge_starvation.swap(0, Ordering::Relaxed))
+    // 5.6 PLAYBACK BRIDGE STARVATION:
+    // The bridge produced no new DSP block (capture paused, resampler rebuild
+    // pending, clock drift or quantum miss). The playback callback delivered a
+    // recycled buffer filled with deterministic silence instead of repeating
+    // stale audio — expected behavior, surfaced as info telemetry.
+    // Latched: sustained starvation (e.g. paused capture) informs once
+    // per episode instead of every control-loop iteration.
+    let current_starvation = stream_status
+        .map(|s| s.playback_bridge_starvation.load(Ordering::Relaxed))
         .unwrap_or(0);
+    let delta_starvation = current_starvation.saturating_sub(state.last_starvation);
+    state.last_starvation = current_starvation;
     if state
         .latches
         .playback_starvation
-        .observe(playback_bridge_starvation > 0)
+        .observe(delta_starvation > 0)
     {
         log::info!(
             "{} Playback delivered {} silence block(s) under bridge starvation (no stale audio repeated).",
             "🔇".blue(),
-            playback_bridge_starvation
+            delta_starvation
         );
     }
 
@@ -516,6 +528,9 @@ pub fn poll_rt_status(
     // some small audio chunks to maintain synchronization.
     // Latched: a sustained drift episode warns once.
     let drops = bridge.drain_dropped_frames();
+    if let Some(s) = stream_status.filter(|_| drops > 0) {
+        s.bridge_dropped_frames.fetch_add(drops, Ordering::Relaxed);
+    }
     if state.latches.drift_drops.observe(drops > 0) {
         log::warn!(
             "{} Drifting detected: {} audio blocks discarded (capture > playback).",

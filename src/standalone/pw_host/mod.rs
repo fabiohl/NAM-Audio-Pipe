@@ -102,6 +102,10 @@ pub use wakeup::ControlPlaneWakeup;
 /// sequence + DSP with no PipeWire daemon. Compiled only under `testing`.
 #[cfg(feature = "testing")]
 pub use rt_callback::harness::RtSwapHarness;
+#[cfg(feature = "testing")]
+pub use rt_callback::{
+    handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,
+};
 
 // Re-exports for test module compatibility (pw_host_test.rs).
 #[cfg(test)]

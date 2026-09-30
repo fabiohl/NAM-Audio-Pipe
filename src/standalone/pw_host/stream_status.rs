@@ -51,6 +51,9 @@ pub struct StreamStatusFlags {
     /// the hardware never repeats stale audio.
     pub playback_bridge_starvation: AtomicU32,
 
+    /// Cumulative count of frames dropped by the bridge due to clock drift (capture > playback).
+    pub bridge_dropped_frames: AtomicU32,
+
     /// Last sample rate negotiated by the capture stream's host renegotiation
     /// listener (`0` = never negotiated). Written on the host stream-negotiation
     /// thread (cold path, outside the RT audio data thread); read by the playback
@@ -118,6 +121,7 @@ impl StreamStatusFlags {
             playback_hist: LatencyHistogram::new(),
             e2e_hist: LatencyHistogram::new(),
             playback_bridge_starvation: AtomicU32::new(0),
+            bridge_dropped_frames: AtomicU32::new(0),
             capture_negotiated_rate: AtomicU32::new(0),
             playback_negotiated_rate: AtomicU32::new(0),
             capture_format_ok: AtomicU32::new(1),

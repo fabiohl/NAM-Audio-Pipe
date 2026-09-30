@@ -286,6 +286,9 @@ if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
             ok "Phase 3 passed (${P3_DUR_STR})"
             emit "PHASE3: PASS log=target/logs/quick-phase3.log"
             emit "LIVE_PW=RAN"
+            while IFS= read -r metric_line; do
+                [ -n "$metric_line" ] && emit "$metric_line"
+            done < <(grep -E '^E2E_METRICS ' target/logs/quick-phase3.log || true)
         else
             die "Phase 3: sigterm_acceptance produced neither >= 2 PASS markers (got $pass_count) nor typed SKIP markers — tests removed, renamed, or failed prematurely?"
         fi

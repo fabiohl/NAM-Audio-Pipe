@@ -9,14 +9,25 @@ use crate::recording::buffer::{
 };
 use crate::recording::transport::RecordingSender;
 use crate::standalone::pw_host::StreamStatusFlags;
+use crate::standalone::pw_host::capture::state::{CaptureState, RtHostChannels};
 use crate::standalone::rt_setup;
-use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
+use neural_amp_modeler_rs::common::spsc::{
+    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_RESAMP_SWAP_PENDING, RtStatusFlags,
+    SwapBudget,
+};
 use neural_amp_modeler_rs::dsp::pipeline::{
     DspPipelineContext, MAX_BRIDGE_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
+use neural_amp_modeler_rs::math::dsp::gain_lut::GainLUT;
+
+use super::{
+    STRUCTURAL_SWAPS_PER_CALLBACK, drain_cabsims, drain_os_engines, drain_resamplers,
+    drain_slimmable_models, receive_commands, sync_rate, try_slimmable_rebuild,
+};
 
 use pipewire as pw;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Runtime FFI contract validation for a single PipeWire buffer channel.
@@ -285,7 +296,7 @@ pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> ChunkWin
 ///
 /// Zero allocations, zero panics, zero locks (RT-safe).
 #[inline(always)]
-pub(crate) fn resolve_capture_chunk_window(
+pub fn resolve_capture_chunk_window(
     chunk: *const pw::spa::sys::spa_chunk,
     ptr_l: usize,
     max_l: usize,
@@ -380,7 +391,7 @@ fn validate_spa_channel_pair(
     clippy::too_many_arguments,
     reason = "Raw SPA descriptor fields required by the FFI contract; signature is stable and shared verbatim by the RT callbacks and the harness tests"
 )]
-pub(crate) fn handle_spa_pair_fail_closed(
+pub fn handle_spa_pair_fail_closed(
     ptr_l: usize,
     max_l: usize,
     chunk_l: *const pw::spa::sys::spa_chunk,
@@ -474,7 +485,7 @@ fn send_recording_metadata(
 /// `recording_failed` suspends enqueueing as soon as the disk
 /// worker reports a fatal error — no panics, no pointless pushes.
 #[inline(always)]
-fn send_recording_audio(
+pub fn send_recording_audio(
     recording_sender: &mut RecordingSender,
     n_pw: usize,
     resamp_out_l: &[f32],
@@ -673,6 +684,12 @@ pub fn process_dsp_buffer(
 
         // 1. CAPTURE TOTAL (callback start → end of SPA validation/dequeue)
         // Measured: TSC overhead =~15ns per sample (LFENCE+RDTSC), total < 0.05% of 333µs quantum
+        if t_cap_start > 0 {
+            stream_status
+                .capture_start_tsc
+                .store(t_cap_start, Ordering::Relaxed);
+        }
+
         if should_measure && t_cap_start > 0 {
             let t_spa_valid = rt_setup::rdtsc_nanos();
             let cap_nanos = t_spa_valid.saturating_sub(t_cap_start);
@@ -680,9 +697,6 @@ pub fn process_dsp_buffer(
                 .capture_cycle_time
                 .store(cap_nanos, Ordering::Relaxed);
             stream_status.capture_hist.record(cap_nanos);
-            stream_status
-                .capture_start_tsc
-                .store(t_cap_start, Ordering::Relaxed);
         }
 
         if (*frame_count & 0x3FF) == 0 {
@@ -798,6 +812,271 @@ pub fn process_dsp_buffer(
             rt_status_for_process
                 .set_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_QUANTUM_LOG);
         }
+    }
+}
+
+/// Verdict of running [`rt_quantum_prologue`].
+///
+/// Distinguishes whether the quantum should proceed with audio buffer dequeue and DSP processing,
+/// or whether DSP execution must be skipped (e.g. while an off-RT resampler swap is in flight,
+/// or following an FFI contract violation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrologueOutcome {
+    /// Prologue completed successfully; DSP processing may proceed for this quantum.
+    Proceed {
+        /// Active host sample rate synchronized for this quantum.
+        current_host_rate: u32,
+        /// Number of structural swaps applied in this quantum (budgeted).
+        structural_applied: usize,
+        /// Number of scalar parameter payloads popped from the param SPSC this quantum.
+        param_pops: usize,
+    },
+    /// The quantum must be skipped: either an off-RT resampler swap is pending,
+    /// or a drain contract violation occurred. The caller must skip DSP processing
+    /// and deliver deterministic silence / dequeue without processing.
+    Skip {
+        /// Active host sample rate at the time of skip (or 0 if contract violation).
+        current_host_rate: u32,
+        /// Number of structural swaps applied in this quantum (if any).
+        structural_applied: usize,
+        /// Number of scalar parameter payloads popped from the param SPSC this quantum (if any).
+        param_pops: usize,
+    },
+}
+
+#[cfg(feature = "testing")]
+impl PrologueOutcome {
+    /// Returns the synchronized host rate.
+    #[inline(always)]
+    pub fn current_host_rate(&self) -> u32 {
+        match *self {
+            PrologueOutcome::Proceed {
+                current_host_rate, ..
+            }
+            | PrologueOutcome::Skip {
+                current_host_rate, ..
+            } => current_host_rate,
+        }
+    }
+
+    /// Returns the count of structural swaps applied during this quantum.
+    #[inline(always)]
+    pub fn structural_applied(&self) -> usize {
+        match *self {
+            PrologueOutcome::Proceed {
+                structural_applied, ..
+            }
+            | PrologueOutcome::Skip {
+                structural_applied, ..
+            } => structural_applied,
+        }
+    }
+
+    /// Returns the count of scalar parameter payloads popped during this quantum.
+    #[inline(always)]
+    pub fn param_pops(&self) -> usize {
+        match *self {
+            PrologueOutcome::Proceed { param_pops, .. }
+            | PrologueOutcome::Skip { param_pops, .. } => param_pops,
+        }
+    }
+}
+
+/// Unified real-time callback prologue shared verbatim by the production PipeWire capture
+/// callback (`capture/setup.rs`) and the offline swap harness (`rt_callback/harness.rs`).
+///
+/// Executes the exact, canonical sequence instruction-by-instruction with zero heap allocations,
+/// zero locks, and zero log calls:
+///
+/// 1. **GC Parking-Lot Flush**: pushes deferred retired items to the SPSC GC channel, clearing
+///    the dirty latch when all 16 slots are drained.
+/// 2. **Shared Command Budgeting**: enforces [`STRUCTURAL_SWAPS_PER_CALLBACK`] across all drains
+///    via [`SwapBudget`].
+/// 3. **Budgeted Drains**:
+///    - Resampler swap drain ([`drain_resamplers`])
+///    - Cab-sim swap drain ([`drain_cabsims`])
+///    - Param & model swap consumer ([`receive_commands`])
+///    - Slimmable model rebuild trigger ([`try_slimmable_rebuild`])
+///    - Slimmable model drain ([`drain_slimmable_models`])
+///    - Oversampling engines drain ([`drain_os_engines`])
+/// 4. **Rate Synchronization**: reads the target host rate ([`sync_rate`]) using `state.shared_target_rate`.
+/// 5. **Gain Multiplier Recomputation**: recomputes input/output gain multipliers when parameters changed.
+/// 6. **Rollback Guard**: inspects `RT_STATUS_RESAMP_SWAP_PENDING`; if a rebuild failed, performs the
+///    fail-open rollback to previous resampler generation; if a rebuild is in flight, returns [`PrologueOutcome::Skip`].
+#[inline(always)]
+pub fn rt_quantum_prologue(
+    state: &mut CaptureState,
+    channels: &mut RtHostChannels,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    rt_status: &Arc<RtStatusFlags>,
+    lut: &GainLUT,
+) -> PrologueOutcome {
+    // 1. Fast-path parking-lot flush: skip the 16-slot scan if no GC item was ever parked since last drain.
+    if parking_lot_dirty.load(Ordering::Acquire) {
+        let mut any_remaining = false;
+        for slot in parking_lot.iter_mut() {
+            let Some(old) = slot.take() else { continue };
+            if let Err(rtrb::PushError::Full(old_back)) = channels.gc_producer.push(old) {
+                *slot = Some(old_back);
+                any_remaining = true;
+                break;
+            }
+        }
+        if !any_remaining {
+            parking_lot_dirty.store(false, Ordering::Release);
+        }
+    }
+
+    // 2. Command Budgeting: shared structural budget across all drains.
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+
+    // 3. Budgeted drains in exact production order.
+    let Some(resampler_drain) = state.resampler_drain.as_mut() else {
+        core::hint::cold_path();
+        rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+        return PrologueOutcome::Skip {
+            current_host_rate: 0,
+            structural_applied: budget.used(),
+            param_pops: 0,
+        };
+    };
+    drain_resamplers(
+        resampler_drain,
+        &mut budget,
+        &mut state.resampler,
+        &mut state.stream,
+        rt_status,
+        &mut channels.gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        &channels.gc_overflow,
+    );
+
+    let Some(cabsim_drain) = state.cabsim_drain.as_mut() else {
+        core::hint::cold_path();
+        rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+        return PrologueOutcome::Skip {
+            current_host_rate: 0,
+            structural_applied: budget.used(),
+            param_pops: 0,
+        };
+    };
+    drain_cabsims(
+        cabsim_drain,
+        &mut budget,
+        &mut state.active_cabsim,
+        rt_status,
+        &mut channels.gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        &channels.gc_overflow,
+    );
+
+    let (param_changed, param_pops) = receive_commands(
+        &mut channels.param_consumer,
+        &mut state.deferred_model,
+        &mut budget,
+        &mut state.model_input_mult_adj,
+        &mut state.model_output_mult_adj,
+        &mut state.current_nam_rate,
+        &mut state.active_model_l,
+        &mut state.active_model_r,
+        &mut channels.gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        &channels.gc_overflow,
+        rt_status,
+        &mut state.user_input_gain_mult,
+        &mut state.user_output_gain_mult,
+        &mut state.gate_params,
+        &mut state.threshold_open_sq,
+        &mut state.threshold_close_sq,
+        lut,
+        &mut state.adaptive_compute,
+    );
+
+    try_slimmable_rebuild(&mut state.adaptive_compute, rt_status);
+
+    drain_slimmable_models(
+        &mut state.slimmable_drain,
+        &mut budget,
+        &mut state.active_model_l,
+        &mut state.active_model_r,
+        rt_status,
+        &mut channels.gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        &channels.gc_overflow,
+    );
+
+    drain_os_engines(
+        &mut state.os_drain,
+        &mut budget,
+        &mut state.os_l,
+        &mut state.os_r,
+        rt_status,
+        &mut channels.gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        &channels.gc_overflow,
+    );
+
+    // 4. Rate synchronization.
+    let current_host_rate = sync_rate(
+        state.shared_target_rate.as_ref(),
+        &state.resampler,
+        state.current_nam_rate,
+        rt_status,
+    );
+
+    // 5. Gain recomputation on parameter change.
+    if param_changed {
+        rt_setup::compute_gain_multipliers(
+            state.user_input_gain_mult,
+            state.user_output_gain_mult,
+            state.model_input_mult_adj,
+            state.model_output_mult_adj,
+            &mut state.input_gain_mult,
+            &mut state.output_gain_mult,
+        );
+    }
+
+    // 6. Fail-open rollback guard.
+    if rt_status.check_flag(RT_STATUS_RESAMP_SWAP_PENDING) {
+        let failed_gen = rt_status
+            .resampler_failed_generation
+            .load(Ordering::Acquire);
+        let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
+
+        if failed_gen != 0 && failed_gen == requested_gen {
+            // Fail-open rollback: the rebuild failed for requested_gen,
+            // so the callback resumes with the previous resampler in safe
+            // bypass/mute mode. Record the requested generation as
+            // resolved so the invariant
+            // `applied_rate_generation == requested_rate_generation`
+            // holds on unmute — the old resampler is the accepted
+            // fallback for this request, never a stale replacement.
+            rt_status
+                .applied_rate_generation
+                .store(requested_gen, Ordering::Release);
+            rt_status.clear_flag(RT_STATUS_RESAMP_SWAP_PENDING);
+            rt_status
+                .resampler_failed_generation
+                .store(0, Ordering::Release);
+        } else {
+            return PrologueOutcome::Skip {
+                current_host_rate,
+                structural_applied: budget.used(),
+                param_pops,
+            };
+        }
+    }
+
+    PrologueOutcome::Proceed {
+        current_host_rate,
+        structural_applied: budget.used(),
+        param_pops,
     }
 }
 

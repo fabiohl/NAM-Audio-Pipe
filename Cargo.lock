@@ -4,9 +4,7 @@ version = 4
 
 [[package]]
 name = "NeuralAmpModeler-rs"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0bcf5860ee098a2f3242f7033714491841e66368210b4ff981a50f934cf35a5"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "libc",
@@ -502,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "nam-audio-pipe"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "NeuralAmpModeler-rs",
  "anyhow",

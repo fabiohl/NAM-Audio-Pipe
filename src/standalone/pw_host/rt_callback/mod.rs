@@ -29,8 +29,14 @@ pub use commands::{
     drain_slimmable_models, os_swap_drain, receive_commands, slimmable_swap_drain,
     try_slimmable_rebuild,
 };
-pub use process::process_dsp_buffer;
-pub(crate) use process::{handle_spa_pair_fail_closed, silence_available_datas};
+#[cfg(not(feature = "testing"))]
+pub(crate) use process::handle_spa_pair_fail_closed;
+pub(crate) use process::silence_available_datas;
+pub use process::{PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
+#[cfg(feature = "testing")]
+pub use process::{
+    handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,
+};
 pub use rate_sync::sync_rate;
 pub use resampler_swap::{ResamplerSwapDrain, drain_resamplers, resampler_swap_drain};
 

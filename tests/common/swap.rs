@@ -274,8 +274,8 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
         // bounded budget; never a silent pass.
         return false;
     }
-    let out_l = h.out_l().to_vec();
-    let out_r = h.out_r().to_vec();
+    let out_l = h.out_l();
+    let out_r = h.out_r();
     if out_l.is_empty() || out_r.is_empty() {
         return false;
     }

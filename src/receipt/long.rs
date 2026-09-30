@@ -58,6 +58,8 @@ pub struct LongPhaseResult {
     pub log: String,
     /// Optional measured duration (`duration_ms=...`).
     pub duration_ms: Option<u64>,
+    /// Optional environment calibration evidence (`env=...`).
+    pub env: Option<String>,
 }
 
 /// Fail-closed parsed representation of `target/logs/long-receipt.txt`.
@@ -106,10 +108,10 @@ pub fn purpose_token_valid(value: &str, token: &str) -> bool {
                 .is_some_and(|c| c.is_whitespace() || c == '—' || c == '-')
 }
 
-/// Parses one `PHASEn: <status> log=... duration_ms=...` line. `None` when the
+/// Parses one `PHASEn: <status> log=... duration_ms=... [env=...]` line. `None` when the
 /// line is not a phase line or is structurally malformed (unknown status
 /// token, missing `log=` attribute).
-fn parse_long_phase(line: &str) -> Option<(String, LongPhaseStatus, String, Option<u64>)> {
+fn parse_long_phase(line: &str) -> Option<LongPhaseResult> {
     let rest = line.strip_prefix("PHASE")?;
     let (num, tail) = rest.split_once(':')?;
     let id = format!("PHASE{num}");
@@ -123,14 +125,23 @@ fn parse_long_phase(line: &str) -> Option<(String, LongPhaseStatus, String, Opti
     };
     let mut log = String::new();
     let mut duration_ms = None;
+    let mut env = None;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("log=") {
             log = v.to_string();
         } else if let Some(v) = tok.strip_prefix("duration_ms=") {
             duration_ms = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("env=") {
+            env = Some(v.to_string());
         }
     }
-    Some((id, status, log, duration_ms))
+    Some(LongPhaseResult {
+        id,
+        status,
+        log,
+        duration_ms,
+        env,
+    })
 }
 
 /// Fail-closed parser for the long-suite receipt format
@@ -230,14 +241,9 @@ pub fn parse_long_receipt(text: &str) -> Result<LongReceipt, String> {
         } else if let Some(v) = line.strip_prefix("GAP:") {
             gaps.push(v.trim().to_string());
         } else if line.starts_with("PHASE") {
-            let (id, status, log, duration_ms) = parse_long_phase(line)
+            let phase = parse_long_phase(line)
                 .ok_or_else(|| format!("line {lineno}: malformed phase line: {line:?}"))?;
-            phases.push(LongPhaseResult {
-                id,
-                status,
-                log,
-                duration_ms,
-            });
+            phases.push(phase);
         } else {
             return Err(format!(
                 "line {lineno}: unrecognized receipt line: {line:?}"
@@ -377,6 +383,30 @@ impl LongReceipt {
                  real endurance's purpose must be declared in the receipt)"
                     .into(),
             );
+        }
+        for phase_id in ["PHASE3", "PHASE4"] {
+            let phase = self
+                .phases
+                .iter()
+                .find(|p| p.id == phase_id)
+                .ok_or_else(|| format!("release certification requires {phase_id}"))?;
+            if phase.status == LongPhaseStatus::Pass {
+                let env_str = phase.env.as_deref().ok_or_else(|| {
+                    format!(
+                        "release certification requires env= evidence on {phase_id}: PASS \
+                         (missing env= declaration)"
+                    )
+                })?;
+                if !env_str.contains("pinned:1")
+                    || !env_str.contains("isolated:1")
+                    || !env_str.contains("fifo:1")
+                {
+                    return Err(format!(
+                        "release certification requires a calibrated RT environment on {phase_id} \
+                         (must contain pinned:1, isolated:1, fifo:1; got {env_str:?})"
+                    ));
+                }
+            }
         }
         Ok(())
     }

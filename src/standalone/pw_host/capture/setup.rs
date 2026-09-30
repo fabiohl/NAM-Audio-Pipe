@@ -11,9 +11,7 @@ use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::SharedBackendStatus;
 use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
 use crate::standalone::rt_setup;
-use neural_amp_modeler_rs::common::spsc::{
-    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags,
-};
+use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
     BridgeRef, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF, StreamingDspBuffers,
 };
@@ -43,6 +41,12 @@ pub fn create_capture_properties(buffer_size: u32) -> pw::properties::Properties
     };
 
     if buffer_size > 0 {
+        // PipeWire `node.latency` property contract:
+        // Expressed as a rational fraction ("quantum/rate", e.g. "128/48000").
+        // PipeWire treats this as a requested duration in seconds: tau = quantum / rate.
+        // When connecting to a graph running at a different rate R, PipeWire dynamically
+        // reschedules the quantum to round(tau * R). Thus "{buffer_size}/48000" requests
+        // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
         let latency_str = format!("{}/48000", buffer_size);
         capture_props.insert("node.latency", latency_str.as_str());
     }
@@ -108,7 +112,6 @@ pub fn setup_capture_stream<'c>(
         capture_props,
     )?;
 
-    let rate_for_process = rate_for_param.clone();
     let rt_status_for_listener = rt_status.clone();
     let rt_status_for_process = rt_status;
     let stream_status_for_process = backend_status.stream_status().clone();
@@ -151,12 +154,7 @@ pub fn setup_capture_stream<'c>(
                     // fresh stream instance — the DSP state (models, resampler,
                     // cab-sim, gains) survives daemon restarts.
                     let state = unsafe { &mut *state_ptr };
-                    let should_measure = (state.frame_count & 0xF) == 0;
-                    let t_cap_start = if should_measure {
-                        rt_setup::rdtsc_nanos()
-                    } else {
-                        0
-                    };
+                    let t_cap_start = rt_setup::rdtsc_nanos();
                     // SAFETY: channels_ptr points to the `Box<RtHostChannels>` owned
                     // by run_pipewire_host — same exclusivity contract as state_ptr.
                     let channels = unsafe { &mut *channels_ptr };
@@ -188,168 +186,21 @@ pub fn setup_capture_stream<'c>(
                         state.thread_configured = true;
                     }
 
-                    // Fast-path: skip the 16-slot scan if no GC item was ever parked since last drain.
-                    // parking_lot_dirty is set Release by gc_cascade callers when parking/disposing an item.
-                    if parking_lot_dirty.load(Ordering::Acquire) {
-                        let mut any_remaining = false;
-                        for slot in parking_lot.iter_mut() {
-                            let Some(old) = slot.take() else { continue };
-                            if let Err(rtrb::PushError::Full(old_back)) =
-                                channels.gc_producer.push(old)
-                            {
-                                *slot = Some(old_back);
-                                any_remaining = true;
-                                break;
-                            }
-                        }
-                        if !any_remaining {
-                            parking_lot_dirty.store(false, Ordering::Release);
-                        }
-                    }
-
-                    // Command Budgeting: at most one structural swap (resampler,
-                    // cab-sim, model pair, oversampling) applies per callback.
-                    // The engine `SwapBudget` is shared across every drain
-                    // below; the excess is parked in the drains' deferred slots
-                    // (T9.5: owned by each `RtSwapDrain`) and resolved at the
-                    // start of the next callback.
-                    let mut budget = neural_amp_modeler_rs::common::spsc::SwapBudget::new(
-                        rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK,
-                    );
-
-                    let Some(resampler_drain) = state.resampler_drain.as_mut() else {
-                        rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
-                        return;
-                    };
-                    rt_callback::drain_resamplers(
-                        resampler_drain,
-                        &mut budget,
-                        &mut state.resampler,
-                        &mut state.stream,
-                        &rt_status_for_process,
-                        &mut channels.gc_producer,
+                    let outcome = rt_callback::rt_quantum_prologue(
+                        state,
+                        channels,
                         parking_lot,
                         parking_lot_dirty,
-                        &channels.gc_overflow,
-                    );
-
-                    let Some(cabsim_drain) = state.cabsim_drain.as_mut() else {
-                        rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
-                        return;
-                    };
-                    rt_callback::drain_cabsims(
-                        cabsim_drain,
-                        &mut budget,
-                        &mut state.active_cabsim,
                         &rt_status_for_process,
-                        &mut channels.gc_producer,
-                        parking_lot,
-                        parking_lot_dirty,
-                        &channels.gc_overflow,
-                    );
-
-                    let (param_changed, _param_pops) = rt_callback::receive_commands(
-                        &mut channels.param_consumer,
-                        &mut state.deferred_model,
-                        &mut budget,
-                        &mut state.model_input_mult_adj,
-                        &mut state.model_output_mult_adj,
-                        &mut state.current_nam_rate,
-                        &mut state.active_model_l,
-                        &mut state.active_model_r,
-                        &mut channels.gc_producer,
-                        parking_lot,
-                        parking_lot_dirty,
-                        &channels.gc_overflow,
-                        &rt_status_for_process,
-                        &mut state.user_input_gain_mult,
-                        &mut state.user_output_gain_mult,
-                        &mut state.gate_params,
-                        &mut state.threshold_open_sq,
-                        &mut state.threshold_close_sq,
                         lut,
-                        &mut state.adaptive_compute,
                     );
-
-                    rt_callback::try_slimmable_rebuild(
-                        &mut state.adaptive_compute,
-                        &rt_status_for_process,
-                    );
-
-                    rt_callback::drain_slimmable_models(
-                        &mut state.slimmable_drain,
-                        &mut budget,
-                        &mut state.active_model_l,
-                        &mut state.active_model_r,
-                        &rt_status_for_process,
-                        &mut channels.gc_producer,
-                        parking_lot,
-                        parking_lot_dirty,
-                        &channels.gc_overflow,
-                    );
-
-                    rt_callback::drain_os_engines(
-                        &mut state.os_drain,
-                        &mut budget,
-                        &mut state.os_l,
-                        &mut state.os_r,
-                        &rt_status_for_process,
-                        &mut channels.gc_producer,
-                        parking_lot,
-                        parking_lot_dirty,
-                        &channels.gc_overflow,
-                    );
-
-                    let current_host_rate = rt_callback::sync_rate(
-                        &rate_for_process,
-                        &state.resampler,
-                        state.current_nam_rate,
-                        &rt_status_for_process,
-                    );
-
-                    if param_changed {
-                        rt_setup::compute_gain_multipliers(
-                            state.user_input_gain_mult,
-                            state.user_output_gain_mult,
-                            state.model_input_mult_adj,
-                            state.model_output_mult_adj,
-                            &mut state.input_gain_mult,
-                            &mut state.output_gain_mult,
-                        );
-                    }
-
-                    if rt_status_for_process.check_flag(
-                        neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING,
-                    ) {
-                        let failed_gen = rt_status_for_process
-                            .resampler_failed_generation
-                            .load(Ordering::Acquire);
-                        let requested_gen = rt_status_for_process
-                            .requested_rate_generation
-                            .load(Ordering::Acquire);
-
-                        if failed_gen != 0 && failed_gen == requested_gen {
-                            // Fail-open rollback: the rebuild failed for requested_gen,
-                            // so the callback resumes with the previous resampler in safe
-                            // bypass/mute mode. Record the requested generation as
-                            // resolved so the invariant
-                            // `applied_rate_generation == requested_rate_generation`
-                            // holds on unmute — the old resampler is the accepted
-                            // fallback for this request, never a stale replacement.
-                            rt_status_for_process
-                                .applied_rate_generation
-                                .store(requested_gen, Ordering::Release);
-                            rt_status_for_process.clear_flag(
-                                neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING,
-                            );
-                            rt_status_for_process
-                                .resampler_failed_generation
-                                .store(0, Ordering::Release);
-                        } else {
-                            let _ = stream.dequeue_buffer();
-                            return;
-                        }
-                    }
+                    let rt_callback::PrologueOutcome::Proceed {
+                        current_host_rate, ..
+                    } = outcome
+                    else {
+                        let _ = stream.dequeue_buffer();
+                        return;
+                    };
 
                     let conv_pair = state
                         .active_cabsim

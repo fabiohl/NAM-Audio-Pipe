@@ -183,42 +183,22 @@ pub fn playback_dsp_cycle(
     // asymmetric or overlapping) by raising `RT_STATUS_HOST_CONTRACT_VIOLATION`
     // and silencing both channels, before the mutable `f32` output slices
     // are formed.
-    let Some((_n_bytes, n_out)) = handle_spa_pair_fail_closed(
-        ptr_l, max_l, chunk_l, 0, n_bytes, ptr_r, max_r, chunk_r, 0, n_bytes, rt_status,
-    ) else {
+    let Some(_n_out) = (unsafe {
+        deliver_playback_pair_fail_closed(
+            ptr_l,
+            max_l,
+            chunk_l,
+            ptr_r,
+            max_r,
+            chunk_r,
+            src_l as *const f32,
+            src_r as *const f32,
+            n_bytes,
+            rt_status,
+        )
+    }) else {
         return;
     };
-
-    // Copies the processed sound directly to your sound card outputs.
-    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
-    // symmetry and strict pointer disjunction, so `out_l` is well-formed.
-    let out_l = unsafe { std::slice::from_raw_parts_mut(ptr_l as *mut f32, n_out) };
-    // SAFETY: `src_l` and `out_l` are valid, disjoint non-overlapping buffers of length `n_out`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src_l as *const f32, out_l.as_mut_ptr(), n_out);
-    }
-    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
-    // symmetry and strict pointer disjunction, so `out_r` is well-formed.
-    let out_r = unsafe { std::slice::from_raw_parts_mut(ptr_r as *mut f32, n_out) };
-    // SAFETY: `src_r` and `out_r` are valid, disjoint non-overlapping buffers of length `n_out`.
-    unsafe {
-        core::ptr::copy_nonoverlapping(src_r as *const f32, out_r.as_mut_ptr(), n_out);
-    }
-
-    // Informs the hardware exactly how much sound was delivered this time.
-    // SAFETY: both chunk pointers were validated non-null above; the chunk
-    // structs are owned by the SPA buffer and stable for the callback duration.
-    unsafe {
-        let chunk_l_mut = &mut *chunk_l;
-        chunk_l_mut.offset = 0;
-        chunk_l_mut.size = (n_out * std::mem::size_of::<f32>()) as u32;
-        chunk_l_mut.stride = std::mem::size_of::<f32>() as i32;
-
-        let chunk_r_mut = &mut *chunk_r;
-        chunk_r_mut.offset = 0;
-        chunk_r_mut.size = (n_out * std::mem::size_of::<f32>()) as u32;
-        chunk_r_mut.stride = std::mem::size_of::<f32>() as i32;
-    }
 
     // 4. PLAYBACK TOTAL & 5. CAPTURE TO PLAYBACK (END-TO-END)
     // Measured: TSC overhead=~15ns per sample (LFENCE+RDTSC), total < 0.05% of 333µs quantum
@@ -239,6 +219,73 @@ pub fn playback_dsp_cycle(
             stream_status.e2e_hist.record(e2e_nanos);
         }
     }
+}
+
+/// Delivers processed audio to a pair of SPA output buffers fail-closed.
+///
+/// Validates pointer alignment, bounds, symmetry, and disjunction via
+/// [`handle_spa_pair_fail_closed`]. If valid, copies `n_out` samples from `src_l`/`src_r`
+/// to `ptr_l`/`ptr_r` and writes `offset=0`, `size=n_out * 4`, `stride=4` into
+/// the respective [`pw::spa::sys::spa_chunk`] descriptors.
+///
+/// Returns `Some(n_out)` on success, or `None` if the SPA contract was violated.
+///
+/// # Safety
+/// - `src_l` and `src_r` must point to valid contiguous slices of at least `n_bytes / size_of::<f32>()` floats.
+/// - If `ptr_l` / `ptr_r` are valid, they must point to writable memory of size `max_l` / `max_r`.
+/// - `chunk_l` and `chunk_r`, if non-null, must point to valid `spa_chunk` memory.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Raw SPA descriptor fields plus audio sources; signature is shared by playback RT callback and test harnesses"
+)]
+pub unsafe fn deliver_playback_pair_fail_closed(
+    ptr_l: usize,
+    max_l: usize,
+    chunk_l: *mut pw::spa::sys::spa_chunk,
+    ptr_r: usize,
+    max_r: usize,
+    chunk_r: *mut pw::spa::sys::spa_chunk,
+    src_l: *const f32,
+    src_r: *const f32,
+    n_bytes: usize,
+    rt_status: &RtStatusFlags,
+) -> Option<usize> {
+    let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
+        ptr_l, max_l, chunk_l, 0, n_bytes, ptr_r, max_r, chunk_r, 0, n_bytes, rt_status,
+    )?;
+
+    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
+    // symmetry and strict pointer disjunction, so `out_l` is well-formed.
+    let out_l = unsafe { std::slice::from_raw_parts_mut(ptr_l as *mut f32, n_out) };
+    // SAFETY: `src_l` and `out_l` are valid, disjoint non-overlapping buffers of length `n_out`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src_l, out_l.as_mut_ptr(), n_out);
+    }
+    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
+    // symmetry and strict pointer disjunction, so `out_r` is well-formed.
+    let out_r = unsafe { std::slice::from_raw_parts_mut(ptr_r as *mut f32, n_out) };
+    // SAFETY: `src_r` and `out_r` are valid, disjoint non-overlapping buffers of length `n_out`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src_r, out_r.as_mut_ptr(), n_out);
+    }
+
+    // Informs the hardware exactly how much sound was delivered this time.
+    // SAFETY: both chunk pointers were validated non-null above; the chunk
+    // structs are owned by the SPA buffer and stable for the callback duration.
+    unsafe {
+        let chunk_l_mut = &mut *chunk_l;
+        chunk_l_mut.offset = 0;
+        chunk_l_mut.size = (n_out * std::mem::size_of::<f32>()) as u32;
+        chunk_l_mut.stride = std::mem::size_of::<f32>() as i32;
+
+        let chunk_r_mut = &mut *chunk_r;
+        chunk_r_mut.offset = 0;
+        chunk_r_mut.size = (n_out * std::mem::size_of::<f32>()) as u32;
+        chunk_r_mut.stride = std::mem::size_of::<f32>() as i32;
+    }
+
+    Some(n_out)
 }
 
 /// Deterministic silence delivery for bridge starvation.

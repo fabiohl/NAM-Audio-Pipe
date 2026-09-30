@@ -13,7 +13,7 @@
 //! | Dimension            | Values                     | Weight (typical use)                       |
 //! |----------------------|----------------------------|--------------------------------------------|
 //! | Host rate            | 44.1 / 48 / 96 kHz         | 0.25 / **0.50** / 0.25 (PipeWire default)  |
-//! | Quantum (frames)     | 64 / 256 / 512             | **0.50** / 0.30 / 0.20 (low-latency first) |
+//! | Quantum (frames)     | 32 / 64 / 128 / 256 / 512 / 1024 | **0.40** / 0.10 / 0.15 / 0.20 / 0.10 / 0.05 (64 dominant; 128 is the PipeWire-common quantum, 32/1024 close the tail coverage gap — Sprint 3b) |
 //! | Topology             | A1 / A2 / LSTM (WaveNet)   | 1/3 each (mandatory)                       |
 //! | Oversampling         | Off / 2× / 4×              | **0.60** / 0.20 / 0.20 (Live first)        |
 //! | CabSim               | IR / bypass                | **0.70** / 0.30 (IR is the default path)   |
@@ -38,7 +38,8 @@
 //!   aborts. The `bypass` half of the matrix proves the no-IR path is also
 //!   representative (zero-cost CabSim).
 //! * All three oversampling modes (`Off`, `2x`, `4x`), all host rates
-//!   (44.1/48/96 kHz) and all quantums (64/256/512) must be exercised.
+//!   (44.1/48/96 kHz) and all quantums (32/64/128/256/512/1024, 64 dominant)
+//!   must be exercised.
 //! * The recording path (`--record` halves) must push every processed block
 //!   into the production recording transport (pool transport) and report a typed
 //!   overrun count — an overrun is recorded, never silently dropped.
@@ -111,10 +112,12 @@ const RATES_HZ: [u32; 3] = [44_100, 48_000, 96_000];
 const RATE_WEIGHTS: [f64; 3] = [0.25, 0.50, 0.25];
 
 /// Process quantums (frames/block) exercised. Weight documents typical use:
-/// 64 is the low-latency default, 256 the common quantum, 512 the safe/large
-/// margin.
-const QUANTUMS: [usize; 3] = [64, 256, 512];
-const QUANTUM_WEIGHTS: [f64; 3] = [0.50, 0.30, 0.20];
+/// 64 stays dominant (low-latency default); 128 closes the PipeWire-common
+/// coverage gap (F-LL-08); 256 is the common quantum; 512 the safe/large
+/// margin; 32/1024 close the tail gaps (tiny/headroom quantums) with small
+/// weights so they enter the profile without dethroning 64.
+const QUANTUMS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
+const QUANTUM_WEIGHTS: [f64; 6] = [0.10, 0.40, 0.15, 0.20, 0.10, 0.05];
 
 /// Oversampling modes exercised. Live mode (`Off`) dominates because it is the
 /// default low-latency configuration; 2×/4× are the HQ/offline configurations.
@@ -1687,7 +1690,10 @@ fn main() {
     };
     for (dim, required) in [
         ("rates", &["44100", "48000", "96000"] as &[&str]),
-        ("quantums", &["64", "256", "512"] as &[&str]),
+        (
+            "quantums",
+            &["32", "64", "128", "256", "512", "1024"] as &[&str],
+        ),
         ("oversampling", &[MODE_OFF, MODE_2X, MODE_4X] as &[&str]),
         ("cabsim", &["ir", "bypass"] as &[&str]),
         ("recording", required_recording),

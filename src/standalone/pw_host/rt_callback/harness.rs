@@ -41,17 +41,15 @@
 //! measured path). It is compiled only under `feature = "testing"`.
 
 use crate::standalone::cli::GateConfig;
-use crate::standalone::pw_host::capture::state::CaptureState;
+use crate::standalone::pw_host::capture::state::{CaptureState, RtHostChannels};
 use crate::standalone::pw_host::rt_callback::{
-    STRUCTURAL_SWAPS_PER_CALLBACK, cabsim_swap_drain, drain_cabsims, drain_os_engines,
-    drain_resamplers, drain_slimmable_models, os_swap_drain, receive_commands,
-    resampler_swap_drain, slimmable_swap_drain, sync_rate, try_slimmable_rebuild,
+    PrologueOutcome, cabsim_swap_drain, os_swap_drain, resampler_swap_drain, rt_quantum_prologue,
+    slimmable_swap_drain,
 };
-use crate::standalone::rt_setup::compute_gain_multipliers;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{
-    CabSimSwapPayload, GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags,
-    RtSwapDrain, SlimModelPair, SwapBudget, setup_spsc,
+    CabSimSwapPayload, GcItem, ParamPayload, ResamplerSwapPayload, RtStatusFlags, RtSwapDrain,
+    SlimModelPair, setup_spsc,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::GateParams;
@@ -280,15 +278,13 @@ pub struct SwapRtSide {
     /// The complete RT mutable state (models, resampler, OS, cab-sim, gains,
     /// gate, hysteresis, adaptive, engine swap drains, working buffers).
     pub state: CaptureState,
-    param_consumer: Consumer<ParamPayload>,
-    gc_producer: Producer<GcItem>,
-    gc_consumer: Consumer<GcItem>,
-    gc_overflow: Arc<GcOverflowBuffer>,
-    parking_lot: [Option<GcItem>; 16],
-    parking_lot_dirty: AtomicBool,
-    rt_status: Arc<RtStatusFlags>,
-    bridge: Box<DspBridge>,
-    lut: &'static GainLUT,
+    pub channels: RtHostChannels,
+    pub gc_consumer: Consumer<GcItem>,
+    pub parking_lot: [Option<GcItem>; 16],
+    pub parking_lot_dirty: AtomicBool,
+    pub rt_status: Arc<RtStatusFlags>,
+    pub bridge: Box<DspBridge>,
+    pub lut: &'static GainLUT,
     /// Last host rate applied by `run_callback`.
     current_host_rate: u32,
     /// `n_pw` of the most recent `run_callback` (valid output frames).
@@ -296,8 +292,23 @@ pub struct SwapRtSide {
 }
 
 impl SwapRtSide {
-    /// Executes one audio quantum: GC flush, all budgeted drains, rate sync,
-    /// gain recompute, pending-resampler guard and the full DSP pipeline.
+    /// Executes the canonical real-time prologue directly, returning the outcome.
+    #[inline(always)]
+    pub fn run_prologue(&mut self) -> PrologueOutcome {
+        let rt_status = self.rt_status.clone();
+        rt_quantum_prologue(
+            &mut self.state,
+            &mut self.channels,
+            &mut self.parking_lot,
+            &self.parking_lot_dirty,
+            &rt_status,
+            self.lut,
+        )
+    }
+
+    /// Executes one audio quantum: delegates the canonical RT prologue (GC flush,
+    /// all budgeted drains, rate sync, gain recompute, pending-resampler rollback guard)
+    /// to [`rt_quantum_prologue`], followed by the full DSP pipeline.
     ///
     /// `in_l`/`in_r` are the host input channels (processed in place by the
     /// pipeline); `n` is the frame count. Returns `n_pw` — the number of
@@ -312,153 +323,17 @@ impl SwapRtSide {
     ///
     /// Zero heap allocations: mirrors the real callback exactly.
     pub fn run_callback(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize) -> usize {
-        let rt_status = self.rt_status.clone();
+        let outcome = self.run_prologue();
 
-        // 1. GC parking-lot flush (fast-path skip on clean lot).
-        if self.parking_lot_dirty.load(Ordering::Acquire) {
-            let mut any_remaining = false;
-            for slot in self.parking_lot.iter_mut() {
-                let Some(old) = slot.take() else { continue };
-                if let Err(rtrb::PushError::Full(old_back)) = self.gc_producer.push(old) {
-                    *slot = Some(old_back);
-                    any_remaining = true;
-                    break;
-                }
-            }
-            if !any_remaining {
-                self.parking_lot_dirty.store(false, Ordering::Release);
-            }
-        }
+        let PrologueOutcome::Proceed {
+            current_host_rate, ..
+        } = outcome
+        else {
+            self.last_n_pw = 0;
+            return 0;
+        };
 
-        // 2. Command budgeting: shared structural budget (engine `SwapBudget`).
-        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
-
-        // 3. Budgeted drains in production order.
-        if let Some(resampler_drain) = self.state.resampler_drain.as_mut() {
-            drain_resamplers(
-                resampler_drain,
-                &mut budget,
-                &mut self.state.resampler,
-                &mut self.state.stream,
-                &rt_status,
-                &mut self.gc_producer,
-                &mut self.parking_lot,
-                &self.parking_lot_dirty,
-                &self.gc_overflow,
-            );
-        }
-
-        if let Some(cabsim_drain) = self.state.cabsim_drain.as_mut() {
-            drain_cabsims(
-                cabsim_drain,
-                &mut budget,
-                &mut self.state.active_cabsim,
-                &rt_status,
-                &mut self.gc_producer,
-                &mut self.parking_lot,
-                &self.parking_lot_dirty,
-                &self.gc_overflow,
-            );
-        }
-
-        let (param_changed, _param_pops) = receive_commands(
-            &mut self.param_consumer,
-            &mut self.state.deferred_model,
-            &mut budget,
-            &mut self.state.model_input_mult_adj,
-            &mut self.state.model_output_mult_adj,
-            &mut self.state.current_nam_rate,
-            &mut self.state.active_model_l,
-            &mut self.state.active_model_r,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-            &rt_status,
-            &mut self.state.user_input_gain_mult,
-            &mut self.state.user_output_gain_mult,
-            &mut self.state.gate_params,
-            &mut self.state.threshold_open_sq,
-            &mut self.state.threshold_close_sq,
-            self.lut,
-            &mut self.state.adaptive_compute,
-        );
-
-        try_slimmable_rebuild(&mut self.state.adaptive_compute, &rt_status);
-
-        drain_slimmable_models(
-            &mut self.state.slimmable_drain,
-            &mut budget,
-            &mut self.state.active_model_l,
-            &mut self.state.active_model_r,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
-
-        drain_os_engines(
-            &mut self.state.os_drain,
-            &mut budget,
-            &mut self.state.os_l,
-            &mut self.state.os_r,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
-
-        // 4. Rate synchronization.
-        let current_host_rate = sync_rate(
-            self.state.shared_target_rate.as_ref(),
-            &self.state.resampler,
-            self.state.current_nam_rate,
-            &rt_status,
-        );
         self.current_host_rate = current_host_rate;
-
-        // 5. Gain recompute on parameter change.
-        if param_changed {
-            compute_gain_multipliers(
-                self.state.user_input_gain_mult,
-                self.state.user_output_gain_mult,
-                self.state.model_input_mult_adj,
-                self.state.model_output_mult_adj,
-                &mut self.state.input_gain_mult,
-                &mut self.state.output_gain_mult,
-            );
-        }
-
-        // 6. Fail-open rollback guard.
-        if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
-        {
-            let failed_gen = rt_status
-                .resampler_failed_generation
-                .load(Ordering::Acquire);
-            let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
-
-            if failed_gen != 0 && failed_gen == requested_gen {
-                rt_status
-                    .applied_rate_generation
-                    .store(requested_gen, Ordering::Release);
-                rt_status
-                    .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
-                rt_status
-                    .resampler_failed_generation
-                    .store(0, Ordering::Release);
-            } else {
-                // The quantum was skipped: no output was produced. Publish the
-                // skip through `last_n_pw = 0` so `current_n_pw()`/`out_l()`
-                // reflect the skip and zero-frame sentinels fire instead
-                // of exposing stale pre-swap output.
-                self.last_n_pw = 0;
-                return 0;
-            }
-        }
-
-        // 7. DSP pipeline.
         let n_pw = self.process_dsp(in_l, in_r, n, current_host_rate);
         self.state.frame_count = self.state.frame_count.wrapping_add(1);
         self.last_n_pw = n_pw;
@@ -466,9 +341,8 @@ impl SwapRtSide {
     }
 
     /// Same quantum as [`Self::run_callback`] but also returns the per-quantum
-    /// swap accounting. The drains run in the exact
-    /// production order; `structural_pops` is the ring-pop lower bound across
-    /// the four structural channels, `param_pops` is the exact scalar pops.
+    /// swap accounting. Delegates the entire prologue to [`rt_quantum_prologue`],
+    /// capturing ring-pop occupancy deltas around it.
     ///
     /// Only used where the accounting is consumed (the production-SPSC
     /// throughput gate) — the RT measurement gates keep using the plain
@@ -480,223 +354,84 @@ impl SwapRtSide {
         in_r: &mut [f32],
         n: usize,
     ) -> CallbackAccounting {
-        let rt_status = self.rt_status.clone();
-
-        // 1. GC parking-lot flush (fast-path skip on clean lot).
-        if self.parking_lot_dirty.load(Ordering::Acquire) {
-            let mut any_remaining = false;
-            for slot in self.parking_lot.iter_mut() {
-                let Some(old) = slot.take() else { continue };
-                if let Err(rtrb::PushError::Full(old_back)) = self.gc_producer.push(old) {
-                    *slot = Some(old_back);
-                    any_remaining = true;
-                    break;
-                }
-            }
-            if !any_remaining {
-                self.parking_lot_dirty.store(false, Ordering::Release);
-            }
-        }
-
-        // 2. Command budgeting: shared structural budget (engine `SwapBudget`).
-        let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
-
-        // 3. Budgeted drains in production order. Ring-pop accounting is
-        //    captured through engine-drain ring-occupancy deltas
-        //    (`RtSwapDrain::ring_occupied`) — single-threaded reads within
-        //    the quantum.
         let resamp_before = self
             .state
             .resampler_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        if let Some(resampler_drain) = self.state.resampler_drain.as_mut() {
-            drain_resamplers(
-                resampler_drain,
-                &mut budget,
-                &mut self.state.resampler,
-                &mut self.state.stream,
-                &rt_status,
-                &mut self.gc_producer,
-                &mut self.parking_lot,
-                &self.parking_lot_dirty,
-                &self.gc_overflow,
-            );
-        }
-        let resamp_after = self
-            .state
-            .resampler_drain
-            .as_ref()
-            .map_or(0, RtSwapDrain::ring_occupied);
-
         let cabsim_before = self
             .state
             .cabsim_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        if let Some(cabsim_drain) = self.state.cabsim_drain.as_mut() {
-            drain_cabsims(
-                cabsim_drain,
-                &mut budget,
-                &mut self.state.active_cabsim,
-                &rt_status,
-                &mut self.gc_producer,
-                &mut self.parking_lot,
-                &self.parking_lot_dirty,
-                &self.gc_overflow,
-            );
-        }
-        let cabsim_after = self
-            .state
-            .cabsim_drain
-            .as_ref()
-            .map_or(0, RtSwapDrain::ring_occupied);
-
-        let (param_changed, param_pops) = receive_commands(
-            &mut self.param_consumer,
-            &mut self.state.deferred_model,
-            &mut budget,
-            &mut self.state.model_input_mult_adj,
-            &mut self.state.model_output_mult_adj,
-            &mut self.state.current_nam_rate,
-            &mut self.state.active_model_l,
-            &mut self.state.active_model_r,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-            &rt_status,
-            &mut self.state.user_input_gain_mult,
-            &mut self.state.user_output_gain_mult,
-            &mut self.state.gate_params,
-            &mut self.state.threshold_open_sq,
-            &mut self.state.threshold_close_sq,
-            self.lut,
-            &mut self.state.adaptive_compute,
-        );
-
-        try_slimmable_rebuild(&mut self.state.adaptive_compute, &rt_status);
-
         let slimmable_before = self
             .state
             .slimmable_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        drain_slimmable_models(
-            &mut self.state.slimmable_drain,
-            &mut budget,
-            &mut self.state.active_model_l,
-            &mut self.state.active_model_r,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
-        let slimmable_after = self
-            .state
-            .slimmable_drain
-            .as_ref()
-            .map_or(0, RtSwapDrain::ring_occupied);
-
         let os_before = self
             .state
             .os_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        drain_os_engines(
-            &mut self.state.os_drain,
-            &mut budget,
-            &mut self.state.os_l,
-            &mut self.state.os_r,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
+
+        let outcome = self.run_prologue();
+
+        let resamp_after = self
+            .state
+            .resampler_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
+        let cabsim_after = self
+            .state
+            .cabsim_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
+        let slimmable_after = self
+            .state
+            .slimmable_drain
+            .as_ref()
+            .map_or(0, RtSwapDrain::ring_occupied);
         let os_after = self
             .state
             .os_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
 
-        // Structural-applied accounting straight from the engine budget
-        // (shared across all five drains of this quantum).
-        let budget_used = budget.used();
+        let structural_pops = resamp_before
+            .saturating_sub(resamp_after)
+            .saturating_add(cabsim_before.saturating_sub(cabsim_after))
+            .saturating_add(slimmable_before.saturating_sub(slimmable_after))
+            .saturating_add(os_before.saturating_sub(os_after));
 
-        // 4. Rate synchronization.
-        let current_host_rate = sync_rate(
-            self.state.shared_target_rate.as_ref(),
-            &self.state.resampler,
-            self.state.current_nam_rate,
-            &rt_status,
-        );
+        let current_host_rate = outcome.current_host_rate();
         self.current_host_rate = current_host_rate;
 
-        // 5. Gain recompute on parameter change.
-        if param_changed {
-            compute_gain_multipliers(
-                self.state.user_input_gain_mult,
-                self.state.user_output_gain_mult,
-                self.state.model_input_mult_adj,
-                self.state.model_output_mult_adj,
-                &mut self.state.input_gain_mult,
-                &mut self.state.output_gain_mult,
-            );
-        }
+        let PrologueOutcome::Proceed {
+            structural_applied,
+            param_pops,
+            ..
+        } = outcome
+        else {
+            self.last_n_pw = 0;
+            return CallbackAccounting {
+                n_pw: 0,
+                structural_applied: outcome.structural_applied(),
+                param_pops: outcome.param_pops(),
+                structural_pops,
+                commands_remaining: self.commands_pending_count(),
+            };
+        };
 
-        // 6. Fail-open rollback guard.
-        if rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING)
-        {
-            let failed_gen = rt_status
-                .resampler_failed_generation
-                .load(Ordering::Acquire);
-            let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
-
-            if failed_gen != 0 && failed_gen == requested_gen {
-                rt_status
-                    .applied_rate_generation
-                    .store(requested_gen, Ordering::Release);
-                rt_status
-                    .clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RESAMP_SWAP_PENDING);
-                rt_status
-                    .resampler_failed_generation
-                    .store(0, Ordering::Release);
-            } else {
-                // The quantum was skipped: publish the skip through
-                // `last_n_pw = 0` so `current_n_pw()`/`out_l()` reflect it and
-                // zero-frame sentinels fire instead of exposing stale
-                // pre-swap output.
-                self.last_n_pw = 0;
-                return CallbackAccounting {
-                    n_pw: 0,
-                    structural_applied: budget_used,
-                    param_pops,
-                    structural_pops: resamp_before
-                        .saturating_sub(resamp_after)
-                        .saturating_add(cabsim_before.saturating_sub(cabsim_after))
-                        .saturating_add(slimmable_before.saturating_sub(slimmable_after))
-                        .saturating_add(os_before.saturating_sub(os_after)),
-                    commands_remaining: self.commands_pending_count(),
-                };
-            }
-        }
-
-        // 7. DSP pipeline.
         let n_pw = self.process_dsp(in_l, in_r, n, current_host_rate);
         self.state.frame_count = self.state.frame_count.wrapping_add(1);
         self.last_n_pw = n_pw;
 
         CallbackAccounting {
             n_pw,
-            structural_applied: budget_used,
+            structural_applied,
             param_pops,
-            structural_pops: resamp_before
-                .saturating_sub(resamp_after)
-                .saturating_add(cabsim_before.saturating_sub(cabsim_after))
-                .saturating_add(slimmable_before.saturating_sub(slimmable_after))
-                .saturating_add(os_before.saturating_sub(os_after)),
+            structural_pops,
             commands_remaining: self.commands_pending_count(),
         }
     }
@@ -823,7 +558,7 @@ impl SwapRtSide {
     /// `true` while any structural/scalar command is still queued or parked —
     /// the RT callback has not yet finished absorbing the current burst.
     pub fn commands_pending(&self) -> bool {
-        !self.param_consumer.is_empty()
+        !self.channels.param_consumer.is_empty()
             || self
                 .state
                 .resampler_drain
@@ -868,7 +603,7 @@ impl SwapRtSide {
     /// [`Self::commands_pending`]) — queued SPSC payloads plus deferred slots,
     /// plus the parking-lot dirty latch.
     pub fn commands_pending_count(&self) -> usize {
-        self.param_consumer.slots()
+        self.channels.param_consumer.slots()
             + self
                 .state
                 .resampler_drain
@@ -1029,10 +764,12 @@ impl RtSwapHarness {
         };
         let rt = SwapRtSide {
             state,
-            param_consumer: spsc.param_consumer,
-            gc_producer: spsc.gc_producer,
+            channels: RtHostChannels {
+                param_consumer: spsc.param_consumer,
+                gc_producer: spsc.gc_producer,
+                gc_overflow: spsc.gc_overflow,
+            },
             gc_consumer: spsc.gc_consumer,
-            gc_overflow: spsc.gc_overflow,
             parking_lot: Default::default(),
             parking_lot_dirty: AtomicBool::new(false),
             rt_status: spsc.rt_status,
@@ -1196,6 +933,11 @@ impl RtSwapHarness {
 
     pub fn current_host_rate(&self) -> u32 {
         self.rt.current_host_rate()
+    }
+
+    /// Executes the canonical real-time prologue directly, returning the outcome.
+    pub fn run_prologue(&mut self) -> PrologueOutcome {
+        self.rt.run_prologue()
     }
 
     pub fn gc_pending(&self) -> usize {

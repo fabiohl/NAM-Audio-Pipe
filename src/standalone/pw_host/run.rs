@@ -319,6 +319,12 @@ pub fn run_pipewire_host(
         let setup_res: anyhow::Result<_> = (|| {
             let _lock = thread_loop.lock();
 
+            // PipeWire `node.latency` property contract:
+            // Expressed as a rational fraction ("quantum/rate", e.g. "128/48000").
+            // PipeWire treats this as a requested duration in seconds: tau = quantum / rate.
+            // When connecting to a graph running at a different rate R, PipeWire dynamically
+            // reschedules the quantum to round(tau * R). Thus "{buffer_size}/48000" requests
+            // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
             let latency_str = format!("{}/48000", buffer_size);
 
             let (cs, cl) = capture::setup_capture_stream(
@@ -562,6 +568,15 @@ pub fn run_pipewire_host(
         // the loop thread to finish its current iteration — is the main thread the
         // sole writer of the recording channel.
         thread_loop.stop();
+
+        // Drain any remaining clock drift drops accumulated in the bridge before resetting.
+        let remaining_drops = unsafe { &*(bridge_ptr.as_ptr()) }.drain_dropped_frames();
+        if remaining_drops > 0 {
+            backend_status
+                .stream_status()
+                .bridge_dropped_frames
+                .fetch_add(remaining_drops, Ordering::Relaxed);
+        }
 
         // Invalidates/advances the DSP bridge to zero so a reconnected instance
         // begins strictly in silence.

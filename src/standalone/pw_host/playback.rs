@@ -123,6 +123,12 @@ pub fn setup_playback_stream<'c>(
     };
 
     if buffer_size > 0 {
+        // PipeWire `node.latency` property contract:
+        // Expressed as a rational fraction ("quantum/rate", e.g. "128/48000").
+        // PipeWire treats this as a requested duration in seconds: tau = quantum / rate.
+        // When connecting to a graph running at a different rate R, PipeWire dynamically
+        // reschedules the quantum to round(tau * R). Thus "{buffer_size}/48000" requests
+        // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
         playback_props.insert("node.latency", latency_str);
     }
 

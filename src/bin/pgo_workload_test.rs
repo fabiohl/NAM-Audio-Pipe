@@ -158,20 +158,24 @@ fn matrix_weights_sum_to_one_per_dimension() {
         (GATE_ON_WEIGHT + GATE_OFF_WEIGHT - 1.0).abs() < 1e-9,
         "gate weights must sum to 1"
     );
-    // Documented typical-use dominance: 48 kHz and 64-frame quantum are the
-    // most-weighted cells (low-latency default first).
+    // Documented typical-use dominance: 48 kHz and the 64-frame quantum are
+    // the most-weighted cells (low-latency default first; 64 stays dominant
+    // over 128/256/512 and over the 32/1024 tails — Sprint 3b).
     const {
         assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[0]);
         assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[2]);
-        assert!(QUANTUM_WEIGHTS[0] > QUANTUM_WEIGHTS[1]);
-        assert!(QUANTUM_WEIGHTS[0] > QUANTUM_WEIGHTS[2]);
+        assert!(QUANTUM_WEIGHTS[1] > QUANTUM_WEIGHTS[0]);
+        assert!(QUANTUM_WEIGHTS[1] > QUANTUM_WEIGHTS[2]);
+        assert!(QUANTUM_WEIGHTS[1] > QUANTUM_WEIGHTS[3]);
+        assert!(QUANTUM_WEIGHTS[1] > QUANTUM_WEIGHTS[4]);
+        assert!(QUANTUM_WEIGHTS[1] > QUANTUM_WEIGHTS[5]);
     }
 }
 
 #[test]
 fn matrix_dimensions_cover_all_mandatory_values() {
     assert_eq!(RATES_HZ, [44_100, 48_000, 96_000]);
-    assert_eq!(QUANTUMS, [64, 256, 512]);
+    assert_eq!(QUANTUMS, [32, 64, 128, 256, 512, 1024]);
     let os: Vec<&str> = OS_WEIGHTS.iter().map(|(m, _)| *m).collect();
     assert_eq!(os, [MODE_OFF, MODE_2X, MODE_4X]);
 }
@@ -365,8 +369,8 @@ fn receipt_json_contains_matrix_fields() {
     for rate in [44_100, 48_000, 96_000] {
         Coverage::bump(&mut receipt.coverage.rates, &rate.to_string(), 2400);
     }
-    for q in [64, 256, 512] {
-        Coverage::bump(&mut receipt.coverage.quantums, &q.to_string(), 2400);
+    for q in [32, 64, 128, 256, 512, 1024] {
+        Coverage::bump(&mut receipt.coverage.quantums, &q.to_string(), 1200);
     }
     Coverage::bump(&mut receipt.coverage.cabsim, "ir", 3600);
     Coverage::bump(&mut receipt.coverage.cabsim, "bypass", 3600);
@@ -427,7 +431,7 @@ fn receipt_json_contains_matrix_fields() {
         r#""schema_version":2"#,
         r#""tool":"pgo_workload""#,
         r#""rates_hz":[44100,48000,96000]"#,
-        r#""quantums_frames":[64,256,512]"#,
+        r#""quantums_frames":[32,64,128,256,512,1024]"#,
         r#""gate_modes":["on","off"]"#,
         r#""no_stage_skipped":true"#,
         r#""disabled":true"#,
@@ -451,7 +455,7 @@ fn mandatory_gate_sets_cover_all_families() {
     // The receipt matrix metadata must enumerate the exact mandatory values so
     // a future edit cannot silently drop one dimension value.
     assert_eq!(RATES_HZ.len(), 3);
-    assert_eq!(QUANTUMS.len(), 3);
+    assert_eq!(QUANTUMS.len(), 6);
     assert_eq!(OS_WEIGHTS.len(), 3);
     let coverage = Coverage::default();
     assert!(coverage.topologies.is_empty());

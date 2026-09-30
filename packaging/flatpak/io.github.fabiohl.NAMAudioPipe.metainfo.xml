@@ -66,13 +66,13 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="0.7.2" date="2026-09-10" type="stable">
+    <release version="0.7.3" date="2026-09-30" type="stable">
       <description>
-        <p>This release updates NeuralAmpModeler-rs to 0.7.4 and improves phase duration tracking:</p>
+        <p>This release introduces recording metadata sequence numbers, cab-sim partition policies, and telemetry refactoring:</p>
         <ul>
-          <li>Updated NeuralAmpModeler-rs engine dependency to 0.7.4, adhering to exclusive-access DSP bridge teardown invariants.</li>
-          <li>Added human-readable duration formatting and millisecond tracking for test and lint phases.</li>
-          <li>Supply chain dependency updates and compiler compatibility alignment.</li>
+          <li>Added sequence numbers to recording metadata payloads for synchronization and track slot leak prevention.</li>
+          <li>Added CabSim partition policy support and validation tests.</li>
+          <li>Refactored telemetry and stream metrics into a dedicated StreamStatusFlags structure.</li>
         </ul>
       </description>
     </release>

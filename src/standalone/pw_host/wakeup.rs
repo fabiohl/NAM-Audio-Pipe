@@ -17,7 +17,7 @@ use std::time::Duration;
 /// to wake the main loop immediately upon receiving events.
 #[derive(Debug, Clone, Default)]
 pub struct ControlPlaneWakeup {
-    inner: Arc<(Mutex<()>, Condvar)>,
+    inner: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl ControlPlaneWakeup {
@@ -31,20 +31,28 @@ impl ControlPlaneWakeup {
     /// Must only be called from off-RT or cold-path threads (e.g. PipeWire ThreadLoop,
     /// backend state handlers, CLI/signal controllers). Zero syscalls on RT path.
     pub fn notify(&self) {
-        self.inner.1.notify_one();
+        if let Ok(mut flag) = self.inner.0.lock() {
+            *flag = true;
+            self.inner.1.notify_one();
+        }
     }
 
     /// Waits on the condition variable for up to `timeout`.
     ///
     /// Returns `true` if woken by a notification or `false` if timed out.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        if let Ok(guard) = self.inner.0.lock() {
-            let (guard, result) = match self.inner.1.wait_timeout(guard, timeout) {
+        if let Ok(mut flag) = self.inner.0.lock() {
+            if *flag {
+                *flag = false;
+                return true;
+            }
+            let (mut guard, result) = match self.inner.1.wait_timeout(flag, timeout) {
                 Ok(res) => res,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            drop(guard);
-            !result.timed_out()
+            let notified = *guard || !result.timed_out();
+            *guard = false;
+            notified
         } else {
             false
         }

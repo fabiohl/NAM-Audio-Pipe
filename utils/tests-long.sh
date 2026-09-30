@@ -66,6 +66,28 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# Shared style helpers (RED/GREEN/YELLOW/BLUE/BOLD/NC), cd to project root,
+# fail-closed executed-test gates, and pick_bench_core helper.
+source "$SCRIPT_DIR/_lib.sh"
+
+# CPU core pinning for the RT measurement phases (Deadline, Jitter).
+# Resolved deterministically via pick_bench_core:
+#   1. Explicit $NAM_BENCH_CORE
+#   2. First online isolated core from /sys/devices/system/cpu/isolated
+#   3. Fallback nproc / 2 with explicit warning
+BENCH_CORE="$(pick_bench_core)"
+HAS_TASKSET=0
+if command -v taskset >/dev/null 2>&1; then
+    HAS_TASKSET=1
+fi
+HAS_CHRT_FIFO=0
+if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then
+    HAS_CHRT_FIFO=1
+fi
+
 STRICT_PRE_RELEASE=0
 SIMULATE=0
 for arg in "$@"; do
@@ -82,6 +104,9 @@ for arg in "$@"; do
             echo "NAM-Audio-Pipe nightly / pre-release long audit suite"
             echo "(~30-60 min, HUMAN OPERATOR ONLY — AI agents must never execute it directly)."
             echo
+            echo "Resolved benchmark core: ${BENCH_CORE} (isolated/affinity target)"
+            echo "SCHED_FIFO capability:  $([ "$HAS_CHRT_FIFO" = "1" ] && echo "available (chrt -f 80)" || echo "unavailable (GAP fallback)")"
+            echo
             echo "Options:"
             echo "  --strict-pre-release   Promote every GAP to a hard failure (release gate)."
             echo "                         Certifies the audit only on a calibrated RT machine."
@@ -94,8 +119,8 @@ for arg in "$@"; do
             echo "Phases (logs in target/logs/):"
             echo "  PHASE1 — Accelerated soak (compressed timeline) phase1-soak.log"
             echo "  PHASE2 — RT-Safety heap-audit (zero-alloc)      phase2-heap-audit.log"
-            echo "  PHASE3 — RT Deadline gate (ns budget)           phase3-rt-deadline.log"
-            echo "  PHASE4 — RT Jitter gate (dispersion)            phase4-rt-jitter.log"
+            echo "  PHASE3 — RT Deadline gate (ns budget)           phase3-rt-deadline.log (core ${BENCH_CORE})"
+            echo "  PHASE4 — RT Jitter gate (dispersion)            phase4-rt-jitter.log (core ${BENCH_CORE})"
             echo "  PHASE5 — Concurrency model checking             phase5-concurrency.log"
             echo "  PHASE6 — Endurance real & state-machine throughput"
             echo "                                                  phase6-endurance.log"
@@ -122,25 +147,6 @@ done
 # semantically via src/bin/long_receipt_check.rs).
 if [ "$STRICT_PRE_RELEASE" = "1" ]; then
     export NAM_RT_STRICT=1
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
-
-# Shared style helpers (RED/GREEN/YELLOW/BLUE/BOLD/NC), cd to project root and
-# the fail-closed executed-test gates (assert_ran_tests / assert_ran_target).
-source "$SCRIPT_DIR/_lib.sh"
-
-# CPU core pinning for the RT measurement phases (Deadline, Jitter). Override
-# with NAM_BENCH_CORE; defaults to the middle physical core. The Rust harness
-# itself preflights the environment and emits typed GAP markers when it cannot
-# certify (see tests/rt_metrics.rs) — the shell never reclassifies.
-NUM_CORES=$(nproc 2>/dev/null || echo 1)
-DEFAULT_CORE=$(( ${NUM_CORES:-1} / 2 ))
-BENCH_CORE="${NAM_BENCH_CORE:-$DEFAULT_CORE}"
-HAS_TASKSET=0
-if command -v taskset >/dev/null 2>&1; then
-    HAS_TASKSET=1
 fi
 
 # Defensive error trap (message + abort). Phase failures are isolated via
@@ -253,22 +259,30 @@ finish_phase() {
     local log_file="$2"
     local phase_rc="$3"
     local status_line
+    local env_suffix=""
+    if [ "$SIMULATE" != "1" ] && [ -f "target/logs/${log_file}" ]; then
+        local env_match
+        env_match=$(grep -oP '\benv=\S+' "target/logs/${log_file}" | head -n1 || true)
+        if [ -n "$env_match" ]; then
+            env_suffix=" $env_match"
+        fi
+    fi
     if [ "$SIMULATE" = "1" ]; then
         status_line="${phase_id}: SIMULATED log=target/logs/${log_file}"
         PHASE_STATUSES+=("SIMULATED")
         echo -e "  ${YELLOW}ⓘ ${phase_id}: simulated (no tests executed)${NC}"
     else
         case "$phase_rc" in
-            0) status_line="${phase_id}: PASS log=target/logs/${log_file} duration_ms=${PHASE_DUR}"
+            0) status_line="${phase_id}: PASS log=target/logs/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
                PHASE_STATUSES+=("PASS")
                echo -e "  ${GREEN}✓ ${phase_id}: PASS${NC}" ;;
-            1) status_line="${phase_id}: FAIL log=target/logs/${log_file} duration_ms=${PHASE_DUR}"
+            1) status_line="${phase_id}: FAIL log=target/logs/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
                PHASE_STATUSES+=("FAIL")
                echo -e "  ${RED}❌ ${phase_id}: FAIL${NC}" ;;
-            2) status_line="${phase_id}: GAP log=target/logs/${log_file} duration_ms=${PHASE_DUR}"
+            2) status_line="${phase_id}: GAP log=target/logs/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
                PHASE_STATUSES+=("GAP")
                echo -e "  ${YELLOW}⚠ ${phase_id}: GAP${NC}" ;;
-            *) status_line="${phase_id}: FAIL log=target/logs/${log_file} duration_ms=${PHASE_DUR}"
+            *) status_line="${phase_id}: FAIL log=target/logs/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
                PHASE_STATUSES+=("FAIL") ;;
         esac
     fi
@@ -413,12 +427,13 @@ run_rt_deadline_phase() {
     # leaving BENCH_CORE cool and quiescent before running the RT benchmark.
     cargo test --features testing --release --no-run --test rt_metrics || rc=1
     if [ "$rc" -eq 0 ]; then
-        if [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-            taskset -c "$BENCH_CORE" cargo test --features testing --release --no-fail-fast \
-                --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+        local rt_cmd=(cargo test --features testing --release --no-fail-fast --test rt_metrics -- deadline --ignored --nocapture --test-threads=1)
+        if [ "$HAS_CHRT_FIFO" = "1" ] && [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
+            chrt -f 80 taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
+        elif [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
+            taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
         else
-            cargo test --features testing --release --no-fail-fast \
-                --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+            "${rt_cmd[@]}" || rc=1
         fi
     fi
     # A real cargo failure is a hard FAIL and must never be masked by a typed
@@ -433,8 +448,16 @@ run_rt_deadline_phase() {
         record_gap "phase3:$(grep -oP 'TEST_RESULT\[rt_deadline\]=GAP:[^ ]+' target/logs/phase3-rt-deadline.log | head -n1)"
         return 2
     fi
+    if grep -qF "TEST_RESULT[rt_deadline_full]=GAP" "target/logs/phase3-rt-deadline.log"; then
+        record_gap "phase3:$(grep -oP 'TEST_RESULT\[rt_deadline_full\]=GAP:[^ ]+' target/logs/phase3-rt-deadline.log | head -n1)"
+        return 2
+    fi
     if ! grep -qF "TEST_RESULT[rt_deadline]=PASS" "target/logs/phase3-rt-deadline.log"; then
         record_gap "phase3:no_typed_deadline_result"
+        return 2
+    fi
+    if ! grep -qF "TEST_RESULT[rt_deadline_full]=PASS" "target/logs/phase3-rt-deadline.log"; then
+        record_gap "phase3:no_typed_deadline_full_result"
         return 2
     fi
     return 0
@@ -452,12 +475,13 @@ run_rt_jitter_phase() {
     fi
     local rc=0
     echo "  → rt_metrics jitter gate (inter-callback dispersion, core ${BENCH_CORE})"
-    if [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-        taskset -c "$BENCH_CORE" cargo test --features testing --release --no-fail-fast \
-            --test rt_metrics -- jitter --ignored --nocapture --test-threads=1 || rc=1
+    local rt_cmd=(cargo test --features testing --release --no-fail-fast --test rt_metrics -- jitter --ignored --nocapture --test-threads=1)
+    if [ "$HAS_CHRT_FIFO" = "1" ] && [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
+        chrt -f 80 taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
+    elif [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
+        taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
     else
-        cargo test --features testing --release --no-fail-fast \
-            --test rt_metrics -- jitter --ignored --nocapture --test-threads=1 || rc=1
+        "${rt_cmd[@]}" || rc=1
     fi
     # Same fail-closed precedence as the deadline gate: a real cargo failure
     # is a hard FAIL, never masked by a typed GAP marker in the same log.
