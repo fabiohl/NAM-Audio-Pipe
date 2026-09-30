@@ -21,15 +21,33 @@ use crate::standalone::rt_setup;
 /// to keep streams and listeners alive via drop semantics. The compiler
 /// may warn about unused fields; that is expected and safe here.
 /// Removing the fields would cause premature deallocation and audio dropout.
-pub struct AppState<S1, L1, S2, L2> {
+///
+/// # Drop Order Invariant (F-RB-102 / Memory Safety)
+///
+/// In Rust, struct fields are dropped in top-to-bottom declaration order (RFC 1857).
+/// Every `*_listener` MUST precede its corresponding `*_stream` field:
+///
+/// 1. `capture_listener` before `capture_stream`
+/// 2. `playback_listener` before `playback_stream`
+///
+/// `StreamBox::drop` invokes `pw_stream_destroy`, which unlinks and frees the
+/// underlying PipeWire `pw_stream` struct (`stream_free`). If a `StreamListener`
+/// is dropped afterwards, its `Drop` implementation calls `spa_hook_remove` /
+/// `spa_list_remove`, performing pointer writes (`elem.prev->next = elem.next`,
+/// `elem.next->prev = elem.prev`) into deallocated memory — causing use-after-free (UB).
+/// By declaring the listeners first, each listener is cleanly detached from a still-live
+/// PipeWire stream during teardown, reconnect cycles, and shutdown.
+pub struct AppState<L1, S1, L2, S2> {
+    /// Listener bound to the capture stream (RAII anchor).
+    /// Must precede `capture_stream` for safe drop order (F-RB-102).
+    pub capture_listener: L1,
     /// PipeWire capture stream (RAII anchor).
     pub capture_stream: S1,
-    /// Listener bound to the capture stream (RAII anchor).
-    pub capture_listener: L1,
+    /// Listener bound to the playback stream (RAII anchor).
+    /// Must precede `playback_stream` for safe drop order (F-RB-102).
+    pub playback_listener: L2,
     /// PipeWire playback stream (RAII anchor).
     pub playback_stream: S2,
-    /// Listener bound to the playback stream (RAII anchor).
-    pub playback_listener: L2,
 }
 
 /// Configuration for PipeWire host initialization.
@@ -173,14 +191,16 @@ pub fn playback_dsp_cycle(
 
     // Copies the processed sound directly to your sound card outputs.
     // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
-    // symmetry and strict pointer disjunction, so the two `&mut [f32]` below
-    // are well-formed and non-overlapping; the source regions were captured
-    // from the bridge front-buffer and remain stable for this cycle.
+    // symmetry and strict pointer disjunction, so `out_l` is well-formed.
     let out_l = unsafe { std::slice::from_raw_parts_mut(ptr_l as *mut f32, n_out) };
+    // SAFETY: `src_l` and `out_l` are valid, disjoint non-overlapping buffers of length `n_out`.
     unsafe {
         core::ptr::copy_nonoverlapping(src_l as *const f32, out_l.as_mut_ptr(), n_out);
     }
+    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
+    // symmetry and strict pointer disjunction, so `out_r` is well-formed.
     let out_r = unsafe { std::slice::from_raw_parts_mut(ptr_r as *mut f32, n_out) };
+    // SAFETY: `src_r` and `out_r` are valid, disjoint non-overlapping buffers of length `n_out`.
     unsafe {
         core::ptr::copy_nonoverlapping(src_r as *const f32, out_r.as_mut_ptr(), n_out);
     }
@@ -288,11 +308,12 @@ pub unsafe fn deliver_silence_pair_fail_closed(
         rt_status,
     )?;
 
-    // SAFETY: the harness proved per-channel alignment, bounds, frame symmetry
-    // and strict pointer disjunction, so the two `&mut [f32]` below are
-    // well-formed and non-overlapping.
+    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
+    // symmetry and strict pointer disjunction, so `out_l` is well-formed.
     let out_l = unsafe { std::slice::from_raw_parts_mut(ptr_l as *mut f32, n_out) };
     out_l.fill(0.0);
+    // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
+    // symmetry and strict pointer disjunction, so `out_r` is well-formed.
     let out_r = unsafe { std::slice::from_raw_parts_mut(ptr_r as *mut f32, n_out) };
     out_r.fill(0.0);
 
@@ -620,7 +641,7 @@ pub fn reject_negotiated_format_violation(
     stream_status.format_contract_ok.store(0, Ordering::Relaxed);
     log::error!(
         "Audio host renegotiated an incompatible SPA format on the {stream_name} stream — \
-         strict contract violated. [E2304 | HOST_FORMAT_CONTRACT_VIOLATION] stream={stream_name} violation={violation}"
+         strict contract violated. [E2304 | SPA_FORMAT_CONTRACT_VIOLATION] stream={stream_name} violation={violation}"
     );
 }
 
@@ -686,7 +707,7 @@ pub fn check_negotiated_rate_mismatch(stream_status: &StreamStatusFlags) {
     if let Some((capture, playback)) = negotiated_rate_mismatch(stream_status) {
         log::warn!(
             "Audio streams operate at discrepant negotiated sample rates — clock drift and \
-             resampler pressure expected. [E2305 | RATE_MISMATCH] capture={capture} playback={playback}"
+             resampler pressure expected. [E2307 | RATE_MISMATCH] capture={capture} playback={playback}"
         );
     }
 }

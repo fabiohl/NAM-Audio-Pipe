@@ -56,6 +56,7 @@ use nam_audio_pipe::recording::buffer::{
 };
 use nam_audio_pipe::recording::pool::{POOL_CAPACITY, RecordingPool};
 use nam_audio_pipe::standalone::rt_setup::affinity::{get_allowed_cpus, select_optimal_cpu};
+use nam_audio_pipe::standalone::rt_setup::{PinThreadError, pin_current_thread};
 
 const DEFAULT_RECEIPT_JSONL: &str = "target/logs/recording-ab-receipt.jsonl";
 const DEFAULT_RECEIPT_TXT: &str = "target/logs/recording-ab-receipt.txt";
@@ -143,20 +144,16 @@ fn measure_freq_ghz_x1000() -> u64 {
 }
 
 /// Pins the calling thread to `cpu` (best-effort; the A/B still runs without
-/// pinning when the topology/cpuset forbids it).
-fn pin_thread(cpu: Option<usize>) {
-    let Some(cpu) = cpu else {
-        return;
-    };
-    // SAFETY: `cpu_set_t` is zeroed before use; `sched_setaffinity` only
-    // touches the supplied set and the calling thread.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+/// pinning when the topology/cpuset forbids it). Out-of-bounds CPUs are rejected
+/// with a typed error before any affinity syscall is made.
+fn pin_thread(cpu: Option<usize>) -> Result<(), PinThreadError> {
+    match pin_current_thread(cpu) {
+        Ok(()) => Ok(()),
+        Err(PinThreadError::SyscallFailed { cpu, .. }) => {
             eprintln!("  warn: could not pin thread to cpu {cpu}");
+            Ok(())
         }
+        Err(e @ PinThreadError::CpuOutOfBounds { .. }) => Err(e),
     }
 }
 
@@ -231,7 +228,7 @@ fn run_inline_phase(cfg: &Cfg, barrier: &Barrier, l: &[f32], r: &[f32]) -> Trans
         let throttle_us = cfg.throttle_us;
 
         let producer_handle = scope.spawn(move || {
-            pin_thread(producer_cpu);
+            let _ = pin_thread(producer_cpu);
             barrier.wait();
             let mut producer_cycles = Vec::with_capacity(quanta);
             let mut overruns = 0u64;
@@ -269,7 +266,7 @@ fn run_inline_phase(cfg: &Cfg, barrier: &Barrier, l: &[f32], r: &[f32]) -> Trans
         });
 
         let consumer_handle = scope.spawn(move || {
-            pin_thread(consumer_cpu);
+            let _ = pin_thread(consumer_cpu);
             barrier.wait();
             let mut io_buf = [0f32; MAX_BLOCK_SIZE];
             let mut consumer_cycles = Vec::with_capacity(quanta);
@@ -343,7 +340,7 @@ fn run_pool_phase(cfg: &Cfg, barrier: &Barrier, l: &[f32], r: &[f32]) -> Transpo
         let throttle_us = cfg.throttle_us;
 
         let producer_handle = scope.spawn(move || {
-            pin_thread(producer_cpu);
+            let _ = pin_thread(producer_cpu);
             barrier.wait();
             let mut producer_cycles = Vec::with_capacity(quanta);
             let mut overruns = 0u64;
@@ -377,7 +374,7 @@ fn run_pool_phase(cfg: &Cfg, barrier: &Barrier, l: &[f32], r: &[f32]) -> Transpo
         });
 
         let consumer_handle = scope.spawn(move || {
-            pin_thread(consumer_cpu);
+            let _ = pin_thread(consumer_cpu);
             barrier.wait();
             let mut io_buf = [0f32; MAX_BLOCK_SIZE];
             let mut consumer_cycles = Vec::with_capacity(quanta);
@@ -637,6 +634,14 @@ fn host_context(freq_ghz_x1000: u64) -> Vec<(String, JsonValue)> {
 
 fn main() -> ExitCode {
     let cfg = parse_args();
+    if let Err(e) = pin_thread(cfg.producer_cpu) {
+        eprintln!("recording_ab_bench: FATAL: --producer-cpu: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = pin_thread(cfg.consumer_cpu) {
+        eprintln!("recording_ab_bench: FATAL: --consumer-cpu: {e}");
+        return ExitCode::FAILURE;
+    }
     let freq = measure_freq_ghz_x1000();
 
     eprintln!(

@@ -196,40 +196,6 @@ P2_DUR_STR=$(format_duration_ms "$P2_DUR_MS")
 ok "Phase 2 passed (${P2_DUR_STR})"
 emit "PHASE2: PASS log=target/logs/quick-phase2.log"
 
-# ── Phase 3: PipeWire Live Integration (release, daemon probe) ───────────────
-P3_START=$(date +%s%N)
-phase "PipeWire Live Integration (release)..."
-echo -e "  Checking PipeWire daemon..."
-if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
-    echo -e "  ${GREEN}PipeWire detected.${NC} Executing live integration tests..."
-    # Besides the pw_integration lifecycle, the service-resilience subprocess
-    # acceptances (real SIGTERM WAV finalization + double-signal _exit(1))
-    # join the live phase — real signals against the compiled binary.
-    timeout 120 cargo test --features testing --release \
-        --test pw_integration \
-        --test service_resilience \
-        -- --ignored --test-threads=1 --nocapture \
-        2>&1 | tee target/logs/quick-phase3.log
-    assert_ran_tests target/logs/quick-phase3.log 1
-    assert_ran_target target/logs/quick-phase3.log "tests/pw_integration.rs" \
-        || die "Phase 3 mandatory target 'tests/pw_integration.rs' failed its execution gate."
-    assert_ran_target target/logs/quick-phase3.log "tests/service_resilience.rs" \
-        || die "Phase 3 mandatory target 'tests/service_resilience.rs' failed its execution gate."
-    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
-    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
-    ok "Phase 3 passed (${P3_DUR_STR})"
-    emit "PHASE3: PASS log=target/logs/quick-phase3.log"
-    emit "LIVE_PW=RAN"
-else
-    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
-    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
-    GAPS+=("pw_integration:daemon_unavailable")
-    echo -e "${YELLOW}${BOLD}WARN GAP: pw_integration:daemon_unavailable — PipeWire daemon not reachable (pw-cli info 0 timed out or failed); live integration test SKIPPED (${P3_DUR_STR}).${NC}"
-    emit "PHASE3: SKIP reason=daemon_unavailable"
-    emit "LIVE_PW=SKIP"
-fi
-
-# ── Phase 4: Recording io_uring capability (release, --ignored) ──────────────
 # Native Rust probe (src/bin/io_uring_probe.rs) — no python3 dependency. The
 # probe maps to exit codes: 0 = available, 1 = kernel_unsupported,
 # 2 = probe_tool_missing. Each is surfaced distinctly so a missing interpreter
@@ -254,6 +220,86 @@ io_uring_probe() {
     return "$rc"
 }
 
+# ── Phase 3: PipeWire Live Integration (release, daemon probe) ───────────────
+P3_START=$(date +%s%N)
+phase "PipeWire Live Integration (release)..."
+echo -e "  Checking PipeWire daemon..."
+if timeout 5 pw-cli info 0 > /dev/null 2>&1; then
+    echo -e "  ${GREEN}PipeWire detected.${NC}"
+    echo -e "  Checking companion tools (pw-play, io_uring)..."
+    if command -v pw-play >/dev/null 2>&1; then
+        echo -e "  ${GREEN}pw-play available.${NC}"
+    else
+        echo -e "  ${YELLOW}Notice: pw-play not found in PATH (sigterm_acceptance will skip).${NC}"
+    fi
+    if io_uring_probe >/dev/null 2>&1; then
+        echo -e "  ${GREEN}io_uring available.${NC}"
+    else
+        echo -e "  ${YELLOW}Notice: io_uring unavailable (${IO_URING_STATUS}; sigterm_acceptance will skip).${NC}"
+    fi
+    echo -e "  Executing live integration tests..."
+    # Besides the pw_integration lifecycle, the service-resilience subprocess
+    # acceptances (real SIGTERM WAV finalization + double-signal _exit(1))
+    # join the live phase — real signals against the compiled binary.
+    timeout 120 cargo test --features testing --release \
+        --test pw_integration \
+        --test service_resilience \
+        -- --ignored --test-threads=1 --nocapture \
+        2>&1 | tee target/logs/quick-phase3.log
+    assert_ran_tests target/logs/quick-phase3.log 1
+    assert_ran_target target/logs/quick-phase3.log "tests/pw_integration.rs" \
+        || die "Phase 3 mandatory target 'tests/pw_integration.rs' failed its execution gate."
+    assert_ran_target target/logs/quick-phase3.log "tests/service_resilience.rs" \
+        || die "Phase 3 mandatory target 'tests/service_resilience.rs' failed its execution gate."
+    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
+    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
+
+    # Inspect target/logs/quick-phase3.log for sigterm_acceptance and double_signal results:
+    # A skip in sigterm acceptance or double_signal must NEVER be certified as LIVE_PW=RAN.
+    sigterm_skips=$(grep -oP 'TEST_RESULT\[sigterm_acceptance\]=SKIP:[a-z_]+' target/logs/quick-phase3.log | sort -u || true)
+    double_signal_skips=$(grep -oP 'TEST_RESULT\[double_signal\]=SKIP:[a-z_]+' target/logs/quick-phase3.log | sort -u || true)
+    if [ -n "$sigterm_skips" ] || [ -n "$double_signal_skips" ]; then
+        first_reason=""
+        if [ -n "$sigterm_skips" ]; then
+            while IFS= read -r marker; do
+                [ -z "$marker" ] && continue
+                skip_reason="${marker#*=SKIP:}"
+                [ -z "$first_reason" ] && first_reason="sigterm_acceptance_${skip_reason}"
+                GAPS+=("sigterm_acceptance:$skip_reason")
+                echo -e "${YELLOW}${BOLD}WARN GAP: sigterm_acceptance:$skip_reason — sigterm acceptance test SKIPPED (${P3_DUR_STR}).${NC}"
+            done <<< "$sigterm_skips"
+        fi
+        if [ -n "$double_signal_skips" ]; then
+            while IFS= read -r marker; do
+                [ -z "$marker" ] && continue
+                skip_reason="${marker#*=SKIP:}"
+                [ -z "$first_reason" ] && first_reason="double_signal_${skip_reason}"
+                GAPS+=("double_signal:$skip_reason")
+                echo -e "${YELLOW}${BOLD}WARN GAP: double_signal:$skip_reason — double_signal acceptance test SKIPPED (${P3_DUR_STR}).${NC}"
+            done <<< "$double_signal_skips"
+        fi
+        emit "PHASE3: SKIP reason=${first_reason}"
+        emit "LIVE_PW=SKIP"
+    else
+        pass_count=$(grep -c -F "TEST_RESULT[sigterm_acceptance]=PASS" target/logs/quick-phase3.log || true)
+        if [ "$pass_count" -ge 2 ]; then
+            ok "Phase 3 passed (${P3_DUR_STR})"
+            emit "PHASE3: PASS log=target/logs/quick-phase3.log"
+            emit "LIVE_PW=RAN"
+        else
+            die "Phase 3: sigterm_acceptance produced neither >= 2 PASS markers (got $pass_count) nor typed SKIP markers — tests removed, renamed, or failed prematurely?"
+        fi
+    fi
+else
+    P3_DUR_MS=$(( ($(date +%s%N) - P3_START) / 1000000 ))
+    P3_DUR_STR=$(format_duration_ms "$P3_DUR_MS")
+    GAPS+=("pw_integration:daemon_unavailable")
+    echo -e "${YELLOW}${BOLD}WARN GAP: pw_integration:daemon_unavailable — PipeWire daemon not reachable (pw-cli info 0 timed out or failed); live integration test SKIPPED (${P3_DUR_STR}).${NC}"
+    emit "PHASE3: SKIP reason=daemon_unavailable"
+    emit "LIVE_PW=SKIP"
+fi
+
+# ── Phase 4: Recording io_uring capability (release, --ignored) ──────────────
 P4_START=$(date +%s%N)
 phase "Recording io_uring capability (release, --ignored)..."
 if io_uring_probe; then

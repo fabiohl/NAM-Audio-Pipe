@@ -69,6 +69,10 @@ impl ChildGuard {
         self.child.as_ref().expect("child present").id() as i32
     }
 
+    fn id(&self) -> u32 {
+        self.child.as_ref().expect("child present").id()
+    }
+
     /// Polls the child without blocking: `Some` once it has exited (the status
     /// is cached by the OS, so repeated polls and a later [`Self::wait`] are
     /// all consistent).
@@ -392,15 +396,15 @@ fn assert_valid_finalized_wav(path: &std::path::Path, expect_silence: bool) {
 #[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-quick Phase 3"]
 fn sigterm_subprocess_finalizes_wav_gracefully() {
     if !common::probe_pipewire_daemon() {
-        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
         return;
     }
     if !common::pw_play_available() {
-        eprintln!("SKIP: pw-play unavailable; cannot drive the capture sink deterministically.");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable");
         return;
     }
     if probe_io_uring() != IoUringSupport::Available {
-        eprintln!("SKIP: io_uring unavailable; --record cannot start.");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:io_uring_unavailable");
         return;
     }
 
@@ -422,7 +426,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
     // (same fail-closed discipline as pw_integration: a daemon loss here is a
     // defect, not a skip — the probe above already gated on the daemon).
     assert!(
-        common::wait_for_nam_sink(Duration::from_secs(10)),
+        common::wait_for_nam_sink_pid(Duration::from_secs(10), child.id()),
         "host capture sink never registered; stderr:\n{}",
         read_child_stderr(&stderr_path)
     );
@@ -452,6 +456,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
 
     // The WAV the child finalized while handling the signal must be complete.
     assert_valid_finalized_wav(&wav_path, false);
+    eprintln!("TEST_RESULT[sigterm_acceptance]=PASS");
 }
 
 /// Spawns `nam-audio-pipe --record --gate off` under live PipeWire, drives the
@@ -461,15 +466,15 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
 #[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-quick Phase 3"]
 fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
     if !common::probe_pipewire_daemon() {
-        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
         return;
     }
     if !common::pw_play_available() {
-        eprintln!("SKIP: pw-play unavailable; cannot drive the capture sink deterministically.");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable");
         return;
     }
     if probe_io_uring() != IoUringSupport::Available {
-        eprintln!("SKIP: io_uring unavailable; --record cannot start.");
+        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:io_uring_unavailable");
         return;
     }
 
@@ -488,7 +493,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
     let (mut child, stderr_path) = spawn_host(&["--record", "--gate", "off"], &dir);
 
     assert!(
-        common::wait_for_nam_sink(Duration::from_secs(10)),
+        common::wait_for_nam_sink_pid(Duration::from_secs(10), child.id()),
         "host capture sink never registered; stderr:\n{}",
         read_child_stderr(&stderr_path)
     );
@@ -515,6 +520,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
 
     // Under --gate off, the WAV is finalized cleanly and validates regardless of silence content.
     assert_valid_finalized_wav(&wav_path, true);
+    eprintln!("TEST_RESULT[sigterm_acceptance]=PASS");
 }
 
 // ---------------------------------------------------------------------------
@@ -538,6 +544,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
 #[ignore = "requires a running PipeWire daemon; runs in tests-quick Phase 3"]
 fn double_signal_force_exits_via_exit1() {
     if !common::probe_pipewire_daemon() {
+        eprintln!("TEST_RESULT[double_signal]=SKIP:daemon_unavailable");
         eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
         return;
     }
@@ -557,7 +564,7 @@ fn double_signal_force_exits_via_exit1() {
         // registered) so the signals are handled cooperatively, not by the
         // default SIGTERM disposition.
         assert!(
-            common::wait_for_nam_sink(Duration::from_secs(10)),
+            common::wait_for_nam_sink_pid(Duration::from_secs(10), child.id()),
             "attempt {attempt}: host capture sink never registered; stderr:\n{}",
             read_child_stderr(&stderr_path)
         );
@@ -1098,5 +1105,90 @@ fn stream_error_observable_and_shutdown_within_sla() {
         backend2.state(),
         BackendState::Running,
         "a successful reconnection must return the backend to Running"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. PipeWire node PID discrimination (simulated dual instances)
+// ---------------------------------------------------------------------------
+
+/// Simulated dual instances in `pw-dump` output: proves that
+/// `parse_nam_sink_in_dump` discriminates between different PIDs when multiple
+/// `NAM-Audio-Pipe-input` nodes coexist (e.g. a user's running daemon instance
+/// and an automated test instance).
+#[test]
+fn nam_sink_pid_discrimination_simulated_dual_instances() {
+    let mock_pw_dump = r#"[
+      {
+        "id": 42,
+        "type": "PipeWire:Interface:Node",
+        "version": 3,
+        "permissions": ["r", "w", "x", "m"],
+        "info": {
+          "max-input-ports": 2,
+          "max-output-ports": 0,
+          "props": {
+            "node.name": "NAM-Audio-Pipe-input",
+            "media.class": "Audio/Sink",
+            "application.process.id": 12345
+          }
+        }
+      },
+      {
+        "id": 43,
+        "type": "PipeWire:Interface:Node",
+        "version": 3,
+        "permissions": ["r", "w", "x", "m"],
+        "info": {
+          "max-input-ports": 2,
+          "max-output-ports": 0,
+          "props": {
+            "node.name": "NAM-Audio-Pipe-input",
+            "media.class": "Audio/Sink",
+            "application.process.id": "67890"
+          }
+        }
+      },
+      {
+        "id": 44,
+        "type": "PipeWire:Interface:Node",
+        "version": 3,
+        "permissions": ["r", "w", "x", "m"],
+        "info": {
+          "max-input-ports": 0,
+          "max-output-ports": 2,
+          "props": {
+            "node.name": "other-node",
+            "media.class": "Audio/Source",
+            "application.process.id": 99999
+          }
+        }
+      }
+    ]"#;
+
+    let bytes = mock_pw_dump.as_bytes();
+
+    // Matching specific PIDs
+    assert!(
+        common::parse_nam_sink_in_dump(bytes, Some(12345)),
+        "must match PID 12345 (integer JSON)"
+    );
+    assert!(
+        common::parse_nam_sink_in_dump(bytes, Some(67890)),
+        "must match PID 67890 (string JSON)"
+    );
+    assert!(
+        !common::parse_nam_sink_in_dump(bytes, Some(11111)),
+        "must reject non-existent PID"
+    );
+    assert!(
+        !common::parse_nam_sink_in_dump(bytes, Some(99999)),
+        "must reject non-matching node name even with matching PID"
+    );
+
+    // Matching any without target_pid
+    assert!(
+        common::parse_nam_sink_in_dump(bytes, None),
+        "must match any when target_pid is None"
     );
 }

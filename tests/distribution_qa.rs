@@ -422,6 +422,7 @@ WARN: SKIP: io_uring unsupported on this kernel
 }
 
 /// (b) Positive: a typed `TEST_RESULT[record_e2e]=SKIP:daemon_unavailable`
+/// (b) Positive: a typed `TEST_RESULT[record_e2e]=SKIP:daemon_unavailable`
 /// marker (the Phase 4 contract) is a *documented* skip and must not be
 /// misclassified as untyped.
 #[test]
@@ -436,6 +437,26 @@ TEST_RESULT[record_e2e]=SKIP:daemon_unavailable
         "typed TEST_RESULT[...]=SKIP: marker must not be flagged as untyped"
     );
     assert_eq!(validate_typed_receipt(log, &["tests/recording.rs"]), Ok(()));
+}
+
+/// (b) Positive: a typed `TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable`
+/// marker (the Phase 3 contract) is a *documented* skip and must not be
+/// misclassified as untyped.
+#[test]
+fn receipt_validator_accepts_sigterm_acceptance_typed_skip() {
+    let log = "\
+Running tests/service_resilience.rs (target/debug/deps/srv-abc123)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable
+";
+    assert!(
+        untyped_skip_markers(log).is_empty(),
+        "typed TEST_RESULT[sigterm_acceptance]=SKIP: marker must not be flagged as untyped"
+    );
+    assert_eq!(
+        validate_typed_receipt(log, &["tests/service_resilience.rs"]),
+        Ok(())
+    );
 }
 
 // ---------------------------------------------------------------------------

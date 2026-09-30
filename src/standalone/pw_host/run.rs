@@ -245,6 +245,11 @@ pub fn run_pipewire_host(
     // re-opens the retry storm for a generation that already failed.
     let mut rebuild_failures = handlers::RebuildFailureTracker::default();
 
+    // Finding F-RB-101: latch guard protecting against spurious `state_changed(Unconnected)`
+    // events emitted synchronously by `pw_stream_destroy()` during teardown and reconnection.
+    // Lives outside the `'host` loop so it covers stream destruction across loop iterations.
+    let mut teardown_guard: Option<super::status::TeardownGuard<'_>> = None;
+
     // =========================================================
     // 4. HOST INSTANCE LOOP (one per bounded-reconnect attempt)
     // =========================================================
@@ -262,6 +267,10 @@ pub fn run_pipewire_host(
         rt_state.thread_configured = false;
 
         // 4.1 PIPEWIRE LOOP INITIALIZATION (fresh per attempt)
+        // SAFETY: `pipewire::init()` is called once in `main()` before entering this host loop.
+        // `identity::PW_THREAD_LOOP_NAME` is a valid null-terminated static string slice.
+        // `ThreadLoopBox::new` wraps `pw_thread_loop_new`; the returned loop is stopped via
+        // `thread_loop.stop()` and dropped at instance teardown.
         let thread_loop = unsafe {
             pipewire::thread_loop::ThreadLoopBox::new(Some(identity::PW_THREAD_LOOP_NAME), None)
         }?;
@@ -378,11 +387,15 @@ pub fn run_pipewire_host(
         };
 
         let _app_state = AppState {
-            capture_stream,
             capture_listener,
-            playback_stream,
+            capture_stream,
             playback_listener,
+            playback_stream,
         };
+
+        // All new streams for this instance are constructed and initialized.
+        // We can safely release the teardown guard from any previous iteration.
+        drop(teardown_guard.take());
 
         let _cpu_dma_lock = rt_setup::lock_cpu_c_states();
 
@@ -489,6 +502,10 @@ pub fn run_pipewire_host(
                 &sys,
                 was_silent,
                 was_fading,
+                // SAFETY: `bridge_ptr` points to the static `DspBridge` allocation created
+                // by `allocate_dsp_bridge()`, valid for the entire process duration.
+                // `poll_rt_status` only invokes `bridge.drain_dropped_frames()`, which reads and
+                // swaps an `AtomicU64` field without racing with concurrent audio buffer access.
                 unsafe { &*(bridge_ptr.as_ptr()) },
                 &mut poll_state,
             );
@@ -536,6 +553,9 @@ pub fn run_pipewire_host(
         // =========================================================
         // 6. INSTANCE TEARDOWN (per attempt)
         // =========================================================
+        // F-RB-101: Enter teardown BEFORE stopping the thread loop and destroying streams.
+        teardown_guard = Some(backend_status.enter_teardown());
+
         // Ordering invariant (R-13): stop the audio loop FIRST so the RT callback
         // releases its `&mut` access to the recording producer (single-writer
         // SPSC contract). Only after `thread_loop.stop()` returns — which waits for
@@ -545,6 +565,9 @@ pub fn run_pipewire_host(
 
         // Invalidates/advances the DSP bridge to zero so a reconnected instance
         // begins strictly in silence.
+        // SAFETY: Sound because `thread_loop.stop()` immediately preceding this call
+        // guarantees that the PipeWire loop thread is stopped and no RT Writer/Reader
+        // is alive or accessing the bridge. The main thread is the sole owner of `bridge_ptr`.
         unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
 
         // R-04: single-owner handoff — the loop thread has stopped, so the RT
@@ -565,6 +588,11 @@ pub fn run_pipewire_host(
                 "nam-audio-pipe: instance GC drain released {final_drained} item(s) off-RT (R-04)"
             );
         }
+
+        // F-RB-102 & F-RB-101: Explicitly drop the streams under the teardown guard.
+        // Listeners are dropped before streams (F-RB-102), and any synchronous
+        // `Unconnected` transitions are discarded by `observe_stream_state` (F-RB-101).
+        drop(_app_state);
 
         // 6.1 Reconnect decision
         match instance_failure {

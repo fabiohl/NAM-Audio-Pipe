@@ -549,7 +549,9 @@ pub(super) fn handle_cabsim_rebuild(
         }
         Err(e) => {
             log::error!(
-                "Failed to rebuild Cab-sim IR ({} -> {} Hz, partition={}): {e:#} — bypassing cab-sim",
+                "[E4103 | CABSIM_BUILD_FAILED] Failed to rebuild Cab-sim IR ({} -> {} Hz, partition={}): {e:#} \
+                 — bypassing cab-sim. The engine will run without cabinet simulation until a \
+                 successful rebuild or the IR is cleared.",
                 ir_source_rate,
                 target_host_rate,
                 partition_size,

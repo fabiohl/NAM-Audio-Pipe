@@ -249,7 +249,10 @@ fn control_barrier_preserves_fifo_position_and_slot_ownership() {
     let mut a = producer.try_acquire().unwrap();
     a.block_mut().fill_planar(&[1.0], &[2.0]);
     assert!(a.publish());
-    assert!(producer.try_push_barrier(), "barrier push is capacity-safe");
+    assert!(
+        producer.try_push_barrier(42),
+        "barrier push is capacity-safe"
+    );
     let mut b = producer.try_acquire().unwrap();
     b.block_mut().fill_planar(&[3.0], &[4.0]);
     assert!(b.publish());
@@ -262,8 +265,9 @@ fn control_barrier_preserves_fifo_position_and_slot_ownership() {
 
     let barrier = consumer.try_pop().expect("barrier");
     assert!(barrier.is_barrier(), "the marker must surface as a barrier");
+    assert_eq!(barrier.barrier_seq(), 42);
     assert_eq!(barrier.descriptor().slot, CONTROL_BARRIER_SLOT);
-    assert_eq!(barrier.descriptor().valid_len, 0);
+    assert_eq!(barrier.descriptor().valid_len, 42);
     assert!(barrier.release(), "barrier release is a no-op success");
 
     let b = consumer.try_pop().expect("audio B");
@@ -289,4 +293,141 @@ fn barrier_slot_is_outside_the_free_ring_domain() {
         drained.iter().all(|&idx| idx != CONTROL_BARRIER_SLOT),
         "0xFFFF must never be handed out as a slot index"
     );
+}
+
+/// Backpressure on pure audio: work ring holds all N audio descriptors without
+/// consumer popping, verifying zero slot leaks and full recovery upon drain.
+#[test]
+fn pool_work_ring_backpressure() {
+    let pool = RecordingPool::<POOL_CAPACITY>::new();
+    let (mut producer, mut consumer) = pool.split();
+
+    for i in 0..POOL_CAPACITY {
+        let mut slot = producer
+            .try_acquire()
+            .unwrap_or_else(|| panic!("slot {i} must be free"));
+        slot.block_mut().fill_planar(&[i as f32], &[-1.0]);
+        assert!(slot.publish(), "publish must succeed for slot {i}");
+    }
+    assert!(producer.try_acquire().is_none(), "all slots in flight");
+    assert_eq!(producer.leaked_slots(), 0);
+
+    let mut drained_count = 0;
+    while let Some(in_flight) = consumer.try_pop() {
+        assert!(!in_flight.is_barrier());
+        assert!(in_flight.release());
+        drained_count += 1;
+    }
+    assert_eq!(drained_count, POOL_CAPACITY);
+    assert_eq!(producer.free_available(), POOL_CAPACITY);
+    assert_eq!(producer.drain_free_for_check().len(), POOL_CAPACITY);
+    assert_eq!(producer.leaked_slots(), 0);
+}
+
+/// Adversarial stress test (Finding F-RB-106):
+/// The work ring contains metadata barriers plus audio descriptors. Verifies
+/// that publishing audio never fails structurally due to work ring capacity,
+/// eliminating the permanent slot leak bug.
+#[test]
+fn pool_work_ring_with_barrier_backpressure() {
+    // 1. Stress scenario: 1 barrier + (N-1) audio descriptors in work ring.
+    // Under the old bug (work ring capacity == N), pushing 1 barrier consumed
+    // the slot needed by the N-th audio block, causing the last slot's publish()
+    // to fail and permanently leak. With work ring capacity N + CONTROL_CAPACITY,
+    // publishing the N-th slot must succeed infallibly.
+    let pool = RecordingPool::<POOL_CAPACITY>::new();
+    let (mut producer, mut consumer) = pool.split();
+
+    // Push initial metadata barrier (present at recording session start)
+    assert!(
+        producer.try_push_barrier(1),
+        "barrier push must succeed in fresh work ring"
+    );
+
+    // Acquire and publish N - 1 audio descriptors
+    for i in 0..(POOL_CAPACITY - 1) {
+        let mut slot = producer
+            .try_acquire()
+            .unwrap_or_else(|| panic!("slot {i} must be free"));
+        slot.block_mut().fill_planar(&[i as f32], &[0.0]);
+        assert!(slot.publish(), "publish must succeed for slot {i}");
+    }
+
+    // Acquire the final (N-th) slot from the free ring
+    let mut last_slot = producer
+        .try_acquire()
+        .expect("final slot must be acquirable from free ring");
+    last_slot.block_mut().fill_planar(&[999.0], &[999.0]);
+
+    // Publish of the N-th slot MUST succeed despite the barrier in flight
+    assert!(
+        last_slot.publish(),
+        "publish must succeed even when work ring already holds 1 barrier + (N-1) audio"
+    );
+    assert_eq!(
+        producer.leaked_slots(),
+        0,
+        "zero slot leaks under adversarial barrier + audio saturation"
+    );
+
+    // Free ring is now fully exhausted
+    assert!(producer.try_acquire().is_none());
+
+    // Consumer drains all N audio blocks + 1 barrier
+    let mut audio_seen = 0;
+    let mut barrier_seen = 0;
+    while let Some(in_flight) = consumer.try_pop() {
+        if in_flight.is_barrier() {
+            barrier_seen += 1;
+        } else {
+            audio_seen += 1;
+        }
+        assert!(in_flight.release());
+    }
+
+    assert_eq!(barrier_seen, 1);
+    assert_eq!(audio_seen, POOL_CAPACITY);
+    assert_eq!(producer.free_available(), POOL_CAPACITY);
+    assert_eq!(producer.drain_free_for_check().len(), POOL_CAPACITY);
+    assert_eq!(producer.leaked_slots(), 0);
+
+    // 2. Worst-case boundary: all CONTROL_CAPACITY barriers concurrently pending
+    // plus all N pool slots acquired and published.
+    let pool_max = RecordingPool::<POOL_CAPACITY>::new();
+    let (mut prod_max, mut cons_max) = pool_max.split();
+
+    for seq in 0..CONTROL_CAPACITY {
+        assert!(
+            prod_max.try_push_barrier(seq as u16),
+            "up to CONTROL_CAPACITY barriers must fit in work ring"
+        );
+    }
+    for i in 0..POOL_CAPACITY {
+        let mut slot = prod_max
+            .try_acquire()
+            .unwrap_or_else(|| panic!("slot {i} must be free"));
+        slot.block_mut().fill_planar(&[i as f32], &[0.0]);
+        assert!(
+            slot.publish(),
+            "publish must succeed even with all CONTROL_CAPACITY barriers pending"
+        );
+    }
+    assert_eq!(prod_max.leaked_slots(), 0);
+    assert!(prod_max.try_acquire().is_none());
+
+    let mut audio_count = 0;
+    let mut barrier_count = 0;
+    while let Some(in_flight) = cons_max.try_pop() {
+        if in_flight.is_barrier() {
+            barrier_count += 1;
+        } else {
+            audio_count += 1;
+        }
+        assert!(in_flight.release());
+    }
+    assert_eq!(barrier_count, CONTROL_CAPACITY);
+    assert_eq!(audio_count, POOL_CAPACITY);
+    assert_eq!(prod_max.free_available(), POOL_CAPACITY);
+    assert_eq!(prod_max.drain_free_for_check().len(), POOL_CAPACITY);
+    assert_eq!(prod_max.leaked_slots(), 0);
 }

@@ -26,6 +26,24 @@ impl Drop for ShutdownRestore {
 }
 
 static TEST_STATUS_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+type PanicHookFn = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+type ArcPanicHookFn = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+/// RAII guard that restores the previous panic hook upon drop, ensuring
+/// test isolation even if an assertion or unexpected unwind occurs.
+struct PanicHookGuard {
+    prev: Option<PanicHookFn>,
+}
+
+impl Drop for PanicHookGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            std::panic::set_hook(prev);
+        }
+    }
+}
 
 /// Initializes the global `NamLogger` once per test binary (idempotent) so the
 /// disconnect tests can assert the log level of the disconnect records.
@@ -105,7 +123,6 @@ fn mark_failed_is_sticky_and_exposes_detail() {
 }
 
 #[test]
-#[cfg(feature = "testing")]
 fn observe_rt_panic_transitions_backend_to_failed() {
     // A panic contained inside an RT callback (the capture
     // and playback `process` closures run under `run_rt_callback_body`) raises
@@ -151,6 +168,180 @@ fn observe_rt_panic_transitions_backend_to_failed() {
             "rt_callback",
             "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)".to_string()
         ))
+    );
+}
+
+#[test]
+fn repeated_rt_panic_invocations_execute_hook_exactly_once() {
+    // Finding F-RB-105 / Task [T3.3]:
+    // After an initial panic contained by catch_unwind in `run_rt_callback_body`,
+    // the PipeWire data loop continues to invoke the `process()` RT callback at
+    // every audio quantum until the main control loop observes
+    // `RT_STATUS_PANIC_CAPTURED` (≤100 ms) and stops the thread loop.
+    //
+    // Without the early latch check, every subsequent quantum would re-execute
+    // the callback body, trigger a new panic, and run the panic hook
+    // (with filesystem operations/fsync) repeatedly inside the SCHED_FIFO thread.
+    //
+    // This test installs an instrumented panic hook with an atomic execution
+    // counter, injects a panic into the RT callback, and simulates 50 subsequent
+    // callback invocations before the control loop observes the latch, plus 10
+    // invocations while thread_loop.stop() is in-flight.
+    //
+    // Invariant: the panic hook executes EXACTLY ONCE, all subsequent callback
+    // invocations return `false` without executing their body, and
+    // `observe_rt_panic` successfully transitions the backend to `Failed`.
+    use crate::standalone::pw_host::rt_callback::{RT_STATUS_PANIC_CAPTURED, run_rt_callback_body};
+    use std::sync::atomic::AtomicUsize;
+
+    let _hook_lock = PANIC_HOOK_TEST_LOCK.lock().unwrap();
+
+    let hook_executions = Arc::new(AtomicUsize::new(0));
+    let hook_executions_cb = Arc::clone(&hook_executions);
+
+    let prev_hook: ArcPanicHookFn = Arc::from(std::panic::take_hook());
+    let prev_for_guard = Arc::clone(&prev_hook);
+    let prev_for_hook = Arc::clone(&prev_hook);
+
+    let _guard = PanicHookGuard {
+        prev: Some(Box::new(move |info| prev_for_guard(info))),
+    };
+
+    std::panic::set_hook(Box::new(move |info| {
+        let is_target_panic = info
+            .payload()
+            .downcast_ref::<&str>()
+            .is_some_and(|&s| s == "injected RT callback repeated panic test")
+            || info
+                .payload()
+                .downcast_ref::<String>()
+                .is_some_and(|s| s == "injected RT callback repeated panic test");
+
+        if is_target_panic {
+            hook_executions_cb.fetch_add(1, Ordering::SeqCst);
+        } else {
+            prev_for_hook(info);
+        }
+    }));
+
+    let rt = Arc::new(RtStatusFlags::default());
+    let backend = SharedBackendStatus::with_rt_status(Arc::clone(&rt));
+    let body_executions = Arc::new(AtomicUsize::new(0));
+
+    // Phase 1: Pre-conditions — clean starting state.
+    assert!(!backend.is_failed());
+    assert_eq!(backend.state(), BackendState::Starting);
+    assert!(!observe_rt_panic(&rt, &backend));
+    assert_eq!(hook_executions.load(Ordering::SeqCst), 0);
+    assert_eq!(body_executions.load(Ordering::SeqCst), 0);
+
+    // Phase 2: First quantum — an unexpected panic occurs in the RT callback.
+    let body_exec_clone = Arc::clone(&body_executions);
+    let ok1 = run_rt_callback_body(
+        &rt,
+        std::panic::AssertUnwindSafe(|| {
+            body_exec_clone.fetch_add(1, Ordering::SeqCst);
+            panic!("injected RT callback repeated panic test");
+        }),
+    );
+    assert!(!ok1, "panicking RT callback must report failure");
+    assert!(
+        rt.check_flag(RT_STATUS_PANIC_CAPTURED),
+        "panic must latch RT_STATUS_PANIC_CAPTURED"
+    );
+    assert_eq!(
+        body_executions.load(Ordering::SeqCst),
+        1,
+        "callback body must have executed once"
+    );
+    assert_eq!(
+        hook_executions.load(Ordering::SeqCst),
+        1,
+        "panic hook must have executed once on initial panic"
+    );
+
+    // Phase 3: Simulate 50 subsequent audio quanta arriving before the control
+    // loop observation window fires (e.g. 50 × 2.6 ms ≈ 130 ms of quanta).
+    // In all subsequent invocations, the early latch check MUST suppress
+    // the callback body, preventing repeat panics and repeat hook runs.
+    const SUBSEQUENT_QUANTA: usize = 50;
+    for q in 1..=SUBSEQUENT_QUANTA {
+        let body_exec_clone = Arc::clone(&body_executions);
+        let ok = run_rt_callback_body(
+            &rt,
+            std::panic::AssertUnwindSafe(|| {
+                body_exec_clone.fetch_add(1, Ordering::SeqCst);
+                panic!("injected RT callback repeated panic test");
+            }),
+        );
+        assert!(!ok, "subsequent quantum #{q} must return false");
+    }
+
+    assert_eq!(
+        body_executions.load(Ordering::SeqCst),
+        1,
+        "callback body must NOT re-execute during subsequent quanta"
+    );
+    assert_eq!(
+        hook_executions.load(Ordering::SeqCst),
+        1,
+        "panic hook must NOT re-execute during subsequent quanta"
+    );
+
+    // Phase 4: Control loop polling tick (<100 ms) observes the fatal latch.
+    assert!(
+        observe_rt_panic(&rt, &backend),
+        "observe_rt_panic must detect RT_STATUS_PANIC_CAPTURED"
+    );
+    assert!(
+        backend.is_failed(),
+        "backend must transition to Failed state"
+    );
+    assert_eq!(
+        backend.state(),
+        BackendState::Failed {
+            stream: "rt_callback",
+            reason: "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)".into(),
+        }
+    );
+    assert_eq!(
+        backend.failure(),
+        Some((
+            "rt_callback",
+            "panic captured in an RT callback closure (contained — no abort, ordered teardown follows)".to_string()
+        ))
+    );
+
+    // Phase 5: Additional quanta arriving while thread_loop.stop() is in-flight.
+    for q in 1..=10 {
+        let body_exec_clone = Arc::clone(&body_executions);
+        let ok = run_rt_callback_body(
+            &rt,
+            std::panic::AssertUnwindSafe(|| {
+                body_exec_clone.fetch_add(1, Ordering::SeqCst);
+                panic!("injected RT callback repeated panic test");
+            }),
+        );
+        assert!(!ok, "post-observation quantum #{q} must return false");
+    }
+
+    // Phase 6: Subsequent control loop poll ticks remain stable.
+    assert!(
+        observe_rt_panic(&rt, &backend),
+        "observe_rt_panic remains true on sticky latch"
+    );
+    assert!(backend.is_failed());
+
+    // Final invariant assertions:
+    assert_eq!(
+        hook_executions.load(Ordering::SeqCst),
+        1,
+        "panic hook must execute EXACTLY ONCE despite 61 callback invocations"
+    );
+    assert_eq!(
+        body_executions.load(Ordering::SeqCst),
+        1,
+        "callback body must execute EXACTLY ONCE despite 61 callback invocations"
     );
 }
 
@@ -771,4 +962,104 @@ fn wakeup_notifies_on_state_transitions() {
     assert_eq!(backend_arc.state(), BackendState::Running);
 
     handle.join().unwrap();
+}
+
+#[test]
+fn teardown_guard_sets_and_clears_latch() {
+    let backend = SharedBackendStatus::new();
+    assert!(!backend.is_teardown_in_progress());
+
+    {
+        let _guard = backend.enter_teardown();
+        assert!(backend.is_teardown_in_progress());
+    }
+    assert!(!backend.is_teardown_in_progress());
+
+    // Panic unwinding safety: guard must clear the latch even if a panic unwinds.
+    let backend_arc = Arc::new(SharedBackendStatus::new());
+    let b_clone = backend_arc.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = b_clone.enter_teardown();
+        assert!(b_clone.is_teardown_in_progress());
+        panic!("simulated panic inside teardown");
+    }));
+    assert!(result.is_err());
+    assert!(!backend_arc.is_teardown_in_progress());
+}
+
+#[test]
+fn observe_unconnected_during_teardown_is_ignored_and_does_not_mark_failed() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(false, Ordering::Release);
+
+    let backend = SharedBackendStatus::new();
+    backend.mark_running();
+
+    // With teardown latch raised:
+    let guard = backend.enter_teardown();
+    assert!(backend.is_teardown_in_progress());
+
+    // Stream disconnects (e.g. peer stream destroyed during teardown/reconnect)
+    observe_stream_state(
+        "playback",
+        StreamState::Streaming,
+        StreamState::Unconnected,
+        &backend,
+    );
+
+    // Finding F-RB-101: must NOT mark the backend as failed!
+    assert!(
+        !backend.is_failed(),
+        "teardown in progress must suppress spurious Unconnected failure"
+    );
+    assert_eq!(backend.failure(), None);
+
+    drop(guard);
+    assert!(!backend.is_teardown_in_progress());
+
+    // Contrast: without teardown latch, an unexpected Unconnected disconnect marks failed
+    observe_stream_state(
+        "playback",
+        StreamState::Streaming,
+        StreamState::Unconnected,
+        &backend,
+    );
+    assert!(
+        backend.is_failed(),
+        "disconnect outside teardown/shutdown must mark failed"
+    );
+    assert!(backend.failure().is_some());
+}
+
+#[test]
+fn observe_error_during_teardown_still_marks_failed() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
+    let _shutdown = ShutdownRestore::capture();
+    SHUTDOWN.store(false, Ordering::Release);
+
+    let backend = SharedBackendStatus::new();
+    let _guard = backend.enter_teardown();
+
+    // Rollback / safety invariant: a genuine StreamState::Error must never be
+    // suppressed by the teardown latch.
+    observe_stream_state(
+        "capture",
+        StreamState::Streaming,
+        StreamState::Error("fatal hardware failure".into()),
+        &backend,
+    );
+
+    assert!(
+        backend.is_failed(),
+        "StreamState::Error must always mark failed even during teardown"
+    );
+    assert_eq!(
+        backend.failure(),
+        Some(("capture", "fatal hardware failure".to_string()))
+    );
 }

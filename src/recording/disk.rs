@@ -547,6 +547,51 @@ async fn disk_writer_loop_inner<S: WavSink>(
 /// descriptors can arrive once it is consumed; the stop handler still drains
 /// every pending descriptor (audio or barrier) before finalizing — no block
 /// published before the stop can be orphaned.
+/// Applies metadata corresponding to a pool control barrier.
+///
+/// Uses RFC 1982 serial arithmetic to discard older superseded metadata (e.g. from
+/// rapidly aborted rate changes whose barrier was never confirmed) and applies the
+/// exact sequence match. Future metadata is left untouched in the ring.
+async fn handle_control_barrier<S: WavSink>(
+    sink: &S,
+    wav_writer: &mut Option<S::Writer>,
+    part_counter: &mut u32,
+    status: &SharedRecordingStatus,
+    control: &mut Consumer<ControlPayload>,
+    barrier_seq: u16,
+) -> Result<()> {
+    while let Ok(head) = control.peek() {
+        match head {
+            ControlPayload::Metadata { seq, .. } => {
+                let seq = *seq;
+                let diff = barrier_seq.wrapping_sub(seq);
+                if diff == 0 {
+                    if let Ok(ControlPayload::Metadata { meta, .. }) = control.pop() {
+                        open_new_part(sink, wav_writer, part_counter, status, meta).await?;
+                    }
+                    return Ok(());
+                } else if diff < 0x8000 {
+                    log::debug!(
+                        "Discarding superseded metadata seq {seq} (waiting for barrier {barrier_seq})"
+                    );
+                    let _ = control.pop();
+                } else {
+                    log::warn!(
+                        "Barrier seq {barrier_seq} precedes head metadata seq {seq}; skipping barrier"
+                    );
+                    return Ok(());
+                }
+            }
+            ControlPayload::StreamStop => {
+                log::warn!("Encountered StreamStop while processing barrier seq {barrier_seq}");
+                return Ok(());
+            }
+        }
+    }
+    log::warn!("Barrier seq {barrier_seq} had no matching metadata in control ring");
+    Ok(())
+}
+
 async fn disk_writer_loop_pool<S: WavSink>(
     sink: &S,
     control: &mut Consumer<ControlPayload>,
@@ -561,13 +606,17 @@ async fn disk_writer_loop_pool<S: WavSink>(
         // 1. Audio pool first — drains in strict FIFO order.
         if let Some(in_flight) = pool.try_pop() {
             if in_flight.is_barrier() {
-                // A control barrier: the RT pushed a Metadata into the control
-                // ring just before this marker — apply it at this stream
-                // position. (StreamStop cannot be here: it is pushed only
-                // after the RT stopped and all barriers were already emitted.)
-                if let Ok(ControlPayload::Metadata(meta)) = control.pop() {
-                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
-                }
+                // A control barrier: apply metadata matching this barrier's sequence number
+                // at this exact stream position.
+                handle_control_barrier(
+                    sink,
+                    &mut wav_writer,
+                    &mut part_counter,
+                    status,
+                    control,
+                    in_flight.barrier_seq(),
+                )
+                .await?;
             } else {
                 write_block_with_overflow_rollover(
                     sink,
@@ -582,32 +631,29 @@ async fn disk_writer_loop_pool<S: WavSink>(
             continue;
         }
 
-        // 2. Pool drained: consume orphan control messages — a metadata whose
-        // barrier push failed while the pool was exhausted (audio publication
-        // was suspended until it was confirmed, so applying it now is still
-        // positionally correct), or the terminal StreamStop.
-        if let Ok(ctrl) = control.pop() {
-            match ctrl {
-                ControlPayload::Metadata(meta) => {
-                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
-                }
+        // 2. Pool drained: check control ring.
+        // Terminal StreamStop is consumed here once the pool is empty.
+        // Unconfirmed orphan metadata whose barrier was never published (e.g. dropped/abandoned)
+        // is discarded if the producers are disconnected.
+        if let Ok(head) = control.peek() {
+            match head {
                 ControlPayload::StreamStop => {
+                    let _ = control.pop();
                     // Terminal condition (1): the token is consumed only after
                     // the RT loop stopped (`thread_loop.stop()`), so no further
                     // audio can be produced. Drain any descriptor that raced
                     // in (audio or barrier), then finalize and exit.
                     while let Some(in_flight) = pool.try_pop() {
                         if in_flight.is_barrier() {
-                            if let Ok(ControlPayload::Metadata(meta)) = control.pop() {
-                                open_new_part(
-                                    sink,
-                                    &mut wav_writer,
-                                    &mut part_counter,
-                                    status,
-                                    meta,
-                                )
-                                .await?;
-                            }
+                            handle_control_barrier(
+                                sink,
+                                &mut wav_writer,
+                                &mut part_counter,
+                                status,
+                                control,
+                                in_flight.barrier_seq(),
+                            )
+                            .await?;
                         } else {
                             write_block_with_overflow_rollover(
                                 sink,
@@ -620,6 +666,14 @@ async fn disk_writer_loop_pool<S: WavSink>(
                         }
                         in_flight.release();
                     }
+                    // Discard any remaining unconfirmed orphan metadata in control ring
+                    while let Ok(ctrl) = control.pop() {
+                        if let ControlPayload::Metadata { seq, .. } = ctrl {
+                            log::debug!(
+                                "Discarding unconfirmed orphan metadata seq {seq} on StreamStop"
+                            );
+                        }
+                    }
                     if let Some(mut writer) = wav_writer.take() {
                         writer
                             .finalize()
@@ -629,11 +683,22 @@ async fn disk_writer_loop_pool<S: WavSink>(
                             "⏹️  Audio source stopped. WAV file safely closed and ready for use.",
                         );
                     }
-                    report_overruns();
+                    report_overruns(pool.leaked_slots());
                     break;
                 }
+                ControlPayload::Metadata { seq, .. } => {
+                    let seq = *seq;
+                    if pool.work_is_abandoned() && control.is_abandoned() {
+                        // Transport abandoned and pool empty: discard unconfirmed orphan metadata
+                        let _ = control.pop();
+                        log::debug!(
+                            "Discarding unconfirmed orphan metadata seq {seq} on abandoned transport"
+                        );
+                        continue;
+                    }
+                    // Producer is still alive: wait for the barrier in the pool work ring.
+                }
             }
-            continue;
         }
 
         // 3. Terminal condition (2): both producers were dropped AND both
@@ -652,7 +717,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                     .context("Failed to finalize WAV file after recording producer was dropped")?;
                 log::info!("⏹️  Recording producer disconnected; capture finalized.");
             }
-            report_overruns();
+            report_overruns(pool.leaked_slots());
             break;
         }
 
@@ -706,7 +771,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
                             "⏹️  Audio source stopped. WAV file safely closed and ready for use.",
                         );
                     }
-                    report_overruns();
+                    report_overruns(0);
                     break;
                 }
             }
@@ -722,7 +787,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
                     .context("Failed to finalize WAV file after recording producer was dropped")?;
                 log::info!("⏹️  Recording producer disconnected; capture finalized.");
             }
-            report_overruns();
+            report_overruns(0);
             break;
         } else {
             // Check hint flag before sleeping to reduce unnecessary poll latency.
@@ -824,16 +889,17 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
 }
 
 /// Logs a warning if the RT producer reported ring overruns (audio loss),
-/// reporting both the lost block count and the lost frame count so the user can
-/// reconcile `frames_captured == frames_enqueued + frames_lost`.
-fn report_overruns() {
+/// reporting the lost block count, lost frame count, and leaked pool slots so
+/// the user can reconcile `frames_captured == frames_enqueued + frames_lost`.
+fn report_overruns(leaked_slots: u64) {
     let blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
     let frames = OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed);
-    if blocks > 0 || frames > 0 {
+    if blocks > 0 || frames > 0 || leaked_slots > 0 {
         log::warn!(
-            "⚠️  lost blocks: {} (frames: {}) — possible audio drop.",
+            "⚠️  lost blocks: {} (frames: {}, leaked pool slots: {}) — possible audio drop.",
             blocks,
-            frames
+            frames,
+            leaked_slots
         );
     }
 }

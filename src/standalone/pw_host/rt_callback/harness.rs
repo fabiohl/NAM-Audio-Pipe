@@ -334,34 +334,32 @@ impl SwapRtSide {
         let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
 
         // 3. Budgeted drains in production order.
-        drain_resamplers(
-            self.state
-                .resampler_drain
-                .as_mut()
-                .expect("resampler drain wired in the harness constructor"),
-            &mut budget,
-            &mut self.state.resampler,
-            &mut self.state.stream,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
+        if let Some(resampler_drain) = self.state.resampler_drain.as_mut() {
+            drain_resamplers(
+                resampler_drain,
+                &mut budget,
+                &mut self.state.resampler,
+                &mut self.state.stream,
+                &rt_status,
+                &mut self.gc_producer,
+                &mut self.parking_lot,
+                &self.parking_lot_dirty,
+                &self.gc_overflow,
+            );
+        }
 
-        drain_cabsims(
-            self.state
-                .cabsim_drain
-                .as_mut()
-                .expect("cabsim drain wired in the harness constructor"),
-            &mut budget,
-            &mut self.state.active_cabsim,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
+        if let Some(cabsim_drain) = self.state.cabsim_drain.as_mut() {
+            drain_cabsims(
+                cabsim_drain,
+                &mut budget,
+                &mut self.state.active_cabsim,
+                &rt_status,
+                &mut self.gc_producer,
+                &mut self.parking_lot,
+                &self.parking_lot_dirty,
+                &self.gc_overflow,
+            );
+        }
 
         let (param_changed, _param_pops) = receive_commands(
             &mut self.param_consumer,
@@ -512,20 +510,19 @@ impl SwapRtSide {
             .resampler_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        drain_resamplers(
-            self.state
-                .resampler_drain
-                .as_mut()
-                .expect("resampler drain wired in the harness constructor"),
-            &mut budget,
-            &mut self.state.resampler,
-            &mut self.state.stream,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
+        if let Some(resampler_drain) = self.state.resampler_drain.as_mut() {
+            drain_resamplers(
+                resampler_drain,
+                &mut budget,
+                &mut self.state.resampler,
+                &mut self.state.stream,
+                &rt_status,
+                &mut self.gc_producer,
+                &mut self.parking_lot,
+                &self.parking_lot_dirty,
+                &self.gc_overflow,
+            );
+        }
         let resamp_after = self
             .state
             .resampler_drain
@@ -537,19 +534,18 @@ impl SwapRtSide {
             .cabsim_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
-        drain_cabsims(
-            self.state
-                .cabsim_drain
-                .as_mut()
-                .expect("cabsim drain wired in the harness constructor"),
-            &mut budget,
-            &mut self.state.active_cabsim,
-            &rt_status,
-            &mut self.gc_producer,
-            &mut self.parking_lot,
-            &self.parking_lot_dirty,
-            &self.gc_overflow,
-        );
+        if let Some(cabsim_drain) = self.state.cabsim_drain.as_mut() {
+            drain_cabsims(
+                cabsim_drain,
+                &mut budget,
+                &mut self.state.active_cabsim,
+                &rt_status,
+                &mut self.gc_producer,
+                &mut self.parking_lot,
+                &self.parking_lot_dirty,
+                &self.gc_overflow,
+            );
+        }
         let cabsim_after = self
             .state
             .cabsim_drain
@@ -711,8 +707,9 @@ impl SwapRtSide {
         // SAFETY: `self.bridge` is owned by the RT side and outlives this call;
         // the writer is used only within `capture_dsp_pipeline` below.
         let bridge_ref = unsafe { BridgeRef::new(&mut *self.bridge as *mut DspBridge) };
-        let writer = DspBridgeWriter::from_ref(bridge_ref)
-            .expect("harness bridge pointer is non-null by construction");
+        let Some(writer) = DspBridgeWriter::from_ref(bridge_ref) else {
+            return 0;
+        };
 
         let conv_pair = self
             .state

@@ -20,12 +20,21 @@
 pub fn detect_hardware_sink() -> Option<String> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-    let child = std::process::Command::new("pw-metadata")
+    let child = match std::process::Command::new("pw-metadata")
         .args(["-n", "default", "0", "default.audio.sink"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
+    {
+        Ok(child) => child,
+        Err(e) => {
+            log::warn!(
+                "[E2113 | HW_SINK_PROBE_FAILED] detect_hardware_sink: Failed to spawn pw-metadata ({e}) — \
+                 skipping default sink detection (WirePlumber will decide routing)."
+            );
+            return None;
+        }
+    };
 
     let output = collect_child_output_with_watchdog(child, TIMEOUT)?;
     parse_sink_name_from_metadata(&output.stdout)
@@ -73,14 +82,20 @@ pub(crate) fn collect_child_output_with_watchdog(
                     std::thread::sleep(std::time::Duration::from_millis(5));
                 }
                 log::warn!(
-                    "detect_hardware_sink: pw-metadata did not respond within {}ms — \
+                    "[E2114 | HW_SINK_PROBE_TIMEOUT] detect_hardware_sink: pw-metadata did not respond within {}ms — \
                      skipping default sink detection (WirePlumber will decide routing).",
                     timeout.as_millis()
                 );
                 return None;
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(5)),
-            Err(_) => return None,
+            Err(e) => {
+                log::warn!(
+                    "[E2113 | HW_SINK_PROBE_FAILED] detect_hardware_sink: Failed to query pw-metadata child status ({e}) — \
+                     skipping default sink detection (WirePlumber will decide routing)."
+                );
+                return None;
+            }
         }
     };
 
@@ -141,15 +156,20 @@ pub fn lock_cpu_c_states() -> Option<std::fs::File> {
                 log::info!("⚡ PM QoS Lock: Deep CPU C-States disabled (Zero DMA Latency).");
                 return Some(file);
             }
-            log::warn!("PM QoS: Failed to write to /dev/cpu_dma_latency.");
+            log::warn!(
+                "[E2111 | PM_QOS_WRITE_FAILED] PM QoS: Failed to write zero-latency request to \
+                 /dev/cpu_dma_latency — C-state deep sleep prevention is inactive. \
+                 Audio latency jitter from CPU power transitions may occur."
+            );
             None
         }
         Err(e) => {
             // Often fails if write permission is missing or the file does not exist.
             log::warn!(
-                "PM QoS: Access denied to /dev/cpu_dma_latency ({}). \
-                 Consider creating a udev rule for the 'audio' group.",
-                e
+                "[E2112 | PM_QOS_ACCESS_DENIED] PM QoS: Access denied to /dev/cpu_dma_latency ({e}). \
+                 Deep CPU C-State prevention is inactive — audio latency jitter from CPU power \
+                 transitions may occur. \
+                 Consider creating a udev rule for the 'audio' group."
             );
             None
         }

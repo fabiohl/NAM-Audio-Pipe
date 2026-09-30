@@ -20,8 +20,20 @@ use crate::recording::buffer::AudioMetadata;
 /// `"unknown"` if the system clock cannot be read.
 pub fn current_capture_timestamp() -> String {
     let mut t: libc::time_t = 0;
-    unsafe { libc::time(&mut t) };
+    // SAFETY: `libc::time` writes the current calendar time into the supplied pointer `&mut t`.
+    // The pointer points to a valid, properly aligned stack variable.
+    let time_ret = unsafe { libc::time(&mut t) };
+    if time_ret == -1 {
+        return "unknown".to_string();
+    }
+
+    // SAFETY: `libc::tm` consists of plain C integer fields on Linux; zero-initializing
+    // it via `std::mem::zeroed()` produces a valid memory representation before `localtime_r`.
     let mut tm_buf: libc::tm = unsafe { std::mem::zeroed() };
+
+    // SAFETY: `localtime_r` is the reentrant thread-safe variant of `localtime`.
+    // It reads `&t` and writes into the caller-provided buffer `&mut tm_buf`.
+    // Both references are valid and properly aligned stack storage.
     let tm = unsafe { libc::localtime_r(&t, &mut tm_buf) };
 
     if tm.is_null() {

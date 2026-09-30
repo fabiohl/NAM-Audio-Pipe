@@ -647,9 +647,9 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
                 // Scope the producer borrows so they are released before the
                 // pushes below re-borrow `sender`.
                 let (control_prod, pool_prod) = match &mut sender {
-                    crate::recording::transport::RecordingSender::Pool { control, pool } => {
-                        (control.as_mut().unwrap(), pool.as_mut().unwrap())
-                    }
+                    crate::recording::transport::RecordingSender::Pool {
+                        control, pool, ..
+                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
                     crate::recording::transport::RecordingSender::Inline(_) => {
                         panic!("pool transport expected")
                     }
@@ -732,6 +732,89 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
                 1,
                 "finalize must fsync exactly once"
             );
+        })
+        .await;
+}
+
+/// Acceptance — sequence-paired barrier discard.
+///
+/// Scenario: A rapid rate change leaves an unconfirmed Metadata in the control
+/// ring (seq 1, 44.1 kHz). The second rate change succeeds with barrier (seq 2, 48 kHz).
+/// The worker must discard seq 1 as superseded, pair with seq 2, and write a
+/// single WAV file with 48 kHz header without corrupting rate or creating a spurious split.
+#[tokio::test(flavor = "current_thread")]
+async fn barrier_pairing_discards_superseded_metadata() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let sink = MockWavSink::default();
+            let disks_handle = Arc::clone(&sink.disks);
+            let worker = tokio::task::spawn_local(async move {
+                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+            });
+
+            {
+                let (control_prod, pool_prod) = match &mut sender {
+                    crate::recording::transport::RecordingSender::Pool {
+                        control, pool, ..
+                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
+                    crate::recording::transport::RecordingSender::Inline(_) => {
+                        panic!("pool expected")
+                    }
+                };
+                let meta1 = AudioMetadata {
+                    sample_rate: 44100.0,
+                    bit_depth: 32,
+                    channels: 2,
+                };
+                let meta2 = AudioMetadata {
+                    sample_rate: 48000.0,
+                    bit_depth: 32,
+                    channels: 2,
+                };
+                // Push superseded metadata (seq 1)
+                assert!(
+                    control_prod
+                        .push(crate::recording::buffer::ControlPayload::Metadata {
+                            seq: 1,
+                            meta: meta1,
+                        })
+                        .is_ok()
+                );
+                // Push active metadata (seq 2)
+                assert!(
+                    control_prod
+                        .push(crate::recording::buffer::ControlPayload::Metadata {
+                            seq: 2,
+                            meta: meta2,
+                        })
+                        .is_ok()
+                );
+                // Push barrier for seq 2 only
+                assert!(pool_prod.try_push_barrier(2));
+            }
+
+            // Push audio block
+            assert!(sender.try_push_audio(&[1.0], &[1.0]));
+
+            // Terminate stream
+            assert!(sender.try_push_stream_stop());
+            drop(sender);
+
+            let res = worker.await.unwrap();
+            assert!(res.is_ok(), "worker completed successfully: {res:?}");
+
+            let disks = disks_handle.lock().unwrap();
+            assert_eq!(
+                disks.len(),
+                1,
+                "stale metadata must not create a spurious file split"
+            );
+            let wav_bytes = disks[0].bytes.lock().unwrap();
+            let sr = u32::from_le_bytes(wav_bytes[24..28].try_into().unwrap());
+            assert_eq!(sr, 48000, "WAV header must have active rate 48000 Hz");
         })
         .await;
 }

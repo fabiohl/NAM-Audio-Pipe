@@ -45,11 +45,16 @@ fn push_stream_stop_succeeds_when_capacity_frees() {
     let mut sender = RecordingSender::Pool {
         control: Some(control_p),
         pool: None,
+        pending_barrier: None,
+        next_seq: 1,
     };
     sender
         .control_producer_mut()
         .unwrap()
-        .push(ControlPayload::Metadata(dummy_meta()))
+        .push(ControlPayload::Metadata {
+            seq: 1,
+            meta: dummy_meta(),
+        })
         .unwrap();
 
     let handle = std::thread::spawn(move || {
@@ -69,11 +74,16 @@ fn push_stream_stop_times_out_when_ring_stays_full() {
     let mut sender = RecordingSender::Pool {
         control: Some(control_p),
         pool: None,
+        pending_barrier: None,
+        next_seq: 1,
     };
     sender
         .control_producer_mut()
         .unwrap()
-        .push(ControlPayload::Metadata(dummy_meta()))
+        .push(ControlPayload::Metadata {
+            seq: 1,
+            meta: dummy_meta(),
+        })
         .unwrap();
 
     let start = std::time::Instant::now();
@@ -323,6 +333,53 @@ fn shutdown_reports_success_with_loss_when_overruns_were_counted() {
     });
 }
 
+/// A clean join where a pool slot was leaked (acquired and dropped without
+/// publishing, e.g. on publish() == false or pool work ring backpressure) must surface
+/// as `SuccessWithLoss` — never as a pristine `Success` — and the exit code must be non-zero.
+#[test]
+fn shutdown_reports_success_with_loss_when_pool_slot_was_leaked() {
+    with_zeroed_overruns(|| {
+        let (mut sender, receiver) = create_recording_transport();
+        let exit_reason = Arc::new(AtomicU8::new(0));
+
+        // Acquire a slot from the pool and drop it without publishing:
+        // this simulates slot leak / publish failure.
+        if let RecordingSender::Pool { pool, .. } = &mut sender {
+            let slot = pool.as_mut().unwrap().try_acquire().unwrap();
+            drop(slot);
+        } else {
+            panic!("expected pool transport");
+        }
+
+        assert_eq!(sender.leaked_slots(), 1);
+
+        let worker = spawn_mock_recording_worker(receiver, Arc::clone(&exit_reason));
+        let guard = RecordingWorkerGuard::new(worker, Some(sender), None);
+        assert_eq!(guard.leaked_slots(), 1);
+
+        let outcome = guard.shutdown();
+
+        assert_eq!(
+            outcome,
+            RecordingWorkerOutcome::SuccessWithLoss {
+                blocks: 1,
+                frames: 0,
+            },
+            "a clean join with leaked pool slots must become SuccessWithLoss"
+        );
+        assert_eq!(
+            outcome.exit_code(),
+            1,
+            "SuccessWithLoss must map to a non-zero exit"
+        );
+        assert_eq!(
+            exit_reason.load(Ordering::Acquire),
+            1,
+            "worker must terminate on the StreamStop token"
+        );
+    });
+}
+
 /// A clean join with zero overruns keeps `Success` — the baseline policy is
 /// unchanged and the exit code stays 0.
 #[test]
@@ -416,7 +473,7 @@ fn sender_slot_is_a_stable_mut_slot() {
 
     match &mut receiver {
         RecordingReceiver::Pool { control, .. } => match control.pop() {
-            Ok(ControlPayload::Metadata(_)) => {}
+            Ok(ControlPayload::Metadata { .. }) => {}
             other => panic!("expected the pushed metadata, got {other:?}"),
         },
         RecordingReceiver::Inline(_) => panic!("pool transport expected"),

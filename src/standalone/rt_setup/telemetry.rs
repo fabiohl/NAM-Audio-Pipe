@@ -224,7 +224,9 @@ pub fn poll_rt_status(
         .observe(slimmable_slice_failed)
     {
         log::error!(
-            "WaveNet slimmable slice_channels rebuild failed — model may run in reduced state."
+            "[E3103 | SLIMMABLE_SLICE_FAILED] WaveNet slimmable slice_channels rebuild failed — \
+             model may run in reduced state. Check that the active channel count is within the \
+             model's supported slimmable range."
         );
     }
 
@@ -236,7 +238,11 @@ pub fn poll_rt_status(
         .slimmable_reset_failed
         .observe(slimmable_reset_failed)
     {
-        log::error!("ContainerModel submodel reset failed — model may run in previous state.");
+        log::error!(
+            "[E3104 | SLIMMABLE_RESET_FAILED] ContainerModel submodel reset failed — \
+             model may run in previous state. This is a transient RT signal; if persistent, \
+             check model graph integrity."
+        );
     }
 
     // 2. RATE CHANGE (Sample Rate):
@@ -330,7 +336,7 @@ pub fn poll_rt_status(
     } else if aff_err > 0 {
         log::error!(
             "\n  ⚡ Failed to set CPU affinity to core {} (errno={}).\n  💡 NAM-Audio-Pipe will continue running, but may suffer jitter due to Core Migration.\n\
-             [E2301 | CPU_AFFINITY_FAILED] cpu={} errno={}\n",
+             [E2306 | CPU_AFFINITY_FAILED] cpu={} errno={}\n",
             target_cpu,
             aff_err,
             target_cpu,

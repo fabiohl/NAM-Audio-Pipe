@@ -39,6 +39,7 @@ fn validate_built_pod_rejects_null_and_out_of_bounds_pointers() {
 
     // One-past-the-end is outside the storage -> rejected.
     let base = storage.as_slice().as_ptr();
+    // SAFETY: pointer offset is exactly one past the end of the allocated slice, which is valid to construct.
     let one_past_end = unsafe { base.add(storage.as_slice().len()) }.cast();
     assert!(validate_built_pod(&storage, one_past_end).is_none());
 }
@@ -100,6 +101,7 @@ fn chunk_of(offset: u32, size: u32) -> pw::spa::sys::spa_chunk {
 }
 
 fn fill_bytes(buf: &mut [f32], byte: u8) {
+    // SAFETY: Reinterpreting an aligned `&mut [f32]` slice as `&mut [u8]` of length `buf.len() * 4`.
     let bytes: &mut [u8] =
         unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4) };
     bytes.fill(byte);
@@ -620,6 +622,7 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
     );
 
     // Samples past MAX_BRIDGE_BUF must remain untouched
+    // SAFETY: pointer points into the remaining 1024 samples of `l` (total size MAX_BRIDGE_BUF + 1024), which is valid for reading 1024 * 4 bytes.
     let trailing_l = unsafe {
         std::slice::from_raw_parts(
             (l.as_ptr() as usize + MAX_BRIDGE_BUF * 4) as *const u8,
@@ -631,6 +634,7 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
         "trailing memory past MAX_BRIDGE_BUF must not be touched"
     );
 
+    // SAFETY: pointer points into the remaining 1024 samples of `r` (total size MAX_BRIDGE_BUF + 1024), which is valid for reading 1024 * 4 bytes.
     let trailing_r = unsafe {
         std::slice::from_raw_parts(
             (r.as_ptr() as usize + MAX_BRIDGE_BUF * 4) as *const u8,
@@ -659,6 +663,7 @@ fn playback_bridge_starvation_rejects_oversized_silence_window() {
     let stream_status = StreamStatusFlags::new();
 
     let oversized = (MAX_BRIDGE_BUF + 1) * std::mem::size_of::<f32>();
+    // SAFETY: `l`/`r` are aligned writable vectors and `chunk_l`/`chunk_r` are valid local structs; oversized silence window is rejected fail-closed.
     let frames = unsafe {
         deliver_silence_pair_fail_closed(
             l.as_ptr() as usize,
@@ -930,5 +935,55 @@ fn negotiated_rate_mismatch_detects_discrepant_streams() {
         negotiated_rate_mismatch(&stream_status),
         Some((48_000, 44_100)),
         "discrepant negotiated rates must be reported"
+    );
+}
+
+#[test]
+fn app_state_drop_order_drops_listeners_before_streams() {
+    use std::sync::Mutex;
+
+    struct DropTracker<'a> {
+        name: &'static str,
+        log: &'a Mutex<Vec<&'static str>>,
+    }
+
+    impl Drop for DropTracker<'_> {
+        fn drop(&mut self) {
+            self.log.lock().unwrap().push(self.name);
+        }
+    }
+
+    let log = Mutex::new(Vec::new());
+    {
+        let _app_state = AppState {
+            capture_listener: DropTracker {
+                name: "capture_listener",
+                log: &log,
+            },
+            capture_stream: DropTracker {
+                name: "capture_stream",
+                log: &log,
+            },
+            playback_listener: DropTracker {
+                name: "playback_listener",
+                log: &log,
+            },
+            playback_stream: DropTracker {
+                name: "playback_stream",
+                log: &log,
+            },
+        };
+    }
+
+    let drops = log.into_inner().unwrap();
+    assert_eq!(
+        drops,
+        vec![
+            "capture_listener",
+            "capture_stream",
+            "playback_listener",
+            "playback_stream",
+        ],
+        "AppState drop order MUST drop listeners before their associated streams to prevent use-after-free (F-RB-102)"
     );
 }

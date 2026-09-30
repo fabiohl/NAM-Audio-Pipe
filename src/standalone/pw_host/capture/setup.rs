@@ -11,7 +11,9 @@ use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::SharedBackendStatus;
 use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
 use crate::standalone::rt_setup;
-use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
+use neural_amp_modeler_rs::common::spsc::{
+    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags,
+};
 use neural_amp_modeler_rs::dsp::pipeline::{
     BridgeRef, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF, StreamingDspBuffers,
 };
@@ -23,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Assembles PipeWire property attributes for the capture Virtual Sink node.
 pub fn create_capture_properties(buffer_size: u32) -> pw::properties::PropertiesBox {
+    let pid_str = std::process::id().to_string();
     let mut capture_props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
         *pw::keys::MEDIA_CATEGORY => "Duplex",
@@ -36,6 +39,7 @@ pub fn create_capture_properties(buffer_size: u32) -> pw::properties::Properties
         "audio.position" => "FL,FR",
         "node.group" => crate::standalone::pw_host::identity::PW_NODE_GROUP,
         "node.link-group" => crate::standalone::pw_host::identity::PW_LINK_GROUP,
+        "application.process.id" => pid_str.as_str(),
     };
 
     if buffer_size > 0 {
@@ -213,11 +217,12 @@ pub fn setup_capture_stream<'c>(
                         rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK,
                     );
 
+                    let Some(resampler_drain) = state.resampler_drain.as_mut() else {
+                        rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+                        return;
+                    };
                     rt_callback::drain_resamplers(
-                        state
-                            .resampler_drain
-                            .as_mut()
-                            .expect("resampler drain wired in run_pipewire_host"),
+                        resampler_drain,
                         &mut budget,
                         &mut state.resampler,
                         &mut state.stream,
@@ -228,11 +233,12 @@ pub fn setup_capture_stream<'c>(
                         &channels.gc_overflow,
                     );
 
+                    let Some(cabsim_drain) = state.cabsim_drain.as_mut() else {
+                        rt_status_for_process.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
+                        return;
+                    };
                     rt_callback::drain_cabsims(
-                        state
-                            .cabsim_drain
-                            .as_mut()
-                            .expect("cabsim drain wired in run_pipewire_host"),
+                        cabsim_drain,
                         &mut budget,
                         &mut state.active_cabsim,
                         &rt_status_for_process,
@@ -515,9 +521,7 @@ fn cabsim_partition_to_request(
     active: Option<&neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair>,
     policy: usize,
 ) -> usize {
-    active
-        .map(|pair| pair.partition_size())
-        .unwrap_or(policy)
+    active.map(|pair| pair.partition_size()).unwrap_or(policy)
 }
 
 /// Decides whether a cab-sim rebuild must be requested.

@@ -122,9 +122,62 @@ fn graph_has_media_class(media_class: &str) -> bool {
     text.contains(&format!("\"media.class\": \"{media_class}\""))
 }
 
+/// Helper that checks whether a node from `pw-dump` represents the NAM-Audio-Pipe
+/// capture sink node, optionally matching a specific `application.process.id`.
+pub fn parse_nam_sink_in_dump(dump_bytes: &[u8], target_pid: Option<u32>) -> bool {
+    if let Ok(serde_json::Value::Array(items)) =
+        serde_json::from_slice::<serde_json::Value>(dump_bytes)
+    {
+        for item in &items {
+            let is_node =
+                item.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Node");
+            let props = item.get("info").and_then(|i| i.get("props"));
+            let name = props
+                .and_then(|p| p.get("node.name"))
+                .and_then(|n| n.as_str());
+
+            if is_node && name == Some("NAM-Audio-Pipe-input") {
+                if let Some(expected_pid) = target_pid {
+                    let pid_match = props
+                        .and_then(|p| p.get("application.process.id"))
+                        .and_then(|p| {
+                            p.as_u64()
+                                .map(|v| v as u32)
+                                .or_else(|| p.as_str().and_then(|s| s.parse::<u32>().ok()))
+                        });
+                    if pid_match == Some(expected_pid) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+        }
+    }
+    // Fallback when target_pid is None and JSON parse was unavailable:
+    if target_pid.is_none() {
+        let text = String::from_utf8_lossy(dump_bytes);
+        text.contains("\"node.name\": \"NAM-Audio-Pipe-input\"")
+    } else {
+        false
+    }
+}
+
 /// Whether the NAM-Audio-Pipe capture sink node is currently registered in the
 /// graph — i.e. the host reconnected and its fresh `Audio/Sink` is live.
 pub fn graph_has_nam_sink() -> bool {
+    graph_has_nam_sink_matching(None)
+}
+
+/// Whether the NAM-Audio-Pipe capture sink node belonging to `target_pid` is
+/// currently registered in the graph.
+pub fn graph_has_nam_sink_pid(target_pid: u32) -> bool {
+    graph_has_nam_sink_matching(Some(target_pid))
+}
+
+/// Matches NAM-Audio-Pipe capture sink node in live `pw-dump`, optionally matching
+/// a specific target PID (`application.process.id`).
+pub fn graph_has_nam_sink_matching(target_pid: Option<u32>) -> bool {
     let Ok(out) = std::process::Command::new("pw-dump")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -132,16 +185,27 @@ pub fn graph_has_nam_sink() -> bool {
     else {
         return false;
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    text.contains("\"node.name\": \"NAM-Audio-Pipe-input\"")
+    parse_nam_sink_in_dump(&out.stdout, target_pid)
 }
 
 /// Waits until the NAM-Audio-Pipe capture sink node is registered in the
 /// graph (the host reconnected after a daemon bounce).
 pub fn wait_for_nam_sink(timeout: std::time::Duration) -> bool {
+    wait_for_nam_sink_matching(timeout, None)
+}
+
+/// Waits until the NAM-Audio-Pipe capture sink node belonging to `pid` is
+/// registered in the graph.
+pub fn wait_for_nam_sink_pid(timeout: std::time::Duration, pid: u32) -> bool {
+    wait_for_nam_sink_matching(timeout, Some(pid))
+}
+
+/// Waits until the NAM-Audio-Pipe capture sink node matching `target_pid`
+/// is registered in the graph.
+pub fn wait_for_nam_sink_matching(timeout: std::time::Duration, target_pid: Option<u32>) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if graph_has_nam_sink() {
+        if graph_has_nam_sink_matching(target_pid) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -317,7 +381,10 @@ pub fn spawn_ready_worker(
         "handshake must confirm the configured output directory"
     );
     match &*status.lock().unwrap() {
-        RecordingStatus::Active { path } => assert_eq!(path.as_path(), dir),
+        RecordingStatus::Active { path } => assert!(
+            path.as_path() == dir || path.parent() == Some(dir),
+            "status must be Active with path in configured output dir, got {path:?}"
+        ),
         other => panic!("status must be Active after the handshake, got {other:?}"),
     }
     (handle, status, failed_flag)

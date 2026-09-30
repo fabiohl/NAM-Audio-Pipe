@@ -70,20 +70,31 @@ pub struct SystemThreadConfigurator;
 
 impl ThreadConfigurator for SystemThreadConfigurator {
     fn set_daz_ftz(&self) {
+        // SAFETY: `set_daz_ftz` executes compiler intrinsics modifying the CPU's MXCSR
+        // control register to set the FTZ (Flush-To-Zero) and DAZ (Denormals-Are-Zero) bits.
+        // It is safe to invoke on x86_64 targets where SSE is guaranteed by the baseline architecture.
         unsafe {
             neural_amp_modeler_rs::math::common::set_daz_ftz();
         }
     }
 
     fn current_thread_id(&self) -> libc::pthread_t {
+        // SAFETY: `pthread_self` has no preconditions, never fails, and safely returns
+        // the calling thread's `pthread_t` identifier.
         unsafe { libc::pthread_self() }
     }
 
     fn set_thread_name(&self, thread_id: libc::pthread_t, name: &CStr) -> i32 {
+        // SAFETY: `pthread_setname_np` expects a valid pthread ID and a valid NUL-terminated
+        // C string with length <= 16 bytes. `name` is a Rust `&CStr` reference guaranteeing
+        // valid NUL-terminated memory for the duration of the call.
         unsafe { libc::pthread_setname_np(thread_id, name.as_ptr()) }
     }
 
     fn set_thread_affinity(&self, thread_id: libc::pthread_t, cpuset: &libc::cpu_set_t) -> i32 {
+        // SAFETY: `pthread_setaffinity_np` reads up to `size` bytes from `cpuset`.
+        // The pointer `cpuset` is an immutable reference valid for `size_of::<libc::cpu_set_t>()`
+        // bytes of memory.
         unsafe {
             libc::pthread_setaffinity_np(thread_id, std::mem::size_of::<libc::cpu_set_t>(), cpuset)
         }
@@ -92,6 +103,8 @@ impl ThreadConfigurator for SystemThreadConfigurator {
     fn get_sched_param(&self, thread_id: libc::pthread_t) -> Result<(i32, libc::sched_param), i32> {
         let mut policy = 0i32;
         let mut param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: `pthread_getschedparam` writes into the provided mutable pointers `&mut policy`
+        // and `&mut param`. Both pointers are properly aligned stack variables valid for writes.
         let ret = unsafe { libc::pthread_getschedparam(thread_id, &mut policy, &mut param) };
         if ret == 0 {
             Ok((policy, param))
@@ -106,8 +119,12 @@ impl ThreadConfigurator for SystemThreadConfigurator {
         policy: i32,
         param: &libc::sched_param,
     ) -> i32 {
+        // SAFETY: `sched_setscheduler` sets the scheduling policy and parameters for thread ID 0
+        // (calling thread). `param` is a valid, aligned reference to `libc::sched_param`.
         let ret = unsafe { libc::sched_setscheduler(0, policy, param) };
         if ret == -1 {
+            // SAFETY: `__errno_location` returns a valid, thread-local pointer to the current
+            // thread's `errno` value. Dereferencing it is safe because `errno` is allocated per-thread.
             unsafe { *libc::__errno_location() }
         } else {
             0
@@ -115,6 +132,8 @@ impl ThreadConfigurator for SystemThreadConfigurator {
     }
 
     fn get_current_cpu(&self) -> i32 {
+        // SAFETY: `sched_getcpu` queries the current CPU core ID via vDSO/kernel syscall;
+        // it requires no pointers and has no safety invariants or preconditions.
         unsafe { libc::sched_getcpu() }
     }
 }
@@ -176,7 +195,8 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     cfg.set_daz_ftz();
 
     let thread_id = cfg.current_thread_id();
-    cfg.set_thread_name(thread_id, c"nam_pipe_dsp");
+    // Thread naming is best-effort diagnostic metadata for htop/perf; failures (e.g. permissions or length) are non-fatal.
+    let _ = cfg.set_thread_name(thread_id, c"nam_pipe_dsp");
 
     pin_thread_affinity_with(thread_id, target_cpu, rt_status, cfg);
 
@@ -227,11 +247,35 @@ pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags
     configure_realtime_thread_with(target_cpu, &rt_status, &SystemThreadConfigurator);
 }
 
+/// Error returned when pinning a thread to a CPU fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinThreadError {
+    /// CPU index is outside the supported `[0, CPU_SETSIZE)` range.
+    CpuOutOfBounds { cpu: usize, max: usize },
+    /// Kernel affinity syscall failed with an errno.
+    SyscallFailed { cpu: usize, errno: i32 },
+}
+
+impl std::fmt::Display for PinThreadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CpuOutOfBounds { cpu, max } => {
+                write!(f, "CPU index {cpu} is outside supported range [0, {max})")
+            }
+            Self::SyscallFailed { cpu, errno } => {
+                write!(f, "could not pin thread to CPU {cpu} (errno {errno})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PinThreadError {}
+
 /// Builds the `cpu_set_t` affinity mask that pins a thread to `target_cpu`.
 ///
 /// Returns `None` when `target_cpu` is outside the `[0, CPU_SETSIZE)` index
 /// range supported by `pthread_setaffinity_np`.
-pub(crate) fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set_t> {
+pub fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set_t> {
     if target_cpu >= libc::CPU_SETSIZE as usize {
         return None;
     }
@@ -252,6 +296,35 @@ pub(crate) fn build_cpu_affinity_mask(target_cpu: usize) -> Option<libc::cpu_set
     }
 
     Some(cpuset)
+}
+
+/// Pins the calling thread to `cpu` using `sched_setaffinity`.
+///
+/// - Returns `Ok(())` if `cpu` is `None` (no pinning requested) or if the affinity
+///   mask was successfully applied to the current thread.
+/// - Returns `Err(PinThreadError::CpuOutOfBounds)` if `cpu >= libc::CPU_SETSIZE`.
+/// - Returns `Err(PinThreadError::SyscallFailed)` if `sched_setaffinity` returns non-zero.
+pub fn pin_current_thread(cpu: Option<usize>) -> Result<(), PinThreadError> {
+    let Some(cpu) = cpu else {
+        return Ok(());
+    };
+    let Some(set) = build_cpu_affinity_mask(cpu) else {
+        return Err(PinThreadError::CpuOutOfBounds {
+            cpu,
+            max: libc::CPU_SETSIZE as usize,
+        });
+    };
+    // SAFETY: `set` is zeroed and populated by `build_cpu_affinity_mask`, which
+    // guarantees `cpu < libc::CPU_SETSIZE`. `sched_setaffinity` only touches
+    // the supplied mask and the calling thread (pid = 0).
+    let ret = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if ret != 0 {
+        // SAFETY: `__errno_location` returns a valid, thread-local pointer to the current
+        // thread's `errno`. Dereferencing it is safe because each thread has its own dedicated errno variable.
+        let errno = unsafe { *libc::__errno_location() };
+        return Err(PinThreadError::SyscallFailed { cpu, errno });
+    }
+    Ok(())
 }
 
 /// Builds the `cpu_set_t` affinity mask covering every CPU in `housekeeping_cpus`.

@@ -36,7 +36,8 @@
 //! non-ignored tests validate the RIFF parser itself against the pure header
 //! builder, so the harness always contributes to `cargo test --all-targets`.
 
-use nam_audio_pipe::recording::buffer::AudioMetadata;
+use nam_audio_pipe::recording::buffer::{AudioMetadata, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT};
+use nam_audio_pipe::recording::pool::POOL_CAPACITY;
 use nam_audio_pipe::recording::transport::RecordingSender;
 use nam_audio_pipe::recording::wav_header::build_wav_header;
 use nam_audio_pipe::recording::{
@@ -703,7 +704,210 @@ fn wav_metadata_change_splits_part2_byte_exact() {
     );
 }
 
+/// Combined integration test for Epic B (F-RB-103, F-RB-106, F-RB-107):
+///
+/// Exercises the combined scenario of:
+/// 1. Artificially stalled I/O (worker not draining yet) saturating the
+///    preallocated pool / work ring (`POOL_CAPACITY` blocks in flight).
+/// 2. Subsequent RT audio pushes fail due to pool exhaustion, incrementing
+///    `OVERRUN_COUNT` and `OVERRUN_FRAMES_COUNT`.
+/// 3. Sample rate renegotiation arriving during saturation (48 kHz → 96 kHz),
+///    properly sequenced behind the saturated blocks via control barrier.
+/// 4. Additional pushes at 96 kHz also rejected during saturation and counted.
+/// 5. Real `io_uring` worker is spawned and drains the saturated queue,
+///    splits the file into `_part2` at the barrier position, and persists
+///    subsequent blocks at 96 kHz cleanly.
+/// 6. Session outcome is verified to be `SuccessWithLoss` with the exact
+///    accumulated loss.
+/// 7. Both WAV files are structurally validated (`parse_riff_wav` + `hound`),
+///    proving headers (sample rate, chunk sizes, formats) are completely intact
+///    with zero corruption and zero spurious splits.
+#[test]
+#[ignore = "requires io_uring support"]
+fn stall_rate_change_pool_saturation_records_loss_and_correct_header() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let _sd = ShutdownGuard::new();
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+
+    struct OverrunResetGuard;
+    impl Drop for OverrunResetGuard {
+        fn drop(&mut self) {
+            OVERRUN_COUNT.store(0, Ordering::Relaxed);
+            OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+        }
+    }
+    let _overrun_guard = OverrunResetGuard;
+
+    // Clean slate for overrun telemetry
+    OVERRUN_COUNT.store(0, Ordering::Relaxed);
+    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+
+    const FRAMES: usize = 256;
+    let meta_48k = AudioMetadata {
+        sample_rate: 48000.0,
+        bit_depth: 32,
+        channels: 2,
+    };
+    let meta_96k = AudioMetadata {
+        sample_rate: 96000.0,
+        bit_depth: 32,
+        channels: 2,
+    };
+
+    let p1_left = vec![0.25f32; FRAMES];
+    let p1_right = vec![-0.25f32; FRAMES];
+    let p2_left = vec![0.75f32; FRAMES];
+    let p2_right = vec![-0.75f32; FRAMES];
+
+    // (a) Artificially stalled I/O: create transport, but hold off spawning
+    // the worker thread, so the consumer is completely frozen.
+    let (mut sender, receiver) = create_recording_transport();
+
+    // Push initial 48 kHz metadata (seq 0)
+    assert!(
+        sender.try_push_metadata(meta_48k),
+        "initial metadata push must succeed"
+    );
+
+    // Fill every slot in the pool (saturating the work ring with audio descriptors)
+    for i in 0..POOL_CAPACITY {
+        assert!(
+            sender.try_push_audio(&p1_left, &p1_right),
+            "block {i} must fit in pool"
+        );
+    }
+
+    // Verify the pool is 100% saturated
+    assert!(
+        !sender.try_push_audio(&p1_left, &p1_right),
+        "pool must be saturated — try_acquire must return None"
+    );
+
+    // Simulate RT audio callback attempting pushes during saturation:
+    // each push fails and is counted in OVERRUN_COUNT and OVERRUN_FRAMES_COUNT.
+    const DROPPED_48K: u64 = 8;
+    for _ in 0..DROPPED_48K {
+        assert!(!sender.try_push_audio(&p1_left, &p1_right));
+        OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        OVERRUN_FRAMES_COUNT.fetch_add(FRAMES as u64, Ordering::Relaxed);
+    }
+
+    // (b) Mid-stream sample rate renegotiation (48 kHz -> 96 kHz) arrives
+    // during saturation!
+    assert!(
+        sender.try_push_metadata(meta_96k),
+        "rate change metadata push must succeed and deposit barrier behind saturated blocks"
+    );
+
+    // Audio blocks at 96 kHz also arrive during saturation before I/O drains:
+    const DROPPED_96K: u64 = 4;
+    for _ in 0..DROPPED_96K {
+        assert!(!sender.try_push_audio(&p2_left, &p2_right));
+        OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        OVERRUN_FRAMES_COUNT.fetch_add(FRAMES as u64, Ordering::Relaxed);
+    }
+
+    // (c) Resume / start the real io_uring worker thread:
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
+
+    // Now that the worker is draining, push additional blocks at 96 kHz
+    const VALID_96K_BLOCKS: usize = 12;
+    for _ in 0..VALID_96K_BLOCKS {
+        push_block_or_retry(&mut sender, &p2_left, &p2_right);
+    }
+
+    // End session gracefully with StreamStop
+    push_stop_or_retry(&mut sender);
+
+    // (d) Finalize via guard and confirm outcome is SuccessWithLoss
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
+    let outcome = guard.shutdown();
+
+    let expected_overrun_blocks = DROPPED_48K + DROPPED_96K;
+    let expected_overrun_frames = expected_overrun_blocks * FRAMES as u64;
+    assert_eq!(
+        outcome,
+        RecordingWorkerOutcome::SuccessWithLoss {
+            blocks: expected_overrun_blocks,
+            frames: expected_overrun_frames,
+        },
+        "all dropped blocks and frames must be reported in SuccessWithLoss"
+    );
+
+    // (e) Verify capture files and structural WAV integrity
+    let files = capture_files(&dir);
+    assert_eq!(
+        files.len(),
+        2,
+        "rate change under saturation must split into exactly 2 parts (no spurious parts)"
+    );
+    assert!(
+        files[0].to_string_lossy().ends_with(".wav"),
+        "part 1 must be base capture: {}",
+        files[0].display()
+    );
+    assert!(
+        files[1].to_string_lossy().contains("_part2"),
+        "part 2 must be sequential part: {}",
+        files[1].display()
+    );
+
+    // Verify Part 1 (48 kHz, POOL_CAPACITY blocks):
+    let p1_bytes = std::fs::read(&files[0]).expect("read part 1");
+    let p1_wav = parse_riff_wav(&p1_bytes).expect("part 1 valid WAV");
+    assert_eq!(p1_wav.format_tag, 3, "IEEE float format");
+    assert_eq!(p1_wav.channels, 2);
+    assert_eq!(p1_wav.sample_rate, 48000);
+    assert_eq!(p1_wav.bits_per_sample, 32);
+    assert_eq!(p1_wav.block_align, 8);
+    assert_eq!(p1_wav.byte_rate, 48000 * 8);
+    assert_eq!(
+        p1_wav.data_size as usize,
+        POOL_CAPACITY * FRAMES * 2 * 4,
+        "part 1 must contain all saturated pool blocks"
+    );
+    let p1_samples = wav_float_samples(&p1_bytes);
+    let expected_p1_samples: Vec<f32> = (0..POOL_CAPACITY * FRAMES)
+        .flat_map(|_| [0.25f32, -0.25f32])
+        .collect();
+    assert_samples_bit_exact(&p1_samples, &expected_p1_samples, "part 1 bit-exact audio");
+
+    // Hound validation for Part 1
+    let reader1 = hound::WavReader::open(&files[0]).expect("hound opens part 1");
+    assert_eq!(reader1.spec().sample_rate, 48000);
+    assert_eq!(reader1.spec().channels, 2);
+    assert_eq!(reader1.duration() as usize, POOL_CAPACITY * FRAMES);
+
+    // Verify Part 2 (96 kHz, VALID_96K_BLOCKS blocks):
+    let p2_bytes = std::fs::read(&files[1]).expect("read part 2");
+    let p2_wav = parse_riff_wav(&p2_bytes).expect("part 2 valid WAV");
+    assert_eq!(p2_wav.format_tag, 3, "IEEE float format");
+    assert_eq!(p2_wav.channels, 2);
+    assert_eq!(p2_wav.sample_rate, 96000);
+    assert_eq!(p2_wav.bits_per_sample, 32);
+    assert_eq!(p2_wav.block_align, 8);
+    assert_eq!(p2_wav.byte_rate, 96000 * 8);
+    assert_eq!(
+        p2_wav.data_size as usize,
+        VALID_96K_BLOCKS * FRAMES * 2 * 4,
+        "part 2 must contain exactly the post-drain blocks"
+    );
+    let p2_samples = wav_float_samples(&p2_bytes);
+    let expected_p2_samples: Vec<f32> = (0..VALID_96K_BLOCKS * FRAMES)
+        .flat_map(|_| [0.75f32, -0.75f32])
+        .collect();
+    assert_samples_bit_exact(&p2_samples, &expected_p2_samples, "part 2 bit-exact audio");
+
+    // Hound validation for Part 2
+    let reader2 = hound::WavReader::open(&files[1]).expect("hound opens part 2");
+    assert_eq!(reader2.spec().sample_rate, 96000);
+    assert_eq!(reader2.spec().channels, 2);
+    assert_eq!(reader2.duration() as usize, VALID_96K_BLOCKS * FRAMES);
+}
+
 // ---------------------------------------------------------------------------
+
 // Ignored: fault injection mid-stream (EFBIG = ENOSPC-class failure)
 // ---------------------------------------------------------------------------
 

@@ -21,6 +21,8 @@ fn pool_sender_and_consumers() -> (
         RecordingSender::Pool {
             control: Some(control_p),
             pool: Some(pool_p),
+            pending_barrier: None,
+            next_seq: 1,
         },
         control_c,
         pool_c,
@@ -204,7 +206,7 @@ fn recording_metadata_confirmed_only_on_push_success() {
     assert_eq!(meta_rate, 48000);
     assert!(flag.load(Ordering::Relaxed));
     match control_c.pop().unwrap() {
-        ControlPayload::Metadata(m) => assert_eq!(m.sample_rate, 48000.0),
+        ControlPayload::Metadata { meta: m, .. } => assert_eq!(m.sample_rate, 48000.0),
         _ => panic!("expected Metadata"),
     }
 }
@@ -217,6 +219,8 @@ fn recording_metadata_not_confirmed_when_channel_full() {
     let mut sender = RecordingSender::Pool {
         control: Some(control_p),
         pool: Some(pool_p),
+        pending_barrier: None,
+        next_seq: 1,
     };
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
@@ -225,7 +229,10 @@ fn recording_metadata_not_confirmed_when_channel_full() {
     sender
         .control_producer_mut()
         .unwrap()
-        .push(ControlPayload::Metadata(dummy_meta()))
+        .push(ControlPayload::Metadata {
+            seq: 1,
+            meta: dummy_meta(),
+        })
         .unwrap();
 
     send_recording_metadata(
@@ -254,7 +261,7 @@ fn recording_metadata_not_confirmed_when_channel_full() {
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
     match control_c.pop().unwrap() {
-        ControlPayload::Metadata(m) => assert_eq!(m.sample_rate, 48000.0),
+        ControlPayload::Metadata { meta: m, .. } => assert_eq!(m.sample_rate, 48000.0),
         _ => panic!("expected Metadata"),
     }
 }
@@ -300,7 +307,7 @@ fn recording_metadata_reset_on_host_rate_change() {
     assert!(meta_sent);
     assert_eq!(meta_rate, 44100);
     match control_c.pop().unwrap() {
-        ControlPayload::Metadata(m) => assert_eq!(m.sample_rate, 44100.0),
+        ControlPayload::Metadata { meta: m, .. } => assert_eq!(m.sample_rate, 44100.0),
         _ => panic!("expected Metadata"),
     }
 }
@@ -653,6 +660,68 @@ fn recording_audio_reconciliation_enqueued_plus_lost_equals_produced() {
         "reconciliation: frames_capturados == frames_enfileirados + frames_perdidos"
     );
     assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
+
+    OVERRUN_COUNT.store(0, Ordering::Relaxed);
+    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[test]
+fn recording_audio_publish_failure_accounts_overruns_and_leaked_slots() {
+    let _guard = crate::recording::buffer::OVERRUN_COUNT_LOCK.lock().unwrap();
+    OVERRUN_COUNT.store(0, Ordering::Relaxed);
+    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+
+    const FRAMES: usize = 128;
+    let (mut sender, _control_c, _pool_c) = pool_sender_and_consumers();
+    let resamp_l = vec![0.5f32; FRAMES];
+    let resamp_r = vec![0.25f32; FRAMES];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+
+    // Satiate the pool's work_ring with sync barriers so that work_producer is full,
+    // but free slots remain available for try_acquire().
+    let pool_producer = sender.pool_producer_mut().expect("pool producer");
+    let mut barrier_seq = 1u16;
+    while pool_producer.try_push_barrier(barrier_seq) {
+        barrier_seq = barrier_seq.wrapping_add(1);
+    }
+
+    assert_eq!(sender.leaked_slots(), 0);
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 0);
+    assert_eq!(OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed), 0);
+
+    // Now send_recording_audio will:
+    // 1. try_acquire() successfully (free ring has slots).
+    // 2. fill_planar().
+    // 3. slot.publish() fails because work_producer is full.
+    // 4. cold_path: OVERRUN_COUNT += 1, OVERRUN_FRAMES_COUNT += FRAMES.
+    // 5. slot is dropped: slot_leaks was incremented by publish() failure.
+    send_recording_audio(
+        &mut sender,
+        FRAMES,
+        &resamp_l,
+        &resamp_r,
+        &mut block,
+        None,
+        None,
+    );
+
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed), FRAMES as u64);
+    assert_eq!(sender.leaked_slots(), 1);
+
+    // Verify acceptance criterion: when publish() == false occurred, the guard's
+    // shutdown outcome is promoted to SuccessWithLoss, never Success.
+    let worker = std::thread::spawn(|| Ok(()));
+    let guard = crate::recording::guard::RecordingWorkerGuard::new(worker, Some(sender), None);
+    assert_eq!(guard.leaked_slots(), 1);
+    let outcome = guard.shutdown();
+    assert_eq!(
+        outcome,
+        crate::recording::guard::RecordingWorkerOutcome::SuccessWithLoss {
+            blocks: 1,
+            frames: FRAMES as u64,
+        }
+    );
 
     OVERRUN_COUNT.store(0, Ordering::Relaxed);
     OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
@@ -1442,6 +1511,8 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
     let mut recording_sender = RecordingSender::Pool {
         control: Some(control_p),
         pool: Some(pool_p),
+        pending_barrier: None,
+        next_seq: 1,
     };
     let mut meta_sent = false;
     let mut meta_rate = 44100u32;
@@ -1464,7 +1535,10 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
         if recording_sender
             .control_producer_mut()
             .unwrap()
-            .push(ControlPayload::Metadata(dummy_meta()))
+            .push(ControlPayload::Metadata {
+                seq: 99,
+                meta: dummy_meta(),
+            })
             .is_err()
         {
             break;

@@ -37,6 +37,7 @@ fi
 
 # 2. Upgrade dependencies in Cargo.toml
 phase "Updating dependency specifications (Cargo.toml)..."
+cargo --list >/dev/null 2>&1 || die "cargo --list failed — check cargo installation"
 if cargo --list | grep -q "upgrade"; then
     if cargo upgrade --verbose; then
         STATUS_CARGO_UPGRADE="UPDATED"

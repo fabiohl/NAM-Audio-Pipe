@@ -241,7 +241,12 @@ pub fn receive_commands(
                             .fetch_add(1, Ordering::Release);
                         rt_status_for_process.set_flag_release(RT_STATUS_NEEDS_OS_REBUILD);
                     }
-                    ParamPayload::LoadModel { .. } => unreachable!("classified above"),
+                    // Defensive guard: a `LoadModel` appearing here violates the
+                    // classification invariant. Rather than panicking or dropping
+                    // on the audio thread, route its heap boxes to the GC cascade.
+                    unexpected @ ParamPayload::LoadModel { .. } => {
+                        discard_load_model(unexpected, &mut gc, rt_status_for_process);
+                    }
                 }
             }
             continue;
@@ -355,7 +360,9 @@ fn install_load_model(
         sample_rate,
     } = payload
     else {
-        unreachable!("only LoadModel reaches install_load_model");
+        // Defensive: non-LoadModel variants carry no heap allocations, so early
+        // returning drops nothing on RT and avoids panicking.
+        return;
     };
 
     if model_l.is_some() || model_r.is_some() {
@@ -405,7 +412,9 @@ fn discard_load_model(
         model_l, model_r, ..
     } = payload
     else {
-        unreachable!("only LoadModel reaches discard_load_model");
+        // Defensive: non-LoadModel variants carry no heap allocations, so early
+        // returning drops nothing on RT and avoids panicking.
+        return;
     };
     for model in [model_l, model_r].into_iter().flatten() {
         gc.retire(GcItem::Model(model));

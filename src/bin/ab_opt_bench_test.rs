@@ -29,3 +29,22 @@ fn json_emitter_escapes_and_sorts_keys() {
     ]);
     assert_eq!(v.to_json_string(), r#"{"a":1,"b":42,"c":"x\"\n","d":1.50}"#);
 }
+
+#[test]
+fn pin_thread_bounds_check() {
+    assert!(pin_thread(None).is_ok());
+    assert_eq!(
+        pin_thread(Some(libc::CPU_SETSIZE as usize)),
+        Err(PinThreadError::CpuOutOfBounds {
+            cpu: libc::CPU_SETSIZE as usize,
+            max: libc::CPU_SETSIZE as usize,
+        })
+    );
+    assert_eq!(
+        pin_thread(Some(99999)),
+        Err(PinThreadError::CpuOutOfBounds {
+            cpu: 99999,
+            max: libc::CPU_SETSIZE as usize,
+        })
+    );
+}

@@ -394,7 +394,7 @@ fn run_cell(
         (0.0f32, 0.0f32)
     };
 
-    let mut signal_offset: usize = 0;
+    let signal_offset: usize = 0;
 
     let opt_model_l = model_l;
     let opt_model_r = model_r;
@@ -435,8 +435,8 @@ fn run_cell(
             samples_l[j] = stress_signal[idx];
             samples_r[j] = stress_signal[(idx + stereo_offset) % stress_signal.len()];
         }
-        signal_offset = (signal_offset + quantum) % stress_signal.len();
-
+        // SAFETY: `bridge` is exclusively owned by this benchmarking thread; `bridge_writer`
+        // narrows writes strictly to the inactive back-buffer without concurrent reader conflicts.
         let bridge_writer = unsafe { Some(DspBridgeWriter::new(&mut *bridge as *mut DspBridge)) };
 
         let ctx = DspPipelineContext {

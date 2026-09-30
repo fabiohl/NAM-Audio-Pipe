@@ -108,9 +108,7 @@ fn accumulation_prefix(partition: usize, block: usize) -> usize {
 #[test]
 fn cabsim_partition_policy_shapes_the_rt_output_stream() {
     let block = 16usize;
-    let stimulus: Vec<f32> = (0..1024)
-        .map(|i| 0.7 * (i as f32 * 0.043).sin())
-        .collect();
+    let stimulus: Vec<f32> = (0..1024).map(|i| 0.7 * (i as f32 * 0.043).sin()).collect();
 
     // Direct FIR reference of the same IR and stimulus.
     let ir = make_ir();
@@ -209,7 +207,9 @@ fn partition_below_quantum_never_violates_contract_and_drains_tail() {
         harness.run_callback(&mut loud.clone(), &mut silence.clone(), quantum);
     }
     assert!(
-        !harness.rt_status().check_flag(RT_STATUS_CABSIM_CONTRACT_VIOLATION),
+        !harness
+            .rt_status()
+            .check_flag(RT_STATUS_CABSIM_CONTRACT_VIOLATION),
         "process_block with partition < quantum must never flag a contract violation"
     );
 
@@ -220,7 +220,10 @@ fn partition_below_quantum_never_violates_contract_and_drains_tail() {
     let mut ringout_nonsilent = false;
     for _ in 0..24 {
         harness.run_callback(&mut silence.clone(), &mut silence.clone(), quantum);
-        if harness.rt_status().check_flag(RT_STATUS_CABSIM_CONTRACT_VIOLATION) {
+        if harness
+            .rt_status()
+            .check_flag(RT_STATUS_CABSIM_CONTRACT_VIOLATION)
+        {
             panic!(
                 "gate-closed drain with quantum {quantum} > partition {partition} \
                  must never flag a contract violation"

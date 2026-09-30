@@ -92,7 +92,7 @@ mod wakeup;
 pub use output_pw::PipewireHostConfig;
 pub use run::run_pipewire_host;
 pub use status::{
-    BackendState, BackendStatusSnapshot, SharedBackendStatus, observe_rt_panic,
+    BackendState, BackendStatusSnapshot, SharedBackendStatus, TeardownGuard, observe_rt_panic,
     observe_stream_state,
 };
 pub use stream_status::StreamStatusFlags;
@@ -105,7 +105,9 @@ pub use rt_callback::harness::RtSwapHarness;
 
 // Re-exports for test module compatibility (pw_host_test.rs).
 #[cfg(test)]
-pub(crate) use neural_amp_modeler_rs::dsp::pipeline::DspBridge;
+pub(crate) use neural_amp_modeler_rs::dsp::pipeline::{
+    BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter,
+};
 
 #[cfg(test)]
 #[path = "pw_host_test.rs"]

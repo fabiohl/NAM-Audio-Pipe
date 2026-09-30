@@ -12,6 +12,7 @@ use crate::standalone::pw_host::output_pw::{
 };
 use crate::standalone::pw_host::rt_callback;
 use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
+use anyhow::Context;
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 use neural_amp_modeler_rs::dsp::pipeline::{BridgeRef, DspBridgeReader};
 
@@ -104,7 +105,8 @@ pub fn setup_playback_stream<'c>(
     rt_status: Arc<RtStatusFlags>,
     backend_status: Arc<SharedBackendStatus>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
-    let bridge_ptr_playback = unsafe { DspBridgeReader::new(bridge_ptr.as_ptr()) };
+    let bridge_ptr_playback = DspBridgeReader::from_ref(bridge_ptr)
+        .context("BridgeRef cannot be null when setting up playback stream")?;
     let rt_status_playback = rt_status;
     let stream_status_playback = backend_status.stream_status().clone();
 
@@ -190,6 +192,8 @@ pub fn setup_playback_stream<'c>(
     playback_audio_info.set_channels(2);
 
     let mut playback_format_storage = SpaPodStorage::new();
+    // SAFETY: `playback_format_storage` guarantees 8-byte alignment required by libspa
+    // and remains valid and unmodified for the duration of the synchronous `connect` call below.
     let playback_format_pod =
         unsafe { build_spa_format_pod(&playback_audio_info, &mut playback_format_storage)? };
 

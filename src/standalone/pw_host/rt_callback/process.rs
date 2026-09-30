@@ -517,10 +517,14 @@ fn send_recording_audio(
             };
             slot.block_mut()
                 .fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
-            if slot.publish()
-                && let Some(flag) = recording_data_available
-            {
-                flag.store(true, Ordering::Relaxed);
+            if slot.publish() {
+                if let Some(flag) = recording_data_available {
+                    flag.store(true, Ordering::Relaxed);
+                }
+            } else {
+                core::hint::cold_path();
+                OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+                OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
             }
         }
         RecordingSender::Inline(producer) => {
@@ -774,6 +778,13 @@ pub fn process_dsp_buffer(
                     .store(rec_nanos, Ordering::Relaxed);
                 stream_status.record_hist.record(rec_nanos);
             }
+        } else if recording_sender.has_producer()
+            && n_pw > 0
+            && !recording_failed.is_some_and(|f| f.load(Ordering::Acquire))
+        {
+            core::hint::cold_path();
+            OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+            OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
         }
 
         let n = n_samples as u32;

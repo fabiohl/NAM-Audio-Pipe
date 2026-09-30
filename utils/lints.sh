@@ -75,20 +75,36 @@ spdx_scope=$(
     }
 )
 
-missing=$(printf '%s\n' "$spdx_scope" | xargs grep -L "SPDX-License-Identifier" 2>/dev/null || true)
+grep_err=$(mktemp -t nam-lints-grep-err.XXXXXX)
+trap 'rm -f "$grep_err"' EXIT
+
+missing=$(printf '%s\n' "$spdx_scope" | xargs grep -L "SPDX-License-Identifier" 2>"$grep_err" || true)
+if [ -s "$grep_err" ]; then
+    echo -e "  ${RED}${BOLD}grep execution error while checking for SPDX header:${NC}" >&2
+    cat "$grep_err" >&2
+    exit 1
+fi
 if [ -n "$missing" ]; then
     echo -e "  ${RED}${BOLD}Missing SPDX header in files:${NC}"
     echo "$missing" | sed 's/^/    /'
     exit 1
 fi
+
 invalid=$(printf '%s\n' "$spdx_scope" \
-    | xargs grep -l "SPDX-License-Identifier" 2>/dev/null \
-    | xargs grep -LE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" 2>/dev/null || true)
+    | xargs grep -l "SPDX-License-Identifier" 2>"$grep_err" \
+    | xargs grep -LE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" 2>>"$grep_err" || true)
+if [ -s "$grep_err" ]; then
+    echo -e "  ${RED}${BOLD}grep execution error while checking SPDX identifier format:${NC}" >&2
+    cat "$grep_err" >&2
+    exit 1
+fi
 if [ -n "$invalid" ]; then
     echo -e "  ${RED}${BOLD}Invalid SPDX identifier (expected GPL-3.0-or-later or MIT):${NC}"
     echo "$invalid" | sed 's/^/    /'
     exit 1
 fi
+rm -f "$grep_err"
+trap - EXIT
 ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT) ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------

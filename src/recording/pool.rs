@@ -67,12 +67,21 @@
 //! once in order. The unit tests prove this with a full ownership-transition
 //! state machine plus an end-of-shutdown exactly-once drain.
 //!
-//! With `POOL_CAPACITY == RING_CAPACITY == 256`, both ring pushes are
-//! **infallible by construction**: `publish` holds ≥ 1 slot, so `work` can
-//! hold at most `N - 1` descriptors; `release` holds ≥ 1 slot, so `free` can
-//! hold at most `N - 1` indices. The only failure point is `try_acquire` on an
-//! empty `free` ring, which is the pool's overrun condition — the caller
-//! accounts it exactly like a full inline ring.
+//! With `POOL_CAPACITY == RING_CAPACITY == 256` and the `work` ring sized to
+//! `N + CONTROL_CAPACITY`, both ring pushes are **infallible by construction**:
+//!
+//! - **`publish`**: the producer holds ≥ 1 slot while filling, so at most `N - 1`
+//!   audio descriptors can be in flight in `work`. Even with all `CONTROL_CAPACITY`
+//!   metadata barriers concurrently pending in `work`, the ring contains at most
+//!   `(N - 1) + CONTROL_CAPACITY` descriptors, leaving at least 1 slot free in the
+//!   `N + CONTROL_CAPACITY` ring. Thus `publish` can never fail structurally.
+//! - **`release`**: the consumer holds ≥ 1 slot while reading, so `free` can
+//!   hold at most `N - 1` indices when returning an audio slot. For barriers,
+//!   `release` does not push to `free`. Thus `release` can never fail structurally.
+//!
+//! The only failure point is `try_acquire` on an empty `free` ring, which is
+//! the pool's overrun condition — the caller accounts it exactly like a full
+//! inline ring.
 //!
 //! A slot acquired (`AcquiredSlot`) or popped (`InFlightBlock`) but dropped
 //! without `publish`/`release` is lost forever (the free-ring producer lives
@@ -85,7 +94,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
+use super::buffer::{AlignedBlock, CONTROL_CAPACITY, MAX_BLOCK_SIZE};
 
 /// Number of preallocated slots. Mirrors [`super::buffer::RING_CAPACITY`]
 /// (256 × ~64 KiB ≈ 16.8 MiB) so both transports operate within the same
@@ -126,7 +135,8 @@ pub struct Descriptor {
     /// [`CONTROL_BARRIER_SLOT`] for a control barrier.
     pub slot: u16,
     /// Valid f32 samples in the slot (`2 * frames`), as published by
-    /// `fill_planar`. `0` for a control barrier.
+    /// `fill_planar`. For a control barrier (`slot == CONTROL_BARRIER_SLOT`),
+    /// this carries the sequence number `seq: u16` matching [`ControlPayload::Metadata`].
     pub valid_len: u16,
 }
 
@@ -167,17 +177,19 @@ pub struct RecordingPool<const N: usize> {
 }
 
 impl<const N: usize> RecordingPool<N> {
-    /// Preallocates `N` slots and seeds the free-list ring with every index.
+    /// Preallocates `N` slots, dimensions the `work` ring to
+    /// `N + CONTROL_CAPACITY` to accommodate control barriers without audio
+    /// backpressure, and seeds the free-list ring with every index.
     ///
     /// # Panics
     ///
     /// Panics if `N == 0` (a pool with no slots is meaningless) or if the ring
-    /// seeding fails — impossible for `N > 0` because both rings have capacity
-    /// `N`, but checked explicitly so a wrong capacity can never silently
-    /// reduce the pool.
+    /// seeding fails — impossible for `N > 0` because `free` has capacity `N`,
+    /// but checked explicitly so a wrong capacity can never silently reduce
+    /// the pool.
     pub fn new() -> Self {
         assert!(N > 0, "RecordingPool requires at least one slot");
-        let (work, work_consumer) = RingBuffer::new(N);
+        let (work, work_consumer) = RingBuffer::new(N + CONTROL_CAPACITY);
         let (mut free, free_consumer) = RingBuffer::new(N);
         for idx in 0..N as u16 {
             free.push(idx)
@@ -290,7 +302,8 @@ impl<const N: usize> PoolProducer<N> {
         out
     }
 
-    /// Publishes a **control barrier** into the `work` ring.
+    /// Publishes a **control barrier** carrying sequence number `seq` into the
+    /// `work` ring.
     ///
     /// The barrier is a pure ordering marker: it tells the I/O thread that a
     /// control message — pushed into the dedicated control ring **just before**
@@ -301,11 +314,11 @@ impl<const N: usize> PoolProducer<N> {
     /// leaves the metadata unconfirmed and retries on the next callback (audio
     /// publication stays gated on the confirmation, so no ordering can break).
     #[inline]
-    pub fn try_push_barrier(&mut self) -> bool {
+    pub fn try_push_barrier(&mut self, seq: u16) -> bool {
         self.work
             .push(Descriptor {
                 slot: CONTROL_BARRIER_SLOT,
-                valid_len: 0,
+                valid_len: seq,
             })
             .is_ok()
     }
@@ -340,10 +353,12 @@ impl<const N: usize> AcquiredSlot<'_, N> {
 
     /// Publishes the slot to the I/O thread by pushing its descriptor.
     ///
-    /// Infallible by construction (`work` ring capacity `N` and ≥ 1 slot held
-    /// by this producer, so `work` can never be full) — returns `false` only
-    /// on an invariant violation, in which case the slot is counted as leaked
-    /// rather than double-returned.
+    /// Infallible by construction: the `work` ring has capacity
+    /// `N + CONTROL_CAPACITY`, while at most `N - 1` audio descriptors and
+    /// `CONTROL_CAPACITY` control barriers can be pending in flight when this
+    /// method is called (`(N - 1) + CONTROL_CAPACITY < N + CONTROL_CAPACITY`).
+    /// Returns `false` only on an invariant violation, in which case the slot
+    /// is counted as leaked rather than double-returned.
     #[inline]
     pub fn publish(self) -> bool {
         // SAFETY: exclusive ownership (see `block_mut`).
@@ -428,6 +443,12 @@ impl<const N: usize> PoolConsumer<N> {
             block,
         })
     }
+
+    /// Total slots lost by dropping an `AcquiredSlot` without publishing.
+    #[inline]
+    pub fn leaked_slots(&self) -> u64 {
+        self.inner.slot_leaks.load(Ordering::Relaxed)
+    }
 }
 
 /// A pool slot owned by the I/O thread, mid-consume.
@@ -449,6 +470,20 @@ impl<const N: usize> InFlightBlock<'_, N> {
     #[inline]
     pub fn is_barrier(&self) -> bool {
         self.desc.slot == CONTROL_BARRIER_SLOT
+    }
+
+    /// Sequence number carried by a control barrier descriptor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this block is not a barrier ([`is_barrier`](Self::is_barrier) is `false`).
+    #[inline]
+    pub fn barrier_seq(&self) -> u16 {
+        assert!(
+            self.is_barrier(),
+            "an audio block does not carry a barrier sequence"
+        );
+        self.desc.valid_len
     }
 
     /// Read access to the audio block (consume it here; no copy out of the

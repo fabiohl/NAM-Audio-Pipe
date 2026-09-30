@@ -133,6 +133,7 @@ impl BackendStatusSnapshot {
 /// [`SharedBackendStatus::is_failed`] poll every control iteration.
 pub struct SharedBackendStatus {
     failed: AtomicBool,
+    teardown_in_progress: AtomicBool,
     capture_active: AtomicBool,
     playback_active: AtomicBool,
     state: Mutex<BackendState>,
@@ -146,6 +147,7 @@ impl Default for SharedBackendStatus {
     fn default() -> Self {
         Self {
             failed: AtomicBool::new(false),
+            teardown_in_progress: AtomicBool::new(false),
             capture_active: AtomicBool::new(false),
             playback_active: AtomicBool::new(false),
             state: Mutex::new(BackendState::Starting),
@@ -161,6 +163,7 @@ impl std::fmt::Debug for SharedBackendStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SharedBackendStatus")
             .field("failed", &self.failed)
+            .field("teardown_in_progress", &self.teardown_in_progress)
             .field("capture_active", &self.capture_active)
             .field("playback_active", &self.playback_active)
             .field("state", &self.lock_state())
@@ -240,6 +243,24 @@ impl SharedBackendStatus {
         if let Some(ref wakeup) = self.wakeup {
             wakeup.notify();
         }
+    }
+
+    /// Returns `true` if backend teardown or stream destruction is currently in progress.
+    pub fn is_teardown_in_progress(&self) -> bool {
+        self.teardown_in_progress.load(Ordering::Acquire)
+    }
+
+    /// Sets the teardown-in-progress latch.
+    pub fn set_teardown_in_progress(&self, in_progress: bool) {
+        self.teardown_in_progress
+            .store(in_progress, Ordering::Release);
+    }
+
+    /// Enters the teardown phase, raising the [`teardown_in_progress`] latch
+    /// and returning an RAII [`TeardownGuard`] that clears the latch on drop.
+    pub fn enter_teardown(&self) -> TeardownGuard<'_> {
+        self.set_teardown_in_progress(true);
+        TeardownGuard { backend: self }
     }
 
     /// Lock-free fast-path poll used by the main control loop.
@@ -425,6 +446,26 @@ impl SharedBackendStatus {
     }
 }
 
+/// RAII guard that manages the lifetime of the backend teardown latch.
+///
+/// While this guard is alive, [`SharedBackendStatus::is_teardown_in_progress`]
+/// evaluates to `true`, preventing spurious `Unconnected` state transitions
+/// (triggered synchronously by `pw_stream_destroy()`) from poisoning
+/// subsequent reconnection attempts with premature `Failed` markers (F-RB-101).
+///
+/// Dropping this guard (including during stack unwinding or normal function exit)
+/// resets the teardown latch to `false`.
+#[derive(Debug)]
+pub struct TeardownGuard<'a> {
+    backend: &'a SharedBackendStatus,
+}
+
+impl<'a> Drop for TeardownGuard<'a> {
+    fn drop(&mut self) {
+        self.backend.set_teardown_in_progress(false);
+    }
+}
+
 /// Maps a PipeWire stream-state transition to the backend state machine.
 pub fn observe_stream_state(
     stream: &'static str,
@@ -447,12 +488,21 @@ pub fn observe_stream_state(
             // shutting down cooperatively (SIGINT/SIGTERM raised `SHUTDOWN`) is
             // the streams being torn down by `thread_loop.stop()` — expected,
             // so it is logged below `ERROR` and the sticky `Failed` transition
-            // is skipped. Without `SHUTDOWN` the strict behavior is kept: an
-            // `error!` signaling an unexpected drop or a daemon restart/crash.
+            // is skipped.
+            //
+            // Finding F-RB-101: if teardown/reconnect is in progress
+            // (e.g. `pw_stream_destroy()` destroying streams while reconnecting),
+            // this synchronous `Unconnected` event is the direct consequence of
+            // host teardown and must not poison the upcoming reconnection attempt
+            // with a premature `mark_failed`.
             if SHUTDOWN.load(Ordering::Acquire) {
                 log::info!(
                     "{} PipeWire {stream} stream disconnected cooperatively during shutdown.",
                     "🔌".yellow(),
+                );
+            } else if backend.is_teardown_in_progress() {
+                log::debug!(
+                    "PipeWire {stream} stream disconnected during host teardown/reconnect (ignored)."
                 );
             } else {
                 log::error!(

@@ -216,7 +216,16 @@ pub enum RingPayload<const SIZE: usize> {
 pub enum ControlPayload {
     /// Stream metadata (sample rate, bit depth, channels) to configure the WAV
     /// file — pushed on format initialization and on every rate change.
-    Metadata(AudioMetadata),
+    ///
+    /// Paired with a [`CONTROL_BARRIER_SLOT`](crate::recording::pool::CONTROL_BARRIER_SLOT)
+    /// descriptor in the pool `work` ring carrying the identical sequence number `seq`,
+    /// eliminating stale/duplicate pairings under retry or renegotiation.
+    Metadata {
+        /// Sequence number matching the barrier descriptor in the `work` ring.
+        seq: u16,
+        /// Audio format parameters.
+        meta: AudioMetadata,
+    },
     /// Stream stop signal — instructs the I/O thread to drain the remaining
     /// pool descriptors and close the current WAV file.
     StreamStop,
@@ -324,6 +333,27 @@ mod tests {
         assert_matches!(c.pop().unwrap(), RingPayload::Metadata(_));
         assert_matches!(c.pop().unwrap(), RingPayload::Audio(_));
         assert_matches!(c.pop().unwrap(), RingPayload::StreamStop);
+    }
+
+    #[test]
+    fn control_ring_buffer_round_trip() {
+        let (mut p, mut c) = create_control_ring_buffer(4);
+        let meta = AudioMetadata {
+            sample_rate: 48000.0,
+            bit_depth: 32,
+            channels: 2,
+        };
+        assert!(p.push(ControlPayload::Metadata { seq: 42, meta }).is_ok());
+        assert!(p.push(ControlPayload::StreamStop).is_ok());
+
+        match c.pop().unwrap() {
+            ControlPayload::Metadata { seq, meta: m } => {
+                assert_eq!(seq, 42);
+                assert_eq!(m, meta);
+            }
+            _ => panic!("expected ControlPayload::Metadata"),
+        }
+        assert_matches!(c.pop().unwrap(), ControlPayload::StreamStop);
     }
 
     #[test]

@@ -108,9 +108,56 @@ fn test_build_affinity_mask_rejects_out_of_bounds() {
 }
 
 #[test]
+fn test_pin_current_thread_bounds_check() {
+    assert!(pin_current_thread(None).is_ok());
+    let max_cpu = libc::CPU_SETSIZE as usize;
+    assert_eq!(
+        pin_current_thread(Some(max_cpu)),
+        Err(PinThreadError::CpuOutOfBounds {
+            cpu: max_cpu,
+            max: max_cpu,
+        })
+    );
+    assert_eq!(
+        pin_current_thread(Some(99999)),
+        Err(PinThreadError::CpuOutOfBounds {
+            cpu: 99999,
+            max: max_cpu,
+        })
+    );
+    assert_eq!(
+        pin_current_thread(Some(usize::MAX)),
+        Err(PinThreadError::CpuOutOfBounds {
+            cpu: usize::MAX,
+            max: max_cpu,
+        })
+    );
+}
+
+#[test]
+fn test_pin_thread_error_display() {
+    let err_oob = PinThreadError::CpuOutOfBounds {
+        cpu: 99999,
+        max: 1024,
+    };
+    assert_eq!(
+        err_oob.to_string(),
+        "CPU index 99999 is outside supported range [0, 1024)"
+    );
+    let err_sys = PinThreadError::SyscallFailed { cpu: 2, errno: 22 };
+    assert_eq!(
+        err_sys.to_string(),
+        "could not pin thread to CPU 2 (errno 22)"
+    );
+}
+
+#[test]
 fn test_configure_realtime_thread_cpu_zero_pins() {
+    // SAFETY: `pthread_self` has no preconditions and queries the current thread ID.
     let thread_id = unsafe { libc::pthread_self() };
+    // SAFETY: zeroing `cpu_set_t` bitmask is well-defined and represents an empty CPU set.
     let mut allowed = unsafe { std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init() };
+    // SAFETY: `thread_id` is the current thread and `allowed` points to a valid `cpu_set_t`.
     let ret = unsafe {
         libc::pthread_getaffinity_np(
             thread_id,
@@ -123,6 +170,7 @@ fn test_configure_realtime_thread_cpu_zero_pins() {
         "pthread_getaffinity_np must succeed on the test thread"
     );
     // Skip when the environment (e.g. a restricted cpuset) forbids CPU 0.
+    // SAFETY: `allowed` is fully initialized and CPU index 0 is within bounds.
     if !unsafe { libc::CPU_ISSET(0, &allowed) } {
         return;
     }
@@ -137,7 +185,9 @@ fn test_configure_realtime_thread_cpu_zero_pins() {
         "pinning to CPU 0 must succeed when the cpuset allows it"
     );
 
+    // SAFETY: zeroing `cpu_set_t` bitmask is well-defined and represents an empty CPU set.
     let mut after = unsafe { std::mem::MaybeUninit::<libc::cpu_set_t>::zeroed().assume_init() };
+    // SAFETY: `thread_id` is the current thread and `after` points to a valid `cpu_set_t`.
     let ret = unsafe {
         libc::pthread_getaffinity_np(
             thread_id,
@@ -146,6 +196,7 @@ fn test_configure_realtime_thread_cpu_zero_pins() {
         )
     };
     assert_eq!(ret, 0);
+    // SAFETY: `after` is fully initialized and CPU index 0 is within bounds.
     assert!(
         unsafe { libc::CPU_ISSET(0, &after) },
         "thread must be pinned to CPU 0"

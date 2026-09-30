@@ -1380,3 +1380,50 @@ fn composite_structural_saturation_bound_measurement() {
          Stats: installed={total_installed}, superseded/coalesced={total_coalesced}, deferred={total_deferred}"
     );
 }
+
+#[test]
+fn install_and_discard_load_model_defensively_ignore_non_load_model() {
+    let (mut gc_prod, _gc_cons) = rtrb::RingBuffer::<GcItem>::new(16);
+    let mut parking_lot: [Option<GcItem>; 16] = [const { None }; 16];
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = Arc::new(RtStatusFlags::new());
+    let mut gc = GcSink {
+        producer: &mut gc_prod,
+        parking_lot: &mut parking_lot,
+        overflow: &gc_overflow,
+        rt_status: &flags,
+        parking_lot_dirty: Some(&parking_lot_dirty),
+    };
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Off);
+
+    let mut model_in = 1.0;
+    let mut model_out = 1.0;
+    let mut rate = 48000;
+    let mut active_l = None;
+    let mut active_r = None;
+
+    // Passing a non-LoadModel payload to install_load_model must return early
+    // without panicking or modifying model slots.
+    install_load_model(
+        ParamPayload::InputGain(2.0),
+        &mut model_in,
+        &mut model_out,
+        &mut rate,
+        &mut active_l,
+        &mut active_r,
+        &mut gc,
+        &flags,
+        &mut adaptive,
+    );
+    assert_eq!(model_in, 1.0);
+    assert_eq!(model_out, 1.0);
+    assert_eq!(rate, 48000);
+    assert!(active_l.is_none());
+    assert!(active_r.is_none());
+
+    // Passing a non-LoadModel payload to discard_load_model must return early
+    // without panicking and without raising superseded flags.
+    discard_load_model(ParamPayload::OutputGain(3.0), &mut gc, &flags);
+    assert!(!flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
+}

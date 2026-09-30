@@ -74,6 +74,9 @@ fn main() -> anyhow::Result<()> {
         let bundle =
             neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
         println!("{}", bundle.render());
+        // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
+        // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
+        // `exit(0)` and is mutually exclusive with the main audio host run loop below.
         unsafe {
             pipewire::deinit();
         }
@@ -345,6 +348,10 @@ fn main() -> anyhow::Result<()> {
     // Signal shutdown to bypass panic hook during cleanup
     neural_amp_modeler_rs::common::panic_hook::set_shutdown_in_progress();
 
+    // SAFETY: `pipewire::init()` was called during startup for the audio host run loop.
+    // The host loop, worker threads, and streams have completed teardown before this point.
+    // This `deinit` executes exactly once on the normal host shutdown path (mutually exclusive
+    // with the early-exit `diagnose_bundle` branch at line 77).
     unsafe {
         pipewire::deinit();
     }

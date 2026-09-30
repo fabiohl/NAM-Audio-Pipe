@@ -62,6 +62,14 @@ pub const RECORDING_POOL_TRANSPORT: bool = true;
 ///
 /// The RT thread is the sole writer of every channel it owns; the guard keeps
 /// custody for the shutdown path.
+///
+/// `Pool` variant is significantly larger than `Inline` due to cache-aligned
+/// SPSC structures, but `RecordingSender` is instantiated once and held by value
+/// across RT thread boundaries; boxing the variant would introduce RT heap drops.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Pool variant holds cache-aligned SPSC structures; held by value across RT threads without heap drops"
+)]
 pub enum RecordingSender {
     /// Promoted transport: a small dedicated control ring
     /// (Metadata/StreamStop) plus the preallocated audio pool producer.
@@ -70,6 +78,12 @@ pub enum RecordingSender {
         control: Option<Producer<ControlPayload>>,
         /// Pool producer (`None` when recording is disabled).
         pool: Option<PoolProducer<POOL_CAPACITY>>,
+        /// Local pending barrier waiting for pool work-ring capacity.
+        /// Holds `(seq, meta)` if the metadata was pushed to control ring
+        /// but `try_push_barrier` failed on pool work ring backpressure.
+        pending_barrier: Option<(u16, AudioMetadata)>,
+        /// Monotonically increasing sequence number for metadata/barrier pairing.
+        next_seq: u16,
     },
     /// Rollback transport: the single inline ring producer.
     Inline(Option<Producer<RingPayload<MAX_BLOCK_SIZE>>>),
@@ -96,13 +110,15 @@ impl RecordingSender {
         Self::Pool {
             control: None,
             pool: None,
+            pending_barrier: None,
+            next_seq: 1,
         }
     }
 
     /// Whether any producer channel is present (recording enabled).
     pub fn has_producer(&self) -> bool {
         match self {
-            RecordingSender::Pool { control, pool } => control.is_some() || pool.is_some(),
+            RecordingSender::Pool { control, pool, .. } => control.is_some() || pool.is_some(),
             RecordingSender::Inline(producer) => producer.is_some(),
         }
     }
@@ -137,14 +153,48 @@ impl RecordingSender {
     #[inline]
     pub fn try_push_metadata(&mut self, meta: AudioMetadata) -> bool {
         match self {
-            RecordingSender::Pool { control, pool } => {
+            RecordingSender::Pool {
+                control,
+                pool,
+                pending_barrier,
+                next_seq,
+            } => {
                 let Some(control) = control.as_mut() else {
                     return false;
                 };
                 let Some(pool) = pool.as_mut() else {
                     return false;
                 };
-                control.push(ControlPayload::Metadata(meta)).is_ok() && pool.try_push_barrier()
+
+                // Single-slot local retry: if this identical metadata was already pushed
+                // to control but its barrier failed due to work-ring backpressure, only
+                // retry the barrier push instead of polluting control with duplicates.
+                if let Some((p_seq, p_meta)) = *pending_barrier
+                    && p_meta == meta
+                {
+                    if pool.try_push_barrier(p_seq) {
+                        *pending_barrier = None;
+                        return true;
+                    }
+                    return false;
+                }
+
+                let seq = *next_seq;
+                if control
+                    .push(ControlPayload::Metadata { seq, meta })
+                    .is_err()
+                {
+                    return false;
+                }
+                *next_seq = next_seq.wrapping_add(1);
+
+                if pool.try_push_barrier(seq) {
+                    *pending_barrier = None;
+                    true
+                } else {
+                    *pending_barrier = Some((seq, meta));
+                    false
+                }
             }
             RecordingSender::Inline(producer) => producer
                 .as_mut()
@@ -194,6 +244,14 @@ impl RecordingSender {
                 .is_some_and(|p| p.push(RingPayload::StreamStop).is_ok()),
         }
     }
+
+    /// Total slots lost by dropping an `AcquiredSlot` without publishing.
+    pub fn leaked_slots(&self) -> u64 {
+        match self {
+            RecordingSender::Pool { pool, .. } => pool.as_ref().map_or(0, |p| p.leaked_slots()),
+            RecordingSender::Inline(_) => 0,
+        }
+    }
 }
 
 impl Default for RecordingSender {
@@ -216,6 +274,14 @@ impl RecordingReceiver {
             RecordingReceiver::Inline(consumer) => consumer.is_abandoned() && consumer.is_empty(),
         }
     }
+
+    /// Total slots lost by dropping an `AcquiredSlot` without publishing.
+    pub fn leaked_slots(&self) -> u64 {
+        match self {
+            RecordingReceiver::Pool { pool, .. } => pool.leaked_slots(),
+            RecordingReceiver::Inline(_) => 0,
+        }
+    }
 }
 
 /// Builds a fresh recording transport pair (sender → RT / guard, receiver →
@@ -233,6 +299,8 @@ pub fn create_recording_transport() -> (RecordingSender, RecordingReceiver) {
         let sender = RecordingSender::Pool {
             control: Some(control),
             pool: Some(pool_producer),
+            pending_barrier: None,
+            next_seq: 1,
         };
         let receiver = RecordingReceiver::Pool {
             control: control_consumer,
@@ -251,6 +319,7 @@ pub fn create_recording_transport() -> (RecordingSender, RecordingReceiver) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recording::buffer::CONTROL_CAPACITY;
 
     /// The `none()` sender must never accept any payload and must not claim a
     /// producer (the RT closure dereferences it unconditionally when recording
@@ -297,7 +366,10 @@ mod tests {
             channels: 2,
         }));
         match control.pop() {
-            Ok(ControlPayload::Metadata(m)) => assert_eq!(m.sample_rate, 44100.0),
+            Ok(ControlPayload::Metadata { meta: m, seq }) => {
+                assert_eq!(m.sample_rate, 44100.0);
+                assert_eq!(seq, 1);
+            }
             other => panic!("expected Metadata, got {other:?}"),
         }
 
@@ -312,6 +384,7 @@ mod tests {
             barrier.is_barrier(),
             "metadata confirmation must leave a barrier"
         );
+        assert_eq!(barrier.barrier_seq(), 1);
         assert!(barrier.release());
 
         let in_flight = pool.try_pop().expect("published descriptor");
@@ -357,5 +430,91 @@ mod tests {
             POOL_CAPACITY
         );
         assert_eq!(sender.pool_producer_mut().unwrap().leaked_slots(), 0);
+    }
+
+    /// When `try_push_barrier` fails because the pool work ring is full,
+    /// `pending_barrier` remembers the failed sequence number. Retrying with
+    /// the same metadata must NOT push duplicate metadata into the control ring,
+    /// and once work capacity is freed, pushing the barrier succeeds.
+    #[test]
+    fn pool_sender_pending_barrier_retry_deduplicates_metadata() {
+        let (mut sender, mut receiver) = create_recording_transport();
+        let (control, pool) = match &mut receiver {
+            RecordingReceiver::Pool { control, pool } => (control, pool),
+            RecordingReceiver::Inline(_) => panic!("pool transport expected"),
+        };
+
+        // Fill the work ring completely: POOL_CAPACITY audio blocks + CONTROL_CAPACITY barriers
+        for _ in 0..POOL_CAPACITY {
+            assert!(sender.try_push_audio(&[0.5], &[0.5]));
+        }
+        for _ in 0..CONTROL_CAPACITY {
+            assert!(
+                sender.pool_producer_mut().unwrap().try_push_barrier(0),
+                "work ring has CONTROL_CAPACITY slack for barriers"
+            );
+        }
+
+        // Now work ring is full. try_push_metadata pushes metadata to control,
+        // but fails to push barrier to work ring!
+        let meta = AudioMetadata {
+            sample_rate: 48000.0,
+            bit_depth: 24,
+            channels: 2,
+        };
+        assert!(
+            !sender.try_push_metadata(meta),
+            "must return false when pool barrier fails to push"
+        );
+
+        // Control ring holds exactly 1 metadata item with seq 1
+        assert_eq!(control.slots(), 1);
+
+        // Retrying with the SAME metadata while work ring is still full
+        // must NOT push a duplicate metadata item into control!
+        assert!(!sender.try_push_metadata(meta));
+        assert_eq!(
+            control.slots(),
+            1,
+            "control ring must not receive duplicate metadata on retry"
+        );
+
+        // Drain one item from the work ring to make space for the barrier
+        let first_item = pool.try_pop().expect("work ring item");
+        assert!(first_item.release());
+
+        // Now retry: barrier push must succeed, confirming the metadata!
+        assert!(
+            sender.try_push_metadata(meta),
+            "retry after freeing work ring space must succeed"
+        );
+
+        // Control ring still has exactly 1 metadata item!
+        assert_eq!(control.slots(), 1);
+        match control.pop() {
+            Ok(ControlPayload::Metadata { seq, meta: m }) => {
+                assert_eq!(seq, 1);
+                assert_eq!(m.sample_rate, 48000.0);
+            }
+            other => panic!("expected Metadata, got {other:?}"),
+        }
+
+        // Drain remaining items from work ring:
+        // (POOL_CAPACITY + CONTROL_CAPACITY - 1) items + 1 barrier
+        let mut audio_count = 0;
+        let mut barrier_seen = false;
+        while let Some(item) = pool.try_pop() {
+            if item.is_barrier() && item.barrier_seq() == 1 {
+                barrier_seen = true;
+            } else if !item.is_barrier() {
+                audio_count += 1;
+            }
+            assert!(item.release());
+        }
+        assert!(audio_count <= POOL_CAPACITY);
+        assert!(
+            barrier_seen,
+            "barrier must have been delivered to work ring"
+        );
     }
 }

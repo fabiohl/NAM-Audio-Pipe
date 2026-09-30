@@ -70,6 +70,7 @@ use neural_amp_modeler_rs::models::{NamModel, StaticModel};
 use neural_amp_modeler_rs::testing::stress::generate_stress_signal_v2_default;
 
 use nam_audio_pipe::standalone::rt_setup::affinity::select_optimal_cpu;
+use nam_audio_pipe::standalone::rt_setup::{PinThreadError, pin_current_thread};
 
 const IR_FILENAME: &str = "cabsim_ir_pgo.wav";
 
@@ -466,19 +467,14 @@ fn measure_freq_ghz_x1000() -> u64 {
     (cyc * 1000) / ns
 }
 
-fn pin_thread(cpu: Option<usize>) {
-    let Some(cpu) = cpu else {
-        return;
-    };
-    // SAFETY: `cpu_set_t` is zeroed before use; `sched_setaffinity` only
-    // touches the supplied set and the calling thread.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        if libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) != 0 {
+fn pin_thread(cpu: Option<usize>) -> Result<(), PinThreadError> {
+    match pin_current_thread(cpu) {
+        Ok(()) => Ok(()),
+        Err(PinThreadError::SyscallFailed { cpu, .. }) => {
             eprintln!("  warn: could not pin thread to cpu {cpu}");
+            Ok(())
         }
+        Err(e @ PinThreadError::CpuOutOfBounds { .. }) => Err(e),
     }
 }
 
@@ -646,6 +642,8 @@ fn run_measured(
         }
         signal_offset = (signal_offset + quantum) % stress_signal.len();
 
+        // SAFETY: `bridge` is uniquely owned by this benchmarking thread; `bridge_writer`
+        // narrows writes strictly to the inactive back-buffer without reader conflicts.
         let bridge_writer = unsafe { Some(DspBridgeWriter::new(&mut *bridge as *mut DspBridge)) };
         let ctx = DspPipelineContext {
             resampler: &mut resampler,
@@ -906,7 +904,10 @@ fn main() -> ExitCode {
     neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE
         .store(true, std::sync::atomic::Ordering::Relaxed);
     let cfg = parse_args();
-    pin_thread(cfg.cpu);
+    if let Err(e) = pin_thread(cfg.cpu) {
+        eprintln!("ab_opt_bench: FATAL: {e}");
+        return ExitCode::FAILURE;
+    }
     let freq = measure_freq_ghz_x1000();
     let models = resolve_models();
     let ir_path = resolve_ir_path();

@@ -212,6 +212,11 @@ impl RecordingWorkerGuard {
         self.failed.as_ref()
     }
 
+    /// Total slots lost by dropping an `AcquiredSlot` without publishing.
+    pub fn leaked_slots(&self) -> u64 {
+        self.sender.as_ref().map_or(0, |s| s.leaked_slots())
+    }
+
     /// Ordered teardown of the recording worker:
     ///
     /// 1. **`StreamStop`** — best-effort delivery (bounded retry) of the
@@ -228,13 +233,14 @@ impl RecordingWorkerGuard {
     ///
     /// When the join reports [`RecordingWorkerOutcome::Success`] but the
     /// capture path counted ring overruns (`OVERRUN_COUNT` /
-    /// `OVERRUN_FRAMES_COUNT`), the outcome is promoted to
+    /// `OVERRUN_FRAMES_COUNT`) or leaked pool slots, the outcome is promoted to
     /// [`RecordingWorkerOutcome::SuccessWithLoss`] — a recording that dropped
     /// audio never surfaces as a pristine capture (non-zero exit).
     pub fn shutdown(mut self) -> RecordingWorkerOutcome {
-        let outcome = teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
+        let (outcome, leaked) =
+            teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
         self.teardown_done = true;
-        classify_loss(outcome)
+        classify_loss(outcome, leaked)
     }
 }
 
@@ -249,11 +255,9 @@ impl Drop for RecordingWorkerGuard {
         // bounded timeout so no zombie thread or open WAV descriptor outlives
         // the guard. The join result cannot be returned from `Drop`; a
         // non-clean teardown is logged for the diagnostics trace.
-        let outcome = classify_loss(teardown(
-            &mut self.handle,
-            &mut self.sender,
-            self.failed.as_deref(),
-        ));
+        let (outcome, leaked) =
+            teardown(&mut self.handle, &mut self.sender, self.failed.as_deref());
+        let outcome = classify_loss(outcome, leaked);
         self.teardown_done = true;
         if !matches!(outcome, RecordingWorkerOutcome::Success) {
             log::warn!(
@@ -271,8 +275,9 @@ fn teardown(
     handle: &mut Option<JoinHandle<anyhow::Result<()>>>,
     sender: &mut Option<RecordingSender>,
     failed: Option<&AtomicBool>,
-) -> RecordingWorkerOutcome {
+) -> (RecordingWorkerOutcome, u64) {
     let recording_failed_observed = failed.is_some_and(|f| f.load(Ordering::Acquire));
+    let leaked_slots = sender.as_ref().map_or(0, |s| s.leaked_slots());
     if let Some(mut sender) = sender.take() {
         if !recording_failed_observed {
             push_stream_stop(&mut sender, STREAM_STOP_RETRY_TIMEOUT);
@@ -281,22 +286,24 @@ fn teardown(
         // condition so finalization happens even if the token never landed.
         drop(sender);
     }
-    join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT)
+    let outcome = join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT);
+    (outcome, leaked_slots)
 }
 
 /// Promotes a clean join outcome to [`RecordingWorkerOutcome::SuccessWithLoss`]
-/// when the capture path counted ring overruns.
+/// when the capture path counted ring overruns or leaked pool slots.
 ///
 /// The overrun counters are process-wide and only incremented on the recording
 /// path (`send_recording_audio` in `process.rs`); a non-recording session keeps
 /// them at zero, so a plain [`RecordingWorkerOutcome::Success`] is preserved.
 /// Any other outcome (failure, panic, timeout) is passed through unchanged —
 /// loss classification is only relevant on an otherwise-clean join.
-fn classify_loss(outcome: RecordingWorkerOutcome) -> RecordingWorkerOutcome {
+fn classify_loss(outcome: RecordingWorkerOutcome, leaked_slots: u64) -> RecordingWorkerOutcome {
     match outcome {
         RecordingWorkerOutcome::Success => {
-            let blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
+            let overrun_blocks = OVERRUN_COUNT.load(Ordering::Relaxed);
             let frames = OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed);
+            let blocks = overrun_blocks.max(leaked_slots);
             if blocks > 0 || frames > 0 {
                 RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }
             } else {

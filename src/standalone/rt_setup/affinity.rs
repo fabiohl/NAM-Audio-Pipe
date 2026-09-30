@@ -96,14 +96,30 @@ pub fn parse_proc_interrupts<R: std::io::BufRead>(reader: R) -> HashMap<usize, u
     totals
 }
 
-/// Parses /proc/interrupts to extract the interrupt load per physical CPU.
+/// Parses `/proc/interrupts` to extract the cumulative interrupt load per physical CPU.
+///
+/// Returns an empty map on failure (e.g. `/proc/interrupts` not mounted in a container).
+/// The caller (CPU selection) treats a missing map as zero IRQ load on all CPUs — a
+/// graceful degradation that can bias core ranking. The warn log below makes the
+/// degradation observable so operators can investigate missing `/proc` mounts.
 pub fn parse_interrupts_per_cpu() -> HashMap<usize, u64> {
     use std::fs::File;
     use std::io::BufReader;
 
     let file = match File::open("/proc/interrupts") {
         Ok(f) => f,
-        Err(_) => return HashMap::new(),
+        Err(e) => {
+            // Fail-open: proceed with zero IRQ counts rather than aborting CPU selection.
+            // Bias risk: all CPUs appear equally loaded — the heuristic may not pick the
+            // least-interrupted core. Common in containers without a full /proc mount.
+            log::warn!(
+                "[E2109 | IRQ_LOAD_UNAVAILABLE] Cannot read /proc/interrupts ({e}) — \
+                 CPU selection will proceed with zero IRQ counts for all cores. \
+                 IRQ load heuristic is disabled; core ranking may be suboptimal. \
+                 Hint: ensure /proc/interrupts is mounted (or bind-mount it in the container)."
+            );
+            return HashMap::new();
+        }
     };
     parse_proc_interrupts(BufReader::new(file))
 }
@@ -124,9 +140,17 @@ pub fn get_allowed_cpus() -> Vec<usize> {
     // SAFETY: `CPU_ZERO` only mutates the already-initialized bitmask in place;
     // `sched_getaffinity` fills the same valid object. On failure the mask is
     // left untouched and the `ok` flag below keeps the loop from reading it.
-    let ok = unsafe {
+    let (ok, errno) = unsafe {
         libc::CPU_ZERO(&mut cpuset);
-        libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpuset) == 0
+        let ret = libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut cpuset);
+        (
+            ret == 0,
+            if ret != 0 {
+                *libc::__errno_location()
+            } else {
+                0
+            },
+        )
     };
 
     if ok {
@@ -138,6 +162,17 @@ pub fn get_allowed_cpus() -> Vec<usize> {
                 allowed.push(i);
             }
         }
+    } else {
+        // Fail-open: CPU selection degrades to the full online CPU set.
+        // The host will still run, but cpuset/cgroup constraints from taskset or
+        // cgroups will not be honoured, potentially placing the RT thread on a
+        // non-preferred core.
+        log::warn!(
+            "[E2108 | CPU_AFFINITY_MASK_UNAVAILABLE] sched_getaffinity failed (errno={errno}) — \
+             cpuset and cgroup CPU constraints cannot be read. CPU selection will fall back \
+             to the full online CPU set, ignoring any taskset/isolcpus restrictions. \
+             Hint: check process capabilities or seccomp filter."
+        );
     }
     allowed
 }
@@ -159,8 +194,21 @@ pub struct SystemSysfsSource;
 
 impl SysfsTopologySource for SystemSysfsSource {
     fn read_cpu_indices(&self) -> Vec<usize> {
-        let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
-            return Vec::new();
+        let entries = match std::fs::read_dir("/sys/devices/system/cpu") {
+            Ok(e) => e,
+            Err(e) => {
+                // Fail-open: CPU topology cannot be discovered from sysfs.
+                // The CPU selection will fall back to cpuset/affinity data only,
+                // and package/core/SMT metadata will be missing, degrading to
+                // the conservative heuristic without package-level ranking.
+                log::warn!(
+                    "[E2110 | SYSFS_TOPOLOGY_UNAVAILABLE] Cannot read /sys/devices/system/cpu ({e}) — \
+                     hardware CPU topology (core IDs, SMT siblings, cpu_capacity) will not be available. \
+                     CPU selection degrades to cpuset-only heuristic without topology awareness. \
+                     Hint: ensure /sys is mounted or relax the seccomp/LSM policy."
+                );
+                return Vec::new();
+            }
         };
         let mut cpus: Vec<usize> = entries
             .filter_map(|entry| {

@@ -368,6 +368,9 @@ mid-stream rate changes (header must apply between the pre-change and post-chang
 confirmed metadata push also deposits a **control barrier** (`slot == 0xFFFF`, an impossible
 pool index) at the exact position in the pool `work`-ring FIFO — the I/O thread applies the
 control message when it reaches the barrier, matching the inline ring's FIFO semantics exactly.
+The `work` ring is dimensioned to `POOL_CAPACITY + CONTROL_CAPACITY` (256 + 4 = 260) so that
+concurrently pending control barriers never fill the ring to the point where an audio descriptor
+`publish()` could fail structurally.
 The wiring abstraction lives in [`src/recording/transport.rs`](../src/recording/transport.rs) (`RecordingSender` /
 `RecordingReceiver`); the inline ring remains fully wired behind the compile-time
 `RECORDING_POOL_TRANSPORT` switch as the rollback path.
@@ -414,13 +417,13 @@ reports.
 
 Typed diagnostic error codes (`NamErrorCode`) provide structured error categorization:
 
-| Range   | Category            | Representative Error Codes                                                                                                                                                                                                                                           |
-|:------- |:------------------- |:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                                                                                                                                  |
-| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2300` SCHED_FIFO_DENIED, `E2301` CPU_AFFINITY_FAILED, `E2302` BACKEND_FAILURE, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` RATE_MISMATCH |
-| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                                                                                                                                                                                                |
-| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` IR_LOAD_FAILED                                                                                                                                                                                                                   |
-| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                |
+| Range   | Category            | Representative Error Codes                                                                                                                                                                                                                                                                                                          |
+|:------- |:------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                                                                                                                                                                                                  |
+| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2004` OS_SCRATCH_CAPACITY, `E2108` CPU_AFFINITY_MASK_UNAVAILABLE, `E2109` IRQ_LOAD_UNAVAILABLE, `E2110` SYSFS_TOPOLOGY_UNAVAILABLE, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH |
+| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED                                                                                                                                                                                                |
+| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                                                                                                                                                                                                                                                              |
+| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                                                                                |
 
 ---
 

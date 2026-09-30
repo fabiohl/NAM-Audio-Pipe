@@ -55,6 +55,12 @@ pub(crate) const RT_STATUS_PANIC_CAPTURED: u64 = 1 << 31;
 /// crosses the FFI boundary, so the process never aborts with a corrupt
 /// capture.
 ///
+/// If [`RT_STATUS_PANIC_CAPTURED`] was already raised during this audio session,
+/// subsequent invocations immediately return `false` without executing `body`.
+/// This prevents repeated panic hook executions (fsync, diagnostic bundle dumps)
+/// within the SCHED_FIFO thread while the PipeWire data loop continues to invoke
+/// `process()` during the control loop observation window (≤100 ms).
+///
 /// `catch_unwind` itself performs **zero heap allocations on the success path**
 /// (verified by the heap-audit gate); the closure body must uphold the RT
 /// zero-alloc/zero-IO/zero-lock contract.
@@ -63,6 +69,10 @@ pub(crate) fn run_rt_callback_body<F>(rt_status: &RtStatusFlags, body: F) -> boo
 where
     F: FnOnce() + std::panic::UnwindSafe,
 {
+    if rt_status.check_flag(RT_STATUS_PANIC_CAPTURED) {
+        return false;
+    }
+
     match std::panic::catch_unwind(body) {
         Ok(()) => true,
         Err(_) => {
@@ -95,6 +105,60 @@ mod tests {
         assert!(
             rt.check_flag(RT_STATUS_PANIC_CAPTURED),
             "panic must raise the fatal RT flag"
+        );
+    }
+
+    #[test]
+    fn rt_panic_captured_latch_prevents_body_reexecution() {
+        let rt = RtStatusFlags::default();
+        rt.set_flag(RT_STATUS_PANIC_CAPTURED);
+
+        let mut body_ran = false;
+        let ok = run_rt_callback_body(
+            &rt,
+            std::panic::AssertUnwindSafe(|| {
+                body_ran = true;
+            }),
+        );
+        assert!(!ok, "must return false when panic was already captured");
+        assert!(
+            !body_ran,
+            "body must not execute when panic was already captured"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "testing")]
+    fn rt_subsequent_callbacks_suppressed_after_first_panic() {
+        let rt = RtStatusFlags::default();
+        let mut executions = 0;
+
+        // First invocation panics and sets the latch.
+        let ok1 = run_rt_callback_body(
+            &rt,
+            std::panic::AssertUnwindSafe(|| {
+                executions += 1;
+                panic!("first panic");
+            }),
+        );
+        assert!(!ok1);
+        assert_eq!(executions, 1);
+        assert!(rt.check_flag(RT_STATUS_PANIC_CAPTURED));
+
+        // Subsequent invocations must be suppressed without running the body again.
+        for _ in 0..5 {
+            let ok_subsequent = run_rt_callback_body(
+                &rt,
+                std::panic::AssertUnwindSafe(|| {
+                    executions += 1;
+                    panic!("subsequent panic should never happen");
+                }),
+            );
+            assert!(!ok_subsequent);
+        }
+        assert_eq!(
+            executions, 1,
+            "body must not be re-executed after initial panic"
         );
     }
 

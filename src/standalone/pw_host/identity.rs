@@ -31,6 +31,9 @@ pub const PW_THREAD_LOOP_NAME: &str = "nam-audio-pipe-loop";
 
 /// Retrieves the runtime version string reported by the PipeWire client library.
 pub fn pw_library_version() -> String {
+    // SAFETY: pw_get_library_version returns a valid, null-terminated static C string
+    // from libpipewire or NULL on initialization error. The pointer is checked for null
+    // before CStr::from_ptr dereferencing and converted to an owned String.
     unsafe {
         let ptr = pw_get_library_version();
         if ptr.is_null() {

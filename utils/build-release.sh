@@ -162,7 +162,17 @@ cleanup() {
     fi
     if [ "${PARANOID_MODIFIED:-false}" = "true" ]; then
         echo -e "\nRestoring kernel.perf_event_paranoid to $ORIG_PARANOID..."
-        sudo sysctl -q -w kernel.perf_event_paranoid="$ORIG_PARANOID" 2>/dev/null || true
+        if sudo sysctl -q -w kernel.perf_event_paranoid="$ORIG_PARANOID" 2>/dev/null; then
+            local current_paranoid
+            current_paranoid=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "")
+            if [ "$current_paranoid" = "$ORIG_PARANOID" ]; then
+                echo -e "  ${GREEN}✓${NC} kernel.perf_event_paranoid restored to $ORIG_PARANOID."
+            else
+                warn "Failed to restore kernel.perf_event_paranoid: expected $ORIG_PARANOID, currently $current_paranoid. Please run: sudo sysctl -w kernel.perf_event_paranoid=$ORIG_PARANOID"
+            fi
+        else
+            warn "Failed to execute sudo sysctl to restore kernel.perf_event_paranoid to $ORIG_PARANOID. Please run: sudo sysctl -w kernel.perf_event_paranoid=$ORIG_PARANOID"
+        fi
     fi
     if [ -n "${PGO_DIR:-}" ] && [ -d "$PGO_DIR" ]; then rm -rf "$PGO_DIR"; fi
     if [ -n "${BOLT_DIR:-}" ] && [ -d "$BOLT_DIR" ]; then rm -rf "$BOLT_DIR"; fi
