@@ -1596,7 +1596,7 @@ fn silence_available_descriptors_single_channel_zeros_and_stamps_chunk() {
     buf.fill_pattern(0xAB);
     let mut chunk = chunk_of(16, 64);
 
-    let mut descriptors = [(buf.ptr(), buf.maxsize(), &mut chunk as *mut _)];
+    let mut descriptors = [(buf.ptr(), buf.maxsize(), &raw mut chunk as *mut _)];
     silence_available_descriptors(&mut descriptors);
 
     // Buffer must be analytical silence
@@ -1619,7 +1619,7 @@ fn silence_available_descriptors_bounds_huge_single_channel() {
     buf.fill_pattern(0x5A);
     let mut chunk = chunk_of(0, 100);
 
-    let mut descriptors = [(buf.ptr(), buf.maxsize(), &mut chunk as *mut _)];
+    let mut descriptors = [(buf.ptr(), buf.maxsize(), &raw mut chunk as *mut _)];
     silence_available_descriptors(&mut descriptors);
 
     // First MAX_BRIDGE_BUF frames must be zeroed
@@ -1652,7 +1652,7 @@ fn capture_datas_less_than_two_sets_contract_violation_flag() {
     let mut chunk = chunk_of(0, 256);
 
     // Emulating the fail-closed action of process_dsp_buffer on datas.len() == 1:
-    let mut descriptors = [(buf.ptr(), buf.maxsize(), &mut chunk as *mut _)];
+    let mut descriptors = [(buf.ptr(), buf.maxsize(), &raw mut chunk as *mut _)];
     rt.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
     silence_available_descriptors(&mut descriptors);
 

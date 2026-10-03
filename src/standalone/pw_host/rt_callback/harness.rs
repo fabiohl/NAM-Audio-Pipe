@@ -441,7 +441,7 @@ impl SwapRtSide {
     fn process_dsp(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize, rate: u32) -> usize {
         // SAFETY: `self.bridge` is owned by the RT side and outlives this call;
         // the writer is used only within `capture_dsp_pipeline` below.
-        let bridge_ref = unsafe { BridgeRef::new(&mut *self.bridge as *mut DspBridge) };
+        let bridge_ref = unsafe { BridgeRef::new(&raw mut *self.bridge) };
         let Some(writer) = DspBridgeWriter::from_ref(bridge_ref) else {
             return 0;
         };

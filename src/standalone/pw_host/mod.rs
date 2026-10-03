@@ -80,6 +80,7 @@ mod bridge;
 mod capture;
 mod handlers;
 pub mod identity;
+pub mod log_redirect;
 pub mod output_pw;
 mod playback;
 mod reconnect;
@@ -89,6 +90,9 @@ pub mod status;
 pub mod stream_status;
 mod wakeup;
 
+pub use log_redirect::{
+    init_pipewire_logging, is_pipewire_logging_installed, restore_pipewire_logging,
+};
 pub use output_pw::PipewireHostConfig;
 pub use run::run_pipewire_host;
 pub use status::{

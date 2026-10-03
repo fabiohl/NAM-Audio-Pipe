@@ -247,7 +247,7 @@ impl Pmc {
         let fd = unsafe {
             libc::syscall(
                 NR_PERF_EVENT_OPEN,
-                &attr as *const PerfEventAttr,
+                &raw const attr,
                 0,  // pid: current thread
                 -1, // cpu: any (pinned to one CPU by the harness)
                 -1, // group_fd: none
@@ -288,7 +288,7 @@ impl Pmc {
         let n = unsafe {
             libc::read(
                 fd,
-                &mut val as *mut u64 as *mut libc::c_void,
+                &raw mut val as *mut libc::c_void,
                 std::mem::size_of::<u64>(),
             )
         };
@@ -644,7 +644,7 @@ fn run_measured(
 
         // SAFETY: `bridge` is uniquely owned by this benchmarking thread; `bridge_writer`
         // narrows writes strictly to the inactive back-buffer without reader conflicts.
-        let bridge_writer = unsafe { Some(DspBridgeWriter::new(&mut *bridge as *mut DspBridge)) };
+        let bridge_writer = unsafe { Some(DspBridgeWriter::new(&raw mut *bridge)) };
         let ctx = DspPipelineContext {
             resampler: &mut resampler,
             os_l: &mut os_l,

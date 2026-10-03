@@ -440,7 +440,7 @@ fn run_cell(
         }
         // SAFETY: `bridge` is exclusively owned by this benchmarking thread; `bridge_writer`
         // narrows writes strictly to the inactive back-buffer without concurrent reader conflicts.
-        let bridge_writer = unsafe { Some(DspBridgeWriter::new(&mut *bridge as *mut DspBridge)) };
+        let bridge_writer = unsafe { Some(DspBridgeWriter::new(&raw mut *bridge)) };
 
         let ctx = DspPipelineContext {
             resampler: &mut resampler,

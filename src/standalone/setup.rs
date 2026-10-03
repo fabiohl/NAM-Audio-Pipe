@@ -6,7 +6,7 @@
 use crate::standalone::{cli, colors::Colorize};
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::{
-    ACTIVE_MODEL_INFO, ACTIVE_MODEL_NAME, ACTIVE_SAMPLE_RATE,
+    ACTIVE_MODEL_INFO, ACTIVE_MODEL_MEMORY_BYTES, ACTIVE_MODEL_NAME, ACTIVE_SAMPLE_RATE,
 };
 use neural_amp_modeler_rs::common::spsc::{self, ParamPayload, SpscChannels};
 use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
@@ -64,6 +64,8 @@ pub fn load_initial_model(
                 if let Ok(mut info_guard) = ACTIVE_MODEL_INFO.write() {
                     *info_guard = Some(model_info);
                 }
+                let mem_bytes = loaded.model_memory_bytes().unwrap_or(0);
+                ACTIVE_MODEL_MEMORY_BYTES.store(mem_bytes, Ordering::Relaxed);
 
                 has_model_r = loaded.model_r.is_some();
 
@@ -94,6 +96,7 @@ pub fn load_initial_model(
             Err(e) => cli::exit_with_error(format!("Model load failed: {}", e)),
         }
     } else {
+        ACTIVE_MODEL_MEMORY_BYTES.store(0, Ordering::Relaxed);
         log::warn!(
             "{} No model loaded — operating in True-Bypass mode (clean audio pass-through).\n  \
              Use --model <file.nam> to load a neural amplifier model.",

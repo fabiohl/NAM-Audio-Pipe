@@ -541,8 +541,8 @@ fn rt_deadline_full() {
         cap_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
         cap_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
 
-        let cap_chunk_l_ptr = &mut cap_chunk_l as *mut pipewire::spa::sys::spa_chunk;
-        let cap_chunk_r_ptr = &mut cap_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        let cap_chunk_l_ptr = &raw mut cap_chunk_l;
+        let cap_chunk_r_ptr = &raw mut cap_chunk_r;
 
         let win_l = resolve_capture_chunk_window(
             cap_chunk_l_ptr,
@@ -588,8 +588,8 @@ fn rt_deadline_full() {
             None,
         );
 
-        let pb_chunk_l_ptr = &mut pb_chunk_l as *mut pipewire::spa::sys::spa_chunk;
-        let pb_chunk_r_ptr = &mut pb_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        let pb_chunk_l_ptr = &raw mut pb_chunk_l;
+        let pb_chunk_r_ptr = &raw mut pb_chunk_r;
         bridge_reader.read_block(&mut last_bridge_gen, |src_l, src_r| unsafe {
             let _ = deliver_playback_pair_fail_closed(
                 pb_ptr_l,
@@ -627,8 +627,8 @@ fn rt_deadline_full() {
         cap_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
         cap_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
 
-        let cap_chunk_l_ptr = &mut cap_chunk_l as *mut pipewire::spa::sys::spa_chunk;
-        let cap_chunk_r_ptr = &mut cap_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        let cap_chunk_l_ptr = &raw mut cap_chunk_l;
+        let cap_chunk_r_ptr = &raw mut cap_chunk_r;
 
         // Stage 1: Capture / SPA validation
         let t0 = now_ns();
@@ -691,8 +691,8 @@ fn rt_deadline_full() {
         let dur_rec = t3 - t2;
 
         // Stage 4: Playback delivery
-        let pb_chunk_l_ptr = &mut pb_chunk_l as *mut pipewire::spa::sys::spa_chunk;
-        let pb_chunk_r_ptr = &mut pb_chunk_r as *mut pipewire::spa::sys::spa_chunk;
+        let pb_chunk_l_ptr = &raw mut pb_chunk_l;
+        let pb_chunk_r_ptr = &raw mut pb_chunk_r;
         bridge_reader.read_block(&mut last_bridge_gen, |src_l, src_r| unsafe {
             let delivered = deliver_playback_pair_fail_closed(
                 pb_ptr_l,

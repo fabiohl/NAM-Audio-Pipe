@@ -4,7 +4,7 @@
 name = "nam-audio-pipe"
 version = "0.7.3"
 edition = "2024"
-rust-version = "1.98.0"
+rust-version = "1.99.0"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/fabiohl/NAM-Audio-Pipe"
 description = "Low-latency PipeWire standalone client for Neural Amp Modeler (NAM)."
@@ -131,3 +131,9 @@ debug = 1
 opt-level = 0
 incremental = true
 split-debuginfo = "unpacked"
+
+[lints.rust]
+raw_borrows_via_references = "warn"
+
+[patch.crates-io]
+NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }

@@ -68,6 +68,7 @@ fn main() -> anyhow::Result<()> {
     // PipeWire socket is not available and a full `pw_init()` would abort or return an error.
     if args.diagnose || args.diagnose_full {
         pipewire::init();
+        pw_host::init_pipewire_logging(level_filter);
         neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
             pw_host::identity::pw_library_version(),
         );
@@ -77,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
         // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
         // `exit(0)` and is mutually exclusive with the main audio host run loop below.
+        pw_host::restore_pipewire_logging();
         unsafe {
             pipewire::deinit();
         }
@@ -86,6 +88,7 @@ fn main() -> anyhow::Result<()> {
     // 2. PREPARE THE AUDIO: Initialize PipeWire (the Linux sound system)
     // and calibrate internal "clocks" to ensure sound output without delays (latency).
     pipewire::init();
+    pw_host::init_pipewire_logging(level_filter);
     neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
         pw_host::identity::pw_library_version(),
     );
@@ -352,6 +355,7 @@ fn main() -> anyhow::Result<()> {
     // The host loop, worker threads, and streams have completed teardown before this point.
     // This `deinit` executes exactly once on the normal host shutdown path (mutually exclusive
     // with the early-exit `diagnose_bundle` branch at line 77).
+    pw_host::restore_pipewire_logging();
     unsafe {
         pipewire::deinit();
     }

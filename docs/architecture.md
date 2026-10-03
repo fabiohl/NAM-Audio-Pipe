@@ -425,6 +425,73 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 | `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                                                                                                                                                                                                                                                              |
 | `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                                                                                |
 
+### 9.2 PipeWire Log Redirection via Pure-Rust C-ABI Variadics (Rust 1.99)
+
+PipeWire dispatches internal diagnostic and runtime messages through its Simple Plugin API (SPA) logging interface (`pw_log_set`, `struct spa_log`, `struct spa_log_methods`). Historically, redirecting C-ABI variadic callbacks (`printf`-style `...` arguments) into Rust required writing external C helper shims (`.c` files compiled via `cc` in `build.rs`) to convert variadics into structured buffers or `va_list` pointers.
+
+With **Rust 1.99** stabilizing C-ABI variadic functions (`unsafe extern "C" fn(..., args: ...)`) and `core::ffi::VaList`, `NAM-Audio-Pipe` implements a 100% pure-Rust logging redirect ([`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs)) with **zero `.c` shim files**:
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          PipeWire / SPA Core Subsystem                      │
+│     pw_log_log / pw_log_logt / spa_log_log / pw_log_warn / pw_log_error     │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼ (Direct C-ABI Function Pointer Dispatch)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│              Pure-Rust SPA Log Methods Table (log_redirect.rs)              │
+│  - log: nam_pw_log(object, level, file, line, func, fmt, ...)               │
+│  - logt: nam_pw_logt(object, level, topic, file, line, func, fmt, ...)      │
+│  - logv: nam_pw_logv(object, level, file, line, func, fmt, args: va_list)   │
+│  - logtv: nam_pw_logtv(object, level, topic, file, line, func, fmt, args)   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼ (Fixed 1024-byte Stack Buffer vsnprintf)
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      RT-Safe In-Place Formatting Path                       │
+│  - let mut buf = [0u8; 1024];                                               │
+│  - vsnprintf / __vsnprintf (ZERO heap allocations, ZERO locks)              │
+│  - CStr::from_bytes_until_nul validation                                    │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│               Unified Rust log::* Facade & Diagnostics Ring                 │
+│  - Target tag: [PipeWire] or [PipeWire:topic_name]                          │
+│  - Level mapping: SPA_LOG_LEVEL_* ──► log::Level::*                         │
+│  - Ingested directly into NamLogger::log_buffer() for DiagnosticBundle      │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Key Architectural Characteristics
+
+1. **Pure Rust C-ABI Variadic Callbacks:**
+   The `spa_log_methods` table registers Rust functions declared with C variadics:
+   ```rust
+   pub unsafe extern "C" fn nam_pw_log(
+       _object: *mut c_void,
+       level: spa_log_level,
+       file: *const c_char,
+       line: c_int,
+       func: *const c_char,
+       fmt: *const c_char,
+       args: ...,
+   )
+   ```
+   Rust 1.99 natively compiles this signature according to the target's C calling convention (System V AMD64 ABI on `x86-64`), passing `args: VaList` cleanly to standard C formatting primitives.
+
+2. **Dual-Path Calling Convention Support:**
+   PipeWire dispatches logs through two distinct conventions depending on the invocation source:
+   - Direct macro invocations (`spa_log_log`, `spa_log_logt`) invoke the variadic `log` and `logt` callbacks.
+   - High-level wrappers (`pw_log_log`, `pw_log_logt`) pack variadic arguments into a platform `va_list` structure and dispatch to `logv` and `logtv`.
+   Implementing all four entry points (`nam_pw_log`, `nam_pw_logt`, `nam_pw_logv`, `nam_pw_logtv`) guarantees comprehensive coverage across all PipeWire versions and plugin modules.
+
+3. **Hard Real-Time Safety & Zero Heap Allocations:**
+   Formatting executes inside an isolated 1024-byte stack buffer (`[0u8; 1024]`) via `vsnprintf` (`__vsnprintf`). No dynamic memory allocation (`malloc`, `String`, `Vec`, `Box`), heap drops, or thread synchronization locks occur on the log formatting path. If a log message exceeds 1023 bytes, it is safely truncated without undefined behavior or heap escalation.
+
+4. **Seamless Diagnostics Bundle Integration:**
+   All PipeWire log messages are tagged (`[PipeWire]` or `[PipeWire:<topic>]`) and dispatched to `log::error!`, `log::warn!`, `log::info!`, `log::debug!`, or `log::trace!`. These messages automatically enter `NamLogger`'s lock-free ring buffer (`LogBuffer`), ensuring that internal PipeWire state changes, stream renegotiations, and backend warnings appear in `nam-audio-pipe --diagnose`, `BACKEND_FAILURE` reports, and crash dumps.
+
 ---
 
 ## 10. Flatpak Packaging & Sandbox Architecture
