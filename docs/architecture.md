@@ -492,6 +492,18 @@ With **Rust 1.99** stabilizing C-ABI variadic functions (`unsafe extern "C" fn(.
 4. **Seamless Diagnostics Bundle Integration:**
    All PipeWire log messages are tagged (`[PipeWire]` or `[PipeWire:<topic>]`) and dispatched to `log::error!`, `log::warn!`, `log::info!`, `log::debug!`, or `log::trace!`. These messages automatically enter `NamLogger`'s lock-free ring buffer (`LogBuffer`), ensuring that internal PipeWire state changes, stream renegotiations, and backend warnings appear in `nam-audio-pipe --diagnose`, `BACKEND_FAILURE` reports, and crash dumps.
 
+### 9.3 Off-RT Log Ring: PW Log Events Never Touch `log::*` on the RT Thread
+
+The auditing finding behind this sub-section: with the redirect of §9.2 installed, PipeWire internals may raise log events **from the RT data thread**, and a synchronous `log::*` dispatch there reaches `NamLogger` admission (mutex) and formatting allocations — a real-time contract violation the moment anyone runs the host with verbose PipeWire levels (`PIPEWIRE_DEBUG=3` + `RUST_LOG=debug`).
+
+The resolution ([`src/standalone/pw_host/rt_log_ring.rs`](../src/standalone/pw_host/rt_log_ring.rs)) keeps §9.2 intact and inserts a bounded off-RT queue between the two:
+
+- **Route decision (O(1), zero lock/alloc/syscall):** the log formatters consult `rt_log_ring::try_offload` before the synchronous dispatch. It combines one `Acquire` load of the routing gate with the thread-local RT-callback mark (`src/standalone/rt_setup/rt_log_mark.rs`, armed once in `configure_realtime_thread_with` — the first `process()` quantum is the only consumer-owned hook on the PW data thread). Unmarked threads, pre-install windows and rollback always keep the exact §9.2 synchronous path.
+- **Single producer by construction:** only the marked data thread can ever push — `rt_log_mark` refuses a second live mark, the mark dies with its thread, and the bounded-reconnect cycle joins one `pw_thread_loop` before the next spawns (`pw_host::run`). rtrb 0.4 requires `&mut self` on `push`, so the producer seat uses interior mutability (`UnsafeCell`) under that documented single-writer invariant, and the event record is copied (msg ≤ 256, topic ≤ 32, file ≤ 48, line) into a pre-allocated ~1024-entry SPSC ring — the drainer never dereferences foreign pointers because topic/file are copied **at capture time** by scoped decoders shared with the synchronous dispatch.
+- **Saturation is counted, never blocking:** a full ring discards the event and increments the `pw_log_dropped` counter, surfaced by the telemetry poll (`poll_rt_status`, latched — one warning per episode). The marked thread never blocks and never falls back to the synchronous dispatch, not even under overload.
+- **One emit source, zero drift:** drained records replay through the same `emit_decoded_pipewire_log` shape the synchronous dispatch uses, so `LogBuffer`, crash reports and `--diagnose` keep seeing the identical `[PipeWire]` messages — the redirect is preserved; what moved off the RT thread is only the synchronous call site.
+- **Rollback at (re)initialization:** the `NAM_PW_LOG_SYNC` environment variable is consulted exactly once, by `install()` (any value) — with it set, the synchronous path is kept for every event (no ring, no drainer, bit-identical behavior to the pre-ring host); the variable is never re-read while the process runs. Runtime rollback is a different lever: `restore_pipewire_logging` disables the routing gate immediately. The drainer is a daemon that parks 10 ms between sweeps and ends only with the process; a failed drainer spawn fails closed (synchronous path is kept).
+
 ---
 
 ## 10. Flatpak Packaging & Sandbox Architecture

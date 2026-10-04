@@ -10,6 +10,7 @@
 
 pub mod affinity;
 pub mod pm_qos;
+pub mod rt_log_mark;
 pub mod telemetry;
 pub mod thread;
 pub use neural_amp_modeler_rs::common::tsc;
@@ -20,6 +21,7 @@ pub use neural_amp_modeler_rs::common::tsc;
 // `neural_amp_modeler_rs::rt_hardening::*` for new code.
 pub use affinity::*;
 pub use pm_qos::*;
+pub use rt_log_mark::*;
 pub use telemetry::*;
 pub use thread::*;
 pub use tsc::*;

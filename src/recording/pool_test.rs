@@ -324,6 +324,86 @@ fn pool_work_ring_backpressure() {
     assert_eq!(producer.leaked_slots(), 0);
 }
 
+/// Border contract (N=1): the minimum viable pool must complete a full
+/// acquire → fill → publish → pop → read → release cycle, return its single
+/// slot exactly once, and keep the barrier ordering machinery intact — the
+/// smallest instantiation admitted by the compile-time invariant
+/// `N < CONTROL_BARRIER_SLOT` (`RecordingPool::new`).
+#[test]
+fn pool_minimum_capacity_one_round_trips() {
+    let pool = RecordingPool::<1>::new();
+    let (mut producer, mut consumer) = pool.split();
+
+    let mut slot = producer.try_acquire().expect("the single slot is free");
+    assert_eq!(slot.slot_index(), 0);
+    slot.block_mut().fill_planar(&[1.0, 2.0], &[3.0, 4.0]);
+    assert!(slot.publish(), "publish is infallible at capacity N");
+
+    let in_flight = consumer.try_pop().expect("the published block");
+    assert!(!in_flight.is_barrier());
+    assert_eq!(in_flight.descriptor().slot, 0);
+    assert_eq!(in_flight.descriptor().valid_len, 4);
+    assert!(in_flight.release(), "release is infallible at capacity N");
+
+    // The single slot is immediately reusable (full second cycle).
+    let mut slot = producer.try_acquire().expect("slot returns after release");
+    slot.block_mut().fill_planar(&[5.0], &[6.0]);
+    assert!(slot.publish());
+    let in_flight = consumer.try_pop().expect("the republished block");
+    assert_eq!(in_flight.block().left_slice(), &[5.0]);
+    assert!(in_flight.release());
+
+    // Shutdown: the slot drains exactly once (no ABA/double-return).
+    let drained = producer.drain_free_for_check();
+    assert_eq!(drained, [0]);
+
+    // Barrier ordering also works at N=1: the work ring is dimensioned
+    // `N + CONTROL_CAPACITY`, so a barrier coexists with audio backpressure.
+    assert!(producer.try_push_barrier(7));
+    let barrier = consumer.try_pop().expect("the barrier");
+    assert!(barrier.is_barrier());
+    assert_eq!(barrier.barrier_seq(), 7);
+    assert!(barrier.release(), "barrier release is a no-op success");
+    assert_eq!(producer.leaked_slots(), 0);
+}
+
+/// Documented scaling limits: the 16-bit descriptor words (`slot`, `valid_len`)
+/// and the reserved barrier sentinel bound every legal instantiation. These
+/// numbers mirror the compile-time asserts — `MAX_BLOCK_SIZE < u16::MAX`
+/// (`recording/buffer.rs`) and `N < CONTROL_BARRIER_SLOT`
+/// (`RecordingPool::new`) — so the quick suite fails loudly if the shipped
+/// configuration ever approaches a limit where a truncating cast or a sentinel
+/// collision could appear.
+#[test]
+fn pool_scaling_limits_are_documented_and_enforced() {
+    // Maximum legal free-ring index stays strictly below the sentinel and the
+    // full production instantiation keeps a huge headroom of unused indices.
+    assert!(POOL_CAPACITY - 1 < CONTROL_BARRIER_SLOT as usize);
+    assert_eq!(
+        CONTROL_BARRIER_SLOT,
+        u16::MAX,
+        "the sentinel is the top of the 16-bit index domain"
+    );
+    assert_eq!(
+        u16::try_from(POOL_CAPACITY).expect("shipped pool fits u16"),
+        256
+    );
+
+    // The largest legal audio `valid_len` (a full block) is publishable:
+    // it fits the 16-bit descriptor word, far from the sentinel.
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new_uninit();
+    let full_plane = [0.0f32; MAX_BLOCK_SIZE / 2];
+    assert_eq!(
+        block.fill_planar(&full_plane, &full_plane),
+        MAX_BLOCK_SIZE,
+        "a slot must hold the largest legal quantum"
+    );
+    assert_eq!(
+        u16::try_from(block.valid_len()).expect("const-enforced headroom"),
+        MAX_BLOCK_SIZE as u16
+    );
+}
+
 /// Adversarial stress test (Finding F-RB-106):
 /// The work ring contains metadata barriers plus audio descriptors. Verifies
 /// that publishing audio never fails structurally due to work ring capacity,

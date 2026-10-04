@@ -416,6 +416,53 @@ fn recording_audio_sender_none_is_noop() {
     send_recording_audio(&mut none, 64, &resamp_l, &resamp_r, &mut block, None, None);
 }
 
+/// Debug tripwire acceptance: while the pool transport is the compiled
+/// default, an `Inline` sender reaching the RT send path is, by construction,
+/// an accidental hand-wired pairing ([`create_recording_transport`] can never
+/// produce it) — debug builds must accuse fail-fast instead of silently using
+/// the rollback route. Release builds compile the guard away and this test
+/// does not exist there.
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Inline recording transport")]
+#[test]
+fn inline_sender_reaching_the_rt_send_path_is_accused_outside_rollback_build() {
+    let (producer, _consumer) = crate::recording::buffer::create_audio_ring_buffer::<MAX_BLOCK_SIZE>(
+        crate::recording::buffer::RING_CAPACITY,
+    );
+    let resamp_l = [0.0f32; 4];
+    let resamp_r = [0.0f32; 4];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    let mut sender = RecordingSender::Inline(Some(producer));
+
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, &mut block, None, None);
+}
+
+/// Release-codegen coverage of the rollback arm: with the debug tripwire
+/// compiled away (also true for a deliberate rollback build with
+/// `RECORDING_POOL_TRANSPORT` flipped to `false`), the `Inline` arm must keep
+/// routing the filled block into the inline ring exactly as before.
+#[cfg(not(debug_assertions))]
+#[test]
+fn inline_sender_still_routes_into_the_inline_ring_once_the_tripwire_is_compiled_out() {
+    let (producer, mut consumer) = crate::recording::buffer::create_audio_ring_buffer::<
+        MAX_BLOCK_SIZE,
+    >(crate::recording::buffer::RING_CAPACITY);
+    let resamp_l = [1.0f32, 2.0, 3.0, 4.0];
+    let resamp_r = [9.0f32, -1.0, 0.5, 7.0];
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    let mut sender = RecordingSender::Inline(Some(producer));
+
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, &mut block, None, None);
+
+    let RingPayload::Audio(published) = consumer.pop().expect("inline ring payload") else {
+        panic!("expected an Audio payload on the inline ring");
+    };
+    assert_eq!(published.valid_len(), 8, "4 stereo frames interleaved");
+    assert_eq!(published.left_slice(), &resamp_l[..]);
+    assert_eq!(published.right_slice(), &resamp_r[..]);
+    assert!(consumer.pop().is_err(), "exactly one payload was enqueued");
+}
+
 #[test]
 fn recording_audio_flag_cleared_when_worker_fails_in_flight() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();

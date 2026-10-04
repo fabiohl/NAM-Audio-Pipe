@@ -88,6 +88,10 @@ pub struct TelemetryLatches {
     pub drift_drops: LatchedSignal,
     /// Audio deadline exceeded (`dsp_cycle_time > quantum budget`).
     pub deadline_exceeded: LatchedSignal,
+    /// PW log ring saturation (`pw_host::rt_log_ring::pw_log_dropped`): PW
+    /// log events discarded with the SPSC ring full (F-APRT-01 off-RT
+    /// offload budget).
+    pub pw_log_dropped: LatchedSignal,
 }
 
 /// Mutable state for `poll_rt_status`, replacing function-scoped statics
@@ -101,6 +105,9 @@ pub struct PollState {
     pub latches: TelemetryLatches,
     /// Last observed cumulative starvation count.
     pub last_starvation: u32,
+    /// Last observed cumulative PW-log ring discard count
+    /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
+    pub pw_log_dropped_last: u64,
 }
 
 impl PollState {
@@ -117,6 +124,7 @@ impl PollState {
             cpu_receipt: receipt,
             latches: TelemetryLatches::default(),
             last_starvation: 0,
+            pw_log_dropped_last: 0,
         }
     }
 }
@@ -505,6 +513,28 @@ pub fn poll_rt_status(
     // stale audio — expected behavior, surfaced as info telemetry.
     // Latched: sustained starvation (e.g. paused capture) informs once
     // per episode instead of every control-loop iteration.
+    // 5.57 PW LOG RING SATURATION (F-APRT-01):
+    // PW log events offloaded to the SPSC ring were DISCARDED with the ring
+    // full. The marked RT thread never blocks and never falls back to the
+    // synchronous dispatch — the diagnostic stream is instead SAMPLED, and
+    // the loss is made visible to the operator here.
+    // Latched: one warning per saturation episode.
+    let pw_log_dropped_now = crate::standalone::pw_host::rt_log_ring::pw_log_dropped();
+    let pw_log_dropped_delta = pw_log_dropped_now.saturating_sub(state.pw_log_dropped_last);
+    state.pw_log_dropped_last = pw_log_dropped_now;
+    if state
+        .latches
+        .pw_log_dropped
+        .observe(pw_log_dropped_delta > 0)
+    {
+        log::warn!(
+            "PipeWire log ring saturated: {} PW log event(s) discarded off-RT this episode \
+             (marked RT thread stayed deadline-clean; PW logging at this rate is a \
+             diagnostic storm — audit the PW level with PIPEWIRE_DEBUG).",
+            pw_log_dropped_delta
+        );
+    }
+
     let current_starvation = stream_status
         .map(|s| s.playback_bridge_starvation.load(Ordering::Relaxed))
         .unwrap_or(0);

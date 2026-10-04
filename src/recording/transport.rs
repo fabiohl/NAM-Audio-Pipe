@@ -56,6 +56,33 @@ use super::pool::{POOL_CAPACITY, PoolConsumer, PoolProducer, RecordingPool};
 /// dead weight.
 pub const RECORDING_POOL_TRANSPORT: bool = true;
 
+/// Debug tripwire for the `Inline` rollback dispatch.
+///
+/// With [`RECORDING_POOL_TRANSPORT`] compiled as the production default, the
+/// only way an `Inline` sender can flow through one of the RT-facing send
+/// paths ([`RecordingSender::try_push_metadata`], [`RecordingSender::try_push_audio`],
+/// [`RecordingSender::try_push_stream_stop`] and the audio enqueue of the
+/// capture callback) is hand-wired construction outside
+/// [`create_recording_transport`] — an accidental production use that debug
+/// builds must accuse fail-fast instead of silently misbehave. The deliberate
+/// rollback (const flipped to `false`) satisfies the condition, and release
+/// builds compile the assertion away so the rollback runtime behavior stays
+/// exactly what it was (debug-only cost, and only while the pool transport is
+/// the default).
+#[inline(always)]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "the constant condition is the design: with the pool transport compiled as default the rollback dispatch must panic on every debug invocation, and a deliberate const flip renders it permanently inert"
+)]
+pub(crate) fn assert_inline_rollback_build() {
+    debug_assert!(
+        !RECORDING_POOL_TRANSPORT,
+        "Inline recording transport used while the pool transport is the \
+         compiled default: `Inline` is the documented rollback path and must \
+         be exercised only after flipping RECORDING_POOL_TRANSPORT to false"
+    );
+}
+
 /// Producer half of the recording transport, held by
 /// [`crate::recording::guard::RecordingWorkerGuard`] (RAII custody) and reached
 /// by the RT callback through a raw pointer.
@@ -196,9 +223,12 @@ impl RecordingSender {
                     false
                 }
             }
-            RecordingSender::Inline(producer) => producer
-                .as_mut()
-                .is_some_and(|p| p.push(RingPayload::Metadata(meta)).is_ok()),
+            RecordingSender::Inline(producer) => {
+                assert_inline_rollback_build();
+                producer
+                    .as_mut()
+                    .is_some_and(|p| p.push(RingPayload::Metadata(meta)).is_ok())
+            }
         }
     }
 
@@ -221,6 +251,7 @@ impl RecordingSender {
                 slot.publish()
             }
             RecordingSender::Inline(producer) => {
+                assert_inline_rollback_build();
                 let Some(producer) = producer.as_mut() else {
                     return false;
                 };
@@ -239,9 +270,12 @@ impl RecordingSender {
             RecordingSender::Pool { control, .. } => control
                 .as_mut()
                 .is_some_and(|p| p.push(ControlPayload::StreamStop).is_ok()),
-            RecordingSender::Inline(producer) => producer
-                .as_mut()
-                .is_some_and(|p| p.push(RingPayload::StreamStop).is_ok()),
+            RecordingSender::Inline(producer) => {
+                assert_inline_rollback_build();
+                producer
+                    .as_mut()
+                    .is_some_and(|p| p.push(RingPayload::StreamStop).is_ok())
+            }
         }
     }
 
@@ -348,6 +382,26 @@ mod tests {
             (RecordingSender::Pool { .. }, RecordingReceiver::Pool { .. })
         ));
         assert!(sender.has_producer());
+    }
+
+    /// Debug tripwire for the metadata route: while the pool transport is the
+    /// compiled default, an `Inline` sender reaching `try_push_metadata` is an
+    /// accidental construction (`create_recording_transport` can never supply
+    /// this pairing) and debug builds accuse fail-fast via
+    /// [`assert_inline_rollback_build`]. Release builds compile the guard away
+    /// and this test does not exist there.
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Inline recording transport")]
+    #[test]
+    fn inline_sender_metadata_route_is_accused_outside_rollback_build() {
+        let (producer, _consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
+        let mut sender = RecordingSender::Inline(Some(producer));
+
+        assert!(!sender.try_push_metadata(AudioMetadata {
+            sample_rate: 48000.0,
+            bit_depth: 32,
+            channels: 2,
+        }));
     }
 
     /// `try_push_audio` on the pool path must land in the pool slot

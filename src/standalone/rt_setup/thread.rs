@@ -207,6 +207,17 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     let engine_cfg = EngineThreadAdapter { inner: cfg };
     let _ =
         neural_amp_modeler_rs::rt_hardening::promote_sched_fifo_with(88, rt_status, &engine_cfg);
+
+    // Arm the RT-callback-thread mark consulted by the PipeWire log handler
+    // (`pw_host::log_redirect`): the first `process()` quantum is the only
+    // consumer-owned hook on the data thread, so arming here — regardless of
+    // the honest-policy outcome (FIFO, RR or fallback OTHER) — remains the
+    // one faithful identity point for "this thread must offload its log
+    // events off its context". The mark dies with the thread; the next
+    // instance's fresh data thread re-arms in its own first quantum. One TLS
+    // store, once, on the cold setup path: no cost on the steady-state hot
+    // path (F-APRT-01).
+    let _ = crate::standalone::rt_setup::rt_log_mark::rt_mark_current_thread();
 }
 
 /// Adapter bridging the local [`ThreadConfigurator`] to the engine's

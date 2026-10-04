@@ -18,6 +18,14 @@
 //! thread count (`/proc/self/status`) and open FD count (`/proc/self/fd`) —
 //! registered in the `TEST_RESULT[endurance_real]=PASS ...` marker.
 //!
+//! Accommodation barrier: each validation window is isolated from the
+//! ambient stream — the RT thread backs off for the whole window attempt
+//! ([`ValidationWindowGate`]) and swap batches are deferred at
+//! `SWAP_INTERVAL` boundaries colliding with a pending window — so the
+//! fail-closed oracle only samples a settled linear tail (the shared
+//! `validate_linear_window` additionally requires a stationarity-confirmed
+//! repeat before its gain/polarity checks).
+//!
 //! Measured: soak 320k blocks in <elapsed> s, RSS delta=<delta> MB, faults=0
 //! (filled by the operator after a calibrated run; the marker carries the live
 //! numbers every run).
@@ -32,11 +40,43 @@ use common::swap::*;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 use nam_audio_pipe::standalone::rt_setup::thread::configure_process_wide;
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 /// Validation window cadence: every N blocks a mandatory Linear A/B polarity
 /// window must complete (fail-closed — zero vanished windows).
 const VALIDATION_INTERVAL: usize = 500;
+
+/// RAII gate that pauses the ambient RT stream while a validation window
+/// runs, so the window's pipeline state is exclusively its own: the ambient
+/// stream (with its fresh signal and whatever engines the latest swap batch
+/// left installed) must not interleave callbacks into the settle/read tail —
+/// that interleave is the drain-race the accommodation barrier exists to
+/// close. The gate releases the stream on drop, including through a panicking
+/// fail-closed oracle (the panic unwinds with the RT stream running again).
+struct ValidationWindowGate {
+    active: Arc<AtomicBool>,
+}
+
+impl ValidationWindowGate {
+    /// Arms the gate: the RT loop observes the flag (Acquire) and yields
+    /// without processing until [`Drop`] releases it.
+    fn arm(active: &std::sync::Arc<AtomicBool>) -> Self {
+        active.store(true, Ordering::Release);
+        Self {
+            active: std::sync::Arc::clone(active),
+        }
+    }
+}
+
+impl Drop for ValidationWindowGate {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
 
 /// Telemetry cadence: a raw RSS/faults/threads/FD sample every N blocks.
 const TELEMETRY_INTERVAL: usize = 1_000;
@@ -132,6 +172,10 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
 
     let harness = std::sync::Arc::new(std::sync::Mutex::new(h));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let window_active = Arc::new(AtomicBool::new(false));
+    let rt_blocked_in_window = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let window_rt = std::sync::Arc::clone(&window_active);
+    let rt_blocked_rt = std::sync::Arc::clone(&rt_blocked_in_window);
     let (tx_ready, rx_ready) = std::sync::mpsc::channel();
 
     let harness_rt = std::sync::Arc::clone(&harness);
@@ -157,6 +201,15 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
             let mut skipped_blocks = 0usize;
 
             while !stop_rt.load(std::sync::atomic::Ordering::Relaxed) {
+                // Validation-window gate: while a window runs the ambient
+                // stream backs off entirely (no callbacks into the harness),
+                // so the window's drain/settle/read tail observe a pipeline
+                // whose state is exclusively the window's own.
+                if window_rt.load(Ordering::Acquire) {
+                    rt_blocked_rt.fetch_add(1, Ordering::Relaxed);
+                    std::thread::yield_now();
+                    continue;
+                }
                 let sig_block = blocks % max_blocks;
                 in_l.copy_from_slice(&sig_l_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
                 in_r.copy_from_slice(&sig_r_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
@@ -207,19 +260,38 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
 
     while start.elapsed() < window {
         let block = blocks;
-        if block.is_multiple_of(SWAP_INTERVAL) {
-            let mut h = harness.lock().expect("harness lock");
-            apply_swap_batch(&mut h, block);
-        }
-
-        // Mandatory validation windows (fail-closed).
+        // Mandatory validation windows (fail-closed). The trigger is declared
+        // BEFORE the swap-batch cadence so a boundary landing exactly on the
+        // trigger block defers its batch: the window is the sole command
+        // producer in flight for the whole attempt.
         if !validation_pending && block >= next_validation {
             validation_pending = true;
             retry_budget = MAX_VALIDATION_ATTEMPTS;
         }
-        if validation_pending {
+        // Swap-batch deferral: an `SWAP_INTERVAL` boundary landing on a
+        // pending validation window (including the trigger block itself) must
+        // not push foreign commands into the harness — the window's own drain
+        // would absorb them (or they would land after it), contaminating the
+        // settle/read tail with a foreign model/OS state. The batch is
+        // skipped here; the cadence continues at the next `SWAP_INTERVAL`
+        // alignment after the window resolves.
+        if !validation_pending && block.is_multiple_of(SWAP_INTERVAL) {
             let mut h = harness.lock().expect("harness lock");
-            if validate_linear_window(&mut h) {
+            apply_swap_batch(&mut h, block);
+        }
+        if validation_pending {
+            // Accommodation barrier, thread leg: the ambient RT stream is
+            // gated off for the whole window attempt so the drain/settle/read
+            // tail sees a pipeline whose state is exclusively the window's
+            // own (the gate releases the stream on drop, including through a
+            // panicking fail-closed oracle).
+            let blocked_before = rt_blocked_in_window.load(std::sync::atomic::Ordering::Relaxed);
+            let _window_gate = ValidationWindowGate::arm(&window_active);
+            let outcome = {
+                let mut h = harness.lock().expect("harness lock");
+                validate_linear_window(&mut h)
+            };
+            if outcome {
                 validation_pending = false;
                 windows_completed += 1;
                 next_validation += VALIDATION_INTERVAL;
@@ -229,6 +301,19 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
                 }
             } else {
                 window_needed_retry = true;
+                // Rate-limited observability: the first retries of a window in
+                // trouble dump the RT pipeline state so a failing run carries
+                // the discriminating information in the log.
+                if retry_budget > MAX_VALIDATION_ATTEMPTS - 4 {
+                    let h = harness.lock().expect("harness lock");
+                    eprintln!(
+                        "endurance window retry ({} remaining): {} — rt_blocked_during_window={}",
+                        retry_budget - 1,
+                        validation_state_debug(&h),
+                        rt_blocked_in_window.load(std::sync::atomic::Ordering::Relaxed)
+                            - blocked_before,
+                    );
+                }
                 retry_budget -= 1;
                 if retry_budget == 0 {
                     panic!(
@@ -256,11 +341,16 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     }
 
     // Resolve a validation window that started before the clock stopped —
-    // fail-closed: it must complete within the budget or the suite fails.
+    // fail-closed: it must complete within the budget or the suite fails
+    // (same accommodation barrier as the in-loop windows).
     let mut final_attempts = 0usize;
     while validation_pending {
-        let mut h = harness.lock().expect("harness lock");
-        if validate_linear_window(&mut h) {
+        let _window_gate = ValidationWindowGate::arm(&window_active);
+        let outcome = {
+            let mut h = harness.lock().expect("harness lock");
+            validate_linear_window(&mut h)
+        };
+        if outcome {
             validation_pending = false;
             windows_completed += 1;
             if window_needed_retry {

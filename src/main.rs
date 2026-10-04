@@ -124,10 +124,12 @@ fn main() -> anyhow::Result<()> {
     );
 
     // 4. EMERGENCY BUTTON: Configures "Ctrl+C" (SIGINT) and service shutdown
-    // (SIGTERM). The unified handler in `standalone::signals` is async-signal-safe:
+    // (SIGTERM). The staged handler in `standalone::signals` is async-signal-safe:
     // the first signal cooperatively sets the process-global `SHUTDOWN` flag so
     // the main loop stops the audio cleanly (thread_loop.stop, recording drain,
-    // WAV header rewrite + fsync); a second signal force-exits via `_exit(1)`.
+    // WAV header rewrite + fsync); further signals inside the 500 ms grace
+    // window are swallowed (exactly one graceful shutdown), and only a signal
+    // after the window expires force-exits via `_exit(1)`.
     // Installation validates every `libc::sigaction` return code.
     signals::install_termination_signal_handlers()?;
 

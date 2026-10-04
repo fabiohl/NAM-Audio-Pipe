@@ -104,7 +104,9 @@ pub const POOL_CAPACITY: usize = 256;
 /// Reserved slot index marking a **control barrier** in the `work` ring.
 ///
 /// `0xFFFF` can never be handed out by [`PoolProducer::try_acquire`] (the free
-/// ring is seeded with `0..N` and `N <= 256`), so the value is free to act as
+/// ring is seeded with `0..N` and the compile-time invariant
+/// `N < CONTROL_BARRIER_SLOT` of [`RecordingPool::new`] guarantees the seeded
+/// domain can never emit the sentinel), so the value is free to act as
 /// an ordering marker: the RT thread pushes it into the `work` ring right after
 /// pushing a [`Metadata`](crate::recording::buffer::ControlPayload::Metadata)
 /// into the dedicated control ring, telling the I/O thread that the control
@@ -188,10 +190,20 @@ impl<const N: usize> RecordingPool<N> {
     /// but checked explicitly so a wrong capacity can never silently reduce
     /// the pool.
     pub fn new() -> Self {
+        // Compile-time invariant, checked for every instantiation: every
+        // legal free-ring index `0..N` stays strictly below the reserved
+        // `CONTROL_BARRIER_SLOT` sentinel. A future instantiation with
+        // `N >= u16::MAX` could seed the sentinel into the free ring, where
+        // an audio slot could never be distinguished from a control barrier
+        // (silent ordering corruption); fail the build instead.
+        const { assert!(N < CONTROL_BARRIER_SLOT as usize) };
         assert!(N > 0, "RecordingPool requires at least one slot");
         let (work, work_consumer) = RingBuffer::new(N + CONTROL_CAPACITY);
         let (mut free, free_consumer) = RingBuffer::new(N);
-        for idx in 0..N as u16 {
+        // Checked conversion (no truncating `as u16`): `N < CONTROL_BARRIER_SLOT`
+        // is const-asserted above, so `N` fits `u16` losslessly and the seeded
+        // domain `0..N` can never emit the sentinel.
+        for idx in 0..u16::try_from(N).expect("`N < CONTROL_BARRIER_SLOT` is const-asserted") {
             free.push(idx)
                 .unwrap_or_else(|_| panic!("free ring seeded with capacity {N}"));
         }
@@ -362,7 +374,20 @@ impl<const N: usize> AcquiredSlot<'_, N> {
     #[inline]
     pub fn publish(self) -> bool {
         // SAFETY: exclusive ownership (see `block_mut`).
-        let valid_len = unsafe { (*self.block).valid_len() } as u16;
+        let raw_len = unsafe { (*self.block).valid_len() };
+        debug_assert!(raw_len <= MAX_BLOCK_SIZE);
+        // Checked 16-bit publication (no truncating `as u16`): `valid_len` is
+        // structurally `<= MAX_BLOCK_SIZE`, and `MAX_BLOCK_SIZE < u16::MAX` is
+        // a const invariant of `recording/buffer.rs`, so the conversion is
+        // infallible for any legal block. A violation can only mean memory
+        // corruption: fail closed instead of silently truncating the
+        // descriptor word — `publish` reports `false`, the caller accounts an
+        // overrun and the `Drop` counts the slot as leaked (the documented
+        // invariant-violation contract of this method).
+        let Ok(valid_len) = u16::try_from(raw_len) else {
+            core::hint::cold_path();
+            return false;
+        };
         let desc = Descriptor {
             slot: self.idx,
             valid_len,

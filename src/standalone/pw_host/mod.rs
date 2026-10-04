@@ -85,6 +85,7 @@ pub mod output_pw;
 mod playback;
 mod reconnect;
 mod rt_callback;
+pub mod rt_log_ring;
 mod run;
 pub mod status;
 pub mod stream_status;

@@ -40,6 +40,8 @@ use pipewire::spa::sys::{
 };
 use pipewire::sys::{pw_log_set, pw_log_set_level};
 
+use super::rt_log_ring;
+
 unsafe extern "C" {
     fn vsnprintf(str: *mut c_char, size: usize, format: *const c_char, ap: VaList) -> c_int;
 
@@ -60,32 +62,78 @@ fn dispatch_pipewire_log(
     _func: *const c_char,
     msg: &str,
 ) {
-    let topic_str = if topic.is_null() {
-        ""
+    // Scoped decodes shared with the off-RT ring drain (`rt_log_ring`), so
+    // both paths print with the exact same shape by construction.
+    unsafe {
+        decode_with_topic(topic, |topic_str| {
+            decode_with_file(file, |file_str| {
+                emit_decoded_pipewire_log(level, topic_str, file_str, line, msg);
+            });
+        });
+    }
+}
+
+/// Shared topic decode of an intercepted PW log event. Scoped borrow: the
+/// decoded text is only usable inside the closure, so no lifetime claim
+/// beyond the call is formed.
+///
+/// # Safety
+///
+/// `topic`, when non-null, must point at a `spa_log_topic` whose `topic`
+/// member, when non-null, points at a valid null-terminated C string for the
+/// call's lifetime — the PipeWire introspection contract upheld by every
+/// caller (`dispatch_pipewire_log` and the off-RT ring drain).
+#[inline]
+pub(crate) unsafe fn decode_with_topic<R>(
+    topic: *const spa_log_topic,
+    f: impl FnOnce(&str) -> R,
+) -> R {
+    if topic.is_null() {
+        f("")
     } else {
-        // SAFETY: `topic` is checked for non-null; `(*topic).topic` is a null-terminated
-        // static string pointer provided by PipeWire.
+        // SAFETY: documented precondition (non-null topic dereference whose
+        // topic text is a null-terminated C string).
         unsafe {
             let topic_ptr = (*topic).topic;
             if topic_ptr.is_null() {
-                ""
+                f("")
             } else {
-                CStr::from_ptr(topic_ptr).to_str().unwrap_or("")
+                f(CStr::from_ptr(topic_ptr).to_str().unwrap_or(""))
             }
         }
-    };
+    }
+}
 
-    let file_str = if file.is_null() {
-        "<pipewire>"
+/// Shared file decode of an intercepted PW log event (null → `"<pipewire>"`,
+/// invalid UTF-8 → `"<invalid>"`). Scoped borrow, same as the topic decode.
+///
+/// # Safety
+///
+/// `file`, when non-null, must point at a valid null-terminated C string
+/// (PipeWire caller-provided log metadata).
+#[inline]
+pub(crate) unsafe fn decode_with_file<R>(file: *const c_char, f: impl FnOnce(&str) -> R) -> R {
+    if file.is_null() {
+        f("<pipewire>")
     } else {
-        // SAFETY: `file` is verified non-null and points to null-terminated C string from caller.
-        unsafe { CStr::from_ptr(file) }
+        // SAFETY: documented precondition (null-terminated C string).
+        f(unsafe { CStr::from_ptr(file) }
             .to_str()
-            .unwrap_or("<invalid>")
-    };
+            .unwrap_or("<invalid>"))
+    }
+}
 
+/// Shared emit of an already-decoded PW log event — the single source of
+/// truth for the message shape used by the synchronous dispatch and the
+/// off-RT ring drain, so the two paths can never drift apart.
+pub(crate) fn emit_decoded_pipewire_log(
+    level: spa_log_level,
+    topic_str: &str,
+    file_str: &str,
+    line: c_int,
+    msg: &str,
+) {
     let trimmed = msg.trim_end();
-
     match level {
         SPA_LOG_LEVEL_ERROR => {
             if topic_str.is_empty() {
@@ -150,6 +198,21 @@ fn dispatch_pipewire_log(
     }
 }
 
+/// Converts the `vsnprintf` stack buffer into a `&str` with zero allocation.
+///
+/// Valid UTF-8 borrows the buffer directly; a payload containing invalid
+/// bytes degrades to the static `"<non-utf8>"` fallback (the lossy bytes are
+/// never materialized into a heap string — the formatter must stay
+/// allocation-free even on hostile input, F-APRT-01). `None` when the buffer
+/// carries no NUL terminator, which a completed `vsnprintf` cannot produce
+/// but stays fail-closed anyway.
+fn stack_msg_to_str(buf: &[u8; 1024]) -> Option<&str> {
+    match CStr::from_bytes_until_nul(buf) {
+        Ok(cstr) => Some(std::str::from_utf8(cstr.to_bytes()).unwrap_or("<non-utf8>")),
+        Err(_) => None,
+    }
+}
+
 /// Formats variadic C arguments into a stack buffer and dispatches to logger.
 #[inline]
 unsafe fn format_and_dispatch_variadic(
@@ -171,11 +234,16 @@ unsafe fn format_and_dispatch_variadic(
     if written < 0 {
         return;
     }
-    let msg = match CStr::from_bytes_until_nul(&buf) {
-        Ok(cstr) => cstr.to_string_lossy(),
-        Err(_) => return,
+    let Some(msg) = stack_msg_to_str(&buf) else {
+        return;
     };
-    dispatch_pipewire_log(level, topic, file, line, func, &msg);
+    // Off-RT ring for the marked RT thread (F-APRT-01): `msg` is consumed by
+    // the ring (queued or discarded+counted) or the sync dispatch follows as
+    // before on unmarked threads / rollback mode. O(1), zero alloc, no locks.
+    if rt_log_ring::try_offload(level, topic, file, line, msg) {
+        return;
+    }
+    dispatch_pipewire_log(level, topic, file, line, func, msg);
 }
 
 /// Formats `va_list` tag pointer into a stack buffer and dispatches to logger.
@@ -198,11 +266,15 @@ unsafe fn format_and_dispatch_va_tag(
     if written < 0 {
         return;
     }
-    let msg = match CStr::from_bytes_until_nul(&buf) {
-        Ok(cstr) => cstr.to_string_lossy(),
-        Err(_) => return,
+    let Some(msg) = stack_msg_to_str(&buf) else {
+        return;
     };
-    dispatch_pipewire_log(level, topic, file, line, func, &msg);
+    // Off-RT ring for the marked RT thread (F-APRT-01), same contract as the
+    // `vsnprintf` formatter above.
+    if rt_log_ring::try_offload(level, topic, file, line, msg) {
+        return;
+    }
+    dispatch_pipewire_log(level, topic, file, line, func, msg);
 }
 
 /// # Safety
@@ -339,6 +411,10 @@ pub fn init_pipewire_logging(level_filter: log::LevelFilter) {
     }
 
     HANDLER_INSTALLED.store(true, Ordering::Release);
+    // Off-RT ring install (F-APRT-01): cold path, main thread; reads
+    // `NAM_PW_LOG_SYNC` and refuses re-install; the marked data thread will
+    // start routing through the ring instead of the synchronous dispatch.
+    rt_log_ring::install();
     log::debug!(
         "[PipeWire] Pure Rust C-ABI variadic log handler installed (level: {:?})",
         level_filter
@@ -347,6 +423,9 @@ pub fn init_pipewire_logging(level_filter: log::LevelFilter) {
 
 /// Restores PipeWire's default internal logger and unregisters the custom handler.
 pub fn restore_pipewire_logging() {
+    // Deactivate the ring routing FIRST so no marked-thread event attempts
+    // en route while the global handler is being removed.
+    rt_log_ring::restore_deactivate();
     if HANDLER_INSTALLED.swap(false, Ordering::AcqRel) {
         // SAFETY: Passing null to pw_log_set resets PipeWire to its internal default logger.
         unsafe {
@@ -363,167 +442,5 @@ pub fn is_pipewire_logging_installed() -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_level_conversion() {
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Off),
-            SPA_LOG_LEVEL_NONE
-        );
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Error),
-            SPA_LOG_LEVEL_ERROR
-        );
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Warn),
-            SPA_LOG_LEVEL_WARN
-        );
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Info),
-            SPA_LOG_LEVEL_INFO
-        );
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Debug),
-            SPA_LOG_LEVEL_DEBUG
-        );
-        assert_eq!(
-            level_filter_to_spa(log::LevelFilter::Trace),
-            SPA_LOG_LEVEL_TRACE
-        );
-    }
-
-    #[test]
-    fn test_spa_log_struct_layout() {
-        assert_eq!(std::mem::size_of::<spa_log>(), 40);
-        assert_eq!(std::mem::align_of::<spa_log>(), 8);
-        assert_eq!(std::mem::size_of::<spa_log_methods>(), 48);
-        assert_eq!(std::mem::align_of::<spa_log_methods>(), 8);
-    }
-
-    #[test]
-    fn test_direct_variadic_log_invocations() {
-        let fmt = b"Test message with int=%d and str=%s\0";
-        let str_arg = b"rust199\0";
-        let file = b"log_redirect_test.rs\0";
-        let func = b"test_direct_variadic_log_invocations\0";
-
-        // SAFETY: Calling our own extern "C" variadic function with valid null-terminated strings.
-        unsafe {
-            nam_pw_log(
-                std::ptr::null_mut(),
-                SPA_LOG_LEVEL_INFO,
-                file.as_ptr() as *const c_char,
-                42,
-                func.as_ptr() as *const c_char,
-                fmt.as_ptr() as *const c_char,
-                199 as c_int,
-                str_arg.as_ptr() as *const c_char,
-            );
-        }
-    }
-
-    #[test]
-    fn test_direct_topic_variadic_log_invocations() {
-        let topic_name = b"nam.test\0";
-        let topic = spa_log_topic {
-            version: 0,
-            topic: topic_name.as_ptr() as *const c_char,
-            level: SPA_LOG_LEVEL_DEBUG,
-            has_custom_level: false,
-        };
-        let fmt = b"Topic log with float=%.2f\0";
-        let file = b"log_redirect_test.rs\0";
-        let func = b"test_direct_topic_variadic_log_invocations\0";
-
-        // SAFETY: Calling our own extern "C" variadic function with valid topic and format arguments.
-        unsafe {
-            nam_pw_logt(
-                std::ptr::null_mut(),
-                SPA_LOG_LEVEL_DEBUG,
-                &raw const topic,
-                file.as_ptr() as *const c_char,
-                100,
-                func.as_ptr() as *const c_char,
-                fmt.as_ptr() as *const c_char,
-                std::f64::consts::PI,
-            );
-        }
-    }
-
-    #[test]
-    fn test_registration_and_restore_lifecycle() {
-        pipewire::init();
-
-        init_pipewire_logging(log::LevelFilter::Debug);
-        assert!(is_pipewire_logging_installed());
-
-        // Emit through PipeWire's C API directly: pw_log_log
-        let fmt = b"E2E PipeWire C API test: status=%s\0";
-        let ok_str = b"SUCCESS\0";
-        let file = b"log_redirect_test.rs\0";
-        let func = b"test_registration_and_restore_lifecycle\0";
-
-        // SAFETY: Calling pw_log_log from PipeWire C library with valid null-terminated strings.
-        unsafe {
-            pipewire::sys::pw_log_log(
-                SPA_LOG_LEVEL_INFO,
-                file.as_ptr() as *const c_char,
-                123,
-                func.as_ptr() as *const c_char,
-                fmt.as_ptr() as *const c_char,
-                ok_str.as_ptr() as *const c_char,
-            );
-        }
-
-        restore_pipewire_logging();
-        assert!(!is_pipewire_logging_installed());
-    }
-
-    #[test]
-    fn test_pipewire_log_captured_in_log_buffer() {
-        pipewire::init();
-        let _ = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::init(
-            neural_amp_modeler_rs::common::diagnostics::logger::LoggerConfig {
-                level_filter: log::LevelFilter::Trace,
-                emit_stderr: false,
-            },
-        );
-        log::set_max_level(log::LevelFilter::Trace);
-
-        init_pipewire_logging(log::LevelFilter::Debug);
-
-        let unique_marker = "PW_LOG_TEST_MARKER_998877";
-        let fmt = b"Testing LogBuffer capture: %s\0";
-        let marker_bytes = b"PW_LOG_TEST_MARKER_998877\0";
-        let file = b"log_redirect_test.rs\0";
-        let func = b"test_pipewire_log_captured_in_log_buffer\0";
-
-        unsafe {
-            pipewire::sys::pw_log_log(
-                SPA_LOG_LEVEL_INFO,
-                file.as_ptr() as *const c_char,
-                456,
-                func.as_ptr() as *const c_char,
-                fmt.as_ptr() as *const c_char,
-                marker_bytes.as_ptr() as *const c_char,
-            );
-        }
-
-        restore_pipewire_logging();
-
-        if let Some(buf) =
-            neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
-        {
-            let entries = buf.snapshot();
-            let found = entries
-                .iter()
-                .any(|rec| rec.message.contains(unique_marker));
-            assert!(
-                found,
-                "Expected marker {unique_marker} to be captured in NamLogger::log_buffer()"
-            );
-        }
-    }
-}
+#[path = "log_redirect_test.rs"]
+mod tests;

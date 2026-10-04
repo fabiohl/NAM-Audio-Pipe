@@ -171,6 +171,49 @@ pub fn test_signal_blocks(total_blocks: usize) -> (Vec<f32>, Vec<f32>) {
 #[cfg(feature = "testing")]
 pub const VALIDATION_DRAIN_BUDGET: usize = 64;
 
+/// Settling barrier for a validation window (count of DC blocks executed after
+/// the command drain, before the window tips are sampled).
+///
+/// Covers the slowest propagation paths a swap batch can leave in flight — the
+/// wet tail of a removed CabSim convolution queue (one `PARTITION` = 512
+/// samples), the oversampled stream of an `X4`→`Off` engine exchange
+/// (`4×BLOCK` per exchange) and the model receptive fields themselves — with a
+/// large margin. The unified RT state is replaced at the swap quantum (old
+/// engines are disposed, never drained into the output), which is why a fixed,
+/// guaranteed count is sufficient: the window only needs the *new* pipeline —
+/// Linear A/B, no CabSim, OS Off, unity gain — to reach and hold its
+/// steady state, which it does within a single block once that state is
+/// installed. 48 blocks × 64 samples ≈ 64 ms of tail headroom (3.07k
+/// samples; 1.33 ms per block) at an RT cost of 48 trivial DC callbacks per
+/// window.
+#[cfg(feature = "testing")]
+pub const VALIDATION_SETTLE_BLOCKS: usize = 48;
+
+/// Frames sampled from the output tail for the oracle (and for the
+/// stationarity snapshots below). `BLOCK - 4 .. BLOCK` covers the quantum's
+/// fresh tip and straddles the previous callback boundary — the exact window
+/// the old drain-race surfaced at (sample 60 with `BLOCK = 64`).
+#[cfg(feature = "testing")]
+pub const VALIDATION_TIP_SAMPLES: usize = 4;
+
+/// Left-channel DC anchor for the validation window (see the oracle table in
+/// [`validate_linear_window`]).
+#[cfg(feature = "testing")]
+pub const VALIDATION_DC_L: f32 = 0.3;
+
+/// Right-channel DC anchor for the validation window — deliberately distinct
+/// from [`VALIDATION_DC_L`]: a mono (identical L/R) window feed would engage
+/// the production dual-mono fold and reduce the R oracle to a tautology
+/// (R == L), certifying the fold instead of the independent right chain.
+#[cfg(feature = "testing")]
+pub const VALIDATION_DC_R: f32 = 0.21;
+
+/// Per-sample gain of the validation right model (`LINEAR_B_JSON`): the sum of
+/// its FIR taps (`-0.28941+0.07963-0.09878+0.14898`), folding to the R oracle
+/// `VALIDATION_DC_R · gain`.
+#[cfg(feature = "testing")]
+pub const VALIDATION_EXPECTED_R_GAIN: f32 = -0.1596;
+
 /// Swap cadence shared by the soak/endurance harnesses: a batch of
 /// model/cabsim/OS/gain commands every N blocks.
 #[cfg(feature = "testing")]
@@ -230,16 +273,36 @@ pub fn apply_swap_batch(h: &mut RtSwapHarness, block: usize) {
 /// and gain symmetry (L positive, R negative, symmetric scaling).
 ///
 /// Returns `false` when the pipeline produced no frames yet (a zero-frame
-/// sentinel — the caller retries within a bounded budget). It never silently
-/// returns a pass: after the drain budget, a persistent zero-frame state fails
-/// hard in the caller.
+/// sentinel — the caller retries within a bounded budget) or when the tail is
+/// still transient — the stationarity gate below. It never silently
+/// returns a pass: after the drain budget, a persistent zero-frame or
+/// never-stationary state fails hard in the caller.
 ///
 /// The validation must also neutralize any active CabSim and oversampling
 /// engine (pushed by the swap batch that shares this block), otherwise the
 /// IR convolution and/or resampled processing would distort the steady-state
 /// Linear gain tags.
+///
+/// Accommodation barrier (drain-race hardening): the steady-state oracle only
+/// samples after (1) the full command drain, (2) a guaranteed
+/// [`VALIDATION_SETTLE_BLOCKS`] settling window sized to the slowest
+/// propagation path the shared swap batches can leave in flight (CabSim
+/// partition queue tail, `X4`→`Off` oversampled stream, model receptive
+/// fields), and (3) a **stationarity gate** — the output tail must repeat
+/// bit-exactly across two consecutive DC callbacks before the oracle runs. A
+/// pipeline whose tail is still propagating a removed engine's transient (or
+/// whose stream is being rewritten by an external producer) is classified as
+/// *not settled* (`false` → bounded retry → hard failure), never validated
+/// against the oracle mid-transient and never granted a loosened pass.
 #[cfg(feature = "testing")]
 pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
+    // Distinct DC anchors per channel: identical L/R would engage the
+    // production dual-mono mono-detector (per-block fold of R over L), making
+    // the R oracle certify the fold instead of the independent right chain.
+    // Distinct anchors keep the detector open exactly as the real stereo
+    // stream does, and both chains stay certified independently.
+    let dc_l = VALIDATION_DC_L; // 0.3: L oracle `1.875·dc + 0.1 = 0.6625`
+    let dc_r = VALIDATION_DC_R; // 0.21: R oracle `-0.1596·dc = -0.0335160`
     h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
     h.push_cabsim(None);
     h.push_os_pair(
@@ -249,11 +312,10 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
     h.push_output_gain(1.0);
     h.push_input_gain(1.0);
 
-    let dc = 0.3f32;
     let mut drained = 0usize;
     while h.commands_pending() && drained < VALIDATION_DRAIN_BUDGET {
-        let mut l = [dc; BLOCK];
-        let mut r = [dc; BLOCK];
+        let mut l = [dc_l; BLOCK];
+        let mut r = [dc_r; BLOCK];
         h.run_callback(&mut l, &mut r, BLOCK);
         drained += 1;
     }
@@ -261,39 +323,116 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
         !h.commands_pending(),
         "validation commands not drained within {VALIDATION_DRAIN_BUDGET} callbacks"
     );
-    for _ in 0..8 {
-        let mut l = [dc; BLOCK];
-        let mut r = [dc; BLOCK];
+    for _ in 0..VALIDATION_SETTLE_BLOCKS {
+        let mut l = [dc_l; BLOCK];
+        let mut r = [dc_r; BLOCK];
         h.run_callback(&mut l, &mut r, BLOCK);
     }
 
     let n = h.current_n_pw();
-    if n == 0 {
+    if n == 0 || n < VALIDATION_TIP_SAMPLES {
         // Zero-frame sentinel: the pipeline is mid-transition (e.g. resampler
         // swap pending). Documented skip — the caller retries within the
         // bounded budget; never a silent pass.
         return false;
     }
-    let out_l = h.out_l();
-    let out_r = h.out_r();
-    if out_l.is_empty() || out_r.is_empty() {
+    let tip = n.saturating_sub(VALIDATION_TIP_SAMPLES);
+    let expected_l = 1.875 * dc_l + 0.1;
+    let expected_r = VALIDATION_EXPECTED_R_GAIN * dc_r;
+
+    // Stationarity gate: the output tip must repeat **bit-exactly** across two
+    // consecutive settled callbacks before the oracle samples it. Any tail
+    // still propagating a removed engine's transient (or a stream being
+    // rewritten by an external producer) fails the repeat, classifying the
+    // window as not-yet-settled — the caller retries within its bounded budget
+    // and a persistent non-stationary state fails hard. Never an oracle sample
+    // mid-transient, never a loosened pass. The tips are snapshotted into
+    // owned slots (shallow borrows of `h` end inside each iteration).
+    let mut tip_l = [[0.0f32; VALIDATION_TIP_SAMPLES]; 2];
+    let mut tip_r = [[0.0f32; VALIDATION_TIP_SAMPLES]; 2];
+    for (slot, (slot_l, slot_r)) in tip_l.iter_mut().zip(tip_r.iter_mut()).enumerate() {
+        if slot > 0 {
+            // A callbacks-skipped quantum must not confirm "steady": a skipped
+            // write keeps the previous bridge content bit-identical, which a
+            // naive snapshot would classify as stability.
+            let frames_before = h.frame_count();
+            let mut l = [dc_l; BLOCK];
+            let mut r = [dc_r; BLOCK];
+            let written = h.run_callback(&mut l, &mut r, BLOCK);
+            let n2 = h.current_n_pw();
+            if n2 != n || h.frame_count() == frames_before || written == 0 || written != n {
+                // The quantum itself changed mid-window (renegotiation,
+                // pipeline transition or a skipped write): not settled —
+                // bounded retry.
+                return false;
+            }
+        }
+        let out_l = h.out_l();
+        let out_r = h.out_r();
+        if out_l.len() < n || out_r.len() < n {
+            // Output shrank under the window: not settled — bounded retry.
+            return false;
+        }
+        slot_l.copy_from_slice(&out_l[tip..n]);
+        slot_r.copy_from_slice(&out_r[tip..n]);
+    }
+    if tip_l[0] != tip_l[1] || tip_r[0] != tip_r[1] {
+        eprintln!(
+            "validating window not settled — {}",
+            validation_state_debug(h)
+        );
         return false;
     }
 
-    let expected_l = 1.875 * dc + 0.1;
-    let expected_r = -0.1596 * dc;
-    let idx = n.saturating_sub(4);
-    for i in idx..n {
-        assert!(
-            (out_l[i] - expected_l).abs() < 1e-2,
-            "soak validation: L at sample {i} = {} expected {expected_l}",
-            out_l[i]
-        );
-        assert!(
-            (out_r[i] - expected_r).abs() < 1e-2,
-            "soak validation: R at sample {i} = {} expected {expected_r}",
-            out_r[i]
-        );
+    for (i, (l_sample, r_sample)) in tip_l[0].iter().zip(tip_r[0].iter()).enumerate() {
+        if ((l_sample - expected_l).abs() >= 1e-2) || ((r_sample - expected_r).abs() >= 1e-2) {
+            // Full-tail diagnostic dump: the whole out buffer that the oracle
+            // rejected — a failing run must carry the discriminating waveform
+            // (values + magnitudes) alongside the state snapshot.
+            let out_l_full = h.out_l().to_vec();
+            let out_r_full = h.out_r().to_vec();
+            panic!(
+                "soak validation: L at sample {} = {l_sample} expected {expected_l}; \
+                 R tip {r_sample} expected {expected_r}; out_l={out_l_full:?}; \
+                 out_r={out_r_full:?}; {}",
+                tip + i,
+                validation_state_debug(h)
+            );
+        }
     }
     true
+}
+
+/// One-line RT pipeline state snapshot for failing window diagnostics:
+/// mono-fold state, gain chain, cabsim presence, OS factor request and
+/// structural-swap counters — the discriminating state that a drained-but-
+/// wrong window exhibits.
+#[cfg(feature = "testing")]
+pub fn validation_state_debug(h: &RtSwapHarness) -> String {
+    let st = h.rt_status();
+    let label = |m: Option<&StaticModel>| match m {
+        Some(m) => format!(
+            "{} rf={} fp={}",
+            m.class_label(),
+            m.receptive_field(),
+            m.memory_footprint()
+        ),
+        None => "none".to_string(),
+    };
+    format!(
+        "state: mono={} in_gain={} out_gain={} cabsim={} os_factor_req={} \
+         model_l=[{}] model_r=[{}] deferred={} superseded={}",
+        h.process_mono(),
+        h.input_gain_mult(),
+        h.output_gain_mult(),
+        h.active_cabsim().is_some(),
+        st.requested_os_factor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        label(h.active_model_l()),
+        label(h.active_model_r()),
+        st.structural_deferred_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        st.structural_superseded_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+    )
 }

@@ -702,3 +702,70 @@ fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
          E2300 / RT_PRIORITY_DENIED concise warning"
     );
 }
+
+#[test]
+fn test_pw_log_ring_drop_warns_once_per_episode() {
+    use crate::standalone::pw_host::rt_log_ring;
+
+    let _guard = init_test_logger();
+    // PW-log ring state is process-global; the lock serializes with the
+    // ring tests in the same binary (see PW_LOG_REDIR_TEST_LOCK).
+    let _ring_lock = crate::standalone::PW_LOG_REDIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    rt_log_ring::reset_pw_log_dropped_for_test();
+
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    let drop_warn_count = || {
+        let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+            .expect("LogBuffer must be initialized");
+        log_buf
+            .snapshot()
+            .iter()
+            .filter(|r| r.message.contains("PipeWire log ring saturated"))
+            .count()
+    };
+
+    let base = drop_warn_count();
+
+    // Clean state: no delta, no warning.
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    assert_eq!(drop_warn_count() - base, 0, "no saturation must not warn");
+
+    // Saturation episode: the first delta warns once.
+    rt_log_ring::bump_pw_log_dropped_for_test(3);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        drop_warn_count() - base,
+        1,
+        "first saturation delta must warn"
+    );
+
+    // Continued saturation: latched — no re-emission without a clear.
+    rt_log_ring::bump_pw_log_dropped_for_test(2);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        drop_warn_count() - base,
+        1,
+        "continued saturation must not re-emit"
+    );
+
+    // Clear, then a fresh episode warns again exactly once.
+    rt_log_ring::reset_pw_log_dropped_for_test();
+    state.pw_log_dropped_last = rt_log_ring::pw_log_dropped();
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    assert_eq!(drop_warn_count() - base, 1, "clear state must not warn");
+
+    rt_log_ring::bump_pw_log_dropped_for_test(1);
+    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    assert_eq!(
+        drop_warn_count() - base,
+        2,
+        "a new saturation episode must emit once"
+    );
+    rt_log_ring::reset_pw_log_dropped_for_test();
+}

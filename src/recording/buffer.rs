@@ -13,6 +13,15 @@ use std::sync::atomic::AtomicU64;
 /// Sized for the maximum host quantum (8192 frames × 2 channels = 16384 samples).
 pub const MAX_BLOCK_SIZE: usize = 16384;
 
+// Compile-time invariant: a block's valid sample count (structurally
+// `<= MAX_BLOCK_SIZE`) is carried in the 16-bit `Descriptor::valid_len` word
+// of the pool transport (`recording/pool.rs`), so a future resize at or
+// beyond `u16::MAX` — the pool's reserved `CONTROL_BARRIER_SLOT` sentinel —
+// would publish a silently truncated `valid_len` through `AcquiredSlot::publish`.
+// Fail the build instead; the strict `<` (not `<=`) documents that even the
+// largest legal audio word keeps clear of the sentinel.
+const _: () = assert!(MAX_BLOCK_SIZE < u16::MAX as usize);
+
 /// Number of slots in the SPSC ring buffer.
 /// Each slot holds a `RingPayload<MAX_BLOCK_SIZE>` (~64 KiB).
 /// Total memory: 256 slots × 64 KiB = 16 MiB (same footprint as the previous

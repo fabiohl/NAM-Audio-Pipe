@@ -7,7 +7,7 @@
 use crate::recording::buffer::{
     AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT, RingPayload,
 };
-use crate::recording::transport::RecordingSender;
+use crate::recording::transport::{RecordingSender, assert_inline_rollback_build};
 use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::pw_host::capture::state::{CaptureState, RtHostChannels};
 use crate::standalone::rt_setup;
@@ -111,14 +111,88 @@ pub(crate) fn check_spa_buffer_pair(
     Some((n_bytes_l, n_samples_l))
 }
 
+/// Central low-level zeroing kernel shared by every fail-closed silence path
+/// of this module (see the wrappers below). One `unsafe` site, one documented
+/// contract: the zeroing itself performs only byte stores of `0` and never
+/// reads the region, so even when Left/Right descriptors alias (overlapping
+/// host buffers) no `&mut` aliasing is formed and no uninitialized read occurs.
+///
+/// # Safety
+///
+/// For the region `[ptr, ptr + bytes)` the caller must guarantee:
+/// - `ptr` is non-null and f32-aligned;
+/// - `bytes` is a non-zero cardinal multiple of `sizeof::<f32>()`, already
+///   bounded to the region the SPA buffer declared writable (the checked
+///   wrapper [`try_zero_region`] enforces the `MAX_BRIDGE_BUF` ceiling);
+/// - the region is writable for the whole call (SPA buffer handed to this
+///   callback).
+///
+/// The kernel applies no bound of its own — every ceiling is enforced by the
+/// checked wrapper [`try_zero_region`] before the call.
+#[inline(always)]
+unsafe fn zero_region(ptr: usize, bytes: usize) {
+    debug_assert!(ptr != 0 && ptr.is_multiple_of(std::mem::align_of::<f32>()));
+    debug_assert!(bytes > 0 && bytes.is_multiple_of(std::mem::size_of::<f32>()));
+    // SAFETY: the caller contract documented above is upheld; `write_bytes`
+    // only stores zeros and does not read the destination.
+    unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, bytes) };
+}
+
+/// Checked wrapper for [`zero_region`]: clamps the span to the
+/// [`MAX_BRIDGE_BUF`]-bounded fail-closed ceiling and validates the raw FFI
+/// descriptor fields (non-null base pointer, f32 alignment, non-zero cardinal
+/// byte count) before any memory access. Returns the number of bytes actually
+/// zeroed — `0` when the descriptor was skipped (fail-closed: malformed
+/// descriptors are never dereferenced).
+#[inline(always)]
+fn try_zero_region(ptr: usize, bytes: usize) -> usize {
+    let bytes = bytes.min(MAX_BRIDGE_BUF * std::mem::size_of::<f32>());
+    let align = std::mem::align_of::<f32>();
+    let stride = std::mem::size_of::<f32>();
+    if ptr == 0 || !ptr.is_multiple_of(align) || bytes == 0 || !bytes.is_multiple_of(stride) {
+        return 0;
+    }
+    // SAFETY: validated non-null, f32-aligned and cardinal above; `bytes` is
+    // clamped to the ceiling of `MAX_BRIDGE_BUF` frames and, by the caller
+    // contract, never exceeds the SPA-declared writable region.
+    unsafe { zero_region(ptr, bytes) };
+    bytes
+}
+
+/// Stamps a silenced SPA chunk's valid-data window so the host consumes
+/// exactly the zeroed interval (`offset = 0`, `size = bytes`,
+/// `stride = sizeof(f32)`) instead of replaying trailing stale data past the
+/// region actually cleared.
+///
+/// Defensive by construction: a null or misaligned chunk pointer is simply
+/// ignored (there is no descriptor to stamp), matching the fail-closed
+/// contract of [`read_chunk_meta`]. Zero allocations, zero panics.
+#[inline(always)]
+fn stamp_chunk(chunk: *mut pw::spa::sys::spa_chunk, bytes: usize) {
+    if chunk.is_null()
+        || !(chunk as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
+    {
+        return;
+    }
+    // SAFETY: `chunk` was validated non-null and correctly aligned; the
+    // struct is owned by the SPA buffer and stable for the duration of the
+    // callback (same ownership contract as `read_chunk_meta`).
+    unsafe {
+        let chunk = &mut *chunk;
+        chunk.offset = 0;
+        chunk.size = bytes as u32;
+        chunk.stride = std::mem::size_of::<f32>() as i32;
+    }
+}
+
 /// Silences both SPA data regions after a contract violation, bounded to at most
 /// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
 ///
-/// Uses raw pointer writes instead of forming `&mut` slices, so even when the
+/// Thin wrapper over [`try_zero_region`] (central SAFETY + zeroing kernel): raw
+/// pointer byte stores instead of forming `&mut` slices, so even when the
 /// Left/Right descriptors alias the same (or overlapping) memory the zeroing
 /// never creates overlapping mutable references. Only regions whose base
-/// pointer is non-null, f32-aligned, and cardinal in size are touched; the
-/// span is bounded to `min(max_l, MAX_BRIDGE_BUF * 4)` and `min(max_r, MAX_BRIDGE_BUF * 4)`.
+/// pointer is non-null, f32-aligned, and cardinal in size are touched.
 ///
 /// **Bounded write invariant**: even if the host declares an oversized `maxsize`
 /// (e.g. 1 MiB or malformed integer), zeroing never touches memory beyond
@@ -127,59 +201,24 @@ pub(crate) fn check_spa_buffer_pair(
 /// Measured: bounded zeroing to 32 KiB in fail-closed executes in ~0.4µs (< 0.15% of 333µs quantum at 48kHz).
 #[inline(always)]
 pub(crate) fn silence_spa_channels(ptr_l: usize, max_l: usize, ptr_r: usize, max_r: usize) {
-    let align = std::mem::align_of::<f32>();
-    let stride = std::mem::size_of::<f32>();
-    let max_cap = MAX_BRIDGE_BUF * stride;
-
-    let len_l = max_l.min(max_cap);
-    if ptr_l != 0 && ptr_l.is_multiple_of(align) && len_l > 0 && len_l.is_multiple_of(stride) {
-        // SAFETY: `ptr_l` is non-null, aligned to f32, and `len_l` is a
-        // cardinal byte count bounded to MAX_BRIDGE_BUF frames (32 KiB).
-        // The caller guarantees the region is writable for at least `max_l` bytes.
-        unsafe { std::ptr::write_bytes(ptr_l as *mut u8, 0, len_l) };
-    }
-    let len_r = max_r.min(max_cap);
-    if ptr_r != 0 && ptr_r.is_multiple_of(align) && len_r > 0 && len_r.is_multiple_of(stride) {
-        // SAFETY: same as above, for the right channel.
-        unsafe { std::ptr::write_bytes(ptr_r as *mut u8, 0, len_r) };
-    }
+    try_zero_region(ptr_l, max_l);
+    try_zero_region(ptr_r, max_r);
 }
 /// Silences every present SPA data descriptor, strictly bounded to at most
 /// [`MAX_BRIDGE_BUF`] frames per channel (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
 ///
-/// Pure descriptor kernel for zeroing available data regions, mockable by harness tests.
+/// Thin wrapper over [`try_zero_region`] + [`stamp_chunk`] (central SAFETY,
+/// ceiling and zeroing kernel). Pure descriptor kernel for zeroing available
+/// data regions, mockable by harness tests.
 #[cfg(test)]
 #[inline(always)]
 pub(crate) fn silence_available_descriptors(
     descriptors: &mut [(usize, usize, *mut pw::spa::sys::spa_chunk)],
 ) {
-    let align = std::mem::align_of::<f32>();
-    let stride = std::mem::size_of::<f32>();
-    let max_cap = MAX_BRIDGE_BUF * stride;
-
     for (ptr, maxsize, chunk_ptr) in descriptors.iter_mut() {
-        let p = *ptr;
-        let silence_bytes = (*maxsize).min(max_cap);
-        if p != 0
-            && p.is_multiple_of(align)
-            && silence_bytes > 0
-            && silence_bytes.is_multiple_of(stride)
-        {
-            // SAFETY: `p` is non-null, aligned to f32, and `silence_bytes` is a cardinal byte count
-            // bounded by MAX_BRIDGE_BUF * 4.
-            unsafe { std::ptr::write_bytes(p as *mut u8, 0, silence_bytes) };
-            let c_ptr = *chunk_ptr;
-            if !c_ptr.is_null()
-                && (c_ptr as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
-            {
-                // SAFETY: chunk_ptr was validated non-null and correctly aligned.
-                unsafe {
-                    let chunk = &mut *c_ptr;
-                    chunk.offset = 0;
-                    chunk.size = silence_bytes as u32;
-                    chunk.stride = stride as i32;
-                }
-            }
+        let zeroed = try_zero_region(*ptr, *maxsize);
+        if zeroed > 0 {
+            stamp_chunk(*chunk_ptr, zeroed);
         }
     }
 }
@@ -197,36 +236,11 @@ pub(crate) fn silence_available_descriptors(
 /// host consumes only the zeroed interval without replaying trailing stale data.
 #[inline(always)]
 pub(crate) fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
-    let align = std::mem::align_of::<f32>();
-    let stride = std::mem::size_of::<f32>();
-    let max_cap = MAX_BRIDGE_BUF * stride;
-
     for data in datas.iter_mut() {
         let raw = data.as_raw();
-        let ptr = raw.data as usize;
-        let maxsize = raw.maxsize as usize;
-        let silence_bytes = maxsize.min(max_cap);
-        if ptr != 0
-            && ptr.is_multiple_of(align)
-            && silence_bytes > 0
-            && silence_bytes.is_multiple_of(stride)
-        {
-            // SAFETY: `ptr` is non-null, aligned to f32, and `silence_bytes` is a cardinal byte count
-            // declared by the SPA buffer as its writable region, bounded by MAX_BRIDGE_BUF * 4.
-            unsafe { std::ptr::write_bytes(ptr as *mut u8, 0, silence_bytes) };
-            let chunk_ptr = raw.chunk;
-            if !chunk_ptr.is_null()
-                && (chunk_ptr as usize)
-                    .is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
-            {
-                // SAFETY: chunk_ptr was validated non-null and correctly aligned.
-                unsafe {
-                    let chunk = &mut *chunk_ptr;
-                    chunk.offset = 0;
-                    chunk.size = silence_bytes as u32;
-                    chunk.stride = stride as i32;
-                }
-            }
+        let zeroed = try_zero_region(raw.data as usize, raw.maxsize as usize);
+        if zeroed > 0 {
+            stamp_chunk(raw.chunk, zeroed);
         }
     }
 }
@@ -539,8 +553,18 @@ pub fn send_recording_audio(
             }
         }
         RecordingSender::Inline(producer) => {
-            // Inline ring path: swap out the reusable block to avoid 64 KiB
-            // of memset per quantum, fill and push into the inline ring.
+            // Inline ring path (documented rollback transport): swap out the
+            // reusable block to avoid 64 KiB of memset per quantum, fill and
+            // push into the inline ring.
+            //
+            // Rollback-only tripwire: with the pool transport compiled as the
+            // production default, an `Inline` sender can only reach this arm
+            // through hand-wired construction outside `create_recording_transport`,
+            // so debug builds accuse the path while `RECORDING_POOL_TRANSPORT`
+            // stays `true`. The deliberate rollback (const flipped to `false`)
+            // passes the guard, and release builds compile the assertion away —
+            // the inline runtime behavior itself is untouched.
+            assert_inline_rollback_build();
             let Some(producer) = producer.as_mut() else {
                 return;
             };
@@ -699,7 +723,21 @@ pub fn process_dsp_buffer(
             stream_status.capture_hist.record(cap_nanos);
         }
 
+        // Denormal policy re-arm: this data-loop thread executes neural
+        // inference whose math relies on FTZ/DAZ being active (constant-cost
+        // denormal handling). The policy lives in per-thread CPU state, so it
+        // must survive alongside the thread for its whole lifetime.
         if (*frame_count & 0x3FF) == 0 {
+            // SAFETY: `set_daz_ftz` only sets the FTZ/DAZ bits of the calling
+            // thread's MXCSR control word (x86_64 `stmxcsr`/`ldmxcsr` on a
+            // stack local): it reads and writes no process memory, allocates
+            // nothing, never unwinds, and the effect is confined to this
+            // thread — sound to invoke in the audio callback. Idempotent (OR
+            // of the control bits into the current MXCSR), so arming it again
+            // here every 1024 quanta is a defensive re-assertion of the
+            // denormal policy against foreign code running on this same
+            // thread that might have reset MXCSR; repeated arming cannot
+            // accumulate state.
             unsafe {
                 neural_amp_modeler_rs::math::common::set_daz_ftz();
             }

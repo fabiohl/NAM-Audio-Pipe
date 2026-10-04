@@ -42,6 +42,9 @@ use crate::recording::status::{
 };
 use crate::recording::transport::create_recording_transport;
 use crate::recording::wav_header::{build_wav_header, capture_filename};
+use crate::standalone::signals::{
+    HandlerRestoreGuard, install_termination_signal_handlers, termination_stage_snapshot_for_tests,
+};
 
 const META: AudioMetadata = AudioMetadata {
     sample_rate: 48000.0,
@@ -726,6 +729,151 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
                 &*disks[0].bytes.lock().unwrap(),
                 &expected_wav[..],
                 "post-SHUTDOWN blocks must be fully drained into the finalized WAV"
+            );
+            assert_eq!(
+                disks[0].sync_calls.load(Ordering::Relaxed),
+                1,
+                "finalize must fsync exactly once"
+            );
+        })
+        .await;
+}
+
+/// Acceptance — end-to-end burst shutdown of an active recording.
+///
+/// Scenario: a recording session is live (metadata + audio flowing through the
+/// promoted pool transport); the operator's shutdown arrives as a burst of
+/// `SIGTERM` + `SIGINT` within 10 ms (e.g. `systemctl stop` racing Ctrl+C).
+/// The staged signal handler must swallow the in-burst second delivery —
+/// process stays alive, cooperative `SHUTDOWN` flips once inside the grace
+/// stage — so the graceful path pushes `StreamStop`, the worker drains 100% of
+/// the blocks and the WAV header is finalized bit-consistently (same bytes the
+/// `recording/wav_header.rs` builder produces for the exact payload).
+// REASON (T-C1): serializing SHUTDOWN-touching tests requires holding the
+// std MutexGuard across `.await`; this is Send-safe because the runtime is
+// `current_thread` (LocalSet), so the guard never crosses threads.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "T-C1 SHUTDOWN test serialization"
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn sigterm_sigint_burst_keeps_finalized_wav_consistent() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
+    // Captures the pre-install dispositions, `SHUTDOWN` value and handler
+    // stage; the drop restores all three also through a panicking assertion
+    // so a failure here can never poison the sibling handler-touching tests.
+    let _guard = HandlerRestoreGuard::capture();
+    install_termination_signal_handlers().expect("termination handler installation must succeed");
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let sink = MockWavSink::default();
+            let disks_handle = Arc::clone(&sink.disks);
+            let worker = tokio::task::spawn_local(async move {
+                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+            });
+
+            // Metadata barrier: the worker consumed it, channels are empty.
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            {
+                let (control_prod, pool_prod) = match &mut sender {
+                    crate::recording::transport::RecordingSender::Pool {
+                        control, pool, ..
+                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
+                    crate::recording::transport::RecordingSender::Inline(_) => {
+                        panic!("pool transport expected")
+                    }
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
+                    || pool_prod.free_available() != POOL_CAPACITY
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "worker never drained the metadata barrier"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            // Real kernel delivery of the burst — TERM then INT, arriving
+            // inside the 10 ms window (raise hands the signal to the calling
+            // thread and returns after the handler executed).
+            let burst_start = std::time::Instant::now();
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            let burst = burst_start.elapsed();
+            assert!(
+                burst < std::time::Duration::from_millis(10),
+                "the two deliveries must land inside a single burst window, got {burst:?}"
+            );
+
+            // Defensive bounded spin: the cooperative flag must be observed
+            // alongside the grace stage (never the forced-exit stage).
+            let observed = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while !SHUTDOWN.load(Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < observed,
+                    "SHUTDOWN was never observed after the signal burst"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                termination_stage_snapshot_for_tests() >> 62,
+                1,
+                "the in-burst second delivery must remain in the grace stage"
+            );
+            // The process survived the burst — this and every assertion below
+            // only run because `_exit(1)` did not fire for signals inside the
+            // grace window.
+
+            // Audio continues up to the RT-loop stop; the main loop confirms
+            // `thread_loop.stop()` and only then sends the terminal token.
+            const BLOCK_SAMPLES: usize = 256;
+            let mut expected_payload = Vec::new();
+            for block_idx in 0..8u32 {
+                let left: Vec<f32> = (0..BLOCK_SAMPLES)
+                    .map(|i| (block_idx * BLOCK_SAMPLES as u32 + i as u32) as f32 * 0.001)
+                    .collect();
+                let right: Vec<f32> = left.iter().map(|v| -v).collect();
+                expected_payload.extend_from_slice(&interleave(&left, &right));
+                assert!(
+                    sender.try_push_audio(&left, &right),
+                    "post-burst audio publish must succeed"
+                );
+            }
+            assert!(
+                sender.try_push_stream_stop(),
+                "StreamStop push must succeed"
+            );
+            drop(sender);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+                .await
+                .expect("worker must exit after consuming StreamStop")
+                .expect("worker task must not panic")
+                .expect("integral drain must succeed");
+
+            // The finalized WAV must match the header builder byte-for-byte:
+            // the burst could not truncate or corrupt the header.
+            let disks = disks_handle.lock().unwrap();
+            assert_eq!(disks.len(), 1, "a single capture file must be produced");
+            let expected_header = build_wav_header(&META, expected_payload.len() as u32)
+                .expect("expected header build");
+            assert_eq!(
+                &disks[0].bytes.lock().unwrap()[..expected_header.len()],
+                &expected_header[..],
+                "finalized WAV header must be bit-consistent after the signal burst"
+            );
+            assert_eq!(
+                disks[0].bytes.lock().unwrap().len(),
+                expected_header.len() + expected_payload.len(),
+                "finalized WAV must carry the full interleaved payload"
             );
             assert_eq!(
                 disks[0].sync_calls.load(Ordering::Relaxed),

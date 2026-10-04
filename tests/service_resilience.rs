@@ -13,8 +13,10 @@
 //!    samples** (two independent readers — a hand-rolled RIFF walker and
 //!    `hound` — must decode the exact same finite `f32` bits, and the declared
 //!    `data` size must equal the file tail).
-//! 2. **Double-signal acceptance** — two rapid `SIGTERM`s must force immediate
-//!    termination via the async-signal-safe `_exit(1)` path.
+//! 2. **Double-signal acceptance** — two rapid `SIGTERM`s inside the 500 ms
+//!    grace window are swallowed (exactly one graceful shutdown, exit `0`);
+//!    only a signal after the grace window expired escalates to `_exit(1)`
+//!    (certified at the unit level by the staged-handler subprocess test).
 //! 3. **Bridge-starvation silence + recycle** — with zero new bridge generation
 //!    the playback kernel must emit `0.0f32` analytical silence sequences,
 //!    stamp/recycle the SPA buffers and never stall (soaked over thousands of
@@ -524,25 +526,28 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Double-signal acceptance (immediate `_exit(1)`)
+// 2. Double-signal acceptance (in-burst grace window stays cooperative)
 // ---------------------------------------------------------------------------
 
-/// Sends two rapid `SIGTERM`s to a live `nam-audio-pipe` and proves immediate
-/// termination through the async-signal-safe `_exit(1)` path (the unified
-/// handler force-exits on the second signal while the graceful teardown of the
-/// first is still in flight). Exit code must be `1`, not `0` (graceful) and not
-/// a signal death.
+/// Sends two rapid `SIGTERM`s to a live `nam-audio-pipe` and proves the staged
+/// handler keeps them both inside the grace window: the burst must produce
+/// **exactly one graceful shutdown** — cooperative exit `0`, never `_exit(1)`
+/// (the second delivery is swallowed so a WAV in flight is always finalized)
+/// and never a signal death.
 ///
-/// The second signal is delivered ~10 ms after the first — well inside the
-/// ≥ 100 ms control-loop poll that gates the graceful teardown, so it lands
-/// deterministically. Up to 3 fresh attempts hedge against a pathological
-/// scheduler race where the process finalized before the second signal.
+/// The second signal is delivered ~10 ms after the first — far inside the 500
+/// ms grace window — and again during the ≥ 100 ms control-loop poll that gates
+/// the graceful teardown, so it lands deterministically while the teardown is
+/// still in flight. Escalation for a signal delivered only **after** the grace
+/// window expired (a stuck teardown) is certified deterministically at the unit
+/// level by the staged-handler subprocess test (`signals.rs`); a healthy
+/// service teardown completes in ~100 ms and can never reach that stage.
 ///
 /// Requires a running PipeWire daemon (to bring the host up). Runs in Phase 3
 /// of `utils/tests-quick.sh`.
 #[test]
 #[ignore = "requires a running PipeWire daemon; runs in tests-quick Phase 3"]
-fn double_signal_force_exits_via_exit1() {
+fn double_signal_burst_within_grace_window_stays_graceful() {
     if !common::probe_pipewire_daemon() {
         eprintln!("TEST_RESULT[double_signal]=SKIP:daemon_unavailable");
         eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
@@ -557,43 +562,43 @@ fn double_signal_force_exits_via_exit1() {
     let dir = common::temp_dir();
     let _guard = common::DirGuard::new(dir.clone());
 
-    let mut observed: Option<i32> = None;
-    for attempt in 0..3 {
-        let (mut child, stderr_path) = spawn_host(&["--fail-fast"], &dir);
-        // Wait until the signal handler is installed (full host startup, sink
-        // registered) so the signals are handled cooperatively, not by the
-        // default SIGTERM disposition.
-        assert!(
-            common::wait_for_nam_sink_pid(Duration::from_secs(10), child.id()),
-            "attempt {attempt}: host capture sink never registered; stderr:\n{}",
-            read_child_stderr(&stderr_path)
-        );
+    let (mut child, stderr_path) = spawn_host(&["--fail-fast"], &dir);
+    // Wait until the signal handler is installed (full host startup, sink
+    // registered) so the signals are handled cooperatively, not by the
+    // default SIGTERM disposition.
+    assert!(
+        common::wait_for_nam_sink_pid(Duration::from_secs(10), child.id()),
+        "host capture sink never registered; stderr:\n{}",
+        read_child_stderr(&stderr_path)
+    );
 
-        send_signal(&child, libc::SIGTERM);
-        std::thread::sleep(Duration::from_millis(10));
-        send_signal(&child, libc::SIGTERM);
+    // Real service burst: TERM then TERM, ~10 ms apart — exactly the
+    // `systemctl stop` + impatient operator pattern the grace window exists
+    // for. Both deliveries must be swallowed into the single cooperative
+    // shutdown.
+    send_signal(&child, libc::SIGTERM);
+    std::thread::sleep(Duration::from_millis(10));
+    send_signal(&child, libc::SIGTERM);
 
-        let started = Instant::now();
-        let status = child.wait(Duration::from_secs(10));
-        let elapsed = started.elapsed();
-        observed = status.code();
-        if observed == Some(1) {
-            println!(
-                "double-signal acceptance (attempt {attempt}): _exit(1) observed after {elapsed:?}"
-            );
-            assert!(
-                elapsed < Duration::from_secs(3),
-                "the second signal must terminate immediately (took {elapsed:?})"
-            );
-            return;
-        }
-        eprintln!(
-            "attempt {attempt}: expected _exit(1), observed {status:?} after {elapsed:?}; \
-             stderr:\n{}",
-            read_child_stderr(&stderr_path)
-        );
-    }
-    panic!("double SIGTERM never forced _exit(1); observed exit codes: {observed:?}");
+    let started = Instant::now();
+    let status = child.wait(Duration::from_secs(10));
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "an in-burst second SIGTERM must be swallowed (graceful exit 0, got {status:?} \
+         after {elapsed:?}); stderr:\n{}",
+        read_child_stderr(&stderr_path)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the burst must remain bounded (took {elapsed:?})"
+    );
+    println!(
+        "double-signal acceptance: in-burst second SIGTERM swallowed; \
+         graceful exit 0 after {elapsed:?}"
+    );
+    eprintln!("TEST_RESULT[double_signal]=PASS");
 }
 
 // ---------------------------------------------------------------------------

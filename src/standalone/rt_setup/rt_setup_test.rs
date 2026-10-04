@@ -643,3 +643,21 @@ fn test_harness_fallback_configures_when_unconfigured() {
         1
     );
 }
+
+#[test]
+fn test_configure_realtime_thread_arms_rt_callback_mark() {
+    let mock = MockThreadConfigurator::new();
+    let flags = neural_amp_modeler_rs::common::spsc::RtStatusFlags::new();
+
+    // The thread running the configuration hook is the RT callback thread:
+    // the log handler consults the mark to route this thread's PW log events
+    // off its context (F-APRT-01). Arming follows the scheduler step and is
+    // independent of the policy outcome the mock reports.
+    rt_log_mark::rt_unmark_current_thread();
+    thread::configure_realtime_thread_with(2, &flags, &mock);
+    assert!(rt_log_mark::rt_is_current_thread_marked());
+
+    // Cleanup: leave no mark residue on the shared runner thread.
+    rt_log_mark::rt_unmark_current_thread();
+    assert!(!rt_log_mark::rt_is_current_thread_marked());
+}

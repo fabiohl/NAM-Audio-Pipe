@@ -15,3 +15,10 @@ pub mod signals;
 /// threads in the same `--lib` binary can never interleave.
 #[cfg(test)]
 pub(crate) static SHUTDOWN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes tests that mutate the process-global PipeWire log handler /
+/// log-ring states (`HANDLER_INSTALLED`, ring routing mode, drop counter) so
+/// parallel test threads in the same `--lib` binary cannot interleave
+/// install/restore cycles with ring-route assertions.
+#[cfg(test)]
+pub(crate) static PW_LOG_REDIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
