@@ -269,14 +269,18 @@ pub fn poll_rt_status(
     }
 
     // 3. DIGITAL DISTORTION (Clipping):
-    // The equivalent of the "red LED" on mixing consoles. Indicates that the signal volume
-    // exceeded the maximum limit of digital processing. Latched: a continuously hot signal
-    // warns once per episode instead of on every control-loop iteration.
+    // The equivalent of the "red LED" on mixing consoles. Indicates that a
+    // delivered sample exceeded full-scale (±1.0). Latched: a continuously
+    // hot signal warns once per episode instead of on every control-loop
+    // iteration. A model carrying a large constant offset can trigger this at
+    // neutral gain even on silence — the delivered sample really exceeds FS,
+    // so check the model as well as the gains.
     let has_clipped =
         rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HAS_CLIPPED);
     if state.latches.clipping.observe(has_clipped) {
         log::warn!(
-            "{} Clipping detected! Consider reducing the input and/or output gain.",
+            "{} Clipping detected! Consider reducing the input and/or output gain, \
+             or checking whether the model itself carries a large DC offset.",
             "🔥".bright_red().bold()
         );
     }

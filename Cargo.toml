@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 [package]
 name = "nam-audio-pipe"
-version = "0.7.3"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "GPL-3.0-or-later"
@@ -58,7 +58,7 @@ path = "src/bin/ab_opt_bench.rs"
 required-features = ["testing"]
 
 [dependencies]
-NeuralAmpModeler-rs = { version = "0.8.1", features = ["rt-hardening"] }
+NeuralAmpModeler-rs = { version = "1.0.0", features = ["rt-hardening"] }
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
@@ -66,7 +66,7 @@ rtrb = "0.4.0"
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tokio-uring = "0.5"
 anyhow = "1.0.104"
-libc = "0.2.189"
+libc = "0.2.190"
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false }
 

@@ -351,6 +351,10 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
             .any(|r| r.message.contains("Clipping detected")),
         "clipping must keep its concise warning"
     );
+    assert!(
+        records.iter().any(|r| r.message.contains("DC offset")),
+        "clipping warning must hint at model DC offset as a possible trigger"
+    );
 
     // The retrospective `Recent Log Trace` support block is
     // reserved for `--diagnose`/`--diagnose-full` and crash reports — runtime

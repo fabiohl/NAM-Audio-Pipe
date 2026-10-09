@@ -227,6 +227,21 @@ A multi-stage optimization and packaging pipeline combining Profile-Guided Optim
 
 All test commands must be executed within `./NAM-Audio-Pipe/`:
 
+### 5.1 Utility Scripts Inventory (`utils/`)
+
+| Script                                  | Responsibility & Operation                                                       | Operational Scope                                    |
+|:--------------------------------------- |:-------------------------------------------------------------------------------- |:---------------------------------------------------- |
+| **`utils/lints.sh`**                    | Static analysis gate: `cargo fmt`, multi-target `cargo check`, clippy, SPDX, AppStream XML | Continuous / first-line pre-commit gate              |
+| **`utils/tests-quick.sh`**              | 4-phase agile suite (structural, release integration, live PipeWire, io_uring)   | Agile test loop (local dev & pre-commit)             |
+| **`utils/tests-long.sh`**               | 6-phase exhaustive audit (accelerated soak, heap-audit, RT deadline/jitter, endurance) | Nightly & release certification (operator only)      |
+| **`utils/build-release.sh`**            | Multi-stage release builder with PGO, BOLT, filtered DSP hotspot gates, and Flatpak | Production release pipeline                          |
+| **`utils/dsp-hotpath-filter.py`**       | Disassembly filter & static gate (0 `zmm`, 0 `libm` in RT, 0 alloc) on hot-path   | Invoked by `build-release.sh` Phase 4.5              |
+| **`utils/ab-opt-ceremony.sh`**          | A/B optimization ceremony measuring cycle count/PMU deltas (Plain → PGO → BOLT)   | Strictly on-demand ceremony (human operator only)    |
+| **`utils/miri-audit.sh`**               | Formal pointer provenance and aliasing audit for lock-free `RecordingPool`        | Strictly out-of-band audit (requires nightly toolchain) |
+| **`utils/test-pick-bench-core.sh`**     | Simulated-sysfs unit tests validating CPU affinity pinning helper `pick_bench_core` | Strictly on-demand infrastructure test               |
+
+### 5.2 Direct Execution Commands
+
 ```bash
 # 1. Run static analysis quality gate
 ./utils/lints.sh

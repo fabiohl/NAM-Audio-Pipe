@@ -40,6 +40,7 @@ fn fake_wavenet(ch: usize) -> Box<StaticModel> {
         post_stack_head: None,
         head_output_scratch: AlignedVec::new(1, 0.0f32).expect("alloc"),
         prewarm_on_reset: false,
+        prewarm_pending: false,
         slimmable_capable: true,
         allowed_channels: None,
         pending_slim_channel: None,

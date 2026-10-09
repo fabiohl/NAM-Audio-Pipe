@@ -66,6 +66,11 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
+    <release version="1.0.0" date="2026-10-06" type="stable">
+      <description>
+        <p>Release 1.0.0: Synchronized with NeuralAmpModeler-rs 1.0.0 core DSP engine.</p>
+      </description>
+    </release>
     <release version="0.7.3" date="2026-09-30" type="stable">
       <description>
         <p>This release introduces recording metadata sequence numbers, cab-sim partition policies, and telemetry refactoring:</p>
