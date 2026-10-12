@@ -431,9 +431,10 @@ fn discard_load_model(
 /// and the RT drain can discard stale in-flight pairs.
 #[inline(always)]
 pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatusFlags) {
-    let Some(target_ch) = adaptive.take_slimmable_rebuild() else {
+    let Some(targets) = adaptive.take_slimmable_rebuild() else {
         return;
     };
+    let target_ch = targets.first().copied().unwrap_or(0);
     rt_status
         .requested_slimmable_ch
         .store(target_ch as u32, Ordering::Relaxed);

@@ -80,6 +80,7 @@ mod bridge;
 mod capture;
 mod handlers;
 pub mod identity;
+pub mod latency;
 pub mod log_redirect;
 pub mod output_pw;
 mod playback;

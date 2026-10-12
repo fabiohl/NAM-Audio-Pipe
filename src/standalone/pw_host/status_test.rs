@@ -806,6 +806,9 @@ fn invalid_stream_format_rejection_prevents_unmute() {
 
 #[test]
 fn stream_active_transitions_propagate_to_rt_latches_four_conditions() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let rt = Arc::new(RtStatusFlags::default());
     let backend = SharedBackendStatus::with_rt_status(rt.clone());
     let stream_status = backend.stream_status();

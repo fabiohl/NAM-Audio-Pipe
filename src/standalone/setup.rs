@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 
 /// Isolate the setup of SPSC lock-free communication channels between host and audio thread.
 pub fn setup_communication_channels() -> SpscChannels {
-    spsc::setup_spsc(spsc::SPSC_CAPACITY)
+    spsc::setup_spsc(spsc::SPSC_CAPACITY).expect("SPSC channels setup failed")
 }
 
 /// Result of loading the initial neural model.

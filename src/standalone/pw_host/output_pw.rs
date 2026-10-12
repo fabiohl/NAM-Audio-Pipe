@@ -520,7 +520,7 @@ impl<const N: usize> Default for SpaPodStorage<N> {
 /// Proves, before forming a `&Pod`, that the pointer is non-null, 8-byte
 /// aligned, lies within the storage bounds, and that its header/body/padding
 /// fit entirely inside the remaining storage (fail-closed contract validation).
-fn validate_built_pod(
+pub(crate) fn validate_built_pod(
     storage: &SpaPodStorage<1024>,
     pod_ptr: *const pw::spa::sys::spa_pod,
 ) -> Option<&pw::spa::pod::Pod> {

@@ -29,6 +29,7 @@ use super::PipewireHostConfig;
 use super::bridge;
 use super::capture;
 use super::identity;
+use super::latency;
 use super::playback;
 use crate::standalone::colors::Colorize;
 use pipewire as pw;
@@ -327,10 +328,20 @@ pub fn run_pipewire_host(
             // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
             let latency_str = format!("{}/48000", buffer_size);
 
+            let initial_latency_samples = if ir_raw_samples.is_some() {
+                cabsim_partition.clamp(
+                    16,
+                    neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF as u32,
+                )
+            } else {
+                0
+            };
+
             let (cs, cl) = capture::setup_capture_stream(
                 &core,
                 bridge_ptr,
                 buffer_size,
+                initial_latency_samples,
                 target_cpu,
                 state_ptr,
                 channels_ptr,
@@ -348,16 +359,22 @@ pub fn run_pipewire_host(
                 &core,
                 bridge_ptr,
                 buffer_size,
+                initial_latency_samples,
                 &latency_str,
                 rt_status.clone(),
                 backend_for_playback.clone(),
             )?;
 
-            Ok((cs, cl, ps, pl))
+            Ok((cs, cl, ps, pl, initial_latency_samples))
         })();
 
-        let (capture_stream, capture_listener, playback_stream, playback_listener) = match setup_res
-        {
+        let (
+            capture_stream,
+            capture_listener,
+            playback_stream,
+            playback_listener,
+            initial_latency_samples,
+        ) = match setup_res {
             Ok(res) => res,
             Err(e) => {
                 if reconnect.attempts_made() == 0 {
@@ -392,7 +409,7 @@ pub fn run_pipewire_host(
             }
         };
 
-        let _app_state = AppState {
+        let app_state = AppState {
             capture_listener,
             capture_stream,
             playback_listener,
@@ -428,6 +445,11 @@ pub fn run_pipewire_host(
         // =========================================================
         // 5. MAIN CONTROL LOOP (Main Thread, Non-RT)
         // =========================================================
+        let mut active_cabsim_latency = initial_latency_samples;
+        let mut active_resampler_latency = 0u32;
+        let mut last_published_dsp_latency = initial_latency_samples;
+        let mut last_published_rate = 48_000u32;
+
         let mut was_silent = false;
         let mut was_fading = false;
         let mut poll_state = rt_setup::PollState::with_cpu_receipt(Some(cpu_receipt.clone()));
@@ -476,15 +498,65 @@ pub fn run_pipewire_host(
                     .store(active, Ordering::Relaxed);
             }
 
-            handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer);
-            handlers::handle_quantum_log(&rt_status);
-            handlers::handle_cabsim_rebuild(
+            let host_rate = if active != 0 {
+                active
+            } else {
+                let p_rate = rate_for_param.load(Ordering::Relaxed);
+                if p_rate != 0 { p_rate } else { 48_000 }
+            };
+
+            if let Some(resamp_lat) =
+                handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer)
+            {
+                active_resampler_latency = resamp_lat;
+            }
+
+            if let Some(cab_lat) = handlers::handle_cabsim_rebuild(
                 &rt_status,
                 ir_raw_samples.as_deref(),
                 ir_source_rate,
                 &sys,
                 &mut cabsim_producer,
-            );
+            ) {
+                active_cabsim_latency = cab_lat;
+            }
+
+            let current_dsp_latency = active_cabsim_latency + active_resampler_latency;
+            handlers::handle_quantum_log(&rt_status, buffer_size, current_dsp_latency, host_rate);
+
+            if current_dsp_latency != last_published_dsp_latency
+                || (active != 0 && active != last_published_rate)
+            {
+                let _lock = thread_loop.lock();
+                let (_, lat_ns) = latency::compute_dsp_latency(
+                    active_cabsim_latency,
+                    active_resampler_latency,
+                    host_rate,
+                );
+                let _ = latency::update_stream_latency(
+                    &app_state.capture_stream,
+                    pw::spa::sys::SPA_DIRECTION_INPUT,
+                    current_dsp_latency,
+                    lat_ns,
+                );
+                let _ = latency::update_stream_latency(
+                    &app_state.playback_stream,
+                    pw::spa::sys::SPA_DIRECTION_OUTPUT,
+                    current_dsp_latency,
+                    lat_ns,
+                );
+                log::info!(
+                    "{} Published updated DSP processing latency to PipeWire graph: {} samples ({:.2} ms @{}Hz)",
+                    "⏱️".cyan(),
+                    current_dsp_latency,
+                    lat_ns as f64 / 1_000_000.0,
+                    host_rate,
+                );
+                last_published_dsp_latency = current_dsp_latency;
+                if active != 0 {
+                    last_published_rate = active;
+                }
+            }
             handlers::handle_slimmable_rebuild(
                 &rt_status,
                 full_wavenet_model_l.as_deref(),
@@ -607,7 +679,7 @@ pub fn run_pipewire_host(
         // F-RB-102 & F-RB-101: Explicitly drop the streams under the teardown guard.
         // Listeners are dropped before streams (F-RB-102), and any synchronous
         // `Unconnected` transitions are discarded by `observe_stream_state` (F-RB-101).
-        drop(_app_state);
+        drop(app_state);
 
         // 6.1 Reconnect decision
         match instance_failure {

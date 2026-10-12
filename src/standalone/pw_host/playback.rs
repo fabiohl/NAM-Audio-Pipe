@@ -6,6 +6,7 @@
 
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::identity;
+use crate::standalone::pw_host::latency;
 use crate::standalone::pw_host::output_pw::{
     SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, mark_format_contract_ok,
     playback_dsp_cycle, reject_negotiated_format_violation, validate_audio_raw_format,
@@ -101,6 +102,7 @@ pub fn setup_playback_stream<'c>(
     core: &'c pw::core::Core,
     bridge_ptr: BridgeRef,
     buffer_size: u32,
+    initial_latency_samples: u32,
     latency_str: &str,
     rt_status: Arc<RtStatusFlags>,
     backend_status: Arc<SharedBackendStatus>,
@@ -203,13 +205,29 @@ pub fn setup_playback_stream<'c>(
     let playback_format_pod =
         unsafe { build_spa_format_pod(&playback_audio_info, &mut playback_format_storage)? };
 
+    let mut proc_storage = SpaPodStorage::new();
+    let mut lat_storage = SpaPodStorage::new();
+    let (init_samples, init_ns) = latency::compute_dsp_latency(initial_latency_samples, 0, 48_000);
+    // SAFETY: `proc_storage` and `lat_storage` remain valid and unmodified for the duration
+    // of the synchronous `connect` call below.
+    let proc_pod =
+        unsafe { latency::build_process_latency_pod(init_samples, init_ns, &mut proc_storage)? };
+    let lat_pod = unsafe {
+        latency::build_latency_pod(
+            pw::spa::sys::SPA_DIRECTION_OUTPUT,
+            init_samples,
+            init_ns,
+            &mut lat_storage,
+        )?
+    };
+
     playback_stream.connect(
         pw::spa::utils::Direction::Output,
         None,
         pw::stream::StreamFlags::AUTOCONNECT
             | pw::stream::StreamFlags::MAP_BUFFERS
             | pw::stream::StreamFlags::RT_PROCESS,
-        &mut [playback_format_pod],
+        &mut [playback_format_pod, proc_pod, lat_pod],
     )?;
 
     log::info!(

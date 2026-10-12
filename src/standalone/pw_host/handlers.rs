@@ -320,9 +320,9 @@ pub(super) fn handle_resampler_rebuild(
     rt_status: &RtStatusFlags,
     _sys: &SystemSnapshot,
     resampler_producer: &mut rtrb::Producer<Box<ResamplerSwapPayload>>,
-) {
+) -> Option<u32> {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_RESAMPLER_REBUILD) {
-        return;
+        return None;
     }
     let generation = rt_status.requested_rate_generation.load(Ordering::Acquire);
     let target_host_rate = rt_status.requested_host_rate.load(Ordering::Relaxed);
@@ -335,12 +335,19 @@ pub(super) fn handle_resampler_rebuild(
                     .resampler_failed_generation
                     .store(0, Ordering::Release);
 
+                let latency_samples = if new_rs.is_bypass() {
+                    0
+                } else {
+                    new_stream.latency_samples()
+                };
+
                 log::info!(
-                    "{} Sample rate updated: PW={} Hz, NAM={} Hz (bypass={})",
+                    "{} Sample rate updated: PW={} Hz, NAM={} Hz (bypass={}, latency={} samples)",
                     "🔄".cyan(),
                     target_host_rate,
                     target_nam_rate,
-                    new_rs.is_bypass()
+                    new_rs.is_bypass(),
+                    latency_samples,
                 );
 
                 let payload = Box::new(ResamplerSwapPayload {
@@ -362,9 +369,10 @@ pub(super) fn handle_resampler_rebuild(
                         target_host_rate,
                         target_nam_rate
                     );
-                    return;
+                    return None;
                 }
                 rearm_rebuild_if_superseded(rt_status, generation);
+                Some(latency_samples)
             }
             (Err(e), _) => {
                 log::error!(
@@ -383,6 +391,7 @@ pub(super) fn handle_resampler_rebuild(
                 // arm. A failure without a newer generation clears the request
                 // (no spurious retry).
                 rearm_rebuild_if_superseded(rt_status, generation);
+                Some(0)
             }
             (_, Err(e)) => {
                 log::error!(
@@ -398,8 +407,11 @@ pub(super) fn handle_resampler_rebuild(
                     .store(generation, Ordering::Release);
                 // Same lost-wakeup guard as the resampler failure arm.
                 rearm_rebuild_if_superseded(rt_status, generation);
+                Some(0)
             }
         }
+    } else {
+        None
     }
 }
 
@@ -421,25 +433,41 @@ fn rearm_rebuild_if_superseded(rt_status: &RtStatusFlags, generation: u64) {
     }
 }
 
-/// Logs PipeWire quantum renegotiation updates.
-pub(super) fn handle_quantum_log(rt_status: &RtStatusFlags) {
+/// Logs PipeWire quantum renegotiation updates, clearly distinguishing
+/// requested quantum, effective quantum, and DSP algorithmic latency.
+pub(super) fn handle_quantum_log(
+    rt_status: &RtStatusFlags,
+    requested_quantum: u32,
+    dsp_latency_samples: u32,
+    host_rate: u32,
+) {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_QUANTUM_LOG) {
         return;
     }
-    let new_quantum = rt_status.requested_buffer_frames.load(Ordering::Relaxed);
+    let effective_quantum = rt_status.requested_buffer_frames.load(Ordering::Relaxed);
     let old_quantum = rt_status.previous_buffer_frames.load(Ordering::Relaxed);
-    if new_quantum != 0 && new_quantum != old_quantum {
+    if effective_quantum != 0 && effective_quantum != old_quantum {
+        let rate = if host_rate > 0 { host_rate } else { 48_000 };
+        let eff_ms = effective_quantum as f64 * 1000.0 / rate as f64;
+        let req_str = if requested_quantum > 0 {
+            format!("{requested_quantum} samples")
+        } else {
+            "graph default".to_string()
+        };
+        let dsp_ms = dsp_latency_samples as f64 * 1000.0 / rate as f64;
         log::info!(
-            "{} PipeWire quantum renegotiated: {} -> {} samples ({}->{} ms @48kHz)",
+            "{} PipeWire quantum updated: requested={} | effective={} samples ({:.2} ms @{}Hz) | DSP processing latency={} samples ({:.2} ms)",
             "🔄".cyan(),
-            old_quantum,
-            new_quantum,
-            old_quantum as f64 * 1000.0 / 48_000.0,
-            new_quantum as f64 * 1000.0 / 48_000.0,
+            req_str,
+            effective_quantum,
+            eff_ms,
+            rate,
+            dsp_latency_samples,
+            dsp_ms,
         );
         rt_status
             .previous_buffer_frames
-            .store(new_quantum, Ordering::Relaxed);
+            .store(effective_quantum, Ordering::Relaxed);
     }
     rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_QUANTUM_LOG);
 }
@@ -470,9 +498,9 @@ pub(super) fn handle_cabsim_rebuild(
     ir_source_rate: u32,
     _sys: &SystemSnapshot,
     cabsim_producer: &mut rtrb::Producer<Box<CabSimSwapPayload>>,
-) {
+) -> Option<u32> {
     if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD) {
-        return;
+        return None;
     }
     let generation = rt_status
         .requested_cabsim_generation
@@ -482,7 +510,7 @@ pub(super) fn handle_cabsim_rebuild(
         .load(Ordering::Relaxed) as usize;
     let target_host_rate = rt_status.requested_cabsim_host_rate.load(Ordering::Relaxed);
     if requested_partition == 0 || target_host_rate == 0 {
-        return;
+        return None;
     }
     // Fail-closed partition bound: the RT-requested partition must lie in
     // [16, MAX_RESAMP_BUF]. A spurious quantum outside that domain is clamped
@@ -498,7 +526,7 @@ pub(super) fn handle_cabsim_rebuild(
     }
     let Some(raw_samples) = ir_raw_samples else {
         rt_status.clear_flag_relaxed(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
-        return;
+        return Some(0);
     };
 
     match build_cabsim_pair(
@@ -543,9 +571,10 @@ pub(super) fn handle_cabsim_rebuild(
                     partition_size,
                     target_host_rate
                 );
-                return;
+                return None;
             }
             rearm_cabsim_if_superseded(rt_status, generation);
+            Some(latency_samples as u32)
         }
         Err(e) => {
             log::error!(
@@ -566,9 +595,10 @@ pub(super) fn handle_cabsim_rebuild(
                      be retried; the audio engine is overloaded. The swap is retried \
                      automatically until delivery succeeds."
                 );
-                return;
+                return None;
             }
             rearm_cabsim_if_superseded(rt_status, generation);
+            Some(0)
         }
     }
 }

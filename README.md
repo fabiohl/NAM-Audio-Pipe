@@ -41,7 +41,7 @@ Designed for live performance, automated studio routing, and headless Linux audi
 | **CPU & IRQ Isolation**        | Dynamic `/proc/interrupts` load profiling + `pthread_setaffinity_np`      | Pins audio loop to the least-interrupted core (noisy neighbor safe) |
 | **SIMD Hardware Acceleration** | Engine `x86-64-v3` (AVX2/FMA) production backend                          | Ultra-low CPU usage (< 3% of 1.33 ms quantum on the AVX2 path)      |
 | **Binary Optimization**        | Profile-Guided Optimization (PGO) + LLVM BOLT basic block reordering      | Drastically minimizes I-Cache and iTLB misses in DSP loops          |
-| **Cabinet IR Convolution**     | Partitioned FFT & Direct FIR convolution engine (.wav IRs)                | Seamless, zero-latency speaker cabinet simulation                   |
+| **Cabinet IR Convolution**     | Partitioned FFT (UPOLS) convolution engine (.wav IRs)                     | Algorithmic latency bounded to configured partition (32–256 samples), reported to PipeWire |
 | **WAV Recording**              | High-performance `tokio-uring` ringbuffer + 4 GiB auto-split (`--record`) | Records 32-bit float stereo WAV files in real-time with gate trim   |
 | **Oversampling**               | Half-band polyphase FIR filters (`off`, `2x`, `4x`)                       | Eliminates aliasing distortion in high-gain amp models              |
 | **Activation Precision**       | `Standard` (exact-grade, default) vs `Fast` (Padé approximations)         | User-selectable trade-off between math precision and latency        |

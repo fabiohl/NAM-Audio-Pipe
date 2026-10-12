@@ -92,6 +92,7 @@ pub fn setup_capture_stream<'c>(
     core: &'c pw::core::Core,
     bridge_ptr: BridgeRef,
     buffer_size: u32,
+    initial_latency_samples: u32,
     target_cpu: usize,
     state_ptr: *mut CaptureState,
     channels_ptr: *mut RtHostChannels,
@@ -342,6 +343,31 @@ pub fn setup_capture_stream<'c>(
     let mut format_storage = SpaPodStorage::new();
     let format_pod = build_capture_format_pod(&mut format_storage)?;
 
+    let mut proc_storage = SpaPodStorage::new();
+    let mut lat_storage = SpaPodStorage::new();
+    let (init_samples, init_ns) = crate::standalone::pw_host::latency::compute_dsp_latency(
+        initial_latency_samples,
+        0,
+        48_000,
+    );
+    // SAFETY: proc_storage and lat_storage remain valid and unmodified for the duration
+    // of the synchronous `connect` call below.
+    let proc_pod = unsafe {
+        crate::standalone::pw_host::latency::build_process_latency_pod(
+            init_samples,
+            init_ns,
+            &mut proc_storage,
+        )?
+    };
+    let lat_pod = unsafe {
+        crate::standalone::pw_host::latency::build_latency_pod(
+            pw::spa::sys::SPA_DIRECTION_INPUT,
+            init_samples,
+            init_ns,
+            &mut lat_storage,
+        )?
+    };
+
     capture_stream.connect(
         pw::spa::utils::Direction::Input,
         None,
@@ -349,7 +375,7 @@ pub fn setup_capture_stream<'c>(
             | pw::stream::StreamFlags::MAP_BUFFERS
             | pw::stream::StreamFlags::RT_PROCESS
             | pw::stream::StreamFlags::EXCLUSIVE,
-        &mut [format_pod],
+        &mut [format_pod, proc_pod, lat_pod],
     )?;
 
     log::info!(
