@@ -25,7 +25,6 @@ impl Drop for ShutdownRestore {
     }
 }
 
-static TEST_STATUS_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static PANIC_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 type PanicHookFn = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
@@ -45,22 +44,11 @@ impl Drop for PanicHookGuard {
     }
 }
 
-/// Initializes the global `NamLogger` once per test binary (idempotent) so the
-/// disconnect tests can assert the log level of the disconnect records.
-fn init_log_capture() -> std::sync::MutexGuard<'static, ()> {
-    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
-    let guard = TEST_STATUS_LOGGER_MUTEX
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let _ = NamLogger::init(LoggerConfig {
-        level_filter: log::LevelFilter::Trace,
-        emit_stderr: false,
-    });
-    if let Some(logger) = NamLogger::global() {
-        logger.set_max_level(log::LevelFilter::Trace);
-        log::set_max_level(log::LevelFilter::Trace);
-    }
-    guard
+/// Initializes the global `NamLogger` and sets the level to `Trace` under
+/// `LOGGER_STATE_LOCK` with RAII restoration so the disconnect tests can assert
+/// the log level of disconnect records.
+fn init_log_capture() -> crate::standalone::test_logger::LoggerLevelGuard {
+    crate::standalone::test_logger::acquire_logger_level(log::LevelFilter::Trace)
 }
 
 /// Returns the buffered log records (after [`init_log_capture`]), if the

@@ -200,12 +200,16 @@ impl<const N: usize> RecordingPool<N> {
         assert!(N > 0, "RecordingPool requires at least one slot");
         let (work, work_consumer) = RingBuffer::new(N + CONTROL_CAPACITY);
         let (mut free, free_consumer) = RingBuffer::new(N);
-        // Checked conversion (no truncating `as u16`): `N < CONTROL_BARRIER_SLOT`
-        // is const-asserted above, so `N` fits `u16` losslessly and the seeded
-        // domain `0..N` can never emit the sentinel.
-        for idx in 0..u16::try_from(N).expect("`N < CONTROL_BARRIER_SLOT` is const-asserted") {
+        // Seed the free ring with `0..N` using a `u16` counter: `N <
+        // CONTROL_BARRIER_SLOT == u16::MAX` is const-asserted above, so the
+        // counter never overflows and the sentinel is never seeded. This keeps
+        // the checked, lossless semantics without a truncating `as u16` or a
+        // fallible `try_from`/`expect` pair.
+        let mut idx: u16 = 0;
+        while (idx as usize) < N {
             free.push(idx)
                 .unwrap_or_else(|_| panic!("free ring seeded with capacity {N}"));
+            idx += 1;
         }
         let slots = {
             // SAFETY: `new_uninit` on an array of length N > 0 yields N

@@ -24,6 +24,14 @@ pub fn allocate_dsp_bridge() -> BridgeRef {
     let page_size = 4096usize;
     let align = page_size.max(std::mem::align_of::<DspBridge>());
     let size = std::mem::size_of::<DspBridge>();
+    // `align` is a page size (power of two) or the struct's own alignment, and
+    // `size` is a fixed compile-time constant: `from_size_align` cannot fail,
+    // so this `expect` documents an invariant instead of adding panic surface
+    // (F-PR-13).
+    #[expect(
+        clippy::expect_used,
+        reason = "DspBridge layout is always valid: power-of-two alignment and a fixed size"
+    )]
     let layout = Layout::from_size_align(size, align)
         .expect("Valid layout for DspBridge with page alignment")
         .pad_to_align();
@@ -111,7 +119,9 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        assert_eq!(bridge.buffers[0].n_samples, 0);
-        assert_eq!(bridge.buffers[1].n_samples, 0);
+        // SAFETY: single-threaded read of the freshly initialized bridge; the
+        // buffers are read race-free through `UnsafeCell::get`.
+        assert_eq!(unsafe { (*bridge.buffers[0].get()).n_samples }, 0);
+        assert_eq!(unsafe { (*bridge.buffers[1].get()).n_samples }, 0);
     }
 }

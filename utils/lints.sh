@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-PHASE_TOTAL=7
+PHASE_TOTAL=8
 source "$(dirname "$0")/_lib.sh"
 
 echo -e "${BLUE}${BOLD}========================================${NC}"
@@ -68,43 +68,43 @@ rs_dirs=( src tests )
 spdx_scope=$(
     {
         find "${rs_dirs[@]}" -type f -name '*.rs'
-        find utils -maxdepth 1 -type f -name '*.sh'
-        test -d packaging && find packaging -type f \( -name '*.py' -o -name '*.sh' \)
-        test -f build.rs && echo build.rs
-        test -f Cargo.toml && echo Cargo.toml
+        find utils tests -type f -name '*.sh'
+        if [ -d packaging ]; then find packaging -type f \( -name '*.py' -o -name '*.sh' \); fi
+        if [ -f build.rs ]; then echo build.rs; fi
+        if [ -f Cargo.toml ]; then echo Cargo.toml; fi
     }
 )
 
-grep_err=$(mktemp -t nam-lints-grep-err.XXXXXX)
-trap 'rm -f "$grep_err"' EXIT
-
-missing=$(printf '%s\n' "$spdx_scope" | xargs grep -L "SPDX-License-Identifier" 2>"$grep_err" || true)
-if [ -s "$grep_err" ]; then
-    echo -e "  ${RED}${BOLD}grep execution error while checking for SPDX header:${NC}" >&2
-    cat "$grep_err" >&2
-    exit 1
-fi
+# Missing SPDX header: scan file-by-file (no xargs, so grep errors are never
+# masked into an empty result) — an unreadable file counts as missing.
+missing=""
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if ! grep -q "SPDX-License-Identifier" "$f"; then
+        missing+="$f"$'\n'
+    fi
+done <<< "$spdx_scope"
 if [ -n "$missing" ]; then
     echo -e "  ${RED}${BOLD}Missing SPDX header in files:${NC}"
     echo "$missing" | sed 's/^/    /'
     exit 1
 fi
 
-invalid=$(printf '%s\n' "$spdx_scope" \
-    | xargs grep -l "SPDX-License-Identifier" 2>"$grep_err" \
-    | xargs grep -LE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" 2>>"$grep_err" || true)
-if [ -s "$grep_err" ]; then
-    echo -e "  ${RED}${BOLD}grep execution error while checking SPDX identifier format:${NC}" >&2
-    cat "$grep_err" >&2
-    exit 1
-fi
+# Invalid SPDX identifier (expected GPL-3.0-or-later or MIT): same file-by-file
+# scan — a grep error on one file is a hard failure, never a silent pass.
+invalid=""
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if grep -q "SPDX-License-Identifier" "$f" \
+        && ! grep -qE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" "$f"; then
+        invalid+="$f"$'\n'
+    fi
+done <<< "$spdx_scope"
 if [ -n "$invalid" ]; then
     echo -e "  ${RED}${BOLD}Invalid SPDX identifier (expected GPL-3.0-or-later or MIT):${NC}"
     echo "$invalid" | sed 's/^/    /'
     exit 1
 fi
-rm -f "$grep_err"
-trap - EXIT
 ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT) ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,33 @@ fi
 ok "All #[allow(clippy::)] suppressions are documented ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
-# [6/7] AppStream packaging metadata validation (mandatory, fail-closed)
+# [6/8] Direct log::set_max_level mutation check (enforce test_logger isolation)
+#
+# Direct mutation of the global log level via `log::set_max_level` causes test
+# race conditions, flaky tests, and poll timeouts. All tests must use
+# `test_logger::acquire_logger_level` or `test_logger::with_logger_level`.
+# Direct invocations of `set_max_level` are restricted exclusively to
+# `src/standalone/test_logger.rs` (and optionally `src/main.rs`).
+# ---------------------------------------------------------------------------
+phase "Checking for unauthorized log::set_max_level invocations..."
+
+unauthorized_set_level=$(
+    grep -rnE '\bset_max_level\s*\(' "${rs_dirs[@]}" 2>/dev/null \
+        | grep -vE ':[0-9]+:\s*(//|/\*|\*)' \
+        | grep -v 'src/standalone/test_logger.rs:' \
+        | grep -v 'src/main.rs:' || true
+)
+
+if [ -n "$unauthorized_set_level" ]; then
+    echo -e "  ${RED}${BOLD}ERROR: Direct set_max_level invocation found!${NC}"
+    echo -e "  ${RED}${BOLD}Direct mutation causes test race conditions. Use test_logger::with_logger_level instead:${NC}"
+    echo "$unauthorized_set_level" | sed 's/^/    /'
+    exit 1
+fi
+ok "No unauthorized log::set_max_level invocations found ($(phase_elapsed_str))."
+
+# ---------------------------------------------------------------------------
+# [7/8] AppStream packaging metadata validation (mandatory, fail-closed)
 # ---------------------------------------------------------------------------
 phase "Validating AppStream packaging metadata (mandatory files + official validators)..."
 
@@ -209,7 +235,7 @@ fi
 ok "Metainfo id/name/launchable aligned with desktop entry ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
-# [7/7] AppStream release version sync check
+# [8/8] AppStream release version sync check
 # ---------------------------------------------------------------------------
 phase "Checking AppStream release version sync with Cargo.toml..."
 

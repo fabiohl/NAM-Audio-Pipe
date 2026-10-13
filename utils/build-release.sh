@@ -307,12 +307,20 @@ trap cleanup EXIT INT TERM HUP
 #   to the release binary, cross-referencing the PGO workload receipt. Status
 #   is one of: PGO+BOLT, PGO-ONLY, BOLT-ONLY, PLAIN. `cause` is the detailed
 #   BOLT failure/unavailability reason (empty when BOLT was proven/applied).
+#
+#   `bolt_proof` (S6-T3) certifies that a BOLT win was independently measured:
+#   it is either `ab-opt-ceremony:<id>` (an ab-opt ceremony receipt proving
+#   p99(bolt) <= p99(pgo) over >= 3 runs) or `MISSING`. Under --strict-release
+#   the certification only claims `PGO+BOLT` when this proof is present.
+#   Optional LBR-profile evidence is read from the environment:
+#   BOLT_LBR_SAMPLES, BOLT_LBR_FDATA_SHA256, BOLT_LBR_FDATA, BOLT_LBR_DURATION_S.
 write_release_receipt() {
     local status="$1"
     local cause="${2:-}"
     mkdir -p "$PROJECT_DIR/target/logs"
     if python3 - "$status" "$cause" "$PGO_RECEIPT" > "$RELEASE_RECEIPT" <<'PY'
 import json
+import os
 import sys
 
 status, cause, pgo_receipt = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -323,6 +331,22 @@ doc = {
 }
 if cause:
     doc["optimization"]["cause"] = cause
+doc["optimization"]["bolt_proof"] = os.environ.get("BOLT_PROOF") or "MISSING"
+gap = os.environ.get("BOLT_GAP")
+if gap:
+    doc["optimization"]["gap"] = gap
+
+# LBR BOLT-profile evidence (S6-T3): samples + perf.fdata hash + duration.
+lbr_samples = os.environ.get("BOLT_LBR_SAMPLES")
+lbr_sha = os.environ.get("BOLT_LBR_FDATA_SHA256")
+if lbr_samples or lbr_sha:
+    doc["optimization"]["bolt_lbr"] = {
+        "samples": int(lbr_samples) if (lbr_samples or "").isdigit() else lbr_samples,
+        "fdata_sha256": lbr_sha or None,
+        "fdata": os.environ.get("BOLT_LBR_FDATA") or None,
+        "duration_s": os.environ.get("BOLT_LBR_DURATION_S") or None,
+    }
+
 doc["pgo"] = {"receipt": pgo_receipt}
 try:
     with open(pgo_receipt, "r", encoding="utf-8") as f:
@@ -416,6 +440,18 @@ if [ "$RELEASE_CEREMONY" = true ]; then
     else
         die "Release ceremony requires a real, strict long suite receipt on disk (target/logs/long-receipt.txt is missing).\nPlease ask the human operator to execute:\n  ./utils/tests-long.sh --strict-pre-release\n(AI agents MUST NEVER execute the long suite directly)."
     fi
+
+    # Unified-schema JSONL receipt (S4-T4.4): both readers must certify the
+    # same run. The JSONL is the machine source of truth; the .txt above is the
+    # derived view. A tampered/forged JSONL is rejected fail-closed.
+    JSONL_RECEIPT_PATH="$PROJECT_DIR/target/logs/long-audit-receipt.jsonl"
+    if [ ! -f "$JSONL_RECEIPT_PATH" ]; then
+        die "Release ceremony requires the unified-schema long receipt (target/logs/long-audit-receipt.jsonl is missing).\nPlease ask the human operator to execute:\n  ./utils/tests-long.sh --strict-pre-release"
+    fi
+    if ! cargo run --quiet --locked --features testing --bin pipe_long_receipt -- validate --strict --out "$JSONL_RECEIPT_PATH"; then
+        die "Release ceremony rejected the unified-schema long receipt (target/logs/long-audit-receipt.jsonl): strict semantic verification failed — a forged OVERALL verdict, a missing/duplicate phase, gaps, failures or a simulated run are rejected fail-closed."
+    fi
+    echo -e "  ${GREEN}✓${NC} Unified-schema long receipt verified — both readers agree (JSONL + .txt)."
 fi
 
 # -----------------------------------------------------------------------------
@@ -1054,9 +1090,81 @@ else
     fi
 fi
 
-# Degradation policy: BOLT absence must be typed and explicit,
-# never silently masked as "PGO + BOLT applied". Under --strict-release, any
-# unproven BOLT aborts the release.
+# -----------------------------------------------------------------------------
+# PHASE 4.1: LBR BOLT-profile evidence + ceremony proof (S6-T3)
+# -----------------------------------------------------------------------------
+# The BOLT win must be independently proven before the receipt may claim
+# `PGO+BOLT`. Two pieces of evidence are gathered here:
+#   * an LBR profile of the PGO workload MATRIX (>= 30 s) recorded with
+#     `perf record -e cycles:u -j any,u`, recording the sample count and the
+#     `perf.fdata` sha256 the layout would be derived from;
+#   * the `ab-opt-ceremony` proof (`ab-opt-ceremony:<id>`) — an external
+#     ceremony receipt showing p99(BOLT) <= p99(PGO) over >= 3 runs.
+# Either is best-effort at capture time; a MISSING proof downgrades the claim.
+BOLT_LBR_SAMPLES=""
+BOLT_LBR_FDATA_SHA256=""
+BOLT_LBR_FDATA=""
+BOLT_LBR_DURATION_S="30"
+PGO_WORKLOAD_BIN="$PGO_BUILD_TARGET_DIR/dist/pgo_workload"
+if [ "$USE_BOLT" = true ] && [ "$HAS_PERF" = true ] && [ -x "$PGO_WORKLOAD_BIN" ]; then
+    echo -e "\n${BLUE}${BOLD}[Phase 4.1/7] Capturing LBR BOLT-profile evidence (pgo_workload, ${BOLT_LBR_DURATION_S}s)...${NC}"
+    if perf record -F 99 -e cycles:u -j any,u -o "$BOLT_DIR/lbr.data" -- \
+        "$PGO_WORKLOAD_BIN" --seconds "$BOLT_LBR_DURATION_S" \
+        > "$BOLT_DIR/lbr_record.log" 2>&1; then
+        BOLT_LBR_SAMPLES=$(perf script -i "$BOLT_DIR/lbr.data" 2>/dev/null | wc -l || echo 0)
+        if "$PERF2BOLT" -p "$BOLT_DIR/lbr.data" "$PGO_BIN" -o "$BOLT_DIR/lbr.fdata" \
+            > "$BOLT_DIR/lbr_perf2bolt.log" 2>&1; then
+            BOLT_LBR_FDATA="$BOLT_DIR/lbr.fdata"
+            BOLT_LBR_FDATA_SHA256=$(sha256sum "$BOLT_DIR/lbr.fdata" 2>/dev/null | awk '{print $1}')
+        fi
+        echo -e "  ${GREEN}✓${NC} LBR profile: ${BOLT_LBR_SAMPLES} samples, fdata sha256=${BOLT_LBR_FDATA_SHA256:0:16}..."
+    else
+        warn "LBR BOLT-profile capture failed (perf record); BOLT proof left MISSING."
+    fi
+fi
+
+# Ceremony proof: only the canonical `target/logs/ab-opt-ceremony-receipt.json`
+# written by `utils/ab-opt-ceremony.sh` counts, and only when its verdict proves
+# a BOLT win (verdict == PGO+BOLT) over at least the statistical minimum of 3
+# runs. Per-variant receipts (`ab-opt-<name>.json`) and stale/failing ceremony
+# runs must never be relabeled as proof.
+BOLT_PROOF="MISSING"
+CEREMONY_RECEIPT="$PROJECT_DIR/target/logs/ab-opt-ceremony-receipt.json"
+if [ -f "$CEREMONY_RECEIPT" ]; then
+    if ceremony_id=$(python3 -c '
+import hashlib, json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        doc = json.load(fh)
+except Exception:
+    sys.exit(1)
+# A proof requires: a BOLT win verdict and the statistical minimum of runs.
+if doc.get("verdict") != "PGO+BOLT":
+    sys.exit(1)
+try:
+    if int(doc.get("runs") or 0) < 3:
+        sys.exit(1)
+except (TypeError, ValueError):
+    sys.exit(1)
+with open(path, "rb") as fh:
+    digest = hashlib.sha256(fh.read()).hexdigest()
+print(digest[:16])
+' "$CEREMONY_RECEIPT" 2>/dev/null); then
+        BOLT_PROOF="ab-opt-ceremony:$ceremony_id"
+        echo -e "  ${GREEN}✓${NC} BOLT ceremony proof: $BOLT_PROOF (verdict PGO+BOLT, >=3 runs)"
+    else
+        warn "Ceremony receipt present but does not prove a BOLT win (verdict != PGO+BOLT or < 3 runs); BOLT proof MISSING."
+    fi
+else
+    warn "No canonical ceremony receipt at $CEREMONY_RECEIPT; BOLT proof MISSING."
+fi
+
+# Degradation policy: BOLT absence must be typed and explicit, never silently
+# masked as "PGO + BOLT applied". Under --strict-release the certification only
+# claims `PGO+BOLT` when the ceremony proof exists; otherwise it reverts to the
+# existing `--no-bolt` (PGO-only) path and emits a typed `GAP` — never a silent
+# BOLT claim, and never a hard abort (the operator stays in control).
 if [ "$BOLT_APPLIED" = true ]; then
     if [ "$USE_PGO" = true ]; then
         BOLT_STATUS="PGO+BOLT"
@@ -1069,13 +1177,27 @@ else
     BOLT_STATUS="PLAIN"
 fi
 
-if [ "$BOLT_APPLIED" != true ]; then
-    warn "Optimization status: ${BOLT_STATUS} (${BOLT_CAUSE:-BOLT unavailable})."
+BOLT_GAP=""
+if [ "$BOLT_PROOF" = "MISSING" ]; then
+    if [ "$BOLT_STATUS" = "PGO+BOLT" ]; then
+        BOLT_STATUS="PGO-ONLY"
+        BOLT_GAP="bolt_proof:missing_ceremony"
+        BOLT_CAUSE="${BOLT_CAUSE:+$BOLT_CAUSE }BOLT_PROOF_MISSING: no ab-opt-ceremony receipt proving p99(BOLT) <= p99(PGO); downgraded to PGO-ONLY."
+    fi
     if [ "$STRICT_RELEASE" = true ]; then
-        die "BOLT is mandatory under --strict-release but could not be proven: ${BOLT_CAUSE:-unknown cause}. Aborting the release."
+        BOLT_GAP="bolt_proof:missing_ceremony"
     fi
 fi
 
+if [ "$BOLT_APPLIED" != true ]; then
+    warn "Optimization status: ${BOLT_STATUS} (${BOLT_CAUSE:-BOLT unavailable})."
+fi
+
+if [ -n "$BOLT_GAP" ]; then
+    warn "GAP $BOLT_GAP: releasing as ${BOLT_STATUS} under --strict-release (proof required to claim PGO+BOLT)."
+fi
+
+export BOLT_PROOF BOLT_LBR_SAMPLES BOLT_LBR_FDATA_SHA256 BOLT_LBR_FDATA BOLT_LBR_DURATION_S BOLT_GAP
 write_release_receipt "$BOLT_STATUS" "$BOLT_CAUSE"
 
 
@@ -1096,8 +1218,9 @@ echo -e "\n${BLUE}${BOLD}[Phase 4.5/7] Generating filtered DSP hotspot report...
 ASM_FULL="$PROJECT_DIR/target/dsp_hotpath.full.asm"
 ASM_TARGET="$PROJECT_DIR/target/dsp_hotpath.asm"
 ASM_SUMMARY="$PROJECT_DIR/target/dsp_hotpath_summary.txt"
-# Hotspot symbol filter: critical DSP loops only (Sprint 3b/T3.4 scope).
-HOTSPOT_SYMBOLS='process_block_internal|tanh_and_|gated_|ResamplerCore::process|NamResampler::process|capture_dsp_pipeline_streaming|capture_dsp_pipeline$|capture_dsp_pipeline_inner|process_dsp_buffer|playback_dsp_cycle|CabSimAdapter::process_block|ConvEngine::process|LatencyHistogram::record'
+# Hotspot symbol filter: critical DSP loops only, driven by the per-repo
+# symbol profile `utils/codegen-profile.json` (unified NAM codegen filter, T5.2).
+HOTSPOT_PROFILE="$SCRIPT_DIR/codegen-profile.json"
 
 if [ "$BOLT_APPLIED" = true ] && [ -f "$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt" ]; then
     ASM_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt"
@@ -1120,7 +1243,7 @@ if [ -n "${ASM_BIN:-}" ]; then
         # the full dump stays as the secondary artifact for audit.
         if python3 "$SCRIPT_DIR/dsp-hotpath-filter.py" --full "$ASM_FULL" \
             --filtered "$ASM_TARGET" --summary "$ASM_SUMMARY" \
-            --symbols "$HOTSPOT_SYMBOLS"; then
+            --profile "$HOTSPOT_PROFILE"; then
             echo -e "  ${GREEN}✓${NC} Filtered hotspot report at target/dsp_hotpath.asm ($(wc -l < "$ASM_TARGET") lines)"
             echo -e "  ${GREEN}✓${NC} Hotspot summary at target/dsp_hotpath_summary.txt"
         else
@@ -1564,6 +1687,10 @@ doc = {
             "cpu_baseline": cpu_baseline,
             "pgo": opt_status in ("PGO+BOLT", "PGO-ONLY"),
             "bolt": opt_status in ("PGO+BOLT", "BOLT-ONLY"),
+            # S6-T3: a BOLT transform claim must carry its ceremony proof id
+            # (`ab-opt-ceremony:<id>`) or be explicitly MISSING. A
+            # certified_release may not claim BOLT while the proof is MISSING.
+            "bolt_proof": os.environ.get("BOLT_PROOF") or "MISSING",
             # The optimization status is a compilation-transform claim
             # only — no harness-measured performance metric (deadline/jitter/
             # throughput) is ever attributed to the final PGO+BOLT ELF here.

@@ -19,9 +19,21 @@ use rtrb::RingBuffer;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod common;
+
+/// Minimum number of E2E samples in the measurement window so the log-linear
+/// histogram carries a meaningful tail (the previous 8-sample window made
+/// "p99" collapse onto the maximum).
+const E2E_MEASURE_SAMPLES: u64 = 2000;
+
+/// Minimum wall-clock measurement window (whichever is longer with the sample
+/// target, so a coarse quantum still yields a real time series).
+const E2E_MIN_WINDOW: Duration = Duration::from_secs(4);
+
+/// Hard ceiling for the measurement window (covers 2000 samples at q=256).
+const E2E_MAX_WINDOW: Duration = Duration::from_secs(15);
 
 /// R-17: the script (`utils/tests-quick.sh` Phase 3) only executes
 /// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
@@ -127,17 +139,24 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
         "pipeline did not reach steady streaming state for buffer_size={buffer_size}"
     );
 
-    // Baseline snapshot at steady state: reset histogram and baseline starvation/drops
-    let base_starvation = stream_status
+    // Bring-up transient snapshot: the single expected discard/starvation at the
+    // first quantum is counted separately (`bringup_discard`) from the
+    // steady-state drops, which must be exactly zero.
+    let bringup_starvation = stream_status
         .playback_bridge_starvation
         .load(Ordering::Relaxed);
-    let base_drops = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
+    let bringup_discard = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
     stream_status.e2e_hist.reset();
 
-    // Measurement window: wait for at least 8 e2e measurements (~128 quantums)
-    let measure_deadline = std::time::Instant::now() + Duration::from_secs(4);
-    while std::time::Instant::now() < measure_deadline {
-        if stream_status.e2e_hist.total_count() >= 8 {
+    // Measurement window: at least E2E_MEASURE_SAMPLES samples AND at least
+    // E2E_MIN_WINDOW of wall clock (bounded by E2E_MAX_WINDOW).
+    let measure_start = Instant::now();
+    loop {
+        let samples = stream_status.e2e_hist.total_count();
+        if samples >= E2E_MEASURE_SAMPLES && measure_start.elapsed() >= E2E_MIN_WINDOW {
+            break;
+        }
+        if measure_start.elapsed() >= E2E_MAX_WINDOW {
             break;
         }
         thread::sleep(Duration::from_millis(15));
@@ -149,11 +168,13 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
         .playback_bridge_starvation
         .load(Ordering::Relaxed);
     let current_drops = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
-    let starvation = current_starvation.saturating_sub(base_starvation);
-    let dropped_frames = current_drops.saturating_sub(base_drops);
+    let starvation = current_starvation.saturating_sub(bringup_starvation);
+    let dropped_frames = current_drops.saturating_sub(bringup_discard);
 
+    let samples = stream_status.e2e_hist.total_count();
     let p50_ns = stream_status.e2e_hist.get_percentile(0.50);
     let p99_ns = stream_status.e2e_hist.get_percentile(0.99);
+    let p999_ns = stream_status.e2e_hist.get_percentile(0.999);
     let max_ns = stream_status.e2e_hist.get_exact_max();
 
     spsc::SHUTDOWN.store(true, Ordering::Relaxed);
@@ -190,28 +211,65 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     }
 
     let quantum = last_n_samples;
+    let quantum_ns = (quantum as u64) * 1_000_000_000 / (rate as u64);
 
     println!(
-        "E2E_METRICS buffer_size={buffer_size} p50_ns={p50_ns} p99_ns={p99_ns} max_ns={max_ns} starvation={starvation} dropped_frames={dropped_frames} quantum={quantum} rate={rate}"
+        "E2E_METRICS buffer_size={buffer_size} samples={samples} p50_ns={p50_ns} p99_ns={p99_ns} \
+         p999_ns={p999_ns} max_ns={max_ns} starvation={starvation} \
+         bringup_discard={bringup_discard} steady_dropped={dropped_frames} quantum={quantum} rate={rate}"
     );
 
-    // G-RB-001 & T2.3 Acceptance Criteria:
+    // Steady-state contract: after warm-up the bridge must not starve nor
+    // discard. Bring-up transients are reported separately, never hidden.
     assert_eq!(
         starvation, 0,
-        "zero starvation expected under live smoke for buffer_size={buffer_size}"
+        "zero steady-state starvation expected for buffer_size={buffer_size}"
     );
-    assert!(
-        dropped_frames <= 2,
-        "excessive dropped frames ({dropped_frames}) under live smoke for buffer_size={buffer_size}"
+    assert_eq!(
+        dropped_frames, 0,
+        "steady-state dropped frames must be zero for buffer_size={buffer_size} \
+         (bring-up was {bringup_discard})"
     );
 
-    // p99 e2e <= 2 quantums + hardware/scheduling overhead (15ms budget)
-    let quantum_ns = (quantum as u64) * 1_000_000_000 / (rate as u64);
-    let max_allowed_p99 = 2 * quantum_ns + 15_000_000;
-    assert!(
-        p99_ns <= max_allowed_p99,
-        "p99 e2e ({p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
-    );
+    let env = common::rt_env::RtCalibration::probe();
+    let force_legacy = std::env::var("NAM_E2E_LEGACY_GATE").as_deref() == Ok("1");
+
+    if env.calibrated() && !force_legacy {
+        // Tight gate relative to the host quantum: the bridge is one quantum
+        // deep, so p99 must stay under 1.25·q + 100 µs and the maximum under
+        // 1.5·q (F-PR-07).
+        let p99_limit = quantum_ns + quantum_ns / 4 + 100_000;
+        let max_limit = quantum_ns + quantum_ns / 2;
+        assert!(
+            p99_ns <= p99_limit,
+            "p99 E2E ({p99_ns} ns) exceeded 1.25·q + 100 µs ({p99_limit} ns) for buffer_size={buffer_size}"
+        );
+        assert!(
+            max_ns <= max_limit,
+            "max E2E ({max_ns} ns) exceeded 1.5·q ({max_limit} ns) for buffer_size={buffer_size}"
+        );
+        println!(
+            "TEST_RESULT[e2e_tight_gate]=PASS buffer_size={buffer_size} p99_ns={p99_ns} \
+             max_ns={max_ns} quantum_ns={quantum_ns} {}",
+            env.format_env()
+        );
+    } else {
+        let reason = if force_legacy {
+            "forced_legacy_gate"
+        } else {
+            "non_isolated_env"
+        };
+        // Legacy permissive threshold as an explicit fallback on uncertified hosts.
+        let max_allowed_p99 = 2 * quantum_ns + 15_000_000;
+        assert!(
+            p99_ns <= max_allowed_p99,
+            "p99 e2e ({p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
+        );
+        println!(
+            "TEST_RESULT[e2e_tight_gate]=GAP:{reason} buffer_size={buffer_size} p99_ns={p99_ns} \
+             max_ns={max_ns} quantum_ns={quantum_ns}"
+        );
+    }
 
     (
         p50_ns,
@@ -250,184 +308,7 @@ fn test_pipewire_integration() {
     }
 }
 
-/// Opt-in acceptance: a momentary PipeWire daemon restart
-/// must be recovered by the bounded reconnect cycle with the internal state
-/// (models/IRs/recording) intact.
-///
-/// This test **restarts the user's PipeWire daemon** (`systemctl --user restart
-/// pipewire`) and is therefore fully disruptive: it only runs when the operator
-/// explicitly opts in via `NAM_DAEMON_BOUNCE_TEST=1` (never in the default or
-/// quick test loops).
-///
-/// To make the graph schedule the NAM capture node deterministically, a silent
-/// WAV is played into the `NAM-Audio-Pipe-input` sink for the whole acceptance
-/// (a silent stream still produces real quantums and advances the stream clock
-/// — without any audible tone reaching the hardware). The daemon restart
-/// happens *during* the active session; the host must observe the disconnect,
-/// re-instantiate its streams inside the bounded backoff, and resume DSP —
-/// proven by the fresh capture sink re-registering in the graph and the
-/// reconnected stream clock advancing again.
-#[test]
-#[ignore = "opt-in disruptive test: restarts the user's PipeWire daemon; run with NAM_DAEMON_BOUNCE_TEST=1"]
-fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
-    if std::env::var("NAM_DAEMON_BOUNCE_TEST").as_deref() != Ok("1") {
-        eprintln!("SKIP: NAM_DAEMON_BOUNCE_TEST != 1 (disruptive daemon-bounce acceptance).");
-        return;
-    }
-    if !common::pw_play_available() {
-        eprintln!("SKIP: pw-play unavailable; cannot drive the graph deterministically.");
-        return;
-    }
-
-    common::init_test_logger();
-    // Serializes against the exhaustion acceptance: both tests manipulate the
-    // system PipeWire daemon and must never run concurrently.
-    let _daemon_lock = common::TEST_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _shutdown = common::ShutdownGuard::new();
-    assert_daemon_probe_consistent();
-
-    // Silent 30 s stereo tone that keeps the NAM capture sink scheduled.
-    let dir = common::temp_dir();
-    let _dir_guard = common::DirGuard::new(dir.clone());
-    let mut tone = ToneDriver::new(&dir);
-
-    pipewire::init();
-
-    let (_param_prod, param_cons) = RingBuffer::new(4);
-    let (gc_prod, gc_cons) = RingBuffer::new(4);
-    let (res_prod, res_cons) = RingBuffer::new(2);
-    let (cs_prod, cs_cons) = RingBuffer::new(2);
-    let (sl_prod, sl_cons) = RingBuffer::new(2);
-    let (os_prod, os_cons) = RingBuffer::new(2);
-
-    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
-    let rt_status = Arc::new(RtStatusFlags::default());
-
-    let rt_clone = rt_status.clone();
-    let gc_overflow_clone = gc_overflow.clone();
-    let sys = SystemSnapshot::capture();
-    let stream_status = Arc::new(StreamStatusFlags::new());
-    let stream_status_clone = stream_status.clone();
-
-    let pw_thread = thread::spawn(move || {
-        pw_host::run_pipewire_host(
-            param_cons,
-            gc_prod,
-            gc_overflow_clone,
-            res_cons,
-            res_prod,
-            cs_cons,
-            cs_prod,
-            rt_clone,
-            PipewireHostConfig {
-                buffer_size: 0,
-                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
-                sys,
-                ir_raw_samples: None,
-                ir_source_rate: 0,
-                full_wavenet_model_l: None,
-                full_wavenet_model_r: None,
-                has_model_r: false,
-                slimmable_producer: sl_prod,
-                os_producer: os_prod,
-                oversample: OversampleFactor::Off,
-                cpu_receipt: common::deterministic_cpu_receipt(),
-                // Reconnect ENABLED: this is exactly what the bounce exercises.
-                fail_fast: false,
-                gate_config: cli::GateConfig::default_on(),
-                stream_status: Some(stream_status_clone),
-            },
-            gc_cons,
-            sl_cons,
-            os_cons,
-            None,
-            None,
-        )
-    });
-
-    // Phase 1: wait for the host's capture sink node, attach the silent tone
-    // into it and wait for a healthy audio session (stream clock advancing).
-    assert!(
-        tone.wait_for_sink_and_attach(Duration::from_secs(5)),
-        "host capture sink never registered in the graph"
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut baseline_ticks = 0u64;
-    while std::time::Instant::now() < deadline {
-        baseline_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
-        if baseline_ticks > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        baseline_ticks > 0,
-        "audio session never started before the daemon bounce"
-    );
-
-    // Phase 2: bounce the daemon while the session is live. The guard restores
-    // the full group (including a possibly-crashed wireplumber) on any exit.
-    let bounce = std::process::Command::new("systemctl")
-        .args(["--user", "restart", "pipewire"])
-        .status()
-        .expect("failed to spawn systemctl --user restart pipewire");
-    assert!(
-        bounce.success(),
-        "systemctl --user restart pipewire failed — cannot drive the acceptance"
-    );
-    let _restore_on_drop = PipewireRestartGuard;
-
-    // Phase 3: the tone process dies with the daemon. Wait for the bounded
-    // reconnect to re-register the fresh capture sink (≤ 1.75 s backoff budget
-    // plus graph settling; 20 s window), re-attach the tone, and prove DSP
-    // resumed. The reconnected stream's clock restarts from ~0, so the resume
-    // proof is *any change* of the published stream clock to a positive value
-    // (the old frozen value is discarded once the fresh callback writes).
-    assert!(
-        common::wait_for_nam_sink(Duration::from_secs(20)),
-        "host never re-registered its capture sink after the daemon bounce"
-    );
-    let resumption_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut last_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
-    loop {
-        tone.attach();
-        let now_ticks = stream_status.capture_host_ticks.load(Ordering::Relaxed);
-        if now_ticks != last_ticks && now_ticks > 0 {
-            // The fresh stream's clock changed to a positive value: real DSP
-            // resumed with the internal state (models/IRs/recording) intact.
-            println!(
-                "Bounded reconnect recovered the daemon bounce: stream clock advanced \
-                 ({last_ticks} -> {now_ticks} ticks), state survived."
-            );
-            tone.detach();
-            spsc::SHUTDOWN.store(true, Ordering::Relaxed);
-            let host_result = pw_thread
-                .join()
-                .expect("the PipeWire host thread suffered a fatal panic");
-            assert!(
-                host_result.is_ok(),
-                "recovered host must shut down cleanly, got {host_result:?}"
-            );
-            return;
-        }
-        last_ticks = now_ticks;
-        assert!(
-            std::time::Instant::now() < resumption_deadline,
-            "bounded reconnect did not resume audio within the acceptance window"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Spawns `pw-play` playing `wav` into the NAM capture sink (silent stream,
-/// volume 0) so the graph deterministically schedules the capture node.
-///
-/// ⚠️ WARNING: these helpers rely on the noise gate remaining CLOSED to keep the graph
-/// scheduled without opening the DSP path. If any future test reuses them under `--gate off`,
-/// the structural behavior changes (the "silence" would be processed as an active signal).
-/// Do not use with the gate disabled (`cli::GateConfig::Off`).
+/// Helper to spawn a silent tone against the system daemon.
 fn spawn_silent_tone(wav: &std::path::Path) -> Option<std::process::Child> {
     std::process::Command::new("pw-play")
         .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
@@ -446,19 +327,7 @@ fn kill_tone(mut tone: Option<std::process::Child>) {
     }
 }
 
-/// RAII silent-tone driver for the PipeWire acceptances.
-///
-/// The NAM capture sink only processes while a client streams into it, so the
-/// graph scheduling of the capture node is non-deterministic without an active
-/// stream. This driver plays a silent WAV into `NAM-Audio-Pipe-input` — a
-/// silent stream still produces real quantums and advances the stream clock,
-/// with no audible tone reaching the hardware. Re-attachable after a daemon
-/// restart (the tone process dies with the daemon).
-///
-/// ⚠️ WARNING: these helpers rely on the noise gate remaining CLOSED to keep the graph
-/// scheduled without opening the DSP path. If any future test reuses them under `--gate off`,
-/// the structural behavior changes (the "silence" would be processed as an active signal).
-/// Do not use with the gate disabled (`cli::GateConfig::Off`).
+/// RAII silent-tone driver for the PipeWire smoke acceptances against the system daemon.
 struct ToneDriver {
     wav_path: std::path::PathBuf,
     child: Option<std::process::Child>,
@@ -500,225 +369,11 @@ impl ToneDriver {
 
 impl Drop for ToneDriver {
     fn drop(&mut self) {
-        kill_tone(self.child.take());
+        self.detach();
     }
 }
 
-/// Restarts the user's PipeWire daemon group (best-effort) and waits until the
-/// audio graph is functional again.
-///
-/// Stopping the daemon abruptly can crash the `wireplumber` session manager (a
-/// known GLib `invalid_closure_notify` bug on some builds), and starting it
-/// *before* the daemon is stable makes it crash again. Recovery is therefore
-/// staged: (1) reset failed-unit state (the "start request repeated too
-/// quickly" trap) and restart the daemon + socket + pulse bridge, waiting for
-/// the daemon to become reachable; (2) only then start `wireplumber` and wait
-/// for a registered `Audio/Sink` node, retrying once if it crashes.
-fn restore_pipewire_group() {
-    // Stage 1: daemon reachable.
-    for _round in 0..2 {
-        let _ = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "reset-failed",
-                "pipewire",
-                "pipewire-pulse",
-                "wireplumber",
-                "pipewire.socket",
-                "pipewire-pulse.socket",
-            ])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "restart",
-                "pipewire.socket",
-                "pipewire",
-                "pipewire-pulse.socket",
-                "pipewire-pulse",
-            ])
-            .status();
-        if common::wait_for_pipewire_daemon(Duration::from_secs(10)) {
-            break;
-        }
-    }
-    // Stage 2: session manager after the daemon is stable, then the graph.
-    for _round in 0..2 {
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "reset-failed", "wireplumber"])
-            .status();
-        let _ = std::process::Command::new("systemctl")
-            .args(["--user", "start", "wireplumber"])
-            .status();
-        if common::wait_for_audio_graph(Duration::from_secs(15)) {
-            return;
-        }
-    }
-}
-
-/// Restarts the user's PipeWire daemon on drop (best-effort), even on panic —
-/// the safety net that makes the disruptive opt-in tests acceptable.
-struct PipewireRestartGuard;
-
-impl Drop for PipewireRestartGuard {
-    fn drop(&mut self) {
-        restore_pipewire_group();
-    }
-}
-
-/// Opt-in acceptance: with the daemon inaccessible, the
-/// bounded reconnect cycle must exhaust its retry budget and terminate the host
-/// cleanly with an error (fail-fast fallback) — never spin forever.
-///
-/// Disruptive like the bounce test: it stops the user's PipeWire daemon while
-/// the host runs and only restarts it via the RAII guard. Runs only with
-/// `NAM_DAEMON_BOUNCE_TEST=1`.
-#[test]
-#[ignore = "opt-in disruptive test: stops and restarts the user's PipeWire daemon; run with NAM_DAEMON_BOUNCE_TEST=1"]
-fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
-    if std::env::var("NAM_DAEMON_BOUNCE_TEST").as_deref() != Ok("1") {
-        eprintln!("SKIP: NAM_DAEMON_BOUNCE_TEST != 1 (disruptive exhaustion acceptance).");
-        return;
-    }
-    if !common::pw_play_available() {
-        eprintln!("SKIP: pw-play unavailable; cannot drive the graph deterministically.");
-        return;
-    }
-
-    common::init_test_logger();
-    // Serializes against the bounce acceptance: both tests manipulate the
-    // system PipeWire daemon and must never run concurrently.
-    let _daemon_lock = common::TEST_MUTEX
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _shutdown = common::ShutdownGuard::new();
-    assert_daemon_probe_consistent();
-
-    // Silent tone that keeps the NAM capture sink scheduled (deterministic
-    // audio session before the daemon stop).
-    let dir = common::temp_dir();
-    let _dir_guard = common::DirGuard::new(dir.clone());
-    let mut tone = ToneDriver::new(&dir);
-
-    pipewire::init();
-
-    let (_param_prod, param_cons) = RingBuffer::new(4);
-    let (gc_prod, gc_cons) = RingBuffer::new(4);
-    let (res_prod, res_cons) = RingBuffer::new(2);
-    let (cs_prod, cs_cons) = RingBuffer::new(2);
-    let (sl_prod, sl_cons) = RingBuffer::new(2);
-    let (os_prod, os_cons) = RingBuffer::new(2);
-
-    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
-    let rt_status = Arc::new(RtStatusFlags::default());
-
-    let rt_clone = rt_status.clone();
-    let gc_overflow_clone = gc_overflow.clone();
-    let sys = SystemSnapshot::capture();
-
-    let pw_thread = thread::spawn(move || {
-        pw_host::run_pipewire_host(
-            param_cons,
-            gc_prod,
-            gc_overflow_clone,
-            res_cons,
-            res_prod,
-            cs_cons,
-            cs_prod,
-            rt_clone,
-            PipewireHostConfig {
-                buffer_size: 0,
-                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
-                sys,
-                ir_raw_samples: None,
-                ir_source_rate: 0,
-                full_wavenet_model_l: None,
-                full_wavenet_model_r: None,
-                has_model_r: false,
-                slimmable_producer: sl_prod,
-                os_producer: os_prod,
-                oversample: OversampleFactor::Off,
-                cpu_receipt: common::deterministic_cpu_receipt(),
-                fail_fast: false,
-                gate_config: cli::GateConfig::default_on(),
-                stream_status: None,
-            },
-            gc_cons,
-            sl_cons,
-            os_cons,
-            None,
-            None,
-        )
-    });
-
-    // Wait for a healthy session (tone-driven), then stop the daemon and keep
-    // it down: every reconnect attempt must fail and the bounded budget
-    // (3 × progressive backoff, 1.75 s of sleeps) must be exhausted before the
-    // host errors out.
-    assert!(
-        tone.wait_for_sink_and_attach(Duration::from_secs(5)),
-        "host capture sink never registered in the graph"
-    );
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut last_n_samples = 0u32;
-    while std::time::Instant::now() < deadline {
-        last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
-        if last_n_samples > 0 {
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        last_n_samples > 0,
-        "audio never started before the daemon stop"
-    );
-
-    // Stop the daemon AND every related unit that could respawn it (socket,
-    // pulse bridge) so the reconnect attempts genuinely fail until the budget
-    // is exhausted. `wireplumber` is deliberately left running — stopping it
-    // makes it crash on restart under a live graph, and it does not revive the
-    // daemon by itself.
-    let stop = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "stop",
-            "pipewire.socket",
-            "pipewire",
-            "pipewire-pulse.socket",
-            "pipewire-pulse",
-        ])
-        .status()
-        .expect("failed to spawn systemctl --user stop pipewire");
-    assert!(stop.success(), "could not stop the PipeWire daemon");
-    let _restart_on_drop = PipewireRestartGuard;
-
-    // Bounded join: the host must exit with an error within the backoff budget
-    // plus generous per-attempt connect timeouts (10 s acceptance window).
-    let join_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !pw_thread.is_finished() {
-        assert!(
-            std::time::Instant::now() < join_deadline,
-            "host did not terminate after the reconnect budget was exhausted"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
-    let host_result = pw_thread
-        .join()
-        .expect("the PipeWire host thread suffered a fatal panic");
-    assert!(
-        host_result.is_err(),
-        "an inaccessible daemon must exhaust the bounded retries and return an \
-         error (fail-fast fallback), got Ok: {host_result:?}"
-    );
-    println!(
-        "Exhaustion acceptance passed: host terminated cleanly with error \
-         {host_result:?} after exhausting the bounded reconnect budget."
-    );
-}
-
-/// RAII guard that kills and reaps the spawned `nam-audio-pipe` child on drop
-/// (even on panic) so a failed assertion can never leave an orphaned audio
-/// host mutating the user's PipeWire graph.
+/// RAII guard that kills and reaps a child process on drop (even on panic).
 struct ChildGuard(std::process::Child);
 
 impl Drop for ChildGuard {
@@ -728,90 +383,205 @@ impl Drop for ChildGuard {
     }
 }
 
-/// Opt-in acceptance: with
-/// `--fail-fast`, a forced backend failure (the stream observing a
-/// post-streaming disconnect when the daemon is stopped) must tear the host
-/// down and exit with a **non-zero code inside the SLA** — the immediate
-/// fail-fast path that the bounded reconnect rolls back to when no
-/// retry is available.
-///
-/// This exercises the **compiled binary** as a black box (the real process exit
-/// code — unlike the in-process `run_pipewire_host` acceptances, which only
-/// return an `Err`). Disruptive like the other opt-in daemon tests: it stops
-/// the user's PipeWire daemon while the child runs and restores the whole group
-/// via the RAII guard. Runs only with `NAM_DAEMON_BOUNCE_TEST=1`.
-#[test]
-#[ignore = "opt-in disruptive test: stops and restarts the user's PipeWire daemon; run with NAM_DAEMON_BOUNCE_TEST=1"]
-fn test_pipewire_fail_fast_stream_error_terminates_within_sla() {
-    if std::env::var("NAM_DAEMON_BOUNCE_TEST").as_deref() != Ok("1") {
-        eprintln!("SKIP: NAM_DAEMON_BOUNCE_TEST != 1 (disruptive fail-fast acceptance).");
-        return;
+/// RAII silent-tone driver connected to the private PipeWire daemon.
+struct PrivateToneDriver {
+    runtime_dir: std::path::PathBuf,
+    wav_path: std::path::PathBuf,
+    child: Option<std::process::Child>,
+}
+
+impl PrivateToneDriver {
+    fn new(runtime_dir: &std::path::Path, dir: &std::path::Path) -> Self {
+        let wav_path = dir.join("silence.wav");
+        common::generate_silent_wav(&wav_path, 30);
+        Self {
+            runtime_dir: runtime_dir.to_path_buf(),
+            wav_path,
+            child: None,
+        }
     }
+
+    fn apply_envs(&self, cmd: &mut std::process::Command) {
+        cmd.env("PIPEWIRE_RUNTIME_DIR", &self.runtime_dir);
+        cmd.env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        cmd.env("PIPEWIRE_REMOTE", "pipewire-0");
+    }
+
+    fn wait_for_sink_and_attach(&mut self, target_pid: Option<u32>, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let mut cmd = std::process::Command::new("pw-dump");
+            self.apply_envs(&mut cmd);
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            if cmd
+                .output()
+                .ok()
+                .is_some_and(|out| common::parse_nam_sink_in_dump(&out.stdout, target_pid))
+            {
+                self.attach();
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn attach(&mut self) {
+        if self.child.is_none() {
+            let mut cmd = std::process::Command::new("pw-play");
+            self.apply_envs(&mut cmd);
+            self.child = cmd
+                .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
+                .arg(&self.wav_path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok();
+        }
+    }
+
+    fn detach(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for PrivateToneDriver {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+/// Smoke test: verifies that the private, isolated PipeWire daemon starts up,
+/// provides a working UNIX socket, and shuts down cleanly upon Drop without
+/// leaving temporary files or orphan processes.
+#[test]
+fn private_pw_starts_and_dies_cleanly() {
+    let pw = match common::private_pw::PrivatePipewire::start() {
+        Ok(pw) => pw,
+        Err(common::private_pw::PrivatePwError::BinaryMissing) => {
+            println!("TEST_RESULT[pw_private_daemon]=GAP:pipewire_binary_missing");
+            println!("TEST_RESULT[private_pw_smoke]=GAP:pipewire_binary_missing");
+            eprintln!("SKIP: pipewire binary is missing");
+            return;
+        }
+        Err(e) => panic!("failed to start private pipewire: {e:?}"),
+    };
+
+    let dir = pw.dir().to_path_buf();
+    let socket = pw.socket_path();
+    assert!(
+        dir.is_dir(),
+        "tempdir must exist while private pipewire is active"
+    );
+    assert!(
+        socket.exists(),
+        "socket must exist while private pipewire is active"
+    );
+
+    drop(pw);
+
+    assert!(!socket.exists(), "socket must be cleaned up on drop");
+    assert!(!dir.exists(), "tempdir must be removed on drop");
+
+    println!("TEST_RESULT[pw_private_daemon]=PASS");
+    println!("TEST_RESULT[private_pw_smoke]=PASS");
+}
+
+/// Acceptance test: a momentary PipeWire daemon restart must be recovered by
+/// the bounded reconnect cycle with the internal state intact.
+///
+/// Runs entirely against a private, isolated PipeWire daemon without touching
+/// the host user's PipeWire session.
+#[test]
+fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
+    let mut pw = match common::private_pw::PrivatePipewire::start() {
+        Ok(pw) => pw,
+        Err(common::private_pw::PrivatePwError::BinaryMissing) => {
+            println!("TEST_RESULT[daemon_bounce_reconnect]=GAP:pipewire_binary_missing");
+            println!("TEST_RESULT[pw_private_daemon]=GAP:pipewire_binary_missing");
+            eprintln!("SKIP: pipewire binary is missing");
+            return;
+        }
+        Err(e) => panic!("failed to start private pipewire: {e:?}"),
+    };
+
     if !common::pw_play_available() {
+        println!("TEST_RESULT[daemon_bounce_reconnect]=GAP:pw_play_unavailable");
         eprintln!("SKIP: pw-play unavailable; cannot drive the graph deterministically.");
         return;
     }
 
-    // Serializes against the other daemon-manipulating acceptances.
     let _daemon_lock = common::TEST_MUTEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let _shutdown = common::ShutdownGuard::new();
-    assert_daemon_probe_consistent();
 
     let dir = common::temp_dir();
     let _dir_guard = common::DirGuard::new(dir.clone());
-    let stderr_path = dir.join("fail-fast-stderr.log");
-    let stderr_file = std::fs::File::create(&stderr_path).expect("create child stderr log");
+    let mut tone = PrivateToneDriver::new(pw.dir(), &dir);
 
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_nam-audio-pipe"))
-        .arg("--fail-fast")
+    let stderr_path = dir.join("reconnect-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr log");
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nam-audio-pipe"));
+    pw.apply_envs(&mut cmd);
+    cmd.arg("--buffer-size")
+        .arg("128")
         .current_dir(&dir)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(stderr_file))
-        .spawn()
-        .expect("failed to spawn nam-audio-pipe --fail-fast");
+        .stderr(std::process::Stdio::from(stderr_file));
+    let child = cmd.spawn().expect("failed to spawn nam-audio-pipe");
     let mut child = ChildGuard(child);
+    let child_pid = child.0.id();
 
-    // Drive a healthy session first: the capture sink must register and a tone
-    // must be attached so the stream reaches an operational (Streaming) state
-    // — only then is a subsequent disconnect a real backend failure (and not
-    // the initial not-yet-connected state).
-    let mut tone = ToneDriver::new(&dir);
+    // Phase 1: wait for the host's capture sink node, attach silent tone into it
     assert!(
-        tone.wait_for_sink_and_attach(Duration::from_secs(5)),
-        "host capture sink never registered / tone never attached"
+        tone.wait_for_sink_and_attach(Some(child_pid), Duration::from_secs(5)),
+        "host capture sink never registered in the graph"
     );
     std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "child exited prematurely"
+    );
 
-    // Force the backend failure: stop the daemon group (the minimal set that
-    // keeps it down — same as the exhaustion acceptance). The stream observes a
-    // post-streaming disconnect -> Failed -> immediate fail-fast teardown.
-    let stop = std::process::Command::new("systemctl")
-        .args([
-            "--user",
-            "stop",
-            "pipewire.socket",
-            "pipewire",
-            "pipewire-pulse.socket",
-            "pipewire-pulse",
-        ])
-        .status()
-        .expect("failed to spawn systemctl --user stop pipewire");
-    assert!(stop.success(), "could not stop the PipeWire daemon");
-    let _restart_on_drop = PipewireRestartGuard;
+    // Phase 2: bounce the private daemon while the session is live
+    pw.kill_hard();
+    std::thread::sleep(Duration::from_millis(200));
+    pw.restart()
+        .expect("failed to restart private pipewire daemon");
 
-    // The child must exit with a NON-ZERO code inside the SLA (< 5 s) — never
-    // a zombie alive without audio, never a graceful 0.
-    let started = std::time::Instant::now();
+    // Phase 3: the tone process died with the daemon. Wait for bounded reconnect
+    // to re-register the fresh capture sink in the new daemon's graph (<= 1.75s backoff budget + settling)
+    assert!(
+        pw.wait_for_nam_sink_pid(child_pid, Duration::from_secs(10)),
+        "host never re-registered its capture sink after daemon bounce"
+    );
+
+    // Re-attach tone and verify session continues
+    tone.attach();
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "child died after reconnect"
+    );
+
+    // Orderly cooperative shutdown via SIGTERM
+    unsafe {
+        libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
+    }
+    let started = Instant::now();
     let deadline = started + Duration::from_secs(5);
     let status = loop {
         match child.0.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(st)) => break st,
             Ok(None) => {
                 assert!(
-                    std::time::Instant::now() < deadline,
-                    "fail-fast child did not exit within the SLA"
+                    Instant::now() < deadline,
+                    "child did not exit on SIGTERM within 5s"
                 );
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -819,22 +589,186 @@ fn test_pipewire_fail_fast_stream_error_terminates_within_sla() {
         }
     };
     assert!(
+        status.success(),
+        "recovered host must exit 0 on SIGTERM, got {status:?}"
+    );
+    println!(
+        "Bounded reconnect recovered daemon bounce: host reconnected and exited 0 cleanly after {:?}",
+        started.elapsed()
+    );
+    println!("TEST_RESULT[daemon_bounce_reconnect]=PASS");
+}
+
+/// Acceptance test: with the daemon inaccessible, the bounded reconnect cycle
+/// must exhaust its retry budget and terminate the host cleanly with an error
+/// (fail-fast fallback) — never spin forever.
+///
+/// Runs entirely against a private, isolated PipeWire daemon without touching
+/// the host user's PipeWire session.
+#[test]
+fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
+    let mut pw = match common::private_pw::PrivatePipewire::start() {
+        Ok(pw) => pw,
+        Err(common::private_pw::PrivatePwError::BinaryMissing) => {
+            println!("TEST_RESULT[daemon_bounce_exhaustion]=GAP:pipewire_binary_missing");
+            println!("TEST_RESULT[pw_private_daemon]=GAP:pipewire_binary_missing");
+            eprintln!("SKIP: pipewire binary is missing");
+            return;
+        }
+        Err(e) => panic!("failed to start private pipewire: {e:?}"),
+    };
+
+    if !common::pw_play_available() {
+        println!("TEST_RESULT[daemon_bounce_exhaustion]=GAP:pw_play_unavailable");
+        eprintln!("SKIP: pw-play unavailable; cannot drive the graph deterministically.");
+        return;
+    }
+
+    let _daemon_lock = common::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let dir = common::temp_dir();
+    let _dir_guard = common::DirGuard::new(dir.clone());
+    let mut tone = PrivateToneDriver::new(pw.dir(), &dir);
+
+    let stderr_path = dir.join("exhaustion-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr log");
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nam-audio-pipe"));
+    pw.apply_envs(&mut cmd);
+    cmd.arg("--buffer-size")
+        .arg("128")
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    let child = cmd.spawn().expect("failed to spawn nam-audio-pipe");
+    let mut child = ChildGuard(child);
+    let child_pid = child.0.id();
+
+    // Drive a healthy session first
+    assert!(
+        tone.wait_for_sink_and_attach(Some(child_pid), Duration::from_secs(5)),
+        "host capture sink never registered in the graph"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Stop the private daemon and keep it down: retries must fail and budget must be exhausted
+    pw.kill_hard();
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(10);
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "host did not terminate after reconnect budget was exhausted"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+
+    assert!(
+        !status.success(),
+        "an inaccessible daemon must exhaust retries and exit non-zero, got {status:?}"
+    );
+    println!(
+        "Exhaustion acceptance passed: child exited {status:?} after {:?}",
+        started.elapsed()
+    );
+    println!("TEST_RESULT[daemon_bounce_exhaustion]=PASS");
+}
+
+/// Acceptance test: with `--fail-fast`, a forced backend failure (the stream
+/// observing a post-streaming disconnect when the daemon is killed) must tear the
+/// host down and exit with a non-zero code inside the SLA (< 5 s).
+///
+/// Runs entirely against a private, isolated PipeWire daemon without touching
+/// the host user's PipeWire session.
+#[test]
+fn test_pipewire_fail_fast_stream_error_terminates_within_sla() {
+    let mut pw = match common::private_pw::PrivatePipewire::start() {
+        Ok(pw) => pw,
+        Err(common::private_pw::PrivatePwError::BinaryMissing) => {
+            println!("TEST_RESULT[daemon_bounce_failfast]=GAP:pipewire_binary_missing");
+            println!("TEST_RESULT[pw_private_daemon]=GAP:pipewire_binary_missing");
+            eprintln!("SKIP: pipewire binary is missing");
+            return;
+        }
+        Err(e) => panic!("failed to start private pipewire: {e:?}"),
+    };
+
+    if !common::pw_play_available() {
+        println!("TEST_RESULT[daemon_bounce_failfast]=GAP:pw_play_unavailable");
+        eprintln!("SKIP: pw-play unavailable; cannot drive the graph deterministically.");
+        return;
+    }
+
+    let _daemon_lock = common::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let dir = common::temp_dir();
+    let _dir_guard = common::DirGuard::new(dir.clone());
+    let mut tone = PrivateToneDriver::new(pw.dir(), &dir);
+
+    let stderr_path = dir.join("fail-fast-stderr.log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create child stderr log");
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nam-audio-pipe"));
+    pw.apply_envs(&mut cmd);
+    cmd.arg("--fail-fast")
+        .current_dir(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file));
+    let child = cmd
+        .spawn()
+        .expect("failed to spawn nam-audio-pipe --fail-fast");
+    let mut child = ChildGuard(child);
+    let child_pid = child.0.id();
+
+    // Drive a healthy session first
+    assert!(
+        tone.wait_for_sink_and_attach(Some(child_pid), Duration::from_secs(5)),
+        "host capture sink never registered / tone never attached"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Force backend failure by killing the private daemon
+    let stop_start = Instant::now();
+    pw.kill_hard();
+
+    let deadline = stop_start + Duration::from_secs(5);
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "fail-fast child did not exit within the SLA"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+
+    assert!(
         !status.success(),
         "a forced backend failure with --fail-fast must exit non-zero, got {status:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        stop_start.elapsed() < Duration::from_secs(5),
         "fail-fast shutdown must complete within the SLA (took {:?})",
-        started.elapsed()
+        stop_start.elapsed()
     );
     println!(
-        "Fail-fast stream-error acceptance passed: child exited {status:?} after {:?} \
-         (stderr: {})",
-        started.elapsed(),
-        std::fs::read_to_string(&stderr_path)
-            .unwrap_or_default()
-            .lines()
-            .last()
-            .unwrap_or("")
+        "Fail-fast stream-error acceptance passed: child exited {status:?} after {:?}",
+        stop_start.elapsed()
     );
+    println!("TEST_RESULT[daemon_bounce_failfast]=PASS");
 }

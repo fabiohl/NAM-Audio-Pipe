@@ -1,0 +1,4 @@
+{
+  "symbols": "process_block_internal|tanh_and_|gated_|ResamplerCore::process|NamResampler::process|capture_dsp_pipeline_streaming|capture_dsp_pipeline$|capture_dsp_pipeline_inner|process_dsp_buffer|playback_dsp_cycle|CabSimAdapter::process_block|ConvEngine::process|LatencyHistogram::record",
+  "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+}

@@ -39,6 +39,14 @@ required-features = ["testing"]
 name = "long_receipt_check"
 path = "src/bin/long_receipt_check.rs"
 
+# Unified-schema (engine `testing::receipt`) emitter/verifier for the
+# machine-readable long receipt (target/logs/long-audit-receipt.jsonl, S4-T4.4).
+# Testing-only because it reuses the engine receipt schema.
+[[bin]]
+name = "pipe_long_receipt"
+path = "src/bin/pipe_long_receipt.rs"
+required-features = ["testing"]
+
 # A/B benchmark of the recording transports (inline SPSC ring
 # vs preallocated pool + small descriptor). A profiling-only harness like
 # pgo_workload: excluded from the standard test path, compiled only when the
@@ -57,8 +65,23 @@ name = "ab_opt_bench"
 path = "src/bin/ab_opt_bench.rs"
 required-features = ["testing"]
 
+# RT regression gate Criterion harness (Sprint 3 / EC-03): promotes the offline
+# rt_deadline real-load scenario to a per-scenario Criterion suite consumed by
+# the engine `nam_perf_gate` (coverage + machine verdict). Testing-only, because
+# the RT harness used to drive the callbacks is test-only.
+[[bench]]
+name = "rt_gate"
+path = "benches/rt_gate.rs"
+harness = false
+required-features = ["testing"]
+
 [dependencies]
-NeuralAmpModeler-rs = { version = "1.0.0", features = ["rt-hardening"] }
+# `default-features = false` keeps the engine's `dual-mono` off unless this
+# crate's own `dual-mono` feature (enabled by default) forwards it. Without it,
+# Cargo would pull the engine's default features and `--no-default-features`
+# could never reach the lean single-inference path (the engine default is
+# `dual-mono`).
+NeuralAmpModeler-rs = { version = "1.0.0", default-features = false, features = ["rt-hardening"] }
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
@@ -87,8 +110,10 @@ rt-hardening = ["NeuralAmpModeler-rs/rt-hardening"]
 
 
 [dev-dependencies]
+# Criterion statistical harness for the RT regression gate (benches/rt_gate.rs).
+criterion = { version = "0.8", default-features = false }
 # Property-based testing for AlignedBlock invariants and future fuzz targets.
-proptest = "1.11.0"
+proptest = "1.12.0"
 # Distribution QA harness: strict XML well-formedness parsing for
 # the AppStream metainfo audit (tests/distribution_qa.rs).
 quick-xml = "0.42"

@@ -2,7 +2,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-# test-pick-bench-core.sh — Unit tests for pick_bench_core helper with simulated sysfs.
+# test-pick-bench-core.sh — unit tests for the canonical `pick_bench_core`
+# helper (defined in _lib_core.sh) against simulated sysfs trees.
+#
+# The body is byte-identical across NeuralAmpModeler-rs, NAM-Plug and
+# NAM-Audio-Pipe; only the SPDX header and the `_lib.sh` include path differ.
 
 set -euo pipefail
 
@@ -39,7 +43,7 @@ SYSFS_EMPTY="$TEST_TMP/sysfs_empty"
 mkdir -p "$SYSFS_EMPTY"
 touch "$SYSFS_EMPTY/isolated"
 
-expected_fallback=$(( $(nproc 2>/dev/null || echo 1) / 2 ))
+expected_fallback=$(( $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1) / 2 ))
 err_out=$(mktemp)
 res=$(unset NAM_BENCH_CORE; pick_bench_core "$SYSFS_EMPTY" 2>"$err_out")
 if [ "$res" -ne "$expected_fallback" ]; then

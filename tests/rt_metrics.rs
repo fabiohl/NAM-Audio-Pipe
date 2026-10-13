@@ -27,7 +27,10 @@
 //! - `rt_jitter_gate_10k_callbacks` (filter `jitter`, Phase 4): 10 000
 //!   callback dispatches at the nominal period while background I/O, cache
 //!   thrash and syscall-storm threads perturb the shared CPU. Measures the
-//!   inter-callback interval dispersion (max / p99 / std-dev) and emits
+//!   inter-callback interval dispersion (max / p99 / p99.9 / p99.99 /
+//!   std-dev), counts `tail_events_gt_200us`, and captures the RT thread's
+//!   `getrusage` (`nvcsw`/`nivcsw`/`minflt`) plus PMU `ipc` deltas. On a
+//!   certified host the 99.99th percentile must stay within 0.25·T. Emits
 //!   `TEST_RESULT[rt_jitter]=PASS max_jitter_us=... p99_jitter_us=...`.
 //!   Without exclusive CPU affinity the gate skips as
 //!   `=GAP:cpu_not_isolated` (task rollback — no false positives).
@@ -82,6 +85,10 @@ use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_NEEDS_RESAMPLER_REBUILD, RtStatusFlags, SHUTDOWN,
 };
 use pipewire::stream::StreamState;
+
+use common::pmu::PmuCounters;
+use common::proc::{ThreadRusage, read_thread_rusage};
+use neural_amp_modeler_rs::testing::metrics::percentile_exact;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -180,12 +187,11 @@ fn sleep_until_monotonic_raw(deadline_raw_ns: u64) {
     }
 }
 
-/// Nearest-rank percentile of a sample series (ns).
+/// Exact percentile of a sample series (ns), from the engine's
+/// `testing::metrics::percentile_exact` (single source of truth).
 fn percentile_ns(mut samples: Vec<u64>, p: f64) -> u64 {
     assert!(!samples.is_empty(), "percentile of an empty sample series");
-    samples.sort_unstable();
-    let idx = ((samples.len() - 1) as f64 * p).round() as usize;
-    samples[idx]
+    percentile_exact(&mut samples, p)
 }
 
 /// Population standard deviation of a sample series (ns).
@@ -201,139 +207,58 @@ fn std_dev_ns(samples: &[u64]) -> f64 {
     var.sqrt()
 }
 
+/// Delta of the RT thread's resource-usage counters across a measurement loop.
+struct RusageDelta {
+    nvcsw: u64,
+    nivcsw: u64,
+    minflt: u64,
+}
+
+/// Computes the per-thread rusage delta, or `None` when unavailable.
+fn rusage_delta(before: Option<ThreadRusage>, after: Option<ThreadRusage>) -> Option<RusageDelta> {
+    match (before, after) {
+        (Some(b), Some(a)) => Some(RusageDelta {
+            nvcsw: a.nvcsw.saturating_sub(b.nvcsw),
+            nivcsw: a.nivcsw.saturating_sub(b.nivcsw),
+            minflt: a.minflt.saturating_sub(b.minflt),
+        }),
+        _ => None,
+    }
+}
+
+/// Formats the RT-thread rusage deltas for `RT_METRICS`, typed when absent.
+fn format_rusage(delta: Option<&RusageDelta>) -> String {
+    match delta {
+        Some(d) => format!("nvcsw={} nivcsw={} minflt={}", d.nvcsw, d.nivcsw, d.minflt),
+        None => "nvcsw=GAP:thread_rusage_unavailable nivcsw=GAP:thread_rusage_unavailable \
+                 minflt=GAP:thread_rusage_unavailable"
+            .to_string(),
+    }
+}
+
+/// Formats the PMU IPC field for `RT_METRICS`, typed when the counters are absent.
+fn format_ipc(pmu: &PmuCounters) -> String {
+    match pmu.ipc() {
+        Some(ipc) => format!("ipc={ipc:.2}"),
+        None => {
+            let reason = pmu.unavailable_reason();
+            if reason.is_empty() {
+                "ipc=GAP:perf_event_unavailable".to_string()
+            } else {
+                format!("ipc=GAP:perf_event_unavailable({reason})")
+            }
+        }
+    }
+}
+
 // ── Environment calibration probe ────────────────────────────────────────────
+//
+// Delegated to `tests/common/rt_env.rs` so `rt_metrics` and `pw_integration`
+// share a single definition of a calibrated RT host (pinned single isolated
+// CPU + SCHED_FIFO).
 
-/// Calibration facts of the measurement environment (probed once per gate).
-struct RtEnvironment {
-    /// `NAM_RT_STRICT=1`: promote every GAP condition to a hard failure.
-    strict: bool,
-    /// The process is pinned to exactly one CPU (`Cpus_allowed_list`).
-    pinned_single_cpu: bool,
-    /// The pinned CPU id, if pinned to a single core.
-    pinned_cpu: Option<u32>,
-    /// The pinned CPU is in the kernel's isolcpus set.
-    cpu_isolated: bool,
-    /// `sched_getscheduler` reports `SCHED_FIFO`.
-    sched_fifo: bool,
-    /// Scaling governor of the pinned CPU or system.
-    governor: String,
-    /// Whether CPU 9 is offline (SMT pair offline).
-    cpu9_offline: bool,
-}
-
-impl RtEnvironment {
-    fn probe() -> Self {
-        let allowed = cpus_allowed_list();
-        let pinned_single_cpu = allowed.len() == 1;
-        let pinned_cpu = if pinned_single_cpu {
-            allowed.first().copied()
-        } else {
-            None
-        };
-        let isolated = isolated_cpus();
-        let cpu_isolated = pinned_cpu.is_some_and(|c| isolated.contains(&c));
-        let sched_fifo = unsafe { libc::sched_getscheduler(0) } == libc::SCHED_FIFO;
-        let governor = read_cpu_governor(pinned_cpu);
-        let cpu9_offline = is_cpu9_offline();
-        Self {
-            strict: std::env::var("NAM_RT_STRICT").as_deref() == Ok("1"),
-            pinned_single_cpu,
-            pinned_cpu,
-            cpu_isolated,
-            sched_fifo,
-            governor,
-            cpu9_offline,
-        }
-    }
-
-    /// A calibrated realtime environment: exclusive CPU affinity on an
-    /// isolated core plus a FIFO scheduler (task spec §1).
-    fn calibrated(&self) -> bool {
-        self.pinned_single_cpu && self.cpu_isolated && self.sched_fifo
-    }
-
-    /// Formats the calibration environment evidence string for `TEST_RESULT[...]`.
-    fn format_env(&self) -> String {
-        let pinned = if self.pinned_single_cpu { 1 } else { 0 };
-        let isolated = if self.cpu_isolated { 1 } else { 0 };
-        let fifo = if self.sched_fifo { 1 } else { 0 };
-        let cpu_str = match self.pinned_cpu {
-            Some(id) => id.to_string(),
-            None => "none".to_string(),
-        };
-        let cpu9_str = if self.cpu9_offline {
-            "offline"
-        } else {
-            "online"
-        };
-        format!(
-            "env=pinned:{pinned},isolated:{isolated},fifo:{fifo},governor:{},cpu:{cpu_str},cpu9:{cpu9_str}",
-            self.governor
-        )
-    }
-}
-
-/// Tries to set SCHED_FIFO with the given priority on the current thread.
-fn try_promote_sched_fifo(priority: i32) -> bool {
-    let param = libc::sched_param {
-        sched_priority: priority,
-    };
-    let rc = unsafe { libc::sched_setscheduler(0, libc::SCHED_FIFO, &param) };
-    rc == 0
-}
-
-/// Reads the cpufreq scaling_governor for the given CPU or cpu0.
-fn read_cpu_governor(cpu: Option<u32>) -> String {
-    let path = match cpu {
-        Some(id) => format!("/sys/devices/system/cpu/cpu{id}/cpufreq/scaling_governor"),
-        None => "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor".to_string(),
-    };
-    std::fs::read_to_string(&path)
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-/// Detects if CPU 9 is offline (SMT pair intentional offline).
-fn is_cpu9_offline() -> bool {
-    let path = "/sys/devices/system/cpu/cpu9/online";
-    if let Ok(s) = std::fs::read_to_string(path) {
-        s.trim() == "0"
-    } else {
-        false
-    }
-}
-
-/// Parses `/proc/self/status` `Cpus_allowed_list` into the allowed CPU ids.
-fn cpus_allowed_list() -> Vec<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    for line in status.lines() {
-        if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
-            return parse_cpu_ranges(rest.trim());
-        }
-    }
-    Vec::new()
-}
-
-/// Parses the kernel's `/sys/devices/system/cpu/isolated` CPU ids.
-fn isolated_cpus() -> Vec<u32> {
-    let s = std::fs::read_to_string("/sys/devices/system/cpu/isolated").unwrap_or_default();
-    parse_cpu_ranges(s.trim())
-}
-
-/// Expands "0,2-4" style CPU ranges into a flat id list.
-fn parse_cpu_ranges(s: &str) -> Vec<u32> {
-    let mut cpus = Vec::new();
-    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        if let Some((lo, hi)) = part.split_once('-') {
-            let lo: u32 = lo.trim().parse().unwrap_or(0);
-            let hi: u32 = hi.trim().parse().unwrap_or(lo);
-            cpus.extend(lo..=hi);
-        } else if let Ok(c) = part.parse::<u32>() {
-            cpus.push(c);
-        }
-    }
-    cpus
-}
+use common::rt_env::RtCalibration as RtEnvironment;
+use common::rt_env::try_promote_sched_fifo;
 
 // ── Shared setup: full real-load harness (WaveNet A1/A2 + CabSim) ───────────
 
@@ -398,6 +323,10 @@ fn rt_deadline_gate_10k_quantums() {
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
     }
 
+    let rusage_before = read_thread_rusage().ok();
+    let pmu = PmuCounters::open();
+    pmu.start();
+
     let mut samples = Vec::with_capacity(DEADLINE_QUANTUMS);
     let mut min_ns = u64::MAX;
     let mut max_ns = 0u64;
@@ -422,14 +351,24 @@ fn rt_deadline_gate_10k_quantums() {
         sum_ns += dur as u128;
     }
     h.consume_gc();
+    pmu.stop();
+    let rusage_after = read_thread_rusage().ok();
 
     let mean_ns = (sum_ns / DEADLINE_QUANTUMS as u128) as u64;
     let p99_ns = percentile_ns(samples.clone(), 0.99);
+    let p999_ns = percentile_ns(samples.clone(), 0.999);
+    let p9999_ns = percentile_ns(samples.clone(), 0.9999);
+    let tail_events_gt_200us = samples.iter().filter(|&&s| s > 200_000).count();
+    let rusage = rusage_delta(rusage_before, rusage_after);
+    let rusage_str = format_rusage(rusage.as_ref());
+    let ipc_str = format_ipc(&pmu);
     let margin_pct = (budget_ns.saturating_sub(max_ns) as f64 / budget_ns as f64) * 100.0;
 
     eprintln!(
         "RT_METRICS rt_deadline quantums={DEADLINE_QUANTUMS} min_ns={min_ns} mean_ns={mean_ns} \
-         p99_ns={p99_ns} max_ns={max_ns} (block {max_block}) budget_ns={budget_ns} margin_pct={margin_pct:.1}"
+         p99_ns={p99_ns} p999_ns={p999_ns} p9999_ns={p9999_ns} \
+         tail_events_gt_200us={tail_events_gt_200us} max_ns={max_ns} (block {max_block}) \
+         budget_ns={budget_ns} margin_pct={margin_pct:.1} {rusage_str} {ipc_str}"
     );
 
     let env_str = env.format_env();
@@ -478,7 +417,7 @@ fn rt_deadline_gate_10k_quantums() {
 /// `CLOCK_MONOTONIC_RAW` under an 85% nanosecond budget.
 ///
 /// Emits per-stage telemetry:
-/// `RT_METRICS rt_deadline_full quantums=10000 cap_p99_ns=... cap_max_ns=... dsp_p99_ns=... dsp_max_ns=... rec_p99_ns=... rec_max_ns=... pb_p99_ns=... pb_max_ns=... total_p99_ns=... max_ns=... budget_ns=... margin_pct=...`
+/// `RT_METRICS rt_deadline_full quantums=10000 cap_p99_ns=... cap_max_ns=... dsp_p99_ns=... dsp_max_ns=... rec_p99_ns=... rec_max_ns=... pb_p99_ns=... pb_max_ns=... total_p99_ns=... tail_events_gt_200us=... max_ns=... budget_ns=... margin_pct=... nvcsw=... nivcsw=... minflt=... ipc=...`
 ///
 /// Fails closed against the budget:
 /// `TEST_RESULT[rt_deadline_full]=PASS max_ns=... budget_ns=... margin_pct=... {env_str}`
@@ -612,6 +551,10 @@ fn rt_deadline_full() {
         }
     }
 
+    let rusage_before = read_thread_rusage().ok();
+    let pmu = PmuCounters::open();
+    pmu.start();
+
     let mut cap_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
     let mut dsp_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
     let mut rec_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
@@ -734,6 +677,8 @@ fn rt_deadline_full() {
         sum_total_ns += dur_total as u128;
     }
     h.consume_gc();
+    pmu.stop();
+    let rusage_after = read_thread_rusage().ok();
 
     let cap_p99_ns = percentile_ns(cap_samples.clone(), 0.99);
     let cap_max_ns = cap_samples.into_iter().max().unwrap_or(0);
@@ -749,6 +694,10 @@ fn rt_deadline_full() {
 
     let mean_total_ns = (sum_total_ns / DEADLINE_QUANTUMS as u128) as u64;
     let total_p99_ns = percentile_ns(total_samples.clone(), 0.99);
+    let tail_events_gt_200us = total_samples.iter().filter(|&&s| s > 200_000).count();
+    let rusage = rusage_delta(rusage_before, rusage_after);
+    let rusage_str = format_rusage(rusage.as_ref());
+    let ipc_str = format_ipc(&pmu);
     let margin_pct = (budget_ns.saturating_sub(max_total_ns) as f64 / budget_ns as f64) * 100.0;
 
     eprintln!(
@@ -757,8 +706,9 @@ fn rt_deadline_full() {
          dsp_p99_ns={dsp_p99_ns} dsp_max_ns={dsp_max_ns} \
          rec_p99_ns={rec_p99_ns} rec_max_ns={rec_max_ns} \
          pb_p99_ns={pb_p99_ns} pb_max_ns={pb_max_ns} \
-         total_p99_ns={total_p99_ns} max_ns={max_total_ns} (block {max_block}) \
-         budget_ns={budget_ns} margin_pct={margin_pct:.1}"
+         total_p99_ns={total_p99_ns} tail_events_gt_200us={tail_events_gt_200us} \
+         max_ns={max_total_ns} (block {max_block}) \
+         budget_ns={budget_ns} margin_pct={margin_pct:.1} {rusage_str} {ipc_str}"
     );
 
     let env_str = env.format_env();
@@ -857,6 +807,10 @@ fn rt_jitter_gate_10k_callbacks() {
     // and initial memory paging so the timing loop measures pure steady-state contention.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
+    let rusage_before = read_thread_rusage().ok();
+    let pmu = PmuCounters::open();
+    pmu.start();
+
     let mut deltas = Vec::with_capacity(JITTER_CALLBACKS - 1);
     let mut next = now_ns() + nominal_ns;
     let mut prev = now_ns();
@@ -880,22 +834,37 @@ fn rt_jitter_gate_10k_callbacks() {
     for th in stressers {
         th.join().expect("background stresser panicked");
     }
+    pmu.stop();
+    let rusage_after = read_thread_rusage().ok();
 
     let max_jitter_ns = *deltas.iter().max().expect("non-empty jitter series");
     let p99_ns = percentile_ns(deltas.clone(), 0.99);
+    let p999_ns = percentile_ns(deltas.clone(), 0.999);
+    let p9999_ns = percentile_ns(deltas.clone(), 0.9999);
+    let tail_events_gt_200us = deltas.iter().filter(|&&d| d > 200_000).count();
     let std_dev = std_dev_ns(&deltas);
+    let rusage = rusage_delta(rusage_before, rusage_after);
+    let rusage_str = format_rusage(rusage.as_ref());
+    let ipc_str = format_ipc(&pmu);
 
     let budget_max_ns = nominal_ns;
     let budget_p99_ns = (nominal_ns as f64 * 0.5) as u64;
+    // Certified tail gate: the 99.99th percentile must stay within 0.25·T.
+    let tail_limit_ns = nominal_ns / 4;
 
     let max_jitter_us = max_jitter_ns as f64 / 1e3;
     let p99_jitter_us = p99_ns as f64 / 1e3;
+    let p999_jitter_us = p999_ns as f64 / 1e3;
+    let p9999_jitter_us = p9999_ns as f64 / 1e3;
     let budget_max_us = budget_max_ns as f64 / 1e3;
     let budget_p99_us = budget_p99_ns as f64 / 1e3;
+    let tail_limit_us = tail_limit_ns as f64 / 1e3;
 
     eprintln!(
         "RT_METRICS rt_jitter profile=release+testing quantums={JITTER_CALLBACKS} max_jitter_us={max_jitter_us:.1} \
-         p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1} std_dev_us={:.1} nominal_us={:.1}",
+         p99_jitter_us={p99_jitter_us:.1} p999_jitter_us={p999_jitter_us:.1} p9999_jitter_us={p9999_jitter_us:.1} \
+         tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1} tail_limit_us={tail_limit_us:.1} \
+         std_dev_us={:.1} nominal_us={:.1} {rusage_str} {ipc_str}",
         std_dev / 1e3,
         nominal_ns as f64 / 1e3,
     );
@@ -912,9 +881,21 @@ fn rt_jitter_gate_10k_callbacks() {
                  uncalibrated host"
             );
         }
+        // Certified-only tail gate: on a calibrated host the 99.99th percentile
+        // must stay within 0.25·T (platform-jitter watch, F-PR-09 p.3).
+        if env.calibrated() {
+            assert!(
+                p9999_ns <= tail_limit_ns,
+                "RT jitter gate FAILED: p99.99 {p9999_jitter_us:.1} us exceeds 0.25·T \
+                 ({tail_limit_us:.1} us) on a calibrated RT environment"
+            );
+        }
         let env_str = env.format_env();
         eprintln!(
-            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1} std_dev_us={:.1} {env_str}",
+            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} \
+             p99_jitter_us={p99_jitter_us:.1} p999_jitter_us={p999_jitter_us:.1} \
+             p9999_jitter_us={p9999_jitter_us:.1} tail_events_gt_200us={tail_events_gt_200us} \
+             budget_max_us={budget_max_us:.1} std_dev_us={:.1} {env_str}",
             std_dev / 1e3,
         );
         return;
@@ -934,7 +915,10 @@ fn rt_jitter_gate_10k_callbacks() {
         );
     }
     eprintln!(
-        "TEST_RESULT[rt_jitter]=GAP:uncalibrated_environment profile=release+testing max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} budget_max_us={budget_max_us:.1}"
+        "TEST_RESULT[rt_jitter]=GAP:uncalibrated_environment profile=release+testing \
+         max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} \
+         p999_jitter_us={p999_jitter_us:.1} p9999_jitter_us={p9999_jitter_us:.1} \
+         tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1}"
     );
 }
 

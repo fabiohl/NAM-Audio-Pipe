@@ -133,112 +133,99 @@ fn test_registration_and_restore_lifecycle() {
 
 #[test]
 fn test_pipewire_log_captured_in_log_buffer() {
-    let _ring_lock = crate::standalone::PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    pipewire::init();
-    let _ = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::init(
-        neural_amp_modeler_rs::common::diagnostics::logger::LoggerConfig {
-            level_filter: log::LevelFilter::Trace,
-            emit_stderr: false,
-        },
-    );
-    log::set_max_level(log::LevelFilter::Trace);
+    crate::standalone::test_logger::with_logger_level(log::LevelFilter::Trace, || {
+        pipewire::init();
+        init_pipewire_logging(log::LevelFilter::Debug);
 
-    init_pipewire_logging(log::LevelFilter::Debug);
+        let unique_marker = "PW_LOG_TEST_MARKER_998877";
+        let fmt = b"Testing LogBuffer capture: %s\0";
+        let marker_bytes = b"PW_LOG_TEST_MARKER_998877\0";
+        let file = b"log_redirect_test.rs\0";
+        let func = b"test_pipewire_log_captured_in_log_buffer\0";
 
-    let unique_marker = "PW_LOG_TEST_MARKER_998877";
-    let fmt = b"Testing LogBuffer capture: %s\0";
-    let marker_bytes = b"PW_LOG_TEST_MARKER_998877\0";
-    let file = b"log_redirect_test.rs\0";
-    let func = b"test_pipewire_log_captured_in_log_buffer\0";
+        unsafe {
+            pipewire::sys::pw_log_log(
+                SPA_LOG_LEVEL_INFO,
+                file.as_ptr() as *const c_char,
+                456,
+                func.as_ptr() as *const c_char,
+                fmt.as_ptr() as *const c_char,
+                marker_bytes.as_ptr() as *const c_char,
+            );
+        }
 
-    unsafe {
-        pipewire::sys::pw_log_log(
-            SPA_LOG_LEVEL_INFO,
-            file.as_ptr() as *const c_char,
-            456,
-            func.as_ptr() as *const c_char,
-            fmt.as_ptr() as *const c_char,
-            marker_bytes.as_ptr() as *const c_char,
-        );
-    }
+        restore_pipewire_logging();
 
-    restore_pipewire_logging();
-
-    if let Some(buf) = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer() {
-        let entries = buf.snapshot();
-        let found = entries
-            .iter()
-            .any(|rec| rec.message.contains(unique_marker));
-        assert!(
-            found,
-            "Expected marker {unique_marker} to be captured in NamLogger::log_buffer()"
-        );
-    }
+        if let Some(buf) =
+            neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        {
+            let entries = buf.snapshot();
+            let found = entries
+                .iter()
+                .any(|rec| rec.message.contains(unique_marker));
+            assert!(
+                found,
+                "Expected marker {unique_marker} to be captured in NamLogger::log_buffer()"
+            );
+        }
+    });
 }
 
 #[test]
 fn non_utf8_payload_falls_back_without_allocation() {
-    let _ring_lock = crate::standalone::PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    pipewire::init();
-    let _ = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::init(
-        neural_amp_modeler_rs::common::diagnostics::logger::LoggerConfig {
-            level_filter: log::LevelFilter::Trace,
-            emit_stderr: false,
-        },
-    );
-    log::set_max_level(log::LevelFilter::Trace);
-    init_pipewire_logging(log::LevelFilter::Debug);
+    crate::standalone::test_logger::with_logger_level(log::LevelFilter::Trace, || {
+        pipewire::init();
+        init_pipewire_logging(log::LevelFilter::Debug);
 
-    // Invalid UTF-8 bytes (%s copy): 0xff/0xfe are never valid UTF-8 lead bytes
-    // and 0x80 without continuation is invalid too — vsnprintf copies them
-    // byte-wise, so the formatter must degrade to "<non-utf8>" without
-    // allocating a replacement string.
-    let bad_payload: &[u8] = b"\xff\xfe\x9f broken-bytes \x80 payload\0";
-    let fmt = b"pw-utf8-probe %s\0";
-    let file = b"log_redirect_test.rs\0";
-    let func = b"non_utf8_payload_falls_back_without_allocation\0";
+        // Invalid UTF-8 bytes (%s copy): 0xff/0xfe are never valid UTF-8 lead bytes
+        // and 0x80 without continuation is invalid too — vsnprintf copies them
+        // byte-wise, so the formatter must degrade to "<non-utf8>" without
+        // allocating a replacement string.
+        let bad_payload: &[u8] = b"\xff\xfe\x9f broken-bytes \x80 payload\0";
+        let fmt = b"pw-utf8-probe %s\0";
+        let file = b"log_redirect_test.rs\0";
+        let func = b"non_utf8_payload_falls_back_without_allocation\0";
 
-    // SAFETY: Calling our own extern "C" variadic function with valid null-terminated strings.
-    unsafe {
-        nam_pw_log(
-            std::ptr::null_mut(),
-            SPA_LOG_LEVEL_INFO,
-            file.as_ptr() as *const c_char,
-            77,
-            func.as_ptr() as *const c_char,
-            fmt.as_ptr() as *const c_char,
-            bad_payload.as_ptr() as *const c_char,
-        );
-    }
+        // SAFETY: Calling our own extern "C" variadic function with valid null-terminated strings.
+        unsafe {
+            nam_pw_log(
+                std::ptr::null_mut(),
+                SPA_LOG_LEVEL_INFO,
+                file.as_ptr() as *const c_char,
+                77,
+                func.as_ptr() as *const c_char,
+                fmt.as_ptr() as *const c_char,
+                bad_payload.as_ptr() as *const c_char,
+            );
+        }
 
-    restore_pipewire_logging();
+        restore_pipewire_logging();
 
-    if let Some(buf) = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer() {
-        let entries = buf.snapshot();
-        // The fallback replaces the whole message (task spec), so the probe
-        // is identified by the static fallback token itself (no other test
-        // produces an intercepted PW event with this shape).
-        let entry = entries
-            .iter()
-            .find(|rec| rec.message.contains("<non-utf8>"));
-        assert!(
-            entry.is_some(),
-            "non-UTF-8 probe message missing from LogBuffer"
-        );
-        let message = &entry.expect("entry checked above").message;
-        assert!(
-            message.starts_with("[PipeWire]"),
-            "probe did not flow through the PW dispatch: {message}"
-        );
-        assert!(
-            !message.contains('\u{fffd}'),
-            "lossy replacement character leaked through: {message}"
-        );
-    }
+        if let Some(buf) =
+            neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+        {
+            let entries = buf.snapshot();
+            // The fallback replaces the whole message (task spec), so the probe
+            // is identified by the static fallback token itself (no other test
+            // produces an intercepted PW event with this shape).
+            let entry = entries
+                .iter()
+                .find(|rec| rec.message.contains("<non-utf8>"));
+            assert!(
+                entry.is_some(),
+                "non-UTF-8 probe message missing from LogBuffer"
+            );
+            let message = &entry.expect("entry checked above").message;
+            assert!(
+                message.starts_with("[PipeWire]"),
+                "probe did not flow through the PW dispatch: {message}"
+            );
+            assert!(
+                !message.contains('\u{fffd}'),
+                "lossy replacement character leaked through: {message}"
+            );
+        }
+    });
 }
 
 // Zero-allocation proof of the formatter contract: runs only with the

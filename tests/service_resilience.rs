@@ -439,6 +439,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
     let wav_path = wait_for_recorded_audio(&mut child, &dir, Duration::from_secs(10));
 
     // Real service signal (SIGTERM is systemd/container default shutdown).
+    std::thread::sleep(Duration::from_millis(500));
     send_signal(&child, libc::SIGTERM);
 
     let started = Instant::now();

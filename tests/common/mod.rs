@@ -20,7 +20,10 @@
 //! the `proc` submodule holds the `/proc` telemetry readers shared by
 //! the accelerated-soak and real-endurance harnesses.
 
+pub mod pmu;
+pub mod private_pw;
 pub mod proc;
+pub mod rt_env;
 pub mod swap;
 
 use nam_audio_pipe::recording::transport::RecordingReceiver;
@@ -264,10 +267,7 @@ pub fn init_test_logger() {
         .ok()
         .and_then(|v| v.parse::<log::LevelFilter>().ok())
         .unwrap_or(log::LevelFilter::Info);
-    let _ = NamLogger::init(LoggerConfig {
-        level_filter,
-        emit_stderr: true,
-    });
+    let _ = NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true));
 }
 
 /// Serializes tests that touch the shared filesystem, the process-wide

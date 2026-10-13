@@ -28,6 +28,9 @@
 #   PHASE6 — Endurance real & state-machine throughput    phase6-endurance.log
 #            tests/endurance.rs: real wall-clock endurance, fail-closed
 #            validation windows, periodic raw RSS/faults/threads/FD telemetry.
+#   PHASE7 — PipeWire resilience (private daemon)         phase7-pw-resilience.log
+#            tests/pw_integration.rs (private daemon isolation battery;
+#            bounded reconnect recovery, stream fail-fast SLA, reconnect exhaustion).
 #
 #   The receipt declares each soak suite's purpose — the accelerated timeline soak
 #   (`SOAK_PURPOSE:`) and the real wall-clock endurance (`ENDURANCE_PURPOSE:`)
@@ -60,7 +63,7 @@
 #   use the non-executing surfaces instead and ask the operator to run the
 #   full audit and report the results:
 #       ./utils/tests-long.sh --help       # usage & phase inventory
-#       ./utils/tests-long.sh --simulate   # registers the 6 planned phases in
+#       ./utils/tests-long.sh --simulate   # registers the 7 planned phases in
 #                                          # target/logs/ without running tests
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -111,7 +114,7 @@ for arg in "$@"; do
             echo "  --strict-pre-release   Promote every GAP to a hard failure (release gate)."
             echo "                         Certifies the audit only on a calibrated RT machine."
             echo "                         Propagates NAM_RT_STRICT=1 to tests/rt_metrics.rs."
-            echo "  --simulate, --dry-run  Dry run: register the 6 planned phases and the"
+            echo "  --simulate, --dry-run  Dry run: register the 7 planned phases and the"
             echo "                         structured receipt in target/logs/ without executing"
             echo "                         any test. Safe for AI/CI structural validation."
             echo "  -h, --help             Show this help and exit."
@@ -124,6 +127,7 @@ for arg in "$@"; do
             echo "  PHASE5 — Concurrency model checking             phase5-concurrency.log"
             echo "  PHASE6 — Endurance real & state-machine throughput"
             echo "                                                  phase6-endurance.log"
+            echo "  PHASE7 — PipeWire resilience (private daemon)   phase7-pw-resilience.log"
             echo
             echo "The receipt declares each suite's purpose —"
             echo "  SOAK_PURPOSE:      accelerated_timeline (compressed timeline)"
@@ -154,9 +158,13 @@ fi
 # function invoked under `||` is executed with errexit/ERR suppressed.
 trap 'echo -e "\n${RED}${BOLD}❌ Unexpected error: command \"$BASH_COMMAND\" failed at line $LINENO with status $? (phase ${PHASE_NUM:-?}/${PHASE_TOTAL:-?}). Aborting audit suite.${NC}"; exit 1' ERR
 
-PHASE_TOTAL=6
+PHASE_TOTAL=7
 
 LONG_RECEIPT="target/logs/long-receipt.txt"
+# Unified-schema machine-readable receipt (S4-T4.4): the JSONL is the source of
+# truth; LONG_RECEIPT (the .txt) is the derived human view kept for the
+# transition. Both readers are verified by the release ceremony.
+PIPE_JSONL="target/logs/long-audit-receipt.jsonl"
 
 mkdir -p target/logs
 # Targeted cleanup: only the artifacts owned by this suite are removed, so
@@ -167,7 +175,25 @@ rm -f target/logs/phase1-soak.log \
       target/logs/phase4-rt-jitter.log \
       target/logs/phase5-concurrency.log \
       target/logs/phase6-endurance.log \
-      target/logs/long-receipt.txt
+      target/logs/phase7-pw-resilience.log \
+      target/logs/long-receipt.txt \
+      "$PIPE_JSONL"
+
+# ── Unified-schema receipt emitter (engine testing::receipt) ────────────────
+# Resolved once, built on demand. Emission is mandatory: a missing emitter
+# fails the suite closed rather than certifying a receipt it could not produce.
+PIPE_RECEIPT_BIN=""
+LONG_RECEIPT_FAILED=0
+ensure_pipe_long_receipt_bin() {
+    if [ -n "$PIPE_RECEIPT_BIN" ] && [ -x "$PIPE_RECEIPT_BIN" ]; then
+        return 0
+    fi
+    if ! cargo build --quiet --features testing --bin pipe_long_receipt >/dev/null 2>&1; then
+        return 1
+    fi
+    PIPE_RECEIPT_BIN="target/debug/pipe_long_receipt"
+    [ -x "$PIPE_RECEIPT_BIN" ]
+}
 
 echo -e "${BLUE}${BOLD}=============================================================${NC}"
 echo -e "${BLUE}${BOLD}  NAM-Audio-Pipe Long-Duration Stress & Audit Suite           ${NC}"
@@ -287,6 +313,30 @@ finish_phase() {
         esac
     fi
     emit_to "$LONG_RECEIPT" "$status_line"
+
+    # Mirror the phase into the unified-schema JSONL (the source of truth). GAP
+    # maps to the engine's SKIPPED status carrying a typed gap reason.
+    local pid_lc jsonl_status jsonl_gaps=""
+    pid_lc=$(printf '%s' "$phase_id" | tr '[:upper:]' '[:lower:]')
+    case "$status_line" in
+        *": SIMULATED "*) jsonl_status="SIMULATED" ;;
+        *": PASS "*) jsonl_status="PASSED" ;;
+        *": GAP "*) jsonl_status="SKIPPED"; jsonl_gaps="$pid_lc:declared_gap" ;;
+        *) jsonl_status="FAILED" ;;
+    esac
+    if ! ensure_pipe_long_receipt_bin; then
+        LONG_RECEIPT_FAILED=1
+    else
+        local -a jargs=(append --phase-id "$pid_lc" --name "$phase_id" --status "$jsonl_status"
+                        --duration-ms "${PHASE_DUR:-0}" --out "$PIPE_JSONL")
+        if [ -f "target/logs/${log_file}" ]; then
+            jargs+=(--log "target/logs/${log_file}")
+        fi
+        if [ -n "$jsonl_gaps" ]; then
+            jargs+=(--gaps "$jsonl_gaps")
+        fi
+        "$PIPE_RECEIPT_BIN" "${jargs[@]}" || LONG_RECEIPT_FAILED=1
+    fi
 }
 
 # empty_target_execution <log_file> <target>
@@ -563,6 +613,30 @@ run_endurance_phase() {
     return "$rc"
 }
 
+# --- Phase 7: PipeWire resilience (private daemon) ---
+# tests/pw_integration.rs: runs bounded reconnect recovery, stream error fail-fast SLA,
+# and reconnect exhaustion against an isolated private daemon.
+# Emits typed markers TEST_RESULT[...]=PASS or GAP.
+run_pw_resilience_phase() {
+    local rc=0
+    echo "  → tests/pw_integration.rs — private daemon resilience battery"
+    cargo test --features testing --release --no-fail-fast \
+        --test pw_integration -- --nocapture --test-threads=1 || rc=1
+
+    if [ "$rc" -ne 0 ]; then
+        return 1
+    fi
+    if grep -qE "TEST_RESULT\[.*\]=GAP" "target/logs/phase7-pw-resilience.log"; then
+        record_gap "phase7:$(grep -oP 'TEST_RESULT\[[^\]]+\]=GAP:[^ ]+' target/logs/phase7-pw-resilience.log | head -n1)"
+        return 2
+    fi
+    if ! grep -qE "TEST_RESULT\[(daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon)\]=PASS" "target/logs/phase7-pw-resilience.log"; then
+        record_gap "phase7:no_typed_resilience_result"
+        return 2
+    fi
+    return 0
+}
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase execution — every phase is isolated via `|| true`; the phase's own
 # return code (PASS/FAIL/GAP) is consumed by finish_phase immediately after.
@@ -585,6 +659,20 @@ finish_phase "PHASE5" "phase5-concurrency.log" "$PHASE_RC"
 
 run_phase "Phase 6: Real endurance & state-machine throughput" "run_endurance_phase" "phase6-endurance.log" || true
 finish_phase "PHASE6" "phase6-endurance.log" "$PHASE_RC"
+
+run_phase "Phase 7: PipeWire resilience (private daemon)" "run_pw_resilience_phase" "phase7-pw-resilience.log" || true
+finish_phase "PHASE7" "phase7-pw-resilience.log" "$PHASE_RC"
+
+# ── Unified-schema receipt: derive the terminal `overall` line in Rust ──────
+if ensure_pipe_long_receipt_bin && "$PIPE_RECEIPT_BIN" summary --out "$PIPE_JSONL" >/dev/null 2>&1; then
+    :
+else
+    LONG_RECEIPT_FAILED=1
+fi
+if [ "$LONG_RECEIPT_FAILED" -ne 0 ]; then
+    echo -e "${RED}${BOLD}❌ Unified-schema long receipt emission failed — $PIPE_JSONL is missing or incomplete.${NC}" >&2
+    exit 1
+fi
 
 # ── Summary & verdict ──────────────────────────────────────────────────────
 if [ "${#GAPS[@]}" -gt 0 ]; then

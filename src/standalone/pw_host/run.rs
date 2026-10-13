@@ -132,6 +132,17 @@ pub fn run_pipewire_host(
     // it touches them only before `thread_loop.start()` and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
+    // S6-T4 / F-PR-11: off-RT bring-up pre-roll. Before any stream is created,
+    // the main thread holds exclusive access to the bridge (no RT producer or
+    // consumer is live), so one quantum of analytical silence can be published
+    // safely. The first playback quantum then reads a real silence block
+    // through the normal wet path instead of paying the starvation/ZOH delay.
+    // `buffer_size == 0` (host-driven quantum) primes a single sample; the
+    // capture producer overwrites the primed block on its first callback.
+    // SAFETY: `bridge_ptr` points to the heap-immortal `DspBridge` just
+    // allocated above; no stream (and therefore no RT Writer/Reader) exists yet.
+    unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
+
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
@@ -656,6 +667,12 @@ pub fn run_pipewire_host(
         // guarantees that the PipeWire loop thread is stopped and no RT Writer/Reader
         // is alive or accessing the bridge. The main thread is the sole owner of `bridge_ptr`.
         unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
+
+        // S6-T4 / F-PR-11: re-arm the off-RT bring-up pre-roll for the next
+        // reconnect attempt, still under the exclusive-access teardown window
+        // (`thread_loop.stop()` above guarantees no live RT Writer/Reader).
+        // SAFETY: same exclusive-access contract as `reset_to_silence` above.
+        unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
 
         // R-04: single-owner handoff — the loop thread has stopped, so the RT
         // callback will never touch `rt_parking_lot` again. One canonical

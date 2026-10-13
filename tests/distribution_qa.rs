@@ -57,16 +57,19 @@ const PROVENANCE_REL: &str = "target/logs/release-provenance.json";
 const LONG_SUITE_REL: &str = "utils/tests-long.sh";
 /// Structured long-suite receipt produced by `utils/tests-long.sh`.
 const LONG_RECEIPT_REL: &str = "target/logs/long-receipt.txt";
-/// The six canonical long-audit phases (PHASE6 = real wall-clock endurance).
-const LONG_PHASE_IDS: [&str; 6] = ["PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6"];
+/// The seven canonical long-audit phases (PHASE7 = PipeWire resilience).
+const LONG_PHASE_IDS: [&str; 7] = [
+    "PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6", "PHASE7",
+];
 /// Canonical `run_phase` names the runner must declare verbatim.
-const LONG_PHASE_NAMES: [&str; 6] = [
+const LONG_PHASE_NAMES: [&str; 7] = [
     "Phase 1: Accelerated soak (compressed timeline) & swap concurrency",
     "Phase 2: RT-Safety heap-audit (zero-alloc)",
     "Phase 3: RT Deadline gate (nanosecond budget)",
     "Phase 4: RT Jitter gate (inter-callback dispersion)",
     "Phase 5: Concurrency interleaving stress & state resilience",
     "Phase 6: Real endurance & state-machine throughput",
+    "Phase 7: PipeWire resilience (private daemon)",
 ];
 
 /// Serializes tests that replace `target/logs/long-receipt.txt` (strict
@@ -321,13 +324,37 @@ fn validate_mandatory_targets(log: &str, mandatory: &[&str]) -> Result<(), Strin
 }
 
 /// Finds untyped skip text in a log: any `SKIP:` occurrence that is not part
-/// of a typed `TEST_RESULT[...]=SKIP:reason` marker (the Phase 4 contract —
-/// a skip must be structured and auditable, never free text).
+/// of a typed `TEST_RESULT[...]=SKIP:reason` or `TEST_RESULT[...]=GAP:reason`
+/// marker, and is not accompanied by a corresponding typed marker within the
+/// same output block. A skip must be structured and auditable, never free text.
 fn untyped_skip_markers(log: &str) -> Vec<String> {
-    log.lines()
-        .filter(|l| l.contains("SKIP:") && !l.contains("TEST_RESULT["))
-        .map(|l| l.trim().to_string())
-        .collect()
+    let lines: Vec<&str> = log.lines().collect();
+    let mut untyped = Vec::new();
+    let mut paired_markers = std::collections::HashSet::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains("SKIP:") && !line.contains("TEST_RESULT[") {
+            // Check if there is an adjacent/nearby TEST_RESULT[...]=SKIP: or GAP: marker
+            let mut found_match = false;
+            let start = i.saturating_sub(3);
+            let end = (i + 4).min(lines.len());
+            for (j, &nearby) in lines.iter().enumerate().take(end).skip(start) {
+                if j != i
+                    && !paired_markers.contains(&j)
+                    && nearby.contains("TEST_RESULT[")
+                    && (nearby.contains("=SKIP:") || nearby.contains("=GAP:"))
+                {
+                    paired_markers.insert(j);
+                    found_match = true;
+                    break;
+                }
+            }
+            if !found_match {
+                untyped.push(line.trim().to_string());
+            }
+        }
+    }
+    untyped
 }
 
 /// Combined typed-receipt validator: mandatory-target presence AND skip
@@ -418,6 +445,48 @@ WARN: SKIP: io_uring unsupported on this kernel
     assert!(
         err.contains("untyped skip marker(s)"),
         "typed receipt validation must fail on untyped skips, got: {err}"
+    );
+}
+
+/// (b) Negative: free-text `SKIP:` on stdout without a corresponding typed
+/// `TEST_RESULT[` marker must fail validation.
+#[test]
+fn receipt_validator_rejects_untyped_stdout_skip() {
+    let log = "\
+Running tests/pw_integration.rs (target/debug/deps/pw-abc123)
+test test_untyped_stdout ... ok
+SKIP: unauthorized free-text skip on stdout without typed marker
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+";
+    let untyped = untyped_skip_markers(log);
+    assert!(
+        !untyped.is_empty(),
+        "bare stdout SKIP: must be detected as an untyped skip"
+    );
+    let err = validate_typed_receipt(log, &["tests/pw_integration.rs"]).unwrap_err();
+    assert!(
+        err.contains("untyped skip marker(s)"),
+        "typed receipt validation must fail on bare stdout skip, got: {err}"
+    );
+}
+
+/// (b) Positive: a `SKIP:` line accompanied by a typed `TEST_RESULT[...]=GAP:`
+/// marker (such as daemon_bounce_* opt-in skips) is documented and accepted.
+#[test]
+fn receipt_validator_accepts_typed_daemon_bounce_gap() {
+    let log = "\
+Running tests/pw_integration.rs (target/debug/deps/pw-abc123)
+TEST_RESULT[daemon_bounce_reconnect]=GAP:opt_in_disruptive
+SKIP: NAM_DAEMON_BOUNCE_TEST != 1 (disruptive daemon-bounce acceptance).
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+";
+    assert!(
+        untyped_skip_markers(log).is_empty(),
+        "SKIP: paired with TEST_RESULT[...]=GAP: must not be flagged as untyped"
+    );
+    assert_eq!(
+        validate_typed_receipt(log, &["tests/pw_integration.rs"]),
+        Ok(())
     );
 }
 
@@ -814,6 +883,47 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         return Err(format!("invalid certification_status: {status:?}"));
     }
 
+    // 4b. BOLT certification proof (S6-T3): a receipt claiming a BOLT
+    //     transform must carry a boolean `bolt` flag and a well-formed proof
+    //     id — `ab-opt-ceremony:<id>` or `perf-gate:<id>` — or the explicit
+    //     `MISSING` sentinel. `MISSING` may never be certified, and the proof
+    //     must agree with the announced optimization status.
+    let opts = build
+        .get("optimizations")
+        .and_then(|v| v.as_object())
+        .ok_or("missing 'build.optimizations'")?;
+    let bolt_claimed = match opts.get("bolt") {
+        Some(v) => v
+            .as_bool()
+            .ok_or("'build.optimizations.bolt' must be a boolean")?,
+        None => false,
+    };
+    let opt_status = opts.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if opt_status.contains("BOLT") && !bolt_claimed {
+        return Err(format!(
+            "optimizations.status {opt_status:?} announces BOLT but optimizations.bolt is false/absent"
+        ));
+    }
+    if bolt_claimed {
+        let bolt_proof = opts.get("bolt_proof").and_then(|v| v.as_str()).ok_or(
+            "'build.optimizations.bolt_proof' is required when bolt=true (ab-opt-ceremony:<id> | perf-gate:<id> | MISSING)",
+        )?;
+        let well_formed = bolt_proof == "MISSING"
+            || bolt_proof.starts_with("ab-opt-ceremony:")
+            || bolt_proof.starts_with("perf-gate:");
+        if !well_formed {
+            return Err(format!(
+                "'build.optimizations.bolt_proof' has invalid form {bolt_proof:?} (expected ab-opt-ceremony:<id> | perf-gate:<id> | MISSING)"
+            ));
+        }
+        if bolt_proof == "MISSING" && status == "certified_release" {
+            return Err(
+                "certified_release cannot claim BOLT without a verified bolt_proof (ab-opt-ceremony:<id> | perf-gate:<id>); got MISSING"
+                    .into(),
+            );
+        }
+    }
+
     let artifacts = doc
         .get("artifacts")
         .and_then(|v| v.as_object())
@@ -1016,6 +1126,7 @@ fn write_synthetic_receipt(receipt_path: &Path, files: &[(&str, &Path)]) {
                 "cpu_baseline": "x86-64-v3",
                 "pgo": true,
                 "bolt": true,
+                "bolt_proof": "ab-opt-ceremony:test",
                 "measured_performance_claims": false
             }
         },
@@ -1117,6 +1228,50 @@ fn provenance_validator_rejects_measured_performance_claims() {
         err.contains("measured_performance_claims")
             && err.contains("no harness metric may be attributed"),
         "measured_performance_claims=true must be rejected, got: {err}"
+    );
+}
+
+/// (c) Negative: a receipt claiming a BOLT transform without any proof field is
+/// rejected, and a `certified_release` claiming BOLT with `bolt_proof: MISSING`
+/// is rejected fail-closed (S6-T3).
+#[test]
+fn provenance_validator_requires_bolt_proof_for_bolt_claims() {
+    // Missing proof field entirely.
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["build"]["optimizations"]
+        .as_object_mut()
+        .unwrap()
+        .remove("bolt_proof");
+    write_synthetic_receipt_with_doc(&receipt, doc);
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("bolt_proof") && err.contains("required when bolt=true"),
+        "missing bolt_proof under bolt=true must be rejected, got: {err}"
+    );
+
+    // `MISSING` proof must not survive a `certified_release` claim.
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+    let file = dir.join("payload.bin");
+    std::fs::write(&file, b"certified artifact payload").expect("write payload");
+    let receipt = dir.join("release-provenance.json");
+    write_synthetic_receipt(&receipt, &[("installed_binary", &file)]);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    doc["build"]["optimizations"]["bolt_proof"] = "MISSING".into();
+    doc["ceremony_chain"]["certification_status"] = "certified_release".into();
+    write_synthetic_receipt_with_doc(&receipt, doc);
+    let err = validate_provenance_receipt(&receipt).unwrap_err();
+    assert!(
+        err.contains("certified_release") && err.contains("bolt_proof"),
+        "certified_release with bolt_proof=MISSING must be rejected, got: {err}"
     );
 }
 
@@ -2083,6 +2238,7 @@ impl LongSimulateGuard {
             "phase4-rt-jitter.log",
             "phase5-concurrency.log",
             "phase6-endurance.log",
+            "phase7-pw-resilience.log",
         ] {
             files.push(root.join(format!("target/logs/{name}")));
         }
@@ -2307,6 +2463,16 @@ fn simulate_receipt_declares_suite_purposes_and_phase6() {
         LongPhaseStatus::Simulated,
         "simulate receipt must register PHASE6 as SIMULATED"
     );
+    let phase7 = receipt
+        .phases
+        .iter()
+        .find(|p| p.id == "PHASE7")
+        .expect("PHASE7 must be declared by the runner");
+    assert_eq!(
+        phase7.status,
+        LongPhaseStatus::Simulated,
+        "simulate receipt must register PHASE7 as SIMULATED"
+    );
     receipt
         .audit()
         .unwrap_or_else(|e| panic!("simulate receipt must audit cleanly: {e}"));
@@ -2328,6 +2494,7 @@ PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
 PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
 PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
 PHASE6: SIMULATED log=target/logs/phase6-endurance.log
+PHASE7: SIMULATED log=target/logs/phase7-pw-resilience.log
 OVERALL: SIMULATED
 ";
     let err = parse_long_receipt(BAD_SOAK).unwrap_err();
@@ -2349,6 +2516,7 @@ PHASE3: SIMULATED log=target/logs/phase3-rt-deadline.log
 PHASE4: SIMULATED log=target/logs/phase4-rt-jitter.log
 PHASE5: SIMULATED log=target/logs/phase5-concurrency.log
 PHASE6: SIMULATED log=target/logs/phase6-endurance.log
+PHASE7: SIMULATED log=target/logs/phase7-pw-resilience.log
 OVERALL: SIMULATED
 ";
     let err = parse_long_receipt(BAD_ENDURANCE).unwrap_err();

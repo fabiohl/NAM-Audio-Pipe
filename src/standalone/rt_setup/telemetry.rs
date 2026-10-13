@@ -108,6 +108,13 @@ pub struct PollState {
     /// Last observed cumulative PW-log ring discard count
     /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
     pub pw_log_dropped_last: u64,
+    /// Last observed `playback_quantums` value; used to re-arm the bridge
+    /// bring-up suppression budget whenever playback makes progress (S6-T4).
+    pub last_bringup_quanta: u32,
+    /// Number of consecutive polls spent suppressing bridge drift drops in the
+    /// current bring-up window. Caps the window so a stalled playback stream
+    /// cannot suppress (and discard) drift drops indefinitely (S6-T4 review fix).
+    pub bringup_suppressed_polls: u32,
 }
 
 impl PollState {
@@ -125,6 +132,8 @@ impl PollState {
             latches: TelemetryLatches::default(),
             last_starvation: 0,
             pw_log_dropped_last: 0,
+            last_bringup_quanta: 0,
+            bringup_suppressed_polls: 0,
         }
     }
 }
@@ -561,16 +570,41 @@ pub fn poll_rt_status(
     // and P2 Headphones). If one is slightly faster than the other, the system needs to discard
     // some small audio chunks to maintain synchronization.
     // Latched: a sustained drift episode warns once.
-    let drops = bridge.drain_dropped_frames();
-    if let Some(s) = stream_status.filter(|_| drops > 0) {
-        s.bridge_dropped_frames.fetch_add(drops, Ordering::Relaxed);
+    //
+    // S6-T4 / F-PR-11: during the first few playback quanta after entering
+    // `Streaming`, the bridge legitimately reports drops while the off-RT
+    // pre-rolled silence block is consumed and the capture producer's first
+    // blocks land (startup ramp, not drift). Those drops are suppressed here —
+    // neither accounted in `bridge_dropped_frames` nor warned — until the
+    // bring-up window closes; afterwards a real drift episode warns normally.
+    // The window is bounded two ways so it can never mask drift indefinitely:
+    // by the quantum count and by a poll budget that reset whenever playback
+    // advances (a stalled playback lets suppression expire).
+    let quanta = stream_status
+        .map(|s| s.playback_quantums.load(Ordering::Relaxed))
+        .unwrap_or(u32::MAX);
+    if quanta != state.last_bringup_quanta {
+        state.last_bringup_quanta = quanta;
+        state.bringup_suppressed_polls = 0;
     }
-    if state.latches.drift_drops.observe(drops > 0) {
-        log::warn!(
-            "{} Drifting detected: {} audio blocks discarded (capture > playback).",
-            "⚠️".yellow(),
-            drops
-        );
+    let bringing_up = quanta < crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS
+        && state.bringup_suppressed_polls
+            < crate::standalone::pw_host::MAX_BRINGUP_SUPPRESSED_POLLS;
+    if bringing_up {
+        state.bringup_suppressed_polls = state.bringup_suppressed_polls.saturating_add(1);
+    }
+    let drops = bridge.drain_dropped_frames();
+    if !bringing_up {
+        if let Some(s) = stream_status.filter(|_| drops > 0) {
+            s.bridge_dropped_frames.fetch_add(drops, Ordering::Relaxed);
+        }
+        if state.latches.drift_drops.observe(drops > 0) {
+            log::warn!(
+                "{} Drifting detected: {} audio blocks discarded (capture > playback).",
+                "⚠️".yellow(),
+                drops
+            );
+        }
     }
 
     // 7. PERFORMANCE TELEMETRY (Latency):

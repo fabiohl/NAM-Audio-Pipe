@@ -6,6 +6,15 @@
 //! Provides real-time PipeWire node setup, lock-free SPSC channel communication,
 //! automatic resampler and CabSim management, and asynchronous WAV recording.
 
+// Non-test production code must not rely on `unwrap`/`expect`: every fallible
+// path returns a typed error, and RT-adjacent invariants are handled with
+// explicit `let ... else`/`debug_assert!` instead of panics (F-PR-13). Modules
+// compiled only for the `testing` feature are test support, not production.
+#![cfg_attr(
+    not(any(test, feature = "testing")),
+    warn(clippy::unwrap_used, clippy::expect_used)
+)]
+
 pub mod receipt;
 pub mod recording;
 pub mod standalone;

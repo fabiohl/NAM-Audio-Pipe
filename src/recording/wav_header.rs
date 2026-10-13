@@ -141,11 +141,15 @@ pub fn build_wav_header(meta: &AudioMetadata, data_bytes: u32) -> Result<Vec<u8>
         if let Some(fact_pos) = header.array_windows::<4>().position(|w| w == b"fact")
             && fact_pos + 12 <= header.len()
         {
-            let chunk_size = u32::from_le_bytes(
-                header[fact_pos + 4..fact_pos + 8]
-                    .try_into()
-                    .expect("4-byte slice to u32 conversion must be infallible"),
-            );
+            // `fact_pos + 12 <= header.len()` was checked above, so the four
+            // bytes are in bounds; assembling the little-endian u32 directly
+            // avoids a fallible slice-to-array conversion.
+            let chunk_size = u32::from_le_bytes([
+                header[fact_pos + 4],
+                header[fact_pos + 5],
+                header[fact_pos + 6],
+                header[fact_pos + 7],
+            ]);
             if chunk_size >= 4 {
                 header[fact_pos + 8..fact_pos + 12]
                     .copy_from_slice(&samples_per_channel.to_le_bytes());

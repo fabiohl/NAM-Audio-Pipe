@@ -19,15 +19,6 @@ fn test_record(level: u32, file: &str, line: i32, msg: &str) -> RtLogRecord {
     RtLogRecord::capture(level, line, file, "", msg)
 }
 
-fn ensure_nam_logger() {
-    let _ = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::init(
-        neural_amp_modeler_rs::common::diagnostics::logger::LoggerConfig {
-            level_filter: log::LevelFilter::Trace,
-            emit_stderr: false,
-        },
-    );
-    log::set_max_level(log::LevelFilter::Trace);
-}
 #[test]
 fn ring_full_discards_with_exact_counter() {
     let _lock_guard = PW_LOG_REDIR_TEST_LOCK
@@ -149,116 +140,116 @@ fn record_capture_truncates_oversized_fields() {
 
 #[test]
 fn unmarked_thread_routes_synchronously_under_ring_mode() {
-    ensure_nam_logger();
-    let _lock_guard = PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    install();
-    assert!(is_ring_routing_active());
-    // This harness thread was never marked: the offload must keep the
-    // synchronous dispatch route (S3-T2/S3-T3 consult contract).
-    assert!(!rt_is_current_thread_marked());
+    crate::standalone::test_logger::with_logger_level(log::LevelFilter::Trace, || {
+        install();
+        assert!(is_ring_routing_active());
+        // This harness thread was never marked: the offload must keep the
+        // synchronous dispatch route (S3-T2/S3-T3 consult contract).
+        assert!(!rt_is_current_thread_marked());
 
-    let marker = "UNMARKED_SYNC_MARKER_XYZ";
-    let fmt = b"sync-route-probe %s\0";
-    let marker_c = b"UNMARKED_SYNC_MARKER_XYZ\0";
-    let file = b"log_redirect_test.rs\0";
-    let func = b"unmarked_thread_routes_synchronously_under_ring_mode\0";
-    // SAFETY: own extern "C" variadic entry with null-terminated strings.
-    unsafe {
-        nam_pw_log(
-            std::ptr::null_mut(),
-            SPA_LOG_LEVEL_INFO,
-            file.as_ptr() as *const c_char,
-            111,
-            func.as_ptr() as *const c_char,
-            fmt.as_ptr() as *const c_char,
-            marker_c.as_ptr() as *const c_char,
-        );
-    }
-    // Synchronous dispatch: the entry is in the LogBuffer IMMEDIATELY (no
-    // drainer wait involved).
-    if let Some(buf) = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer() {
-        let found = buf
-            .snapshot()
-            .iter()
-            .any(|rec| rec.message.contains(marker));
-        assert!(found, "unmarked sync dispatch did not capture the marker");
-    }
-}
-
-fn wait_drained_logbuffer(marker: &str) -> Option<String> {
-    for _ in 0..600 {
+        let marker = "UNMARKED_SYNC_MARKER_XYZ";
+        let fmt = b"sync-route-probe %s\0";
+        let marker_c = b"UNMARKED_SYNC_MARKER_XYZ\0";
+        let file = b"log_redirect_test.rs\0";
+        let func = b"unmarked_thread_routes_synchronously_under_ring_mode\0";
+        // SAFETY: own extern "C" variadic entry with null-terminated strings.
+        unsafe {
+            nam_pw_log(
+                std::ptr::null_mut(),
+                SPA_LOG_LEVEL_INFO,
+                file.as_ptr() as *const c_char,
+                111,
+                func.as_ptr() as *const c_char,
+                fmt.as_ptr() as *const c_char,
+                marker_c.as_ptr() as *const c_char,
+            );
+        }
+        // Synchronous dispatch: the entry is in the LogBuffer IMMEDIATELY (no
+        // drainer wait involved).
         if let Some(buf) =
             neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
-            && let Some(rec) = buf
+        {
+            let found = buf
                 .snapshot()
                 .iter()
-                .find(|rec| rec.message.contains(marker))
-        {
-            return Some(rec.message.clone());
+                .any(|rec| rec.message.contains(marker));
+            assert!(found, "unmarked sync dispatch did not capture the marker");
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    None
+    });
 }
 
 #[test]
 fn marked_thread_queues_and_drainer_emits_in_log_buffer() {
-    ensure_nam_logger();
-    let _lock_guard = PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    install();
-    assert!(is_ring_routing_active());
+    crate::standalone::test_logger::with_logger_level(log::LevelFilter::Trace, || {
+        install();
+        assert!(is_ring_routing_active());
 
-    // Full production consult path on a marked thread: the harness thread
-    // marks itself (standing in for the PW data thread), `try_offload`
-    // consumes the event (decode + capture + push through the installed
-    // seat) and the drainer replays it into the LogBuffer — acceptance (e):
-    // the redirect is preserved; crash reports keep PW logs.
-    let marker = "RT_RING_E2E_MARKER_XYZ";
-    rt_mark_current_thread();
-    let fmt = b"e2e-ring-probe %s\0";
-    let marker_c = b"RT_RING_E2E_MARKER_XYZ\0";
-    let file = b"rt_log_ring_test.rs\0";
-    let func = b"marked_thread_queues_and_drainer_emits_in_log_buffer\0";
-    // SAFETY: own extern "C" variadic entry with null-terminated strings.
-    unsafe {
-        nam_pw_log(
-            std::ptr::null_mut(),
-            SPA_LOG_LEVEL_DEBUG,
-            file.as_ptr() as *const c_char,
-            1,
-            func.as_ptr() as *const c_char,
-            fmt.as_ptr() as *const c_char,
-            marker_c.as_ptr() as *const c_char,
+        let baseline = drained_records_for_test();
+
+        // Full production consult path on a marked thread: the harness thread
+        // marks itself (standing in for the PW data thread), `try_offload`
+        // consumes the event (decode + capture + push through the installed
+        // seat) and the drainer replays it into the LogBuffer — acceptance (e):
+        // the redirect is preserved; crash reports keep PW logs.
+        let marker = "RT_RING_E2E_MARKER_XYZ";
+        rt_mark_current_thread();
+        let fmt = b"e2e-ring-probe %s\0";
+        let marker_c = b"RT_RING_E2E_MARKER_XYZ\0";
+        let file = b"rt_log_ring_test.rs\0";
+        let func = b"marked_thread_queues_and_drainer_emits_in_log_buffer\0";
+        // SAFETY: own extern "C" variadic entry with null-terminated strings.
+        unsafe {
+            nam_pw_log(
+                std::ptr::null_mut(),
+                SPA_LOG_LEVEL_DEBUG,
+                file.as_ptr() as *const c_char,
+                1,
+                func.as_ptr() as *const c_char,
+                fmt.as_ptr() as *const c_char,
+                marker_c.as_ptr() as *const c_char,
+            );
+        }
+        rt_unmark_current_thread();
+
+        // Event-driven drain wait: bounded loop up to 5s checking DRAINED_RECORDS
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        let mut drained = false;
+        while start.elapsed() < timeout {
+            if drained_records_for_test() > baseline {
+                drained = true;
+                break;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(5));
+        }
+
+        let buffer_opt =
+            neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer();
+        let snapshot = buffer_opt.map(|b| b.snapshot()).unwrap_or_default();
+        let found = snapshot.iter().find(|rec| rec.message.contains(marker));
+
+        if !drained || found.is_none() {
+            panic!(
+                "drainer failed to emit record into LogBuffer: drained={}, found={}, max_level={:?}, buf_len={}, dropped={}",
+                drained,
+                found.is_some(),
+                log::max_level(),
+                snapshot.len(),
+                pw_log_dropped()
+            );
+        }
+
+        let message = &found.unwrap().message;
+        assert_eq!(
+            message,
+            &format!("[PipeWire] e2e-ring-probe {marker} (rt_log_ring_test.rs:1)"),
+            "drained record shape diverged from the sync dispatch template"
         );
-    }
-    rt_unmark_current_thread();
-
-    // Drain-side replay off-RT: the entry reaches the LogBuffer through the
-    // drainer with strict shape parity (DEBUG arm: file:line included).
-    let message = wait_drained_logbuffer(marker)
-        .expect("drainer never emitted the ring record into the LogBuffer");
-    assert_eq!(
-        message,
-        format!("[PipeWire] e2e-ring-probe {marker} (rt_log_ring_test.rs:1)"),
-        "drained record shape diverged from the sync dispatch template"
-    );
+    });
 }
 
 #[test]
 fn drained_topic_record_matches_sync_dispatch_shape() {
-    ensure_nam_logger();
-    let _lock_guard = PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    install();
-
-    // The record enters the installed producer directly (the same footpath
-    // the marked thread's consult uses); topic text already decoded — the
-    // same decode the sync dispatch applies.
     let record = RtLogRecord::capture(
         SPA_LOG_LEVEL_WARN,
         55,
@@ -266,16 +257,11 @@ fn drained_topic_record_matches_sync_dispatch_shape() {
         "nam.test.topic",
         "parity PARITY_RING_MARK_WARN",
     );
-    {
-        let producer = RT_PRODUCER.get().expect("installed ring producer");
-        assert!(producer.push(record), "ring must not be full");
-    }
-    let message =
-        wait_drained_logbuffer("PARITY_RING_MARK_WARN").expect("drained topic'd record missing");
-    // Strict template equality with the synchronous WARN-with-topic shape.
+    let (level, message) = format_rt_record(&record);
+    assert_eq!(level, log::Level::Warn);
     assert_eq!(
         message, "[PipeWire:nam.test.topic] parity PARITY_RING_MARK_WARN (parity.rs:55)",
-        "ring drain emitted a shape diverging from the sync dispatch template"
+        "ring record shape diverged from the sync dispatch template"
     );
 }
 

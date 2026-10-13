@@ -158,29 +158,31 @@ On a fatal connectivity loss the control loop enters the **bounded reconnect cyc
 
 ## 4. Linux Real-Time & Kernel Tuning Layer (`rt_setup`)
 
-To guarantee glitch-free audio processing at quantum sizes down to 64 samples (1.33 ms deadline at 48 kHz), NAM-Audio-Pipe configures Linux kernel subsystems on startup ([`src/standalone/rt_setup/`](../src/standalone/rt_setup/)):
+To guarantee glitch-free audio processing at quantum sizes down to 64 samples (1.33 ms deadline at 48 kHz), NAM-Audio-Pipe configures Linux kernel subsystems on startup ([`src/standalone/rt_setup/`](../src/standalone/rt_setup/)). The CPU affinity/topology/selection API and the generic housekeeping pinning are the engine's canonical, host-agnostic `neural_amp_modeler_rs::rt_hardening` implementation, re-exported by `rt_setup` (single source of truth); only the PipeWire-specific glue lives here.
 
-### 4.1 CPU Core Affinity (`affinity.rs`)
+### 4.1 CPU Core Affinity & Housekeeping Confinement (engine `rt_hardening`)
 
-- Automatically queries system CPU topology (`/sys/devices/system/cpu/`) via `select_optimal_cpu()`.
-- Parses `/proc/interrupts` with a streaming reader (`parse_interrupts_per_cpu()`) that extracts numeric interrupt counts mapped directly to physical CPU IDs parsed from header tokens (`CPU0`, `CPU1`, ...), returning a `HashMap<usize, u64>` without allocating monolithic string representations ([`src/standalone/rt_setup/affinity.rs`](../src/standalone/rt_setup/affinity.rs)).
+- Automatically queries system CPU topology (`/sys/devices/system/cpu/`) via the engine's `select_optimal_cpu_with_receipt()`, returning a typed `CpuSelectionReceipt` (selected core + derived housekeeping set).
+- Parses `/proc/interrupts` with a streaming reader (`parse_interrupts_per_cpu()`), mapping numeric interrupt counts directly to physical CPU IDs parsed from header tokens (`CPU0`, `CPU1`, ...), returning a `HashMap<usize, u64>` without allocating monolithic string representations.
 - Binds the PipeWire real-time loop thread to an isolated non-boot CPU core, avoiding IRQ interruptions and scheduler migrations.
+- Derives and applies the housekeeping set — every cpuset-allowed CPU except the RT core and its SMT siblings — via the engine's `apply_housekeeping_affinity()` to the main control-loop thread, the `nam-recording-io` worker and the PipeWire thread-loop thread, keeping scheduler/IRQ noise off the dedicated core.
 - Issues IRQ balancing advisories (`sys.emit_irq_advisory(target_cpu)`) to alert maintainers if system hardware interrupts share the audio core.
+- Environmental degradation (unreadable `/proc/interrupts`, unavailable sysfs topology, failed `sched_getaffinity`) is logged generically by the engine so selection never fails silently.
 
 ### 4.2 Power Management QoS Latency Pinning & Hardware Sink Detection (`pm_qos.rs`)
 
-- Opens Linux power management interface `/dev/cpu_dma_latency` and writes `0` (target 0 µs C-state latency) via [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs).
+- Opens Linux power management interface `/dev/cpu_dma_latency` and writes `0` (target 0 µs C-state latency); the request is delegated to the engine's `rt_hardening::request_cpu_dma_latency(0)` while the local `File` handle keeps the historical RAII contract ([`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)).
 - Prevents CPU cores from entering deep sleep states (C-states: C1, C6, C8), eliminating CPU wake-up latency penalties when processing intermittent audio blocks.
 - **Hardware Sink Auto-Detection (`detect_hardware_sink`):** Queries `pw-metadata` to discover the default audio output sink, using a 500 ms watchdog deadline that terminates the probe via the owned `Child` handle (immune to PID recycling), and parsing the sink JSON (`parse_sink_name_from_metadata`) while filtering out `NAM-Audio-Pipe-input` to avoid feedback routing.
 
 ### 4.3 Memory Paging Lock (`thread.rs`)
 
-- Invokes `libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE)` via [`src/standalone/rt_setup/thread.rs`](../src/standalone/rt_setup/thread.rs).
+- Invokes the engine's `rt_hardening::mlockall_current()` via [`src/standalone/rt_setup/thread.rs`](../src/standalone/rt_setup/thread.rs).
 - Locks the entire application virtual memory space in physical RAM, preventing the Linux kernel virtual memory subsystem from swapping audio execution pages to disk.
 
 ### 4.4 Transparent Huge Pages (THP) Disablement
 
-- Executes `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)`.
+- Invokes the engine's `rt_hardening::disable_thp()`, which runs `prctl(PR_SET_THP_DISABLE, ...)` (modern `PR_THP_DISABLE_EXCEPT_ADVISED` with a classic fallback).
 - Prevents background kernel `khugepaged` memory compaction sweeps from causing latency spikes during audio processing.
 
 ### 4.5 TSC Clock Calibration (`calibrate_tsc`)
@@ -420,10 +422,12 @@ Typed diagnostic error codes (`NamErrorCode`) provide structured error categoriz
 | Range   | Category            | Representative Error Codes                                                                                                                                                                                                                                                                                                          |
 |:------- |:------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                                                                                                                                                                                                  |
-| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2004` OS_SCRATCH_CAPACITY, `E2108` CPU_AFFINITY_MASK_UNAVAILABLE, `E2109` IRQ_LOAD_UNAVAILABLE, `E2110` SYSFS_TOPOLOGY_UNAVAILABLE, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH |
+| `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2004` OS_SCRATCH_CAPACITY, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH |
 | `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED                                                                                                                                                                                                |
 | `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                                                                                                                                                                                                                                                              |
 | `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                                                                                |
+
+> Affinity/topology environmental degradation (unreadable `/proc/interrupts` or `/sys/devices/system/cpu`, failed `sched_getaffinity`) is reported by the engine's host-agnostic `rt_hardening` layer via generic `log::warn!` records rather than host-specific `E21xx` codes, since the selection code is shared across hosts. Power-QoS and hardware-sink probe codes remain Pipe-specific.
 
 ### 9.2 PipeWire Log Redirection via Pure-Rust C-ABI Variadics (Rust 1.99)
 

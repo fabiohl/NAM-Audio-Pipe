@@ -137,6 +137,13 @@ impl CaptureState {
         os: OversampleFactor,
         gate_config: GateConfig,
     ) -> Self {
+        // The 48 kHz identity bypass re-instantiates the same resampler with
+        // fixed valid parameters; the first fallible build already emitted a
+        // diagnostic, so the second failure is treated as an invariant.
+        #[expect(
+            clippy::expect_used,
+            reason = "48 kHz identity resampler bypass construction is infallible in practice"
+        )]
         let resampler = NamResampler::new_simple(48_000, 48_000).unwrap_or_else(|e| {
             NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
                 .message("Failed to create initial NamResampler (using 48k bypass).")
@@ -147,6 +154,10 @@ impl CaptureState {
             NamResampler::new_simple(48_000, 48_000).expect("bypass cannot fail")
         });
 
+        #[expect(
+            clippy::expect_used,
+            reason = "48 kHz identity streaming buffer bypass construction is infallible in practice"
+        )]
         let stream =
             StreamingResampleBuffer::new(48_000, 48_000, MAX_RESAMP_BUF).unwrap_or_else(|e| {
                 NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
@@ -213,33 +224,44 @@ impl CaptureState {
             vec![0.0f32; os_scratch_len].into_boxed_slice()
         };
 
+        #[expect(
+            clippy::expect_used,
+            reason = "Off-mode oversample engine bypass construction is infallible"
+        )]
+        let os_l = Box::new(
+            OversampleEngine::new(os, MAX_RESAMP_BUF).unwrap_or_else(|e| {
+                NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
+                    .message("Failed to create oversample engine (L).")
+                    .hint("Falling back to bypass mode.")
+                    .param("detail", e)
+                    .emit_warning();
+                OversampleEngine::new(OversampleFactor::Off, MAX_RESAMP_BUF)
+                    .expect("bypass oversample engine cannot fail")
+            }),
+        );
+        #[expect(
+            clippy::expect_used,
+            reason = "Off-mode oversample engine bypass construction is infallible"
+        )]
+        let os_r = Box::new(
+            OversampleEngine::new(os, MAX_RESAMP_BUF).unwrap_or_else(|e| {
+                NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
+                    .message("Failed to create oversample engine (R).")
+                    .hint("Falling back to bypass mode.")
+                    .param("detail", e)
+                    .emit_warning();
+                OversampleEngine::new(OversampleFactor::Off, MAX_RESAMP_BUF)
+                    .expect("bypass oversample engine cannot fail")
+            }),
+        );
+
         Self {
             active_model_l: None,
             active_model_r: None,
             resampler: Box::new(resampler),
             stream: Box::new(stream),
-            os_l: Box::new(
-                OversampleEngine::new(os, MAX_RESAMP_BUF).unwrap_or_else(|e| {
-                    NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
-                        .message("Failed to create oversample engine (L).")
-                        .hint("Falling back to bypass mode.")
-                        .param("detail", e)
-                        .emit_warning();
-                    OversampleEngine::new(OversampleFactor::Off, MAX_RESAMP_BUF)
-                        .expect("bypass oversample engine cannot fail")
-                }),
-            ),
-            os_r: Box::new(
-                OversampleEngine::new(os, MAX_RESAMP_BUF).unwrap_or_else(|e| {
-                    NamDiagnostic::new(NamErrorCode::OutOfMemory, sys)
-                        .message("Failed to create oversample engine (R).")
-                        .hint("Falling back to bypass mode.")
-                        .param("detail", e)
-                        .emit_warning();
-                    OversampleEngine::new(OversampleFactor::Off, MAX_RESAMP_BUF)
-                        .expect("bypass oversample engine cannot fail")
-                }),
-            ),
+            os_l,
+            os_r,
             active_cabsim: None,
             current_nam_rate: 48_000,
             resamp_out_l: Box::new([0.0f32; MAX_RESAMP_BUF]),

@@ -32,6 +32,7 @@ use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 use neural_amp_modeler_rs::common::spsc::RT_STATUS_CABSIM_CONTRACT_VIOLATION;
 use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
 use neural_amp_modeler_rs::dsp::cabsim::conv::ConvEngine;
+use neural_amp_modeler_rs::testing::perceptual::compute_esr;
 
 const RATE: u32 = 48000;
 const IR_LEN: usize = 2304; // 48 ms @ 48 kHz — 9 partitions of 256
@@ -76,22 +77,6 @@ fn direct_convolve(ir: &[f32], signal: &[f32]) -> Vec<f32> {
         }
     }
     out
-}
-
-/// ESR between two aligned streams.
-fn compute_esr(a: &[f32], b: &[f32]) -> f64 {
-    let n = a.len().min(b.len());
-    let mut num = 0.0f64;
-    let mut den = 0.0f64;
-    for i in 0..n {
-        let e = (a[i] - b[i]) as f64;
-        num += e * e;
-        den += b[i] as f64 * b[i] as f64;
-    }
-    if den == 0.0 {
-        return if num == 0.0 { 0.0 } else { f64::INFINITY };
-    }
-    num / den
 }
 
 /// Causal silence prefix of a fresh adapter driven with host blocks of

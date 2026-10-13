@@ -4,22 +4,29 @@
 
 //! Utilities for real-time and hardware configuration and monitoring.
 //!
-//! This module contains helper functions for managing CPU affinity,
-//! SCHED_FIFO priorities, memory locking (mlockall), and telemetry
-//! for the audio engine's RT status.
+//! CPU affinity/topology/selection and the generic housekeeping pinning helpers
+//! are the engine's canonical, host-agnostic `rt_hardening` API and are
+//! re-exported here (single source of truth); only PipeWire-specific glue
+//! (thread naming and RT-callback mark, hardware-sink probe, telemetry) stays
+//! local.
 
-pub mod affinity;
 pub mod pm_qos;
 pub mod rt_log_mark;
 pub mod telemetry;
 pub mod thread;
+
 pub use neural_amp_modeler_rs::common::tsc;
-// Engine RT-hardening equivalents (S4-T6 migration target). Local modules
-// above delegate process/thread/PM-QoS setup to them; the affinity
-// topology/selection API stays local because `PollState`/`telemetry` carry
-// the local `CpuSelectionReceipt` type — engine re-exports are available as
-// `neural_amp_modeler_rs::rt_hardening::*` for new code.
-pub use affinity::*;
+// Engine-canonical affinity API, re-exported at the `rt_setup` root and as the
+// `rt_setup::affinity` module so both `rt_setup::<item>` and
+// `rt_setup::affinity::<item>` paths resolve to the engine.
+pub use neural_amp_modeler_rs::rt_hardening::affinity;
+pub use neural_amp_modeler_rs::rt_hardening::{
+    CpuCoreTopology, CpuSelectionReason, CpuSelectionReceipt, PinThreadError, SysfsTopologySource,
+    SystemSysfsSource, apply_housekeeping_affinity, build_cpu_affinity_mask,
+    build_housekeeping_affinity_mask, get_allowed_cpus, parse_cpu_list, parse_interrupts_per_cpu,
+    parse_proc_interrupts, pin_current_thread, select_cpu_with_source, select_optimal_cpu,
+    select_optimal_cpu_with_receipt,
+};
 pub use pm_qos::*;
 pub use rt_log_mark::*;
 pub use telemetry::*;

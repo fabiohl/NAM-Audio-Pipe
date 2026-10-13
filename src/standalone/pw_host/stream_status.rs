@@ -8,7 +8,7 @@
 //! belong strictly to the audio streaming host (`NAM-Audio-Pipe`), keeping the core
 //! DSP engine host-agnostic.
 
-use neural_amp_modeler_rs::dsp::telemetry::LatencyHistogram;
+use neural_amp_modeler_rs::dsp::telemetry::{AtomicHistogram, LatencyHistogram};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Host audio streaming telemetry, format latches, and clock synchronization.
@@ -33,15 +33,18 @@ pub struct StreamStatusFlags {
     pub capture_start_tsc: AtomicU64,
 
     /// Latency histogram for capture stage (callback start → end of host format validation/dequeue).
-    pub capture_hist: LatencyHistogram,
+    pub capture_hist: AtomicHistogram,
 
     /// Latency histogram for record enqueue stage (pre-push → post-push).
-    pub record_hist: LatencyHistogram,
+    pub record_hist: AtomicHistogram,
 
     /// Latency histogram for playback stage (callback start → hardware buffer write).
-    pub playback_hist: LatencyHistogram,
+    pub playback_hist: AtomicHistogram,
 
     /// Latency histogram for end-to-end processing (capture start → hardware playback).
+    ///
+    /// Uses the log-linear [`LatencyHistogram`] (≤ 12.5 % error) so the E2E gate
+    /// can be relative to the host quantum instead of snapping to a power of two.
     pub e2e_hist: LatencyHistogram,
 
     /// Incremented by the playback callback each time the bridge produced no
@@ -53,6 +56,17 @@ pub struct StreamStatusFlags {
 
     /// Cumulative count of frames dropped by the bridge due to clock drift (capture > playback).
     pub bridge_dropped_frames: AtomicU32,
+
+    /// Playback quanta delivered since the playback stream last entered
+    /// `Streaming` (reset to `0` by the state handler on that transition).
+    ///
+    /// Bounds the bring-up window (S6-T4 / F-PR-11): bridge clock-drift drops
+    /// observed while this counter is below
+    /// [`PLAYBACK_BRINGUP_QUANTUMS`](crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS)
+    /// are the expected startup ramp (the pre-rolled silence block plus the
+    /// capture producer's first block), not real drift, so the telemetry loop
+    /// suppresses the `Drifting detected` warning and does not account them.
+    pub playback_quantums: AtomicU32,
 
     /// Last sample rate negotiated by the capture stream's host renegotiation
     /// listener (`0` = never negotiated). Written on the host stream-negotiation
@@ -116,12 +130,13 @@ impl StreamStatusFlags {
             playback_cycle_time: AtomicU64::new(0),
             e2e_cycle_time: AtomicU64::new(0),
             capture_start_tsc: AtomicU64::new(0),
-            capture_hist: LatencyHistogram::new(),
-            record_hist: LatencyHistogram::new(),
-            playback_hist: LatencyHistogram::new(),
+            capture_hist: AtomicHistogram::new(),
+            record_hist: AtomicHistogram::new(),
+            playback_hist: AtomicHistogram::new(),
             e2e_hist: LatencyHistogram::new(),
             playback_bridge_starvation: AtomicU32::new(0),
             bridge_dropped_frames: AtomicU32::new(0),
+            playback_quantums: AtomicU32::new(0),
             capture_negotiated_rate: AtomicU32::new(0),
             playback_negotiated_rate: AtomicU32::new(0),
             capture_format_ok: AtomicU32::new(1),

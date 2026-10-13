@@ -8,90 +8,20 @@
 # or for scripts that manage their own working directory (e.g. build-release.sh):
 #   NAM_LIB_NO_CD=1 PHASE_TOTAL=<N>; source "$(dirname "$0")/_lib.sh"
 #
+# The project-neutral helpers (ANSI colors, phase/ok/warn/die,
+# format_duration_ms/phase_elapsed_str, emit/emit_to, assert_ran_tests/
+# assert_subphase_ran, pick_bench_core) live in the canonical, byte-identical
+# `_lib_core.sh` block (see utils/test-lib-drift.sh). This file adds only the
+# repository-specific glue on top.
+#
 # Then call:
 #   phase "Description of the current step"
 #   die  "Fatal error message"    # prints to stderr and exits 1
 #   ok   "Success message"        # prints indented green OK line
 #   warn "Warning message"        # prints indented yellow notice
 
-# ---------------------------------------------------------------------------
-# ANSI style helpers
-# ---------------------------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-# ---------------------------------------------------------------------------
-# Phase counter (global — not safe for concurrent subshells)
-# ---------------------------------------------------------------------------
-PHASE_NUM=0
-PHASE_START_NS=0
-
-# phase <description>
-#   Increments and prints a phase header: [N/TOTAL] description
-phase() {
-    PHASE_NUM=$((PHASE_NUM + 1))
-    PHASE_START_NS=$(date +%s%N 2>/dev/null || echo 0)
-    echo -e "\n${BLUE}${BOLD}[${PHASE_NUM}/${PHASE_TOTAL:-?}]${NC} $*"
-}
-
-# die <message>
-#   Prints a fatal error to stderr and exits with code 1.
-die() {
-    echo -e "${RED}${BOLD}[FATAL]${NC} $*" >&2
-    exit 1
-}
-
-# ok <message>
-#   Prints an indented green OK confirmation line.
-ok() {
-    echo -e "  ${GREEN}OK${NC} $*"
-}
-
-# warn <message>
-#   Prints an indented yellow informational/warning line.
-warn() {
-    echo -e "  ${YELLOW}ⓘ${NC} $*"
-}
-
-# format_duration_ms <milliseconds>
-#   Formats an interval in ms to human-readable scale:
-#   < 1000 ms: "Xms" (e.g. 790ms, 45ms)
-#   < 10000 ms: "X.YYs" (e.g. 1.35s)
-#   >= 10000 ms: "X.Ys" (e.g. 65.2s)
-format_duration_ms() {
-    local ms="${1:-0}"
-    if [ "$ms" -lt 1000 ]; then
-        echo "${ms}ms"
-    elif [ "$ms" -lt 10000 ]; then
-        local sec=$(( ms / 1000 ))
-        local dec=$(( (ms % 1000) / 10 ))
-        printf "%d.%02ds\n" "$sec" "$dec"
-    else
-        local sec=$(( ms / 1000 ))
-        local dec=$(( (ms % 1000) / 100 ))
-        printf "%d.%ds\n" "$sec" "$dec"
-    fi
-}
-
-# phase_elapsed_str
-#   Returns the formatted duration elapsed since the last phase() call.
-phase_elapsed_str() {
-    if [ "${PHASE_START_NS:-0}" -ne 0 ]; then
-        local now_ns dur_ms
-        now_ns=$(date +%s%N 2>/dev/null || echo 0)
-        if [ "$now_ns" -ge "$PHASE_START_NS" ]; then
-            dur_ms=$(( (now_ns - PHASE_START_NS) / 1000000 ))
-            format_duration_ms "$dur_ms"
-            return 0
-        fi
-    fi
-    echo "0ms"
-}
+# Canonical project-neutral core (drift-pinned; see utils/test-lib-drift.sh).
+source "$(dirname "${BASH_SOURCE[0]}")/_lib_core.sh"
 
 # ---------------------------------------------------------------------------
 # Resolve project root dynamically relative to this helper script.
@@ -115,67 +45,8 @@ if [ "${NAM_LIB_NO_CD:-0}" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Quick-runner gate infrastructure (typed receipt + fail-closed assertion)
+# Mandatory test-target execution gate
 # ---------------------------------------------------------------------------
-
-# emit_to <receipt_file> <line>
-#   Appends one structured line to an arbitrary typed receipt file
-#   (e.g. target/logs/long-receipt.txt for the long suite), mirroring it on
-#   stdout. Single-line appends are atomic under O_APPEND.
-emit_to() {
-    local receipt_file="$1"
-    shift
-    mkdir -p target/logs
-    printf '%s\n' "$*" | tee -a "$receipt_file"
-}
-
-# emit <receipt-line>
-#   Appends one structured line to the typed quick-run receipt
-#   (target/logs/quick-receipt.txt), mirroring it on stdout. Single-line
-#   appends are atomic under O_APPEND.
-emit() {
-    emit_to target/logs/quick-receipt.txt "$*"
-}
-
-# assert_ran_tests <log_file> [min_count]
-#   Verifies that a test log proves real execution: sums the "X passed" and
-#   "X measured" counters of every libtest summary line (plus a benchmark
-#   fallback) and fails the gate when the total falls below min_count.
-#   Fail-closed against typo'd targets, empty filters and 100% skip selection.
-assert_ran_tests() {
-    local log_file="$1"
-    local min_count="${2:-1}"
-
-    local total_passed=0
-
-    local passed
-    if passed=$(grep -oP 'test result: ok\.\s+\K\d+(?=\s+passed)' "$log_file" 2>/dev/null); then
-        for p in $passed; do
-            total_passed=$((total_passed + p))
-        done
-    fi
-
-    local measured
-    if measured=$(grep -oP '\K\d+(?=\s+measured)' "$log_file" 2>/dev/null); then
-        for m in $measured; do
-            total_passed=$((total_passed + m))
-        done
-    fi
-
-    if [ "$total_passed" -eq 0 ]; then
-        local bench_count
-        bench_count=$(grep -cP '^\S.*time:\s+\[' "$log_file" 2>/dev/null || true)
-        bench_count="${bench_count:-0}"
-        total_passed=$bench_count
-    fi
-
-    if [ "$total_passed" -lt "$min_count" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: phase executed 0 tests/benchmarks (empty selection or filter mismatch).${NC}"
-        return 1
-    fi
-    echo -e "  Gate: ${total_passed} test(s)/benchmark(s) executed ≥ ${min_count}  ✓"
-    return 0
-}
 
 # assert_ran_target <log_file> <target_name> [min_count]
 #   Verifies that a specific mandatory test target was actually executed in the
@@ -213,9 +84,9 @@ assert_ran_target() {
         return 1
     fi
 
-    passed=$(printf '%s\n' "$result_line" | grep -oP '\d+(?=\s+passed)' | head -n1 || true)
+    passed=$(printf '%s\n' "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -n1 || true)
     passed="${passed:-0}"
-    measured=$(printf '%s\n' "$result_line" | grep -oP '\d+(?=\s+measured)' | head -n1 || true)
+    measured=$(printf '%s\n' "$result_line" | grep -oE '[0-9]+ measured' | grep -oE '^[0-9]+' | head -n1 || true)
     measured="${measured:-0}"
     executed=$((passed + measured))
 
@@ -226,85 +97,3 @@ assert_ran_target() {
     echo -e "  Gate: target '${target_name}' executed $executed test(s)/benchmark(s) ≥ $min_count  ✓"
     return 0
 }
-
-# ---------------------------------------------------------------------------
-# Benchmark Core Resolution Helper
-# ---------------------------------------------------------------------------
-
-# pick_bench_core [sysfs_cpu_dir]
-#   Resolves the deterministic benchmark CPU core according to policy:
-#     1. $NAM_BENCH_CORE if explicitly set and non-empty.
-#     2. First online isolated CPU from /sys/devices/system/cpu/isolated
-#        (treating 8-9 as a physical core, preferring 8 with cpu9=offline intentional).
-#     3. Fallback to $((nproc / 2)) with a warning and GAP marker.
-pick_bench_core() {
-    local sysfs_cpu="${1:-/sys/devices/system/cpu}"
-
-    # 1. Explicit override
-    if [ -n "${NAM_BENCH_CORE:-}" ]; then
-        echo "$NAM_BENCH_CORE"
-        return 0
-    fi
-
-    # 2. Inspect /sys/devices/system/cpu/isolated
-    local isolated_file="$sysfs_cpu/isolated"
-    if [ -f "$isolated_file" ]; then
-        local raw_isolated
-        raw_isolated=$(cat "$isolated_file" 2>/dev/null | tr -d '[:space:]')
-        if [ -n "$raw_isolated" ]; then
-            local -a candidate_cpus=()
-            local IFS=','
-            local -a parts=($raw_isolated)
-            unset IFS
-            for part in "${parts[@]}"; do
-                if [[ "$part" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-                    local start="${BASH_REMATCH[1]}"
-                    local end="${BASH_REMATCH[2]}"
-                    for ((c = start; c <= end; c++)); do
-                        candidate_cpus+=("$c")
-                    done
-                elif [[ "$part" =~ ^[0-9]+$ ]]; then
-                    candidate_cpus+=("$part")
-                fi
-            done
-
-            # Special policy: treat 8-9 as a physical core; if 8 is in isolated and online, prefer 8.
-            # Document cpu9=offline intentional.
-            local preferred_8=0
-            for c in "${candidate_cpus[@]}"; do
-                if [ "$c" -eq 8 ]; then
-                    preferred_8=1
-                    break
-                fi
-            done
-
-            if [ "$preferred_8" -eq 1 ]; then
-                local online_file="$sysfs_cpu/cpu8/online"
-                if [ ! -f "$online_file" ] || [ "$(cat "$online_file" 2>/dev/null | tr -d '[:space:]')" = "1" ]; then
-                    echo 8
-                    return 0
-                fi
-            fi
-
-            for c in "${candidate_cpus[@]}"; do
-                local online_file="$sysfs_cpu/cpu$c/online"
-                if [ ! -f "$online_file" ] || [ "$(cat "$online_file" 2>/dev/null | tr -d '[:space:]')" = "1" ]; then
-                    echo "$c"
-                    return 0
-                fi
-            done
-        fi
-    fi
-
-    # 3. Fallback: nproc / 2
-    local num_cores
-    num_cores=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
-    local fallback_core=$(( ${num_cores:-1} / 2 ))
-    echo -e "  \033[1;33mⓘ WARN: no online isolated CPU found in $sysfs_cpu/isolated; falling back to core $fallback_core (nproc/2)\033[0m" >&2
-    if type record_gap >/dev/null 2>&1; then
-        record_gap "cpu_not_isolated"
-    fi
-    echo "$fallback_core"
-    return 0
-}
-

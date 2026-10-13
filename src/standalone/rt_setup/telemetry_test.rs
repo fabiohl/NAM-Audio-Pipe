@@ -11,27 +11,15 @@ use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_IS_SILENT, RT_STATUS_PARAM_QUEUE_BACKLOG, RT_STATUS_SLIMMABLE_RESET_FAILED,
     RT_STATUS_SLIMMABLE_SLICE_FAILED, RT_STATUS_THP_ACTIVE, RtStatusFlags,
 };
-use neural_amp_modeler_rs::dsp::pipeline::DspBridge;
+use neural_amp_modeler_rs::dsp::pipeline::{DspBridge, DspBridgeReader};
 use std::sync::atomic::Ordering;
 
 fn create_test_bridge() -> Box<DspBridge> {
     DspBridge::new_boxed()
 }
 
-static TEST_LOGGER_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn init_test_logger() -> std::sync::MutexGuard<'static, ()> {
-    use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
-    let guard = TEST_LOGGER_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = NamLogger::init(LoggerConfig {
-        level_filter: log::LevelFilter::Info,
-        emit_stderr: false,
-    });
-    if let Some(logger) = NamLogger::global() {
-        logger.set_max_level(log::LevelFilter::Info);
-        log::set_max_level(log::LevelFilter::Info);
-    }
-    guard
+fn init_test_logger() -> crate::standalone::test_logger::LoggerLevelGuard {
+    crate::standalone::test_logger::acquire_logger_level(log::LevelFilter::Info)
 }
 
 #[test]
@@ -442,6 +430,31 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     assert_eq!(stream_status.e2e_hist.total_count(), 0);
 }
 
+/// EC-15 / T3.4: the end-to-end capture↦playback observation uses the log-linear
+/// `LatencyHistogram` (≤ 12.5 % per-bin error), so a right-skewed distribution
+/// resolves **distinct** p50 and p99. The pre-migration power-of-two
+/// `AtomicHistogram` collapsed both onto the same bin edge, hiding tail
+/// regressions in the E2E gate.
+#[test]
+fn test_e2e_histogram_resolves_distinct_percentiles() {
+    let stream_status = StreamStatusFlags::new();
+    // Nominal 256/48k quantum ≈ 5.3 ms with a small tail of capture↦playback
+    // misses near 9 ms (distinct octaves).
+    for _ in 0..98 {
+        stream_status.e2e_hist.record(5_300_000);
+    }
+    for _ in 0..2 {
+        stream_status.e2e_hist.record(9_000_000);
+    }
+    let p50 = stream_status.e2e_hist.get_percentile(0.50);
+    let p99 = stream_status.e2e_hist.get_percentile(0.99);
+    assert!(p50 <= p99, "p50 ({p50}) must not exceed p99 ({p99})");
+    assert_ne!(
+        p50, p99,
+        "the E2E LatencyHistogram must resolve a distinct tail percentile (EC-15)"
+    );
+}
+
 #[test]
 fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
     let _guard = init_test_logger();
@@ -711,12 +724,9 @@ fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
 fn test_pw_log_ring_drop_warns_once_per_episode() {
     use crate::standalone::pw_host::rt_log_ring;
 
+    // Unified logger lock in init_test_logger() already serializes with the
+    // ring tests in the same binary (LOGGER_STATE_LOCK).
     let _guard = init_test_logger();
-    // PW-log ring state is process-global; the lock serializes with the
-    // ring tests in the same binary (see PW_LOG_REDIR_TEST_LOCK).
-    let _ring_lock = crate::standalone::PW_LOG_REDIR_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
     rt_log_ring::reset_pw_log_dropped_for_test();
 
     let rt_status = RtStatusFlags::new();
@@ -772,4 +782,83 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
         "a new saturation episode must emit once"
     );
     rt_log_ring::reset_pw_log_dropped_for_test();
+}
+
+/// S6-T4 / F-PR-11: the off-RT `prime_silence` pre-roll delivers the first
+/// playback quantum through the normal wet path (no starvation), and the
+/// telemetry loop suppresses bridge clock-drift drops observed inside the
+/// bring-up window, accounting them only once the window closes.
+#[test]
+fn test_playback_bringup_preroll_suppresses_drift() {
+    let _guard = init_test_logger();
+    let quantum = 64usize;
+
+    let mut bridge = create_test_bridge();
+    bridge.prime_silence(quantum);
+
+    // SAFETY: `bridge` is a valid, heap-immortal `DspBridge` allocation.
+    let reader = unsafe { DspBridgeReader::new(&raw mut *bridge) };
+    let stream_status = StreamStatusFlags::new();
+
+    // First quantum: the pre-roll surfaces as a real silence block, so the
+    // starvation path is never taken.
+    let mut last_gen = 0u64;
+    let block = reader.read_block(&mut last_gen, |l, r| (l.len(), r.len()));
+    assert_eq!(
+        block,
+        Some((quantum, quantum)),
+        "pre-rolled first quantum must deliver a block, not starve"
+    );
+    assert_eq!(
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
+        0,
+        "pre-rolled first quantum must not count as starvation"
+    );
+    assert_eq!(bridge.dropped_frames.load(Ordering::Relaxed), 0);
+
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let mut state = PollState::default();
+
+    // Inside the bring-up window: a startup-ramp drop is neither accounted nor
+    // warned.
+    bridge.dropped_frames.store(3, Ordering::Relaxed);
+    stream_status.playback_quantums.store(1, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        0,
+        "bring-up drops must be suppressed"
+    );
+
+    // After the window: a real drift drop is accounted (and warns once).
+    bridge.dropped_frames.store(3, Ordering::Relaxed);
+    stream_status.playback_quantums.store(
+        crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS,
+        Ordering::Relaxed,
+    );
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        3,
+        "post-bring-up drops must be accounted"
+    );
 }

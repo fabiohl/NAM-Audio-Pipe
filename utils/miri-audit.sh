@@ -16,10 +16,11 @@
 # SCOPE & TARGET MATRIX:
 #   - TARGET: `recording::pool::pool_test` (RecordingPool SPSC ring & descriptors)
 #     Soundness proof for lock-free slot reuse, atomic barriers, and drop leaks (11/11 pass under Miri).
-#   - DEFERRED / WAIVED: `standalone::pw_host::pw_host_test` (DspBridge concurrent access)
-#     Waived under F-MIRI-BRIDGE-01: upstream NeuralAmpModeler-rs 0.8.0 lacks UnsafeCell on buffers;
-#     creates whole-struct &DspBridge retags during concurrent reads/writes.
-#     Tracked for re-activation once upstream narrows borrows or wraps buffers in UnsafeCell.
+#   - TARGET: `standalone::pw_host::pw_host_test` (DspBridge concurrent access)
+#     Interior-mutability narrowing landed upstream: NeuralAmpModeler-rs 1.0.0 wraps
+#     `DspBridge::buffers` in `UnsafeCell` and the writer/reader never form a whole-struct
+#     `&DspBridge` reference, so the concurrent writer/reader handshake is now auditable.
+#     Waiver `F-MIRI-BRIDGE-01` is RESOLVED.
 #   - EXCLUDED: `rt_callback/harness.rs` (Full offline DSP pipeline)
 #     Excluded from full-pipeline Miri interpretation due to x86-64-v3 AVX2/FMA
 #     vector intrinsics and severe simulation overhead (~10,000x slowdown).
@@ -69,9 +70,15 @@ export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}"
 
 echo -e "${YELLOW}${BOLD}Target: RecordingPool SPSC lock-free ring (pool_test)...${NC}"
 MIRI_LOG=$(mktemp)
-trap 'rm -f "$MIRI_LOG"' EXIT
+BRIDGE_MIRI_LOG=$(mktemp)
+trap 'rm -f "$MIRI_LOG" "$BRIDGE_MIRI_LOG"' EXIT
 cargo +nightly miri test --lib recording::pool::pool_test 2>&1 | tee "$MIRI_LOG"
 assert_ran_tests "$MIRI_LOG" 11
 
 echo ""
-ok "Miri concurrency and aliasing audit completed successfully (11/11 pool tests passed)!"
+echo -e "${YELLOW}${BOLD}Target: DspBridge concurrent handshake (pw_host_test)...${NC}"
+cargo +nightly miri test --lib standalone::pw_host::pw_host_test 2>&1 | tee "$BRIDGE_MIRI_LOG"
+assert_ran_tests "$BRIDGE_MIRI_LOG" 1
+
+echo ""
+ok "Miri concurrency and aliasing audit completed successfully (pool 11/11 + bridge handshake)!"

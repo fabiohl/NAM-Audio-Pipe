@@ -7,10 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[test]
-#[cfg_attr(
-    miri,
-    ignore = "Upstream DspBridge in NeuralAmpModeler-rs 0.8.0 lacks UnsafeCell on buffers; concurrent &DspBridge retag produces UB under Miri (Finding F-MIRI-BRIDGE-01)"
-)]
 fn test_dsp_bridge_concurrent_access() {
     // 1. DspBridge setup:
     // We allocate the bridge on the heap and leak it to obtain a static reference

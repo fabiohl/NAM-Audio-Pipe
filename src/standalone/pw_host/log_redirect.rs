@@ -123,9 +123,76 @@ pub(crate) unsafe fn decode_with_file<R>(file: *const c_char, f: impl FnOnce(&st
     }
 }
 
+/// Formats an already-decoded PW log event into a log level and formatted message string.
+///
+/// This is the single source of truth for the message shape used by the synchronous
+/// dispatch, off-RT ring drain, and unit tests, ensuring the paths never drift apart.
+pub(crate) fn render_decoded_pipewire_log(
+    level: spa_log_level,
+    topic_str: &str,
+    file_str: &str,
+    line: c_int,
+    msg: &str,
+) -> (log::Level, String) {
+    let trimmed = msg.trim_end();
+    match level {
+        SPA_LOG_LEVEL_ERROR => (
+            log::Level::Error,
+            if topic_str.is_empty() {
+                format!("[PipeWire] {} ({}:{})", trimmed, file_str, line)
+            } else {
+                format!(
+                    "[PipeWire:{}] {} ({}:{})",
+                    topic_str, trimmed, file_str, line
+                )
+            },
+        ),
+        SPA_LOG_LEVEL_WARN => (
+            log::Level::Warn,
+            if topic_str.is_empty() {
+                format!("[PipeWire] {} ({}:{})", trimmed, file_str, line)
+            } else {
+                format!(
+                    "[PipeWire:{}] {} ({}:{})",
+                    topic_str, trimmed, file_str, line
+                )
+            },
+        ),
+        SPA_LOG_LEVEL_INFO => (
+            log::Level::Info,
+            if topic_str.is_empty() {
+                format!("[PipeWire] {}", trimmed)
+            } else {
+                format!("[PipeWire:{}] {}", topic_str, trimmed)
+            },
+        ),
+        SPA_LOG_LEVEL_DEBUG => (
+            log::Level::Debug,
+            if topic_str.is_empty() {
+                format!("[PipeWire] {} ({}:{})", trimmed, file_str, line)
+            } else {
+                format!(
+                    "[PipeWire:{}] {} ({}:{})",
+                    topic_str, trimmed, file_str, line
+                )
+            },
+        ),
+        _ => (
+            log::Level::Trace,
+            if topic_str.is_empty() {
+                format!("[PipeWire] {} ({}:{})", trimmed, file_str, line)
+            } else {
+                format!(
+                    "[PipeWire:{}] {} ({}:{})",
+                    topic_str, trimmed, file_str, line
+                )
+            },
+        ),
+    }
+}
+
 /// Shared emit of an already-decoded PW log event — the single source of
-/// truth for the message shape used by the synchronous dispatch and the
-/// off-RT ring drain, so the two paths can never drift apart.
+/// truth for dispatching into the unified `log::*` facade.
 pub(crate) fn emit_decoded_pipewire_log(
     level: spa_log_level,
     topic_str: &str,
@@ -133,68 +200,16 @@ pub(crate) fn emit_decoded_pipewire_log(
     line: c_int,
     msg: &str,
 ) {
-    let trimmed = msg.trim_end();
-    match level {
-        SPA_LOG_LEVEL_ERROR => {
-            if topic_str.is_empty() {
-                log::error!("[PipeWire] {} ({}:{})", trimmed, file_str, line);
-            } else {
-                log::error!(
-                    "[PipeWire:{}] {} ({}:{})",
-                    topic_str,
-                    trimmed,
-                    file_str,
-                    line
-                );
-            }
-        }
-        SPA_LOG_LEVEL_WARN => {
-            if topic_str.is_empty() {
-                log::warn!("[PipeWire] {} ({}:{})", trimmed, file_str, line);
-            } else {
-                log::warn!(
-                    "[PipeWire:{}] {} ({}:{})",
-                    topic_str,
-                    trimmed,
-                    file_str,
-                    line
-                );
-            }
-        }
-        SPA_LOG_LEVEL_INFO => {
-            if topic_str.is_empty() {
-                log::info!("[PipeWire] {}", trimmed);
-            } else {
-                log::info!("[PipeWire:{}] {}", topic_str, trimmed);
-            }
-        }
-        SPA_LOG_LEVEL_DEBUG => {
-            if topic_str.is_empty() {
-                log::debug!("[PipeWire] {} ({}:{})", trimmed, file_str, line);
-            } else {
-                log::debug!(
-                    "[PipeWire:{}] {} ({}:{})",
-                    topic_str,
-                    trimmed,
-                    file_str,
-                    line
-                );
-            }
-        }
-        SPA_LOG_LEVEL_TRACE => {
-            if topic_str.is_empty() {
-                log::trace!("[PipeWire] {} ({}:{})", trimmed, file_str, line);
-            } else {
-                log::trace!(
-                    "[PipeWire:{}] {} ({}:{})",
-                    topic_str,
-                    trimmed,
-                    file_str,
-                    line
-                );
-            }
-        }
-        _ => {}
+    if level == SPA_LOG_LEVEL_NONE {
+        return;
+    }
+    let (lvl, rendered) = render_decoded_pipewire_log(level, topic_str, file_str, line, msg);
+    match lvl {
+        log::Level::Error => log::error!("{}", rendered),
+        log::Level::Warn => log::warn!("{}", rendered),
+        log::Level::Info => log::info!("{}", rendered),
+        log::Level::Debug => log::debug!("{}", rendered),
+        log::Level::Trace => log::trace!("{}", rendered),
     }
 }
 

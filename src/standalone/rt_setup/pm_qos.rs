@@ -118,18 +118,23 @@ impl StdoutCapture {
     /// the capture ceiling. Returns when the pipe end hits EOF, would block,
     /// errors, or `until` arrives.
     fn absorb(&mut self, until: std::time::Instant) {
-        if self.out.is_none() || self.fd.is_none() {
+        // The pipe `out` and its raw `fd` are created together; a `None` fd
+        // means capture already finished, so this is the natural stop condition.
+        let Some(fd) = self.fd else {
             self.eof = true;
             return;
-        }
-        let fd = self.fd.unwrap();
+        };
         while !self.eof && std::time::Instant::now() < until {
             if !self.poll_ready(fd, until) {
                 return;
             }
             // Non-blocking read: an empty pipe yields `WouldBlock` (loop back
             // to the poll), EOF yields `Ok(0)`.
-            let read_result = std::io::Read::read(self.out.as_mut().unwrap(), &mut self.scratch);
+            let Some(out) = self.out.as_mut() else {
+                self.eof = true;
+                return;
+            };
+            let read_result = std::io::Read::read(out, &mut self.scratch);
             match read_result {
                 Ok(0) => self.eof = true,
                 Ok(n) => {

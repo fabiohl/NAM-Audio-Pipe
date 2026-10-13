@@ -37,9 +37,16 @@
 
 mod common;
 
-use common::proc::TelemetrySample;
+use common::proc::{TelemetrySample, read_thread_rusage};
 use common::swap::*;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
+use nam_audio_pipe::standalone::rt_setup::thread::configure_process_wide;
+
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use std::time::{Duration, Instant};
 
 /// Total continuous audio blocks for the soak (≈426 s of nominal timeline at
 /// 48 kHz / BLOCK=64).
@@ -245,8 +252,9 @@ fn test_soak_320k_multichannel_swaps() {
 
 /// Captures **raw** resident memory (VmRSS), page faults, thread and FD counts
 /// periodically across the full soak and asserts the post-warmup drift is
-/// strictly below the OS page-margin threshold (zero memory leak). RSS
-/// shrinkage is never a failure; growth beyond the margin is.
+/// strictly below the OS page-margin threshold (zero memory leak). Measures
+/// thread-specific rusage (`ru_minflt`, `ru_nivcsw`) on the RT audio callback
+/// thread post-warmup and gates on zero minor page faults (F-PR-06 / F-PR-08).
 ///
 /// The full-length signal is pre-allocated once and kept alive across the
 /// soak so its heap footprint is part of the baseline (the delta isolates the
@@ -254,20 +262,142 @@ fn test_soak_320k_multichannel_swaps() {
 #[test]
 #[ignore]
 fn test_soak_rss_memory_stability() {
+    configure_process_wide();
+
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+    h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
+    for _ in 0..8 {
+        let mut l = [0f32; BLOCK];
+        let mut r = [0f32; BLOCK];
+        h.run_callback(&mut l, &mut r, BLOCK);
+    }
+    h.consume_gc();
+
+    // Pre-warm every model kind the swap batches build so the timed window
+    // starts from a resident working set (the baseline RSS sample includes the
+    // preallocated signal buffers).
+    for step in 0..8 {
+        apply_swap_batch(&mut h, step * SWAP_INTERVAL);
+        let (sig_l, sig_r) = test_signal_blocks(8);
+        let mut in_l = [0f32; BLOCK];
+        let mut in_r = [0f32; BLOCK];
+        for block in 0..8 {
+            in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+            in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        h.consume_gc();
+    }
+    validate_linear_window(&mut h);
+    h.consume_gc();
+
     let (sig_l, sig_r) = test_signal_blocks(TOTAL_BLOCKS);
 
-    let _ = run_soak_blocks(&mut h, 0, 1_000, false, &sig_l, &sig_r);
+    let harness = Arc::new(Mutex::new(h));
+    let stop = Arc::new(AtomicBool::new(false));
+    let warmup_done = Arc::new(AtomicBool::new(false));
+    let rt_blocks = Arc::new(AtomicUsize::new(0));
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel();
+
+    let harness_rt = Arc::clone(&harness);
+    let stop_rt = Arc::clone(&stop);
+    let warmup_done_rt = Arc::clone(&warmup_done);
+    let rt_blocks_rt = Arc::clone(&rt_blocks);
+    let sig_l_rt = sig_l.clone();
+    let sig_r_rt = sig_r.clone();
+
+    let rt_handle = std::thread::Builder::new()
+        .name("nam_pipe_dsp".into())
+        .spawn(move || {
+            let mut in_l = [0f32; BLOCK];
+            let mut in_r = [0f32; BLOCK];
+
+            for _ in 0..16 {
+                let mut h = harness_rt.lock().expect("harness lock");
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+            tx_ready.send(()).expect("notify ready");
+
+            // Warmup loop: process until signaled that 2s warmup completed
+            while !warmup_done_rt.load(Ordering::Acquire) {
+                let b = rt_blocks_rt.fetch_add(1, Ordering::Relaxed);
+                let sig_block = b % TOTAL_BLOCKS;
+                in_l.copy_from_slice(&sig_l_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                in_r.copy_from_slice(&sig_r_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                let mut h = harness_rt.lock().expect("harness lock");
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+
+            let rusage_before = read_thread_rusage().expect("initial thread rusage");
+
+            while !stop_rt.load(Ordering::Relaxed) {
+                let b = rt_blocks_rt.fetch_add(1, Ordering::Relaxed);
+                if b >= TOTAL_BLOCKS {
+                    break;
+                }
+                let sig_block = b % TOTAL_BLOCKS;
+                in_l.copy_from_slice(&sig_l_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                in_r.copy_from_slice(&sig_r_rt[sig_block * BLOCK..(sig_block + 1) * BLOCK]);
+                let mut h = harness_rt.lock().expect("harness lock");
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+
+            let rusage_after = read_thread_rusage().expect("final thread rusage");
+            (rusage_before, rusage_after)
+        })
+        .expect("spawn RT thread");
+
+    rx_ready.recv().expect("wait RT thread ready");
+
+    // 2 s warm-up window (reutilizando padrão de tests/endurance.rs)
+    let warmup_start = Instant::now();
+    let warmup_duration = Duration::from_secs(2);
+    while warmup_start.elapsed() < warmup_duration || rt_blocks.load(Ordering::Relaxed) < 2_000 {
+        let b = rt_blocks.load(Ordering::Relaxed);
+        if b.is_multiple_of(SWAP_INTERVAL) {
+            let mut h = harness.lock().expect("harness lock");
+            apply_swap_batch(&mut h, b);
+        }
+        if b.is_multiple_of(50) {
+            let mut h = harness.lock().expect("harness lock");
+            h.consume_gc();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    warmup_done.store(true, Ordering::Release);
     let mut telemetry: Vec<TelemetrySample> = vec![TelemetrySample::capture()];
 
-    // Periodic raw telemetry across the rest of the soak (every 10k blocks).
-    let mut remaining = 1_000;
-    while remaining < TOTAL_BLOCKS {
-        let next = (remaining + 10_000).min(TOTAL_BLOCKS);
-        let _ = run_soak_blocks(&mut h, remaining, next - remaining, false, &sig_l, &sig_r);
-        telemetry.push(TelemetrySample::capture());
-        remaining = next;
+    let mut last_swap_block = rt_blocks.load(Ordering::Relaxed);
+    let mut last_gc_block = last_swap_block;
+    let mut last_telem_block = last_swap_block;
+
+    while rt_blocks.load(Ordering::Relaxed) < TOTAL_BLOCKS {
+        let b = rt_blocks.load(Ordering::Relaxed);
+        if b.saturating_sub(last_swap_block) >= SWAP_INTERVAL {
+            let mut h = harness.lock().expect("harness lock");
+            apply_swap_batch(&mut h, b);
+            last_swap_block = b;
+        }
+        if b.saturating_sub(last_gc_block) >= 50 {
+            let mut h = harness.lock().expect("harness lock");
+            h.consume_gc();
+            last_gc_block = b;
+        }
+        if b.saturating_sub(last_telem_block) >= 10_000 {
+            telemetry.push(TelemetrySample::capture());
+            last_telem_block = b;
+        }
+        std::thread::yield_now();
     }
+
+    stop.store(true, Ordering::Release);
+    let (rusage_before, rusage_after) = rt_handle.join().expect("join RT thread");
+    telemetry.push(TelemetrySample::capture());
+
+    let minflt_thread_delta = rusage_after.minflt.saturating_sub(rusage_before.minflt);
+    let nivcsw_thread_delta = rusage_after.nivcsw.saturating_sub(rusage_before.nivcsw);
+    let majflt_thread_delta = rusage_after.majflt.saturating_sub(rusage_before.majflt);
 
     let first = telemetry.first().expect("telemetry baseline");
     let last = telemetry.last().expect("telemetry final");
@@ -280,7 +410,7 @@ fn test_soak_rss_memory_stability() {
     assert!(first.rss_kb > 0, "VmRSS unavailable on this platform");
     assert!(
         rss_delta_kb <= MAX_RSS_DRIFT_KB as i64,
-        "RSS growth of {rss_delta_kb} KiB between block 1 000 ({} KiB) and block {TOTAL_BLOCKS} \
+        "RSS growth of {rss_delta_kb} KiB between warmup baseline ({} KiB) and block {TOTAL_BLOCKS} \
          ({} KiB) exceeds {MAX_RSS_DRIFT_KB} KiB margin — possible memory leak",
         first.rss_kb,
         last.rss_kb,
@@ -301,10 +431,19 @@ fn test_soak_rss_memory_stability() {
         first.fds,
         last.fds,
     );
+    assert_eq!(
+        minflt_thread_delta, 0,
+        "minor page faults on RT callback thread ({minflt_thread_delta}) violate zero-fault invariant"
+    );
+    assert_eq!(
+        majflt_thread_delta, 0,
+        "major page faults on RT callback thread ({majflt_thread_delta}) violate zero-fault invariant"
+    );
     eprintln!(
         "SOAK_RSS_MEASURED rss_first_kb={} rss_last_kb={} rss_delta_kb={rss_delta_kb} \
-         minflt_delta={minflt_delta} majflt_delta={majflt_delta} threads_first={} threads_last={} \
-         fds_first={} fds_last={} telemetry_samples={}",
+         minflt_delta={minflt_delta} majflt_delta={majflt_delta} \
+         minflt_thread_delta={minflt_thread_delta} nivcsw_thread_delta={nivcsw_thread_delta} \
+         threads_first={} threads_last={} fds_first={} fds_last={} telemetry_samples={}",
         first.rss_kb,
         last.rss_kb,
         first.threads,

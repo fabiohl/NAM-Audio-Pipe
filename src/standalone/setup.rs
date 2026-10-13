@@ -21,8 +21,13 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 /// Isolate the setup of SPSC lock-free communication channels between host and audio thread.
-pub fn setup_communication_channels() -> SpscChannels {
-    spsc::setup_spsc(spsc::SPSC_CAPACITY).expect("SPSC channels setup failed")
+///
+/// # Errors
+///
+/// Propagates [`spsc::SpscSetupError`] when [`spsc::SPSC_CAPACITY`] is invalid
+/// (zero, or its ring capacity computation overflows).
+pub fn setup_communication_channels() -> Result<SpscChannels, spsc::SpscSetupError> {
+    spsc::setup_spsc(spsc::SPSC_CAPACITY)
 }
 
 /// Result of loading the initial neural model.
@@ -223,13 +228,13 @@ mod tests {
 
     #[test]
     fn test_setup_communication_channels() {
-        let channels = setup_communication_channels();
+        let channels = setup_communication_channels().expect("test SPSC setup");
         assert!(channels.param_consumer.slots() <= spsc::SPSC_CAPACITY);
     }
 
     #[test]
     fn test_load_initial_model_none() {
-        let mut channels = setup_communication_channels();
+        let mut channels = setup_communication_channels().expect("test SPSC setup");
         let sys = SystemSnapshot::capture();
         let result = load_initial_model(None, &sys, &mut channels.param_producer);
         assert!(result.full_wavenet_model_l.is_none());
@@ -239,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_load_initial_cabsim_none() {
-        let mut channels = setup_communication_channels();
+        let mut channels = setup_communication_channels().expect("test SPSC setup");
         let result = load_initial_cabsim(None, 128, &mut channels.cabsim_producer).unwrap();
         assert!(result.is_none());
     }

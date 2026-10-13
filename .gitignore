@@ -32,6 +32,8 @@ scratch.rs
 # Ignore extraneous json files but allow test fixtures
 *.json
 !tests/fixtures/**/*.json
+# Unified codegen symbol profile is JSON — do not ignore (T5.2)
+!utils/codegen-profile.json
 
 # Proptest regression files (automatically generated)
 *.proptest-regressions
@@ -65,3 +67,6 @@ __pycache__/
 
 # Local IDE tool artifacts
 /.kilo/
+
+# Performance baselines
+.performance-baselines/

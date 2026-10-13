@@ -1,0 +1,28 @@
+# Fixture freshness manifest — NAM-Audio-Pipe
+#
+# Schema shared with NeuralAmpModeler-rs `testing::freshness`:
+#   * `# FIXTURES` section lines are `<sha256>  <path relative to tests/fixtures>`
+#   * `# MODEL-REGISTRY: <file>` registers each committed `.nam` so the
+#     reverse orphan scan finds nothing unaccounted for.
+#
+# Provenance (origin / license) is recorded per fixture below as comments; the
+# parser ignores every `#` line, so these annotations never affect the gate.
+
+# FIXTURES
+2d2d744516dc0197737a2c5001010429692d4cb20d72b08264781de626fcf4ca  models/a2_example.nam
+422bf2dae9d72a1dd0ae6bbbfe8739fc12086193c09ef5a0936b8db4d531b90c  models/cabsim_ir_pgo.wav
+df9f78c49f49c2bb32411df47e3f53746075adb206b92d017e06379d1e56234a  models/lstm.nam
+ceb53469a19ce278e2235da982ae676cb8d5451a8de22a7ecc7a2617d07224d1  models/wavenet_a1_standard.nam
+b78568bb0b042ef6aa09600b4b62153c0bcd7e3694f131aa85ef38083df18fe6  models/wavenet_dyn_free.nam
+
+# MODEL-REGISTRY: a2_example.nam
+# MODEL-REGISTRY: lstm.nam
+# MODEL-REGISTRY: wavenet_a1_standard.nam
+# MODEL-REGISTRY: wavenet_dyn_free.nam
+
+# Provenance:
+#   models/wavenet_a1_standard.nam — Official Real; WaveNet A1 (CH=16) CC0 / S. Atkinson.
+#   models/a2_example.nam          — Synthetic; SlimmableContainer A2, Apache-2.0 / generate_a2_fixtures.py.
+#   models/lstm.nam                — Official Real; LSTM (1 layer, H=3) CC0 / S. Atkinson.
+#   models/wavenet_dyn_free.nam    — Synthetic; WaveNetDyn (CH=7/4) Apache-2.0 / generate_b1_2_fixtures.py.
+#   models/cabsim_ir_pgo.wav       — Synthetic public-domain CabSim IR (project-generated).

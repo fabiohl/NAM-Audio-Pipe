@@ -51,6 +51,8 @@
 //! gracefully and it deliberately consults no process-global flag, so tests
 //! flipping `SHUTDOWN` can never stall it).
 
+#[cfg(test)]
+use super::log_redirect::render_decoded_pipewire_log;
 use super::log_redirect::{decode_with_file, decode_with_topic, emit_decoded_pipewire_log};
 use pipewire::spa::sys::{spa_log_level, spa_log_topic};
 use std::ffi::{c_char, c_int};
@@ -262,6 +264,17 @@ pub(crate) fn bump_pw_log_dropped_for_test(delta: u64) {
     PW_LOG_DROPPED.fetch_add(delta, Ordering::Relaxed);
 }
 
+/// Test-only counter of total drained records (event-driven test synchronization).
+#[cfg(test)]
+pub(crate) static DRAINED_RECORDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only snapshot of total drained records.
+#[cfg(test)]
+pub(crate) fn drained_records_for_test() -> u64 {
+    DRAINED_RECORDS.load(Ordering::Acquire)
+}
+
 /// Cumulative count of PW log events discarded with a full ring (plan
 /// identifier: `pw_log_dropped`; telemetry-visible via `poll_rt_status`).
 #[must_use]
@@ -368,6 +381,18 @@ fn drain_loop(mut consumer: rtrb::Consumer<RtLogRecord>) {
     }
 }
 
+/// Formats a queued ring record into its target log level and message shape.
+#[cfg(test)]
+pub(crate) fn format_rt_record(record: &RtLogRecord) -> (log::Level, String) {
+    render_decoded_pipewire_log(
+        record.level,
+        record.topic_str(),
+        record.file_str(),
+        record.line,
+        record.msg_str(),
+    )
+}
+
 /// Drain-side replay: record → the shared dispatch shape of `log_redirect`,
 /// so sync and ring paths can never drift apart. Operates purely on copies
 /// of already-decoded strings; no foreign pointers.
@@ -379,6 +404,8 @@ fn emit_rt_record(record: &RtLogRecord) {
         record.line,
         record.msg_str(),
     );
+    #[cfg(test)]
+    DRAINED_RECORDS.fetch_add(1, Ordering::Release);
 }
 
 #[cfg(test)]

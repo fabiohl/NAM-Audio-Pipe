@@ -38,11 +38,8 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "info".to_string())
         .parse::<log::LevelFilter>()
         .unwrap_or(log::LevelFilter::Info);
-    let _logger = NamLogger::init(LoggerConfig {
-        level_filter,
-        emit_stderr: true,
-    })
-    .expect("Failed to initialize NamLogger backend");
+    let _logger = NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true))
+        .expect("Failed to initialize NamLogger backend");
 
     #[cfg(feature = "testing")]
     if std::env::var("NAM_DISABLE_GATE").is_ok() {
@@ -134,7 +131,7 @@ fn main() -> anyhow::Result<()> {
     signals::install_termination_signal_handlers()?;
 
     // 5. COMMUNICATION CHANNELS: Creates ultra-fast "pipes" for communication.
-    let channels = setup::setup_communication_channels();
+    let channels = setup::setup_communication_channels()?;
     let mut producer = channels.param_producer;
     let consumer = channels.param_consumer;
     let gc_producer = channels.gc_producer;

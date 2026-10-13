@@ -36,6 +36,17 @@ pub fn playback_state_changed_handler(
     new: pw::stream::StreamState,
     backend: &SharedBackendStatus,
 ) {
+    // S6-T4 / F-PR-11: re-arm the bring-up window on every fresh entry into
+    // `Streaming` so bridge drops during the startup ramp are attributed to
+    // the pre-roll ramp, not to clock drift.
+    if matches!(new, pw::stream::StreamState::Streaming)
+        && !matches!(old, pw::stream::StreamState::Streaming)
+    {
+        backend
+            .stream_status()
+            .playback_quantums
+            .store(0, Ordering::Relaxed);
+    }
     observe_stream_state("playback", old, new, backend);
 }
 
@@ -181,6 +192,19 @@ pub fn setup_playback_stream<'c>(
                             .store(pw_time.delay(), Ordering::Relaxed);
                     }
                     pb_frame_count = pb_frame_count.wrapping_add(1);
+                    // S6-T4 / F-PR-11: quantum counter for the bring-up window.
+                    // Saturate at the window size (no wrap) so a long-running
+                    // stream can never re-open the suppression window; the
+                    // counter is reset to 0 by the state handler on entering
+                    // `Streaming`.
+                    let quanta = stream_status_playback
+                        .playback_quantums
+                        .load(Ordering::Relaxed);
+                    if quanta < crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS {
+                        stream_status_playback
+                            .playback_quantums
+                            .store(quanta + 1, Ordering::Relaxed);
+                    }
 
                     playback_dsp_cycle(
                         stream,
