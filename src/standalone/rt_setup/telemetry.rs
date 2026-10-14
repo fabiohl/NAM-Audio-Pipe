@@ -424,6 +424,7 @@ pub fn poll_rt_status(
                         super::affinity::CpuSelectionReason::FullyIsolated { .. } => {
                             "Fully isolated core"
                         }
+                        _ => "Unclassified CPU selection reason",
                     },
                 );
 

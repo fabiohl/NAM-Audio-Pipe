@@ -475,6 +475,12 @@ fn pin_thread(cpu: Option<usize>) -> Result<(), PinThreadError> {
             Ok(())
         }
         Err(e @ PinThreadError::CpuOutOfBounds { .. }) => Err(e),
+        // `PinThreadError` is `#[non_exhaustive]`; an unknown future variant is
+        // best-effort treated like a syscall failure (warn and continue).
+        Err(e) => {
+            eprintln!("  warn: could not pin thread: {e}");
+            Ok(())
+        }
     }
 }
 

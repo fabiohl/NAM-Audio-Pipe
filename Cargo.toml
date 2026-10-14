@@ -81,7 +81,9 @@ required-features = ["testing"]
 # Cargo would pull the engine's default features and `--no-default-features`
 # could never reach the lean single-inference path (the engine default is
 # `dual-mono`).
-NeuralAmpModeler-rs = { version = "1.0.0", default-features = false, features = ["rt-hardening"] }
+NeuralAmpModeler-rs = { version = "1.0.0", default-features = false, features = [
+    "rt-hardening",
+] }
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
@@ -159,6 +161,3 @@ split-debuginfo = "unpacked"
 
 [lints.rust]
 raw_borrows_via_references = "warn"
-
-[patch.crates-io]
-NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }
