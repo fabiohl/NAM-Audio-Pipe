@@ -174,6 +174,10 @@ pub fn setup_capture_stream<'c>(
                     // The periodic drain in run_pipewire_host NEVER touches this
                     // slot — that would race with the RT flush below.
                     let parking_lot = unsafe { &mut *parking_lot_ptr };
+                    // SAFETY: `parking_lot_dirty_ptr` shares the same single-owner
+                    // handoff contract as `parking_lot_ptr` above; the RT callback is
+                    // the sole writer while the loop runs and the main thread drains
+                    // it off-RT only after `thread_loop.stop()`.
                     let parking_lot_dirty = unsafe { &*parking_lot_dirty_ptr };
 
                     // RT thread setup: performed on the first invocation of `process` on the
@@ -359,6 +363,8 @@ pub fn setup_capture_stream<'c>(
             &mut proc_storage,
         )?
     };
+    // SAFETY: `lat_storage` remains valid and unmodified for the duration of the
+    // synchronous `connect` call below (same contract as `proc_storage`).
     let lat_pod = unsafe {
         crate::standalone::pw_host::latency::build_latency_pod(
             pw::spa::sys::SPA_DIRECTION_INPUT,

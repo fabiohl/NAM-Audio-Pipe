@@ -64,6 +64,9 @@ fn dispatch_pipewire_log(
 ) {
     // Scoped decodes shared with the off-RT ring drain (`rt_log_ring`), so
     // both paths print with the exact same shape by construction.
+    // SAFETY: `topic`/`file` are NUL-terminated C strings supplied by PipeWire for
+    // the duration of this log call; the decode helpers read them inside scoped
+    // borrows only.
     unsafe {
         decode_with_topic(topic, |topic_str| {
             decode_with_file(file, |file_str| {

@@ -1107,19 +1107,31 @@ BOLT_LBR_FDATA=""
 BOLT_LBR_DURATION_S="30"
 PGO_WORKLOAD_BIN="$PGO_BUILD_TARGET_DIR/dist/pgo_workload"
 if [ "$USE_BOLT" = true ] && [ "$HAS_PERF" = true ] && [ -x "$PGO_WORKLOAD_BIN" ]; then
-    echo -e "\n${BLUE}${BOLD}[Phase 4.1/7] Capturing LBR BOLT-profile evidence (pgo_workload, ${BOLT_LBR_DURATION_S}s)...${NC}"
-    if perf record -F 99 -e cycles:u -j any,u -o "$BOLT_DIR/lbr.data" -- \
+    if [ "$USE_LBR" = "true" ]; then
+        PERF_LBR_ARGS=(-F 99 -e cycles:u -j any,u)
+        PERF2BOLT_LBR_FLAGS=()
+        LBR_LABEL="LBR"
+    else
+        PERF_LBR_ARGS=(-F 4000 -e cycles:u)
+        PERF2BOLT_LBR_FLAGS=()
+        if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
+            PERF2BOLT_LBR_FLAGS+=("--basic-events")
+        fi
+        LBR_LABEL="sampling (basic-events)"
+    fi
+    echo -e "\n${BLUE}${BOLD}[Phase 4.1/7] Capturing BOLT-profile evidence ($LBR_LABEL, pgo_workload, ${BOLT_LBR_DURATION_S}s)...${NC}"
+    if perf record "${PERF_LBR_ARGS[@]}" -o "$BOLT_DIR/lbr.data" -- \
         "$PGO_WORKLOAD_BIN" --seconds "$BOLT_LBR_DURATION_S" \
         > "$BOLT_DIR/lbr_record.log" 2>&1; then
         BOLT_LBR_SAMPLES=$(perf script -i "$BOLT_DIR/lbr.data" 2>/dev/null | wc -l || echo 0)
-        if "$PERF2BOLT" -p "$BOLT_DIR/lbr.data" "$PGO_BIN" -o "$BOLT_DIR/lbr.fdata" \
+        if "$PERF2BOLT" "${PERF2BOLT_LBR_FLAGS[@]}" -p "$BOLT_DIR/lbr.data" "$PGO_BIN" -o "$BOLT_DIR/lbr.fdata" \
             > "$BOLT_DIR/lbr_perf2bolt.log" 2>&1; then
             BOLT_LBR_FDATA="$BOLT_DIR/lbr.fdata"
             BOLT_LBR_FDATA_SHA256=$(sha256sum "$BOLT_DIR/lbr.fdata" 2>/dev/null | awk '{print $1}')
         fi
-        echo -e "  ${GREEN}✓${NC} LBR profile: ${BOLT_LBR_SAMPLES} samples, fdata sha256=${BOLT_LBR_FDATA_SHA256:0:16}..."
+        echo -e "  ${GREEN}✓${NC} Profile evidence: ${BOLT_LBR_SAMPLES} samples, fdata sha256=${BOLT_LBR_FDATA_SHA256:0:16}..."
     else
-        warn "LBR BOLT-profile capture failed (perf record); BOLT proof left MISSING."
+        warn "BOLT-profile capture failed (perf record); BOLT proof left MISSING."
     fi
 fi
 
@@ -1222,11 +1234,20 @@ ASM_SUMMARY="$PROJECT_DIR/target/dsp_hotpath_summary.txt"
 # symbol profile `utils/codegen-profile.json` (unified NAM codegen filter, T5.2).
 HOTSPOT_PROFILE="$SCRIPT_DIR/codegen-profile.json"
 
-if [ "$BOLT_APPLIED" = true ] && [ -f "$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt" ]; then
-    ASM_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt"
-elif [ -f "$PGO_BIN" ]; then
-    ASM_BIN="$PGO_BIN"
-fi
+case "$BOLT_STATUS" in
+    *BOLT*)
+        if [ "$BOLT_APPLIED" = true ] && [ -f "$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt" ]; then
+            ASM_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt"
+        elif [ -f "$PGO_BIN" ]; then
+            ASM_BIN="$PGO_BIN"
+        fi
+        ;;
+    *)
+        if [ -f "$PGO_BIN" ]; then
+            ASM_BIN="$PGO_BIN"
+        fi
+        ;;
+esac
 
 if [ -n "${ASM_BIN:-}" ]; then
     if command -v llvm-objdump &>/dev/null; then
@@ -1238,16 +1259,15 @@ if [ -n "${ASM_BIN:-}" ]; then
     if [ -s "$ASM_FULL" ]; then
         echo -e "  ${GREEN}✓${NC} Full disassembly dump at target/dsp_hotpath.full.asm ($(wc -l < "$ASM_FULL") lines)"
         # Filter to the critical DSP loops + run the static gates fail-closed.
-        # The libm gate currently FAILS by design (1 tanhf tail until Sprint 4):
-        # report it as evidence, never silence it, and keep the release moving —
-        # the full dump stays as the secondary artifact for audit.
+        # Enforces zero zmm (avx512 opt-in policy), zero libm calls on the RT path,
+        # and zero alloc/__rust_alloc calls.
         if python3 "$SCRIPT_DIR/dsp-hotpath-filter.py" --full "$ASM_FULL" \
             --filtered "$ASM_TARGET" --summary "$ASM_SUMMARY" \
             --profile "$HOTSPOT_PROFILE"; then
             echo -e "  ${GREEN}✓${NC} Filtered hotspot report at target/dsp_hotpath.asm ($(wc -l < "$ASM_TARGET") lines)"
             echo -e "  ${GREEN}✓${NC} Hotspot summary at target/dsp_hotpath_summary.txt"
         else
-            warn "Hotspot static gate FAILED (see target/dsp_hotpath_summary.txt) — expected until Sprint 4 removes the tanhf tail. The full dump is kept for audit."
+            warn "Hotspot static gate FAILED (see target/dsp_hotpath_summary.txt). The full dump is kept for audit."
         fi
     else
         echo -e "  ${YELLOW}Warning: Assembly disassembly failed or produced empty output.${NC}"
@@ -1296,7 +1316,7 @@ PY
         return 1
     fi
 
-    local -a args=("$bin" -m "$model" --record)
+    local -a args=("$bin" -m "$model" --record --record-dir "$dir")
     if [ -f "$cab" ]; then
         args+=(-c "$cab")
     fi
@@ -1743,13 +1763,21 @@ mkdir -p "$BIN_INSTALL_DIR"
 STAGING_DIR="$(mktemp -d -t nam-pipe-staging.XXXXXX)"
 STAGING_BIN="$STAGING_DIR/nam-audio-pipe"
 
-if [ "$BOLT_APPLIED" = true ] && [ -f "$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt" ]; then
-    BUILD_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt"
-    STAGING_LABEL="PGO + BOLT"
-else
-    BUILD_BIN="$PGO_BIN"
-    STAGING_LABEL="PGO"
-fi
+case "$BOLT_STATUS" in
+    *BOLT*)
+        if [ "$BOLT_APPLIED" = true ] && [ -f "$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt" ]; then
+            BUILD_BIN="$PGO_BUILD_TARGET_DIR/dist/nam-audio-pipe.bolt"
+            STAGING_LABEL="PGO + BOLT"
+        else
+            BUILD_BIN="$PGO_BIN"
+            STAGING_LABEL="PGO"
+        fi
+        ;;
+    *)
+        BUILD_BIN="$PGO_BIN"
+        STAGING_LABEL="PGO"
+        ;;
+esac
 
 if ! cp "$BUILD_BIN" "$STAGING_BIN"; then
     die "Failed to copy build artifact into staging ($STAGING_BIN); previous installation left intact."

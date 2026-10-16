@@ -875,6 +875,8 @@ impl FfiHarnessBuf {
     }
 
     fn fill_pattern(&mut self, byte: u8) {
+        // SAFETY: `f32` is plain old data and the byte length is exact, so the
+        // mutable byte view covers exactly the initialized sample buffer.
         let bytes: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(self.samples.as_mut_ptr() as *mut u8, self.maxsize())
         };

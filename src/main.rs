@@ -15,7 +15,9 @@
 //! - **ZERO ALLOCATIONS** in the Audio thread: The audio channel memory (`process()`) is always prepared 100% in advance. Audio never "requests more RAM" out of nowhere.
 
 use nam_audio_pipe::recording;
-use nam_audio_pipe::standalone::{cli, colors::Colorize, pw_host, rt_setup, setup, signals};
+use nam_audio_pipe::standalone::banner::{BannerRequest, CabStatus};
+use nam_audio_pipe::standalone::colors::{self, Colorize};
+use nam_audio_pipe::standalone::{cli, exit, pw_host, rt_setup, setup, signals};
 
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
@@ -38,8 +40,15 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| "info".to_string())
         .parse::<log::LevelFilter>()
         .unwrap_or(log::LevelFilter::Info);
-    let _logger = NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true))
-        .expect("Failed to initialize NamLogger backend");
+    let _logger = match NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true)) {
+        Ok(logger) => logger,
+        Err(e) => exit::exit_runtime_error(
+            exit::ExitKind::Backend,
+            format!("Failed to initialize the logging backend: {e}"),
+            "Set RUST_LOG or NAM_LOG_LEVEL to a valid level \
+             (error, warn, info, debug, trace).",
+        ),
+    };
 
     #[cfg(feature = "testing")]
     if std::env::var("NAM_DISABLE_GATE").is_ok() {
@@ -49,6 +58,9 @@ fn main() -> anyhow::Result<()> {
 
     // 1. READ CONFIGURATIONS: The system starts by reading what you typed in the terminal.
     // It figures out which "amplifier" file (.nam) you want to use and the initial volumes.
+    // The color policy is resolved from the environment before any output (help,
+    // errors, logs); an explicit `--color` flag parsed below overrides it.
+    colors::init_from_env();
     let args = cli::parse_args();
 
     let model_path = args.model_path;
@@ -71,13 +83,22 @@ fn main() -> anyhow::Result<()> {
         );
         let bundle =
             neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
-        println!("{}", bundle.render());
+        // `write_stdout` tolerates a closed pipe (e.g. `--diagnose | head`) instead
+        // of panicking like `println!`.
+        cli::write_stdout(&format!("{}\n", bundle.render()));
+        pw_host::restore_pipewire_logging();
         // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
         // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
         // `exit(0)` and is mutually exclusive with the main audio host run loop below.
-        pw_host::restore_pipewire_logging();
         unsafe {
             pipewire::deinit();
+        }
+        // F-UX-05: the `.desktop` "Diagnostics" action passes `--pause` so the
+        // launcher's terminal stays open long enough to read the support block.
+        // The helper requires both stdin and stdout to be terminals, so a
+        // redirected stdin can never block automation on an unread read.
+        if args.pause {
+            nam_audio_pipe::standalone::launcher::pause_if_interactive();
         }
         std::process::exit(0);
     }
@@ -98,8 +119,14 @@ fn main() -> anyhow::Result<()> {
     // loop thread is pinned to the housekeeping set below, the recording
     // worker pins itself at spawn, the PipeWire thread-loop thread pins via
     // its event source and the RT data thread keeps `configure_realtime_thread`.
-    let cpu_receipt = rt_setup::select_optimal_cpu_with_receipt(args.cpu)
-        .expect("CPU selection receipt is always produced by the system source");
+    let Some(cpu_receipt) = rt_setup::select_optimal_cpu_with_receipt(args.cpu) else {
+        exit::exit_runtime_error(
+            exit::ExitKind::Backend,
+            "CPU selection did not produce a receipt.",
+            "Re-run with --diagnose to inspect the CPU topology; the audio host \
+             cannot start without an RT-core decision.",
+        );
+    };
     // T9.1(a): the main thread runs the control loop, GC drains, handlers and
     // telemetry — pure housekeeping work. Pin it away from the RT core so the
     // DSP data thread stays exclusive. A kernel rejection is logged inside the
@@ -120,13 +147,14 @@ fn main() -> anyhow::Result<()> {
         .bold()
     );
 
-    // 4. EMERGENCY BUTTON: Configures "Ctrl+C" (SIGINT) and service shutdown
-    // (SIGTERM). The staged handler in `standalone::signals` is async-signal-safe:
-    // the first signal cooperatively sets the process-global `SHUTDOWN` flag so
-    // the main loop stops the audio cleanly (thread_loop.stop, recording drain,
-    // WAV header rewrite + fsync); further signals inside the 500 ms grace
-    // window are swallowed (exactly one graceful shutdown), and only a signal
-    // after the window expires force-exits via `_exit(1)`.
+    // 4. EMERGENCY BUTTON: Configures "Ctrl+C" (SIGINT), service shutdown
+    // (SIGTERM), terminal hang-up (SIGHUP) and quit (SIGQUIT). The staged handler
+    // in `standalone::signals` is async-signal-safe: the first signal cooperatively
+    // sets the process-global `SHUTDOWN` flag so the main loop stops the audio
+    // cleanly (thread_loop.stop, recording drain, WAV header rewrite + fsync);
+    // further signals inside the grace window (500 ms, widened to 5 s while a
+    // recording is active) are swallowed (exactly one graceful shutdown), and
+    // only a signal after the window expires force-exits via `_exit(1)`.
     // Installation validates every `libc::sigaction` return code.
     signals::install_termination_signal_handlers()?;
 
@@ -159,13 +187,28 @@ fn main() -> anyhow::Result<()> {
     // this is where the computer opens that WAV file and builds the convolution engine.
     // The UPOLS partition comes from `--cabsim-partition` (never from the
     // quantum), fixing the published cab-sim latency in samples.
-    let (ir_raw_samples, ir_source_rate) = match setup::load_initial_cabsim(
+    let (ir_raw_samples, ir_source_rate, cab_status) = match setup::load_initial_cabsim(
         args.cab_path.as_deref(),
         args.cabsim_partition,
+        args.cab_optional,
         &mut cabsim_producer,
-    )? {
-        Some(ir) => (Some(ir.raw_samples), ir.source_rate),
-        None => (None, 0),
+    ) {
+        Ok(Some(ir)) => (Some(ir.raw_samples), ir.source_rate, CabStatus::Loaded),
+        Ok(None) => (
+            None,
+            0,
+            if args.cab_path.is_some() {
+                CabStatus::SkippedOptional
+            } else {
+                CabStatus::Absent
+            },
+        ),
+        Err(e) => exit::exit_runtime_error(
+            exit::ExitKind::CabIr,
+            format!("{e:#}"),
+            "The cab-sim IR could not be loaded. Verify it is a valid .wav impulse \
+             response, or pass --cab-optional to continue without cab-sim.",
+        ),
     };
 
     // Initial gains
@@ -227,6 +270,7 @@ fn main() -> anyhow::Result<()> {
     // bounded timeout even if the PipeWire host returns early via `?`, and the
     // guard's shutdown outcome propagates recording failures into the process
     // exit code.
+    let mut banner_recording_dir: Option<PathBuf> = None;
     let (recording_data_available, recording_status, recording_worker) = if args.record {
         let (sender, receiver) = recording::create_recording_transport();
         let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -237,7 +281,36 @@ fn main() -> anyhow::Result<()> {
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed_for_thread = Arc::clone(&failed_flag);
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // F-UX-11: resolve the capture directory (--record-dir → XDG music →
+        // ~/Music → CWD) and create it eagerly; the worker's probe stays the
+        // fail-fast gate that reports EROFS/EACCES with an actionable hint.
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let (base_dir, cwd_fallback) = cli::resolve_record_dir(
+            args.record_dir.as_deref(),
+            std::env::var_os("XDG_MUSIC_DIR").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            &cwd,
+        );
+        if cwd_fallback {
+            log::warn!(
+                "Neither $XDG_MUSIC_DIR nor $HOME is set; recording into the \
+                 current directory: {} (use --record-dir to override).",
+                base_dir.display()
+            );
+        }
+        if let Err(e) = std::fs::create_dir_all(&base_dir) {
+            exit::exit_runtime_error(
+                exit::ExitKind::Recording,
+                format!(
+                    "Failed to create the recording directory {}: {e}",
+                    base_dir.display()
+                ),
+                "Check that the path is writable (read-only mount? permissions?) \
+                 and that its parent directory exists, or pass --record-dir <DIR>.",
+            );
+        }
+        log::info!("💾 Recording directory: {}", base_dir.display());
+        banner_recording_dir = Some(base_dir.clone());
         let init = recording::RecordingInit::new(
             recording_status.clone(),
             init_tx,
@@ -260,13 +333,12 @@ fn main() -> anyhow::Result<()> {
             Ok(h) => h,
             Err(e) => {
                 log::error!("🛑 Failed to spawn recording worker: {e}");
-                eprintln!(
-                    "{}",
-                    format!("Failed to spawn recording worker: {e}")
-                        .bright_red()
-                        .bold()
+                exit::exit_runtime_error(
+                    exit::ExitKind::Recording,
+                    format!("Failed to spawn recording worker: {e}"),
+                    "The recording disk-I/O thread could not be created. Check the \
+                     process/thread limit (`ulimit -u`) and available memory, then retry.",
                 );
-                std::process::exit(1);
             }
         };
 
@@ -279,14 +351,22 @@ fn main() -> anyhow::Result<()> {
                     "🎙️  Recording worker ready — capture directory: {}",
                     dir.display()
                 );
+                // A recording is in flight: widen the termination grace window so
+                // a second Ctrl+C arriving while the capture is drained, its
+                // header rewritten and `fsync`ed is swallowed instead of
+                // force-exiting mid-finalization (F-UX-04). The worker guard
+                // disarms the window when shutdown completes.
+                signals::arm_recording_grace_window();
             }
             Err(e) => {
                 log::error!("🛑 Recording startup FAILED: {e}");
-                eprintln!(
-                    "{}",
-                    format!("Recording startup FAILED: {e}").bright_red().bold()
+                exit::exit_runtime_error(
+                    exit::ExitKind::Recording,
+                    format!("Recording startup FAILED: {e}"),
+                    "Verify the capture directory is writable (pass --record-dir <DIR>), \
+                     that it has free space, and that the kernel allows io_uring \
+                     (`/proc/sys/kernel/io_uring_disabled`).",
                 );
-                std::process::exit(1);
             }
         }
 
@@ -304,6 +384,18 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Run the PipeWire host (blocking)
+    // F-UX-13: the static banner facts (model, cab-sim state, capture dir) are
+    // resolved here; the host loop adds the runtime facts from `rt_status` and
+    // emits one consolidated status banner after the first RT confirmations.
+    let banner_request = BannerRequest {
+        model_arch: if model_architecture.is_empty() {
+            None
+        } else {
+            Some(model_architecture)
+        },
+        cab: cab_status,
+        recording_dir: banner_recording_dir,
+    };
     let res = pw_host::run_pipewire_host(
         consumer,
         gc_producer,
@@ -327,8 +419,11 @@ fn main() -> anyhow::Result<()> {
             oversample: args.oversample,
             cpu_receipt,
             fail_fast: args.fail_fast,
+            reconnect_timeout: args.reconnect_timeout,
             gate_config: args.gate,
             stream_status: None,
+            recording_status: recording_status.clone(),
+            banner: banner_request,
         },
         gc_consumer,
         slimmable_consumer,
@@ -350,11 +445,11 @@ fn main() -> anyhow::Result<()> {
     // Signal shutdown to bypass panic hook during cleanup
     neural_amp_modeler_rs::common::panic_hook::set_shutdown_in_progress();
 
+    pw_host::restore_pipewire_logging();
     // SAFETY: `pipewire::init()` was called during startup for the audio host run loop.
     // The host loop, worker threads, and streams have completed teardown before this point.
     // This `deinit` executes exactly once on the normal host shutdown path (mutually exclusive
-    // with the early-exit `diagnose_bundle` branch at line 77).
-    pw_host::restore_pipewire_logging();
+    // with the early-exit `diagnose_bundle` branch above).
     unsafe {
         pipewire::deinit();
     }
@@ -362,12 +457,15 @@ fn main() -> anyhow::Result<()> {
         Ok(outcome) => outcome,
         // A fatal backend failure surfaced by the host
         // (PipeWire daemon crash/restart, stream Error, post-streaming
-        // disconnect) becomes a non-zero process exit — `main` returns
-        // `Result`, so the runtime reports the error and exits with code 1.
-        // The process never exits 0 after losing the audio backend.
+        // disconnect) becomes the classified `Backend` process exit (code 5);
+        // the process never exits 0 after losing the audio backend.
         Err(e) => {
             log::error!("🛑 PipeWire backend terminated with an error: {e:#}");
-            return Err(e);
+            exit::exit_runtime_error(
+                exit::ExitKind::Backend,
+                format!("{e:#}"),
+                exit::BACKEND_UNREACHABLE_HINT,
+            );
         }
     };
 

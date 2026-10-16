@@ -226,6 +226,9 @@ pub(crate) fn try_offload(
     // Decode at capture time (this context), inside scoped borrows: same
     // pointer-deref pattern as the synchronous dispatch; after the copy the
     // drainer never dereferences foreign pointers. Zero allocation.
+    // SAFETY: `topic`/`file` are NUL-terminated C strings supplied by PipeWire for
+    // the duration of this capture; the decode helpers read them inside scoped
+    // borrows only.
     unsafe {
         decode_with_topic(topic, |topic_str| {
             decode_with_file(file, |file_str| {

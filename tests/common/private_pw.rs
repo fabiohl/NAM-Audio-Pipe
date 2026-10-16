@@ -148,6 +148,8 @@ context.modules = [
     pub fn kill_hard(&mut self) {
         if let Some(mut child) = self.child.take() {
             let pid = child.id() as libc::pid_t;
+            // SAFETY: `pid` comes from the owned `Child` handle and no memory is
+            // dereferenced; the child is reaped right after.
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
             }
@@ -159,6 +161,8 @@ context.modules = [
     pub fn freeze(&self) {
         if let Some(child) = &self.child {
             let pid = child.id() as libc::pid_t;
+            // SAFETY: `pid` comes from the live owned `Child` handle; no memory is
+            // dereferenced.
             unsafe {
                 libc::kill(pid, libc::SIGSTOP);
             }
@@ -169,6 +173,8 @@ context.modules = [
     pub fn thaw(&self) {
         if let Some(child) = &self.child {
             let pid = child.id() as libc::pid_t;
+            // SAFETY: `pid` comes from the live owned `Child` handle; no memory is
+            // dereferenced.
             unsafe {
                 libc::kill(pid, libc::SIGCONT);
             }

@@ -346,8 +346,11 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 cpu_receipt: common::deterministic_cpu_receipt(),
                 // Fail-fast under the deterministic harness (see pw_integration).
                 fail_fast: true,
+                reconnect_timeout: None,
                 gate_config: cli::GateConfig::default_on(),
                 stream_status: None,
+                recording_status: None,
+                banner: Default::default(),
             },
             gc_cons,
             sl_cons,

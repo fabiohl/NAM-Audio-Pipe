@@ -62,7 +62,10 @@ fn watchdog_child_exiting_before_timeout_is_reaped_without_signal() {
     // The child was reaped by the caller via the owned handle; `kill(pid, 0)`
     // must report ESRCH (no such process) — not a zombie, and nothing left
     // for a recycled-PID signal to hit.
+    // SAFETY: `kill(pid, 0)` is a null-signal probe on a PID obtained from the
+    // owned `Child` handle; no memory is dereferenced.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    // SAFETY: `__errno_location` returns this thread's valid errno pointer.
     assert_eq!(unsafe { *libc::__errno_location() }, libc::ESRCH);
 }
 
@@ -85,7 +88,10 @@ fn watchdog_timeout_kills_via_handle_and_reaps() {
         "a child that outlives the deadline must yield None"
     );
 
+    // SAFETY: `kill(pid, 0)` is a null-signal probe on the reaped child's PID; no
+    // memory is dereferenced.
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    // SAFETY: `__errno_location` returns this thread's valid errno pointer.
     assert_eq!(unsafe { *libc::__errno_location() }, libc::ESRCH);
 }
 
@@ -164,4 +170,23 @@ fn watchdog_returns_within_deadline_plus_grace_with_fd_inheriting_grandchild() {
         elapsed < std::time::Duration::from_secs(2),
         "the probe must not wait out the fd-inheriting grandchild (5 s): {elapsed:?}"
     );
+}
+
+#[test]
+fn force_nonblocking_surfaces_invalid_fd_without_panicking() {
+    // An invalid descriptor makes `fcntl(F_GETFL)` fail; the helper must log an
+    // `E2113` warn and return instead of panicking, leaving poll-gated reads as
+    // the bound. `F_GETFL` is the shared entry for every `fcntl` failure mode.
+    crate::standalone::test_logger::with_logger_level(log::LevelFilter::Trace, || {
+        force_nonblocking(-1);
+        let records = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
+            .map(|buffer| buffer.snapshot())
+            .unwrap_or_default();
+        assert!(
+            records
+                .iter()
+                .any(|r| r.message.contains("E2113") && r.message.contains("F_GETFL")),
+            "an invalid fd must surface an E2113/F_GETFL warn record, got: {records:?}"
+        );
+    });
 }

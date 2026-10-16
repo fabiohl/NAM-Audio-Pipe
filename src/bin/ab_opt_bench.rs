@@ -784,6 +784,7 @@ enum TopoFilter {
     Lstm,
 }
 
+#[derive(Debug)]
 struct Cfg {
     variant: String,
     runs: usize,
@@ -816,55 +817,68 @@ impl Default for Cfg {
     }
 }
 
-fn parse_args() -> Cfg {
+const USAGE: &str = "usage: ab_opt_bench [--variant NAME] [--runs N] [--blocks N] [--warmup N] \
+                     [--rate Hz] [--quantum N] [--oversample Off|2x|4x] [--cabsim ir|bypass] \
+                     [--topology all|a1|a2|lstm] [--cpu N] [--receipt PATH]";
+
+/// Parses the CLI arguments into a [`Cfg`].
+///
+/// Returns a typed usage error (never panics) so the caller can report it and
+/// exit with the conventional usage status `2`. `--help`/`-h` and `--variant`
+/// keep their existing behaviour.
+fn parse_args_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cfg, String> {
     let mut cfg = Cfg::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--variant" => cfg.variant = args.next().expect("--variant <name>"),
+            "--variant" => {
+                cfg.variant = args
+                    .next()
+                    .ok_or_else(|| "--variant <name> requires a value".to_string())?;
+            }
             "--runs" => {
                 cfg.runs = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--runs <N>")
+                    .ok_or_else(|| "--runs requires a numeric value <N>".to_string())?;
             }
             "--blocks" => {
                 cfg.blocks = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--blocks <N>")
+                    .ok_or_else(|| "--blocks requires a numeric value <N>".to_string())?;
             }
             "--warmup" => {
                 cfg.warmup = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--warmup <N>")
+                    .ok_or_else(|| "--warmup requires a numeric value <N>".to_string())?;
             }
             "--rate" => {
                 cfg.rate = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--rate <Hz>")
+                    .ok_or_else(|| "--rate requires a numeric value <Hz>".to_string())?;
             }
             "--quantum" => {
                 cfg.quantum = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--quantum <N>")
+                    .ok_or_else(|| "--quantum requires a numeric value <N>".to_string())?;
             }
             "--oversample" => {
                 cfg.os = match args.next().as_deref() {
                     Some("Off") => MODE_OFF,
                     Some("2x") => MODE_2X,
                     Some("4x") => MODE_4X,
-                    other => panic!("--oversample must be Off|2x|4x, got {other:?}"),
+                    other => return Err(format!("--oversample must be Off|2x|4x, got {other:?}")),
                 };
             }
             "--cabsim" => {
                 cfg.cabsim_ir = match args.next().as_deref() {
                     Some("ir") => true,
                     Some("bypass") => false,
-                    other => panic!("--cabsim must be ir|bypass, got {other:?}"),
+                    other => return Err(format!("--cabsim must be ir|bypass, got {other:?}")),
                 };
             }
             "--topology" => {
@@ -873,35 +887,53 @@ fn parse_args() -> Cfg {
                     Some("a1") => TopoFilter::A1,
                     Some("a2") => TopoFilter::A2,
                     Some("lstm") => TopoFilter::Lstm,
-                    other => panic!("--topology must be all|a1|a2|lstm, got {other:?}"),
+                    other => {
+                        return Err(format!("--topology must be all|a1|a2|lstm, got {other:?}"));
+                    }
                 };
             }
             "--cpu" => {
                 cfg.cpu = args.next().and_then(|v| v.parse().ok());
             }
             "--receipt" => {
-                cfg.receipt_json = PathBuf::from(args.next().expect("--receipt <path>"));
+                cfg.receipt_json = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--receipt <path> requires a value".to_string())?,
+                );
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "usage: ab_opt_bench [--variant NAME] [--runs N] [--blocks N] [--warmup N] \
-                     [--rate Hz] [--quantum N] [--oversample Off|2x|4x] [--cabsim ir|bypass] \
-                     [--topology all|a1|a2|lstm] [--cpu N] [--receipt PATH]"
-                );
+                eprintln!("{USAGE}");
                 std::process::exit(0);
             }
-            other => panic!("unknown argument {other} (see --help)"),
+            other => return Err(format!("unknown argument {other}")),
         }
     }
     if let Ok(path) = std::env::var(RECEIPT_ENV) {
         cfg.receipt_json = PathBuf::from(path);
     }
-    assert!(cfg.runs >= 1, "--runs must be >= 1");
-    assert!(cfg.blocks >= 1000, "--blocks must be >= 1000");
+    if cfg.runs < 1 {
+        return Err("--runs must be >= 1".to_string());
+    }
+    if cfg.blocks < 1000 {
+        return Err("--blocks must be >= 1000".to_string());
+    }
     if cfg.cpu.is_none() {
         cfg.cpu = select_optimal_cpu();
     }
-    cfg
+    Ok(cfg)
+}
+
+/// Parses the process arguments, exiting with status `2` and the usage block on
+/// a malformed invocation (never panicking on bad argv).
+fn parse_args() -> Cfg {
+    match parse_args_from(std::env::args().skip(1)) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("ab_opt_bench: {msg}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

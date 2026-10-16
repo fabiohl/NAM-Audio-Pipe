@@ -11,6 +11,7 @@ use crate::recording::buffer::{
     RingPayload,
 };
 use crate::recording::transport::{RecordingReceiver, RecordingSender, create_recording_transport};
+use crate::standalone::exit::ExitKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
@@ -322,8 +323,8 @@ fn shutdown_reports_success_with_loss_when_overruns_were_counted() {
         );
         assert_eq!(
             outcome.exit_code(),
-            1,
-            "SuccessWithLoss must map to a non-zero exit"
+            ExitKind::Recording.code(),
+            "SuccessWithLoss must map to the recording failure class"
         );
         assert_eq!(
             exit_reason.load(Ordering::Acquire),
@@ -369,8 +370,8 @@ fn shutdown_reports_success_with_loss_when_pool_slot_was_leaked() {
         );
         assert_eq!(
             outcome.exit_code(),
-            1,
-            "SuccessWithLoss must map to a non-zero exit"
+            ExitKind::Recording.code(),
+            "SuccessWithLoss must map to the recording failure class"
         );
         assert_eq!(
             exit_reason.load(Ordering::Acquire),

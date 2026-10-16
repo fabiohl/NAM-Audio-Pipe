@@ -84,6 +84,36 @@ fn mark_running_and_degraded_are_observable() {
 }
 
 #[test]
+fn is_running_mirrors_state_transitions() {
+    let backend = SharedBackendStatus::new();
+    assert!(!backend.is_running(), "Starting is not Running");
+
+    backend.mark_running();
+    assert!(backend.is_running());
+
+    // Leaving Running (Degraded here) clears the lock-free mirror.
+    backend.mark_degraded("contract");
+    assert!(!backend.is_running());
+
+    // Both streams active drives Starting → Running and sets the mirror.
+    let backend = SharedBackendStatus::new();
+    backend.set_stream_active("capture", true);
+    assert!(!backend.is_running(), "one active stream is not enough");
+    backend.set_stream_active("playback", true);
+    assert!(backend.is_running());
+
+    // One stream dropping returns to Starting and clears the mirror.
+    backend.set_stream_active("playback", false);
+    assert!(!backend.is_running());
+
+    // A sticky failure and the reconnect transition both keep it false.
+    backend.mark_failed("capture", "boom");
+    assert!(!backend.is_running());
+    backend.begin_reconnect(1, 6, Duration::from_millis(250));
+    assert!(!backend.is_running());
+}
+
+#[test]
 fn mark_failed_is_sticky_and_exposes_detail() {
     let backend = SharedBackendStatus::new();
     backend.mark_failed("capture", "daemon disconnected");

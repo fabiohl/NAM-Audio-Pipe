@@ -94,6 +94,11 @@ anyhow = "1.0.104"
 libc = "0.2.190"
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false }
+# Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs,
+# D3): the engine-owned unified receipt schema has no `fail_reason` field, so
+# the cause is emitted to a sibling `*.fail-reasons.json` JSONL. Already in the
+# dependency tree transitively via NeuralAmpModeler-rs.
+serde_json = "1"
 
 [features]
 default = ["dual-mono"]
@@ -119,13 +124,17 @@ proptest = "1.12.0"
 # Distribution QA harness: strict XML well-formedness parsing for
 # the AppStream metainfo audit (tests/distribution_qa.rs).
 quick-xml = "0.42"
-# Distribution QA harness: JSON parsing + SHA-256 verification of
-# the release provenance receipt (tests/distribution_qa.rs).
-serde_json = "1"
+# Distribution QA harness: SHA-256 verification of the release provenance
+# receipt (tests/distribution_qa.rs). JSON parsing uses the normal `serde_json`
+# dependency declared above (available to test targets as well).
 sha2 = "0.11"
 
 [lints.clippy]
 allow_attributes = "warn"
+# Every `unsafe` block/expression must carry a `// SAFETY:` comment documenting
+# its invariant and pointer provenance; enforces the §4 hygiene contract by
+# machine instead of by line-count heuristic.
+undocumented_unsafe_blocks = "warn"
 
 # Profile Configuration: `dist` intentionally inherits `panic = "unwind"` from `release`.
 #

@@ -55,6 +55,9 @@ pub unsafe fn build_process_latency_pod(
         rate: latency_samples as i32,
         ns: latency_ns,
     };
+    // SAFETY: `builder` is a zeroed struct initialized by `spa_pod_builder_init`
+    // over `storage`'s live, 8-byte-aligned buffer; the built pod is validated
+    // against that same storage before being returned.
     unsafe {
         pw::spa::sys::spa_pod_builder_init(
             &mut builder,
@@ -96,6 +99,9 @@ pub unsafe fn build_latency_pod(
         min_ns: latency_ns,
         max_ns: latency_ns,
     };
+    // SAFETY: `builder` is a zeroed struct initialized by `spa_pod_builder_init`
+    // over `storage`'s live, 8-byte-aligned buffer; the built pod is validated
+    // against that same storage before being returned.
     unsafe {
         pw::spa::sys::spa_pod_builder_init(
             &mut builder,
@@ -182,6 +188,8 @@ mod tests {
         pw::init();
         let mut storage = SpaPodStorage::new();
         let (samples, ns) = compute_dsp_latency(128, 0, 48_000);
+        // SAFETY: `storage` is a live stack-local buffer kept alive and unmodified
+        // for the lifetime of the returned pod.
         let pod = unsafe { build_process_latency_pod(samples, ns, &mut storage) }
             .expect("process latency pod build");
 
@@ -190,7 +198,9 @@ mod tests {
         assert!(addr.is_multiple_of(8));
 
         // Parse back using libspa FFI to verify field accuracy
+        // SAFETY: `parsed` is overwritten by the parse call and `pod` is the live pod.
         let mut parsed: pw::spa::sys::spa_process_latency_info = unsafe { std::mem::zeroed() };
+        // SAFETY: `pod.as_raw_ptr()` is a valid built POD and `parsed` is writable.
         let ret = unsafe { pw::spa::sys::spa_process_latency_parse(pod.as_raw_ptr(), &mut parsed) };
         assert_eq!(ret, 0);
         assert_eq!(parsed.rate, 128);
@@ -202,6 +212,8 @@ mod tests {
         pw::init();
         let mut storage = SpaPodStorage::new();
         let (samples, ns) = compute_dsp_latency(64, 16, 48_000);
+        // SAFETY: `storage` is a live stack-local buffer kept alive and unmodified
+        // for the lifetime of the returned pod.
         let pod = unsafe {
             build_latency_pod(
                 pw::spa::sys::SPA_DIRECTION_OUTPUT,
@@ -217,7 +229,9 @@ mod tests {
         assert!(addr.is_multiple_of(8));
 
         // Parse back using libspa FFI
+        // SAFETY: `parsed` is overwritten by the parse call and `pod` is the live pod.
         let mut parsed: pw::spa::sys::spa_latency_info = unsafe { std::mem::zeroed() };
+        // SAFETY: `pod.as_raw_ptr()` is a valid built POD and `parsed` is writable.
         let ret = unsafe { pw::spa::sys::spa_latency_parse(pod.as_raw_ptr(), &mut parsed) };
         assert_eq!(ret, 0);
         assert_eq!(parsed.direction, pw::spa::sys::SPA_DIRECTION_OUTPUT);

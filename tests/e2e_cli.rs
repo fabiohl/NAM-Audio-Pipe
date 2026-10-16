@@ -13,6 +13,27 @@ fn binary() -> Command {
     Command::new(path)
 }
 
+/// Runs `command` capturing stdout/stderr, failing the test if it does not
+/// exit within `timeout` (the child is then killed, so a hung host never
+/// blocks the suite).
+fn output_with_timeout(mut command: Command, timeout: std::time::Duration) -> std::process::Output {
+    use std::process::Stdio;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().expect("failed to spawn binary");
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            return child.wait_with_output().expect("collect child output");
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("binary did not exit within {timeout:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn help_flag_exits_zero_and_prints_usage() {
     let output = binary()
@@ -384,7 +405,7 @@ fn gate_numeric_thresholds_accepted_in_diagnose() {
 fn invalid_gate_threshold_exits_with_error_before_pipewire() {
     // Out-of-domain thresholds (both as typed negatives and as positive values
     // auto-normalized past the -20 dBFS safety ceiling) must fail fast with
-    // exit code 1 and a didactic message BEFORE any PipeWire connection.
+    // the usage exit code (2) and a didactic message BEFORE any PipeWire connection.
     for value in ["-120", "-100", "-10", "10", "15"] {
         let output = binary()
             .args(["--gate", value])
@@ -393,8 +414,8 @@ fn invalid_gate_threshold_exits_with_error_before_pipewire() {
 
         assert_eq!(
             output.status.code(),
-            Some(1),
-            "expected exit code 1 when passing --gate {value}, got: {:?}",
+            Some(2),
+            "expected usage exit code 2 when passing --gate {value}, got: {:?}",
             output.status
         );
 
@@ -420,4 +441,287 @@ fn invalid_gate_threshold_exits_with_error_before_pipewire() {
             stderr
         );
     }
+}
+
+// --input file validation (F-UX-12) ----------------------------------------
+// An explicitly provided --model/--cab that does not resolve to a readable
+// regular file is a legitimate *argument* error: it must fail fast with the
+// usage exit code (2) and the resolved absolute path, before any PipeWire
+// connection.
+
+#[test]
+fn missing_model_path_exits_with_argument_error_before_pipewire() {
+    let output = binary()
+        .args(["--model", "/nonexistent/definitely/missing_model.nam"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing --model must exit with the usage code 2, got: {:?}",
+        output.status
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error"),
+        "stderr should contain 'Argument error', got: {stderr}"
+    );
+    assert!(
+        stderr.contains("--model") && stderr.contains("not found"),
+        "stderr should name --model and the missing path, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("PipeWire"),
+        "validation must reject before any PipeWire connection, got: {stderr}"
+    );
+}
+
+#[test]
+fn directory_as_model_path_exits_with_argument_error() {
+    let output = binary()
+        .args(["--model", "/tmp"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Argument error") && stderr.contains("not a regular file"),
+        "a directory passed to --model must be rejected didactically, got: {stderr}"
+    );
+}
+
+// --color policy (F-UX-10) -------------------------------------------------
+
+#[test]
+fn color_always_forces_ansi_in_help() {
+    let output = binary()
+        .args(["--color", "always", "--help"])
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('\u{1b}'),
+        "--color always must emit ANSI even when stdout is a pipe, got: {stdout:?}"
+    );
+}
+
+#[test]
+fn no_color_env_disables_ansi_in_help() {
+    // Acceptance (F-UX-10): `NO_COLOR=1 … --help | grep -c $'\x1b'` == 0.
+    let output = binary()
+        .env("NO_COLOR", "1")
+        .arg("--help")
+        .output()
+        .expect("failed to execute binary");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "NO_COLOR=1 must suppress every ANSI sequence, got: {stdout:?}"
+    );
+}
+
+// --BrokenPipe tolerance (F-UX-03) -----------------------------------------
+// `nam-audio-pipe --help | head -1` closes the pipe while the process is still
+// writing; the write must be tolerated (no `println!` panic).
+
+#[test]
+fn help_with_closed_stdout_pipe_does_not_panic() {
+    use std::process::Stdio;
+
+    let mut child = binary()
+        .arg("--help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+
+    // Close the read end immediately so any subsequent write hits EPIPE.
+    drop(child.stdout.take());
+
+    let output = child.wait_with_output().expect("wait for binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "--help must tolerate a closed stdout pipe, got: {stderr}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "--help must exit 0 even with a closed pipe, got: {:?} / {stderr}",
+        output.status
+    );
+}
+
+// --runtime error classes (F-UX-06/07/08) ----------------------------------
+// A file that exists (so it passes the argument pre-validation) but cannot be
+// loaded is a *runtime* failure: it must be labelled with its own class and
+// exit with the documented code, never as "Argument error".
+
+#[test]
+fn unloadable_model_fixtures_exit_with_model_code() {
+    let dir = std::env::temp_dir().join(format!("nam_s2_models_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let empty = dir.join("empty.nam");
+    std::fs::write(&empty, b"").expect("write empty fixture");
+    let truncated = dir.join("truncated.nam");
+    std::fs::write(&truncated, b"{\"version\"").expect("write truncated fixture");
+    let future = dir.join("future.nam");
+    std::fs::write(
+        &future,
+        br#"{"version":"9.9.9","architecture":"WaveNet","config":{},"weights":[]}"#,
+    )
+    .expect("write future-version fixture");
+
+    for fixture in [&empty, &truncated, &future] {
+        let output = binary()
+            .args(["--model", fixture.to_str().expect("utf-8 fixture path")])
+            .output()
+            .expect("failed to execute binary");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "an unloadable model must exit with the model code 3 ({}): {stderr}",
+            fixture.display()
+        );
+        assert!(
+            stderr.contains("Model"),
+            "the error line must name the Model class, got: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Argument error"),
+            "a load failure is not an argument error, got: {stderr}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn explicit_unloadable_cab_is_fatal_with_cab_code() {
+    let dir = std::env::temp_dir().join(format!("nam_s2_cab_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    let bad = dir.join("bad.wav");
+    std::fs::write(&bad, b"not a wav file at all").expect("write bad IR fixture");
+
+    let output = binary()
+        .args(["--cab", bad.to_str().expect("utf-8 IR path")])
+        .output()
+        .expect("failed to execute binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "an explicit unloadable --cab must be fatal with the cab-IR code 4: {stderr}"
+    );
+    assert!(
+        stderr.contains("Cab IR"),
+        "the error line must name the Cab IR class, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Argument error"),
+        "a load failure is not an argument error, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pipewire_first_connection_failure_exits_backend_with_hint() {
+    // A fresh, empty runtime dir makes the very first `context.connect` fail:
+    // the startup failure must carry a remediation hint and the backend exit
+    // code, never a raw panic/backtrace.
+    let rt = std::env::temp_dir().join(format!("nam_s2_rt_{}", std::process::id()));
+    std::fs::create_dir_all(&rt).expect("create empty runtime dir");
+    let mut command = binary();
+    command
+        .env("PIPEWIRE_RUNTIME_DIR", &rt)
+        .env("XDG_RUNTIME_DIR", &rt)
+        .args(["--fail-fast", "--gate", "off"]);
+    let output = output_with_timeout(command, std::time::Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(5),
+        "a first-connection failure must exit with the backend code 5: {stderr}"
+    );
+    assert!(
+        stderr.contains("systemctl --user"),
+        "the remediation hint must be reachable, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "no panic backtrace is allowed on the user's screen, got: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(&rt);
+}
+
+// --recording startup failures (R-1) ---------------------------------------
+// A `--record` startup that cannot bring the disk worker up (unusable output
+// directory, unavailable io_uring, ...) must exit with the documented recording
+// code (6), never the legacy generic 1. Regression guard for the exit-code
+// contract in `exit.rs` / `README.md` (T7.1).
+
+#[test]
+fn recording_startup_failure_exits_with_recording_code() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("nam_s7_recording_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // Make the directory unwritable so the worker's startup probe fails.
+    let mut perms = std::fs::metadata(&dir)
+        .expect("stat temp dir")
+        .permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&dir, perms).expect("chmod temp dir read-only");
+
+    // Permission bits do not apply to root: the startup would then succeed and
+    // the host would run indefinitely. Detect that case and skip.
+    let root_probe = dir.join(".nam_euid_probe");
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&root_probe)
+        .is_ok()
+    {
+        let _ = std::fs::remove_file(&root_probe);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("skipping recording_startup_failure test: permission bits ignored (root)");
+        return;
+    }
+
+    let mut command = binary();
+    command.args([
+        "--record",
+        "--record-dir",
+        dir.to_str().expect("utf-8 dir path"),
+        "--gate",
+        "off",
+    ]);
+    let output = output_with_timeout(command, std::time::Duration::from_secs(30));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "a recording startup failure must exit with the recording code 6: {stderr}"
+    );
+    assert!(
+        stderr.contains("Recording"),
+        "the error line must name the Recording class, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Argument error"),
+        "a startup failure is not an argument error, got: {stderr}"
+    );
 }

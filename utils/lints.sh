@@ -42,6 +42,11 @@ ok "Compilation checks passed ($(phase_elapsed_str))."
 
 # ---------------------------------------------------------------------------
 # [3/7] Static analysis (cargo clippy) — strict, broad feature matrix
+#
+# `-D warnings` promotes `[lints.clippy] undocumented_unsafe_blocks` (declared
+# in Cargo.toml) to an error, so every `unsafe` block/expression in src/ and
+# tests/ must carry a `// SAFETY:` comment documenting its invariant and
+# pointer provenance (§4 hygiene contract, machine-enforced).
 # ---------------------------------------------------------------------------
 phase "Executing strict static analysis (cargo clippy)..."
 

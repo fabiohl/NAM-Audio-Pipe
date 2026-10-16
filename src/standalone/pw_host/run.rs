@@ -10,8 +10,9 @@ use super::capture::state::{CaptureState, RtHostChannels};
 use super::handlers;
 use super::observe_rt_panic;
 use super::output_pw::AppState;
-use super::reconnect::{ReconnectCycle, ReconnectPolicy};
+use super::reconnect::{ReconnectCycle, ReconnectPolicy, STABLE_RESET, StabilityEvent};
 use super::wakeup::ControlPlaneWakeup;
+use crate::recording::alert::RecordingAlert;
 use crate::recording::guard::{RecordingWorkerGuard, RecordingWorkerOutcome};
 use crate::recording::transport::RecordingSender;
 use crate::standalone::rt_setup;
@@ -31,7 +32,10 @@ use super::capture;
 use super::identity;
 use super::latency;
 use super::playback;
-use crate::standalone::colors::Colorize;
+use crate::standalone::banner::{
+    BannerInfo, SessionSummary, render_banner, render_session_summary,
+};
+use crate::standalone::colors::{Colorize, color_enabled};
 use pipewire as pw;
 
 /// Initializes the PipeWire dual-stream topology (Capture + Playback).
@@ -61,8 +65,11 @@ use pipewire as pw;
 /// The PipeWire daemon may be restarted by the package manager, by the user or
 /// by a USB interface reconnect. Instead of aborting immediately, the host
 /// re-instantiates the streams inside a **strictly bounded** retry cycle
-/// ([`ReconnectCycle`], default 3 attempts with progressive 250/500/1000 ms
+/// ([`ReconnectCycle`], default 6 attempts with progressive 250 ms → 4 s
 /// exponential backoff — disabled under `--fail-fast` or `max_attempts == 0`).
+/// The budget is bounded **per episode** and replenished after
+/// [`STABLE_RESET`] of uninterrupted healthy streaming (F-UX-09), so isolated
+/// drops spread over a long session never accumulate into an exhaustion.
 /// The DSP state ([`CaptureState`]: models, resampler, cab-sim, gains) and the
 /// RT-side SPSC channels ([`RtHostChannels`]) live in heap `Box`es reached via
 /// raw pointers, so **no internal state is lost** across a re-instantiation —
@@ -109,18 +116,34 @@ pub fn run_pipewire_host(
         oversample,
         cpu_receipt,
         fail_fast,
+        reconnect_timeout,
         gate_config,
         stream_status,
+        recording_status,
+        banner,
     } = config;
 
     // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
-    // entirely; the production default allows 3 attempts with progressive
-    // backoff.
+    // entirely; otherwise the production default allows 6 attempts per episode
+    // with progressive backoff, optionally capped by `--reconnect-timeout <s>`.
     let reconnect_policy = if fail_fast {
         ReconnectPolicy::fail_fast()
     } else {
-        ReconnectPolicy::production()
+        match reconnect_timeout {
+            Some(timeout) => ReconnectPolicy::with_backoff_timeout(timeout),
+            None => ReconnectPolicy::production(),
+        }
     };
+
+    // F-UX-02a: turn the observable recording status into visible, de-duplicated
+    // alerts. Built once (outside the reconnect loop) so a reconnect never
+    // resets the reminder cadence or re-emits an already-reported failure.
+    let mut recording_alert = recording_status.as_ref().map(|_| RecordingAlert::new());
+
+    // Whether a WAV capture is live. Drives the extended termination grace
+    // window (armed in `main` after the recording handshake) and the shutdown
+    // feedback message: finalizing a capture must be allowed to finish.
+    let recording_enabled = recording_worker.is_some();
 
     // =========================================================
     // 1. PERSISTENT HOST RESOURCES (survive reconnect attempts)
@@ -262,6 +285,10 @@ pub fn run_pipewire_host(
     // Lives outside the `'host` loop so it covers stream destruction across loop iterations.
     let mut teardown_guard: Option<super::status::TeardownGuard<'_>> = None;
 
+    // F-UX-13: emit the consolidated status banner exactly once, as soon as the
+    // first RT confirmations (rate / quantum / SCHED) are available.
+    let mut banner_emitted = false;
+
     // =========================================================
     // 4. HOST INSTANCE LOOP (one per bounded-reconnect attempt)
     // =========================================================
@@ -298,6 +325,7 @@ pub fn run_pipewire_host(
             Ok(core) => core,
             Err(e) => {
                 if reconnect.attempts_made() == 0 {
+                    emit_startup_backend_diagnostic(&sys, "connect", &e);
                     return Err(e.into());
                 }
                 match reconnect.begin_attempt() {
@@ -389,6 +417,7 @@ pub fn run_pipewire_host(
             Ok(res) => res,
             Err(e) => {
                 if reconnect.attempts_made() == 0 {
+                    emit_startup_backend_diagnostic(&sys, "stream-setup", &e);
                     return Err(e);
                 }
                 match reconnect.begin_attempt() {
@@ -475,6 +504,15 @@ pub fn run_pipewire_host(
         // attempts guaranteed-futile) and fails fast.
         let mut panic_is_terminal = false;
         while !SHUTDOWN.load(Ordering::Acquire) {
+            // F-UX-02a: surface a runtime recording failure (or low-space
+            // warning) immediately instead of only at shutdown. `try_lock` only
+            // — the control loop never blocks on the worker's status mutex.
+            if let (Some(alert), Some(status)) = (&mut recording_alert, &recording_status)
+                && let Some(emitted) = alert.poll(status)
+            {
+                log::error!("{}", emitted.render());
+            }
+
             // A fatal loss of backend connectivity (daemon crash/restart,
             // stream `Error`, post-streaming `Unconnected`) must never leave the
             // process idling forever without sound. It is polled every
@@ -500,6 +538,31 @@ pub fn run_pipewire_host(
                         .to_owned(),
                 ));
                 break;
+            }
+
+            // F-UX-09: a healthy, streaming iteration feeds the stability
+            // window. After `STABLE_RESET` of uninterrupted streaming the
+            // per-episode retry budget is replenished (isolated drops spread
+            // over a long session never accumulate into an exhaustion), and the
+            // first healthy poll after a recovery confirms the restoration.
+            // `is_running()` is a lock-free atomic mirror of `state == Running`,
+            // so this per-iteration gate never takes the backend state mutex.
+            if backend_status.is_running() {
+                match reconnect.note_stable() {
+                    StabilityEvent::Restored { attempts } => {
+                        log::info!("🎸 Audio restored after {attempts} attempt(s)");
+                    }
+                    StabilityEvent::Replenished => {
+                        log::debug!(
+                            "Reconnect budget replenished after {STABLE_RESET:?} of stable streaming"
+                        );
+                    }
+                    StabilityEvent::None => {}
+                }
+            } else {
+                // Not streaming (startup, a degraded blip or a lost stream): the
+                // uninterrupted-healthy window is broken.
+                reconnect.note_unstable();
             }
 
             // pairs with Release store in main.rs:104
@@ -599,6 +662,42 @@ pub fn run_pipewire_host(
                 &mut poll_state,
             );
 
+            // F-UX-13: one consolidated status banner, emitted a single time as
+            // soon as the first real audio quantum is processed — the RT thread is
+            // configured in that same first callback, so `SCHED_FIFO`/`mlockall`
+            // are already visible. The gate is the effective quantum, NOT
+            // `active_rate`: `active_rate` is only published on a resampler swap,
+            // which never happens for a 48 kHz graph with a 48 kHz/identity model
+            // or in bypass, so gating on it would suppress the banner in the most
+            // common configuration.
+            let effective_quantum = rt_status.requested_buffer_frames.load(Ordering::Relaxed);
+            if !banner_emitted && effective_quantum != 0 {
+                let policy = rt_status.rt_policy.load(Ordering::Relaxed);
+                let policy_name = if policy == libc::SCHED_FIFO {
+                    "FIFO"
+                } else if policy == libc::SCHED_RR {
+                    "RR"
+                } else {
+                    "OTHER"
+                };
+                let banner_info = BannerInfo {
+                    request: banner.clone(),
+                    sample_rate: host_rate,
+                    quantum: effective_quantum,
+                    dsp_latency_samples: current_dsp_latency,
+                    rt_fifo: rt_status
+                        .check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO),
+                    rt_policy: policy_name,
+                    rt_priority: rt_status.confirmed_priority.load(Ordering::Relaxed),
+                    mlockall_ok: rt_setup::mlockall_ok(),
+                };
+                log::info!(
+                    "{}",
+                    render_banner(&banner_info, color_enabled()).trim_end()
+                );
+                banner_emitted = true;
+            }
+
             // R-04: while the loop runs, the parking lot is RT-owned (the callback
             // flushes it back to this SPSC every cycle), so this periodic drain
             // must NOT touch `rt_parking_lot` — concurrent `take()`s would race.
@@ -653,6 +752,8 @@ pub fn run_pipewire_host(
         thread_loop.stop();
 
         // Drain any remaining clock drift drops accumulated in the bridge before resetting.
+        // SAFETY: `bridge_ptr` is the live bridge allocation for this attempt and the
+        // audio loop has been stopped above, so the main thread is the sole accessor.
         let remaining_drops = unsafe { &*(bridge_ptr.as_ptr()) }.drain_dropped_frames();
         if remaining_drops > 0 {
             backend_status
@@ -746,6 +847,23 @@ pub fn run_pipewire_host(
     // =========================================================
     // 7. GRACEFUL SHUTDOWN (final)
     // =========================================================
+    // User feedback on the first cooperative SHUTDOWN observation (F-UX-04):
+    // without it the terminal shows nothing while the ring drains and the WAV
+    // header is rewritten + `fsync`ed, so the operator presses Ctrl+C again and
+    // (past the grace window) forces an exit that can corrupt the capture. The
+    // message is emitted only for a genuine cooperative shutdown, never for a
+    // backend failure (which is already reported by the diagnostic below).
+    if backend_failure.is_none() {
+        if recording_enabled {
+            log::warn!(
+                "⏹ Shutting down… finalizing recording (a second Ctrl+C will \
+                 force exit and may corrupt the capture)"
+            );
+        } else {
+            log::info!("⏹ Shutting down…");
+        }
+    }
+
     // The main thread now exclusively owns the recording producer slot (the RT
     // callback released its `&mut` after `thread_loop.stop()`). Hand the whole
     // worker custody to the guard's explicit shutdown: StreamStop → producer
@@ -801,8 +919,55 @@ pub fn run_pipewire_host(
         ));
     }
 
+    // F-UX-13: analogous end-of-session summary (xruns, bridge drops,
+    // recording), emitted only once a real streaming session was established.
+    if banner_emitted {
+        let summary = SessionSummary {
+            xruns: rt_status.xruns.load(Ordering::Relaxed),
+            bridge_dropped_frames: backend_status
+                .stream_status()
+                .bridge_dropped_frames
+                .load(Ordering::Relaxed),
+            recording_dir: banner.recording_dir.clone(),
+        };
+        log::info!(
+            "{}",
+            render_session_summary(&summary, color_enabled()).trim_end()
+        );
+    }
+
     backend_status.mark_terminated();
     Ok(recording_outcome)
+}
+
+/// Emits the first-connection backend diagnostic with a stage-specific hint.
+///
+/// The two startup failures reached before the bounded-reconnect control loop
+/// used to bubble a raw `anyhow` error that `main` printed with no hint
+/// (F-UX-08). Emitting the structured diagnostic here keeps the remediation
+/// hint reachable (it is rendered into the support block consumed by
+/// `--diagnose`) and pairs with the classified `Backend` exit code in `main`.
+fn emit_startup_backend_diagnostic(
+    sys: &neural_amp_modeler_rs::SystemSnapshot,
+    stage: &'static str,
+    error: &dyn std::fmt::Display,
+) {
+    let hint = match stage {
+        "connect" => crate::standalone::exit::BACKEND_UNREACHABLE_HINT,
+        _ => {
+            "PipeWire is running but the audio streams could not be created: \
+             verify the graph with `pw-cli info 0` and that a capture/playback \
+             device is available."
+        }
+    };
+    NamDiagnostic::new(NamErrorCode::BackendFailure, sys)
+        .message(format!(
+            "PipeWire first connection failed ({stage}): {error}"
+        ))
+        .hint(hint)
+        .param("phase", "startup")
+        .param("stage", stage)
+        .emit();
 }
 
 /// Sleeps for `duration` in small slices, bailing out early when the

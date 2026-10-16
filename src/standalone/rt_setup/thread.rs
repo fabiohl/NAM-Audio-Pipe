@@ -13,6 +13,21 @@ use neural_amp_modeler_rs::rt_hardening::{
     SystemThreadConfigurator, ThreadConfigurator, promote_sched_fifo_with, set_cpu_affinity_with,
 };
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the process-wide `mlockall` succeeded (F-UX-13).
+///
+/// The engine's `rt_hardening::mlockall_current` logs the outcome but does not
+/// publish it; the consolidated status banner needs the result, so it is
+/// latched here. Set once by [`configure_process_wide`] on the `main` thread
+/// (before any RT thread exists) and only read afterwards, so a `Relaxed` load
+/// is sufficient.
+static MLOCKALL_OK: AtomicBool = AtomicBool::new(false);
+
+/// Returns whether `mlockall` succeeded during [`configure_process_wide`].
+pub fn mlockall_ok() -> bool {
+    MLOCKALL_OK.load(Ordering::Relaxed)
+}
 
 /// Configures the process for real-time operation (process-wide).
 ///
@@ -35,8 +50,12 @@ pub fn configure_process_wide() {
     // on the setup path); outcome is identical, telemetry unchanged.
     let _ = neural_amp_modeler_rs::rt_hardening::disable_thp();
     match neural_amp_modeler_rs::rt_hardening::mlockall_current() {
-        Ok(()) => log::info!("mlockall: ok"),
+        Ok(()) => {
+            MLOCKALL_OK.store(true, Ordering::Relaxed);
+            log::info!("mlockall: ok");
+        }
         Err(err) => {
+            MLOCKALL_OK.store(false, Ordering::Relaxed);
             let errno = err.raw_os_error().unwrap_or(-1);
             log::warn!("mlockall: failed({errno})");
         }

@@ -383,7 +383,12 @@ fn validate_spa_channel_pair(
     let max_cap = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
     let bound_l = max_l.min(max_cap);
     let bound_r = max_r.min(max_cap);
+    // SAFETY: `ptr_l` is a validated non-null buffer data pointer and `bound_l` is
+    // clamped to `MAX_BRIDGE_BUF * sizeof(f32)`; the shared `&[u8]` view only feeds
+    // the pure validator and is dead before any mutable `f32` slice is formed.
     let raw_l: &[u8] = unsafe { std::slice::from_raw_parts(ptr_l as *const u8, bound_l) };
+    // SAFETY: same validated non-null pointer and clamped bound contract for the
+    // right channel.
     let raw_r: &[u8] = unsafe { std::slice::from_raw_parts(ptr_r as *const u8, bound_r) };
     check_spa_buffer_pair(raw_l, offset_l, size_l, raw_r, offset_r, size_r)
 }
@@ -691,6 +696,8 @@ pub fn process_dsp_buffer(
         // below are well-formed and non-overlapping.
         let samples_l =
             unsafe { std::slice::from_raw_parts_mut((ptr_l + offset_l) as *mut f32, n_samples) };
+        // SAFETY: `check_spa_buffer_pair` proved strict pointer disjunction, so this
+        // right-channel mutable slice does not overlap `samples_l`.
         let samples_r =
             unsafe { std::slice::from_raw_parts_mut((ptr_r + offset_r) as *mut f32, n_samples) };
 

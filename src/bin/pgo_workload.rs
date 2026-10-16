@@ -1166,6 +1166,7 @@ enum GateArg {
 }
 
 /// Manual CLI parsing (keeps the profiling harness dependency-free).
+#[derive(Debug)]
 struct Cli {
     record: RecordArg,
     gate: GateArg,
@@ -1186,60 +1187,78 @@ impl Default for Cli {
     }
 }
 
-fn parse_cli() -> Cli {
+const USAGE: &str = "usage: pgo_workload [--record|--no-record] [--gate on|off] [--seconds S] \
+                     [--min-blocks N] [--receipt PATH]";
+
+/// Parses the CLI arguments into a [`Cli`].
+///
+/// Returns a typed usage error (never panics) so the caller can report it and
+/// exit with the conventional usage status `2`.
+fn parse_cli_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String> {
     let mut cli = Cli::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--record" => cli.record = RecordArg::Yes,
             "--no-record" => cli.record = RecordArg::No,
             "--gate" => {
-                let val = args.next().expect("--gate <on|off>");
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--gate <on|off> requires a value".to_string())?;
                 match val.as_str() {
                     "on" => cli.gate = GateArg::On,
                     "off" => cli.gate = GateArg::Off,
-                    other => {
-                        eprintln!(
-                            "pgo_workload: FATAL: invalid gate mode {other:?} (expected 'on' or 'off')"
-                        );
-                        process::exit(1);
-                    }
+                    other => return Err(format!("--gate must be on|off, got {other:?}")),
                 }
             }
             "--seconds" => {
                 cli.seconds = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--seconds <f64>");
+                    .ok_or_else(|| "--seconds requires a numeric value <S>".to_string())?;
             }
             "--min-blocks" => {
                 cli.min_blocks = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--min-blocks <u64>");
+                    .ok_or_else(|| "--min-blocks requires a numeric value <N>".to_string())?;
             }
             "--receipt" => {
-                cli.receipt_path = PathBuf::from(args.next().expect("--receipt <path>"));
+                cli.receipt_path = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| "--receipt <path> requires a value".to_string())?,
+                );
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "usage: pgo_workload [--record|--no-record] [--gate on|off] [--seconds S] \
-                     [--min-blocks N] [--receipt PATH]"
-                );
+                eprintln!("{USAGE}");
                 process::exit(0);
             }
-            other => {
-                eprintln!("pgo_workload: FATAL: unknown argument {other:?} (see --help)");
-                process::exit(1);
-            }
+            other => return Err(format!("unknown argument {other}")),
         }
     }
-    assert!(cli.seconds > 0.0, "--seconds must be > 0");
-    assert!(cli.min_blocks >= 1, "--min-blocks must be >= 1");
+    if !cli.seconds.is_finite() || cli.seconds <= 0.0 {
+        return Err("--seconds must be a finite value > 0".to_string());
+    }
+    if cli.min_blocks < 1 {
+        return Err("--min-blocks must be >= 1".to_string());
+    }
     if let Ok(path) = std::env::var(RECEIPT_PATH_ENV) {
         cli.receipt_path = PathBuf::from(path);
     }
-    cli
+    Ok(cli)
+}
+
+/// Parses the process arguments, exiting with status `2` and the usage block on
+/// a malformed invocation (never panicking on bad argv).
+fn parse_cli() -> Cli {
+    match parse_cli_from(std::env::args().skip(1)) {
+        Ok(cli) => cli,
+        Err(msg) => {
+            eprintln!("pgo_workload: {msg}");
+            eprintln!("{USAGE}");
+            process::exit(2);
+        }
+    }
 }
 
 fn main() {

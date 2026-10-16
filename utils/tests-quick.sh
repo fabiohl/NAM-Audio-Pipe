@@ -253,6 +253,16 @@ assert_ran_target target/logs/quick-phase2.log "tests/recording.rs" 0 \
 while IFS= read -r marker; do
     GAPS+=("distribution_qa:$marker")
     echo -e "${YELLOW}${BOLD}WARN GAP: distribution_qa:$marker${NC}"
+    case "$marker" in
+    *long_receipt_audit]*SKIP:receipt_not_found*)
+        # By design: a quick pass runs before the long suite, so no long receipt
+        # exists yet to audit. This is an *expected* gap — labelled here, never
+        # turned into a PASS (the verdict stays COMPLETED_WITH_GAPS). Running
+        # utils/tests-long.sh closes it.
+        emit "GAP_EXPECTED: distribution_qa:$marker reason=long_suite_not_run"
+        echo -e "${CYAN}           accepted — long_receipt_audit SKIP is expected when the long suite has not run (utils/tests-long.sh).${NC}"
+        ;;
+    esac
 done < <(grep -oP 'TEST_RESULT\[[a-z_]+\]=SKIP:[^() ]+' target/logs/quick-phase2.log || true)
 P2_DUR_MS=$(( ($(date +%s%N) - P2_START) / 1000000 ))
 P2_DUR_STR=$(format_duration_ms "$P2_DUR_MS")

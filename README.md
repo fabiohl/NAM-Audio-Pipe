@@ -213,8 +213,9 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 
 | Option                   | Description                                                                                                                                                        | Default             |
 |:------------------------ |:------------------------------------------------------------------------------------------------------------------------------------------------------------------ |:------------------- |
-| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (supports `~`, `../`)                                                                                                  | *Optional (Bypass)* |
-| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file                                                                                                                       | *Optional (bypass)* |
+| `-m, --model <FILE>`     | Path to `.nam` or `.namb` neural model file (must exist and be readable; supports `~`, `../`); an invalid path fails fast before PipeWire           | *Optional (Bypass)* |
+| `-c, --cab <FILE>`       | Path to cabinet impulse response `.wav` file (supports `~`, `../`); a missing or bad IR is **fatal by default** (exit `2` for a missing path, exit `4` for an unloadable one) unless `--cab-optional` | *Optional (bypass)* |
+| `--cab-optional`         | A missing or failed `--cab` IR load is warning-only: the host continues without cab-sim instead of aborting                                                                    | `false`             |
 | `-i, --input-gain <DB>`  | Input gain staging in dB (`-20.0` to `+20.0`)                                                                                                                      | `0.0`               |
 | `-o, --output-gain <DB>` | Output gain staging in dB (`-20.0` to `+20.0`)                                                                                                                     | `0.0`               |
 | `-b, --buffer-size <N>`  | Quantum block size in samples (e.g. `64`, `256`, `512`; `0` for auto)                                                                                              | `256`               |
@@ -222,10 +223,50 @@ flatpak uninstall --user io.github.fabiohl.NAMAudioPipe
 | `--activation <MODE>`    | Math precision mode: `standard` (exact) or `fast` (Padé polynomial)                                                                                                | `standard`          |
 | `--slim <MODE>`          | Adaptive compute override: `auto` (CPU-gated), `full`, `lite`                                                                                                      | `auto`              |
 | `--gate <MODE>`          | Polymorphic silence gate: `on` (`-70 dB` default), `off` (disabled), or an explicit dBFS threshold (e.g. `-60`, `-65.5`, `-45dB`; positive values auto-normalized) | `on` (`-70 dB`)     |
+| `--color <WHEN>`         | ANSI color policy: `auto` (TTY-based, honors `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb`), `always`, `never`                                                           | `auto`              |
 | `--record`               | Enables lock-free 32-bit float WAV recording of processed (neural + cab) audio via `io_uring` (silences trimmed when `--gate on`)                                  | `false`             |
+| `--record-dir <DIR>`     | Output directory for WAV captures (created if missing); `~` is expanded                                                                                            | `$XDG_MUSIC_DIR/NAM-Audio-Pipe`, else `~/Music/NAM-Audio-Pipe`, else the current directory |
+| `--fail-fast`            | Disables the bounded backend reconnect cycle: exits with an error on the first PipeWire stream failure instead of retrying                                           | `false`             |
+| `--reconnect-timeout <S>`| Caps the per-episode reconnect backoff budget in seconds (6 attempts, 250 ms → 4 s by default); the attempt count is trimmed to fit, at least one retry is kept      | `11.75 s` budget    |
 | `--diagnose`             | Emits technical system diagnostic bundle and exits                                                                                                                 | `false`             |
 | `--diagnose-full`        | Emits diagnostic bundle with unredacted raw file paths and exits                                                                                                   | `false`             |
+| `--pause`                | After an immediate-exit invocation (e.g. `--diagnose`) on a terminal, wait for Enter before exiting (used by the `.desktop` "Diagnostics" action)                   | `false`             |
 | `-h, --help`             | Displays command-line help screen and exits                                                                                                                        | —                   |
+
+---
+
+### Exit Codes
+
+`nam-audio-pipe` classifies its exit status so scripts and automation can tell
+a bad invocation apart from a failed load or a dead audio backend. Argument
+errors keep the "Argument error" wording and the `👉 Use '-h'` pointer;
+runtime errors print `❌ <Class> error:` plus an actionable `💡` hint instead.
+
+| Code | Class            | Meaning                                                                                          |
+|:---- |:---------------- |:------------------------------------------------------------------------------------------------ |
+| `0`  | Success          | Clean run (or `--help`/`--diagnose`).                                                            |
+| `1`  | Generic / forced | Uncategorized failure, or the forced exit after a second termination signal after the grace window (prints `forced exit: capture may be incomplete`). |
+| `2`  | Usage            | Invalid command-line arguments (`❌ Argument error:`).                                            |
+| `3`  | Model            | Neural model file exists but cannot be loaded/validated (`.nam`/`.namb`).                        |
+| `4`  | Cab IR           | `--cab` IR exists but cannot be loaded; suppress with `--cab-optional`.                          |
+| `5`  | Backend          | PipeWire first connection / host startup failed (also logger or CPU-receipt init).               |
+| `6`  | Recording        | WAV capture failed, was lost to overruns, or could not be finalized.                             |
+
+An explicitly provided `--model`, or a `--cab` without `--cab-optional`, that
+does **not** resolve to a readable regular file is caught earlier, before any
+PipeWire connection, and reported as a usage error (exit `2`) with the resolved
+absolute path. With `--cab-optional`, a missing `--cab` is instead passed to the
+loader, which warns and starts without cab-sim.
+
+> [!NOTE]
+> **First run & session banner**
+> Launched from the desktop/Flatpak entry with **no arguments** on a terminal (the `.desktop` `Terminal=true` window), the program prints the help and waits for Enter so the window does not vanish before you can read it; redirected invocations (scripts, pipes, `systemd`) still exit immediately. The desktop entry also offers **Run in bypass (no model)** and **Diagnostics** actions. Once audio starts, a single consolidated **status banner** is logged (model/bypass, cab-sim, rate, quantum, total latency, `SCHED_FIFO`/`mlockall`, recording path), followed by an analogous session summary (xruns, bridge drops, recording) at shutdown — so a healthy session reads at a glance instead of being buried in per-transition gate logs (now rate-limited to one line per second).
+
+> [!NOTE]
+> **Backend reconnect & daemon restarts**
+> If the PipeWire daemon is restarted (`systemctl --user restart pipewire`), resumed from suspend or loses a USB interface mid-session, the host re-instantiates its streams without losing models, IRs or an active recording. The retry budget is bounded **per incident** (6 attempts, 250 ms → 4 s, ≈ 11.75 s of backoff) and is replenished after 60 s of uninterrupted healthy streaming, so isolated drops spread over a long session never kill the app. `--reconnect-timeout <s>` caps the per-incident budget; `--fail-fast` disables reconnection entirely. A successful recovery logs `🎸 Audio restored after N attempt(s)`.
+>
+> **Migration note:** worst-case time-to-terminate after an *unrecoverable* daemon loss is now ≈ 11.75 s of backoff plus per-attempt handshake time (previously ≈ 1.75 s). Watchdogs/supervisors tuned to the old ~2 s window should allow the new budget, or restore it with a shorter timeout — `--reconnect-timeout 2` yields 3 attempts (250/500/1000 ms ≈ 1.75 s).
 
 ---
 
@@ -272,7 +313,11 @@ nam-audio-pipe \
   --record
 ```
 
-*Creates timestamped `capture_YYYYMMDD_HHMMSS.wav` files in the current working directory (32-bit float stereo PCM at PipeWire sample rate, automatically splitting into `_partN.wav` if reaching the 4 GiB RIFF size limit).*
+*Creates timestamped `capture_YYYYMMDD_HHMMSS.wav` files in the resolved output directory — `--record-dir <DIR>` when given, otherwise `$XDG_MUSIC_DIR/NAM-Audio-Pipe`, else `~/Music/NAM-Audio-Pipe`, else the current directory (with a warning) — 32-bit float stereo PCM at the PipeWire sample rate, automatically splitting into `_partN.wav` if reaching the 4 GiB RIFF size limit. On shutdown the terminal prints a single summary line (`💾 Capture saved: <dir> (<duration> across N segments)`).*
+
+> [!NOTE]
+> **Crash durability, visible failure & safe shutdown**
+> While recording, the WAV header is rewritten with the running byte count and `fsync`ed every 3 s of audio, so an abrupt death (SIGKILL, OOM-killer, power loss) loses at most ~3 s instead of the whole take — the partial file stays readable in any standard player. A **runtime** recording failure (disk full, `EIO`) is surfaced **immediately** as a red multi-line alert (repeated every 30 s while it persists) instead of only at shutdown — audio keeps playing, but you know the capture stopped. Free space is estimated at the first segment (`≈ N min writable`) and pre-warned when the volume drops below 1 GiB or ~5 min of recording. On Ctrl+C the terminal shows `Shutting down… finalizing recording`; the termination grace window is widened to 5 s under `--record` so a second Ctrl+C during finalization is ignored instead of corrupting the capture. A forced exit (past the window) exits `1` and prints `forced exit: capture may be incomplete`.
 
 > [!NOTE]
 > **Silence Gate Behavior & Recording Impact**
@@ -297,7 +342,7 @@ nam-audio-pipe --model models/HighGainDrive.nam --gate -50
 # Shorthand: 60 dB of attenuation is auto-normalized to -60 dBFS (logged)
 nam-audio-pipe --gate 60
 
-# Safety validation: -120 dBFS is below the LUT floor (-96 dB) → rejected with exit 1
+# Safety validation: -120 dBFS is below the LUT floor (-96 dB) → rejected with exit 2
 nam-audio-pipe --gate -120
 ```
 

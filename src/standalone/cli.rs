@@ -9,12 +9,14 @@
 use neural_amp_modeler_rs::math::activations::ActivationPrecision;
 use neural_amp_modeler_rs::math::constants::{GAIN_MAX_DB, GAIN_MIN_DB};
 
-use crate::standalone::colors::Colorize;
+use crate::standalone::colors::{ColorFlag, Colorize};
 use lexopt::prelude::*;
 use neural_amp_modeler_rs::dsp::adaptive::SlimOverride;
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // Domain contract for `--buffer-size`.
 //
@@ -128,14 +130,151 @@ pub fn validate_buffer_size(size: u32) -> Result<u32, BufferSizeError> {
     }
 }
 
-// DESIGN NOTE: The functions below use `println!` (stdout) and `eprintln!` (stderr)
-// intentionally — the `NamLogger` backend has not yet been initialized at the time
-// of CLI argument parsing. This is standard POSIX practice for command-line tools.
-// Do NOT replace with `log::*` without ensuring the logger is initialized prior to `parse_args()`.
+// DESIGN NOTE: The functions below write to stdout/stderr directly — the
+// `NamLogger` backend is initialized before parsing, but `print_help` and
+// `exit_with_error` are the canonical CLI surface and print unconditionally.
+// This is standard POSIX practice for command-line tools.
+
+/// Writes `text` to stdout, tolerating a closed pipe instead of panicking.
+///
+/// `println!` panics when the write fails with `BrokenPipe` (e.g.
+/// `nam-audio-pipe --help | head -1` closes the pipe after the first line).
+/// A `BrokenPipe` means the downstream consumer already stopped reading, so
+/// there is nothing left to do and the process must exit cleanly.
+pub fn write_stdout(text: &str) {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let _ = lock.write_all(text.as_bytes());
+    let _ = lock.flush();
+}
+
+/// Expands a leading `~` in a user-supplied path against `home`.
+///
+/// Supported forms (a POSIX-shell subset; no `~user` lookup):
+/// - `~`    → `home`;
+/// - `~/x`  → `home/x`;
+/// - `~user/..` → error: explicit user-home expansion is unsupported;
+/// - a leading `~` with no `home` available → error requesting an absolute path;
+/// - any other path is returned unchanged.
+///
+/// The function is pure (the `home` directory is injected) so the expansion
+/// matrix is fully unit-testable without touching the process environment.
+pub fn expand_user_path(raw: &str, home: Option<&OsStr>) -> Result<PathBuf, String> {
+    if !raw.starts_with('~') {
+        return Ok(PathBuf::from(raw));
+    }
+
+    // `~user` (tilde immediately followed by anything but a separator) is a
+    // different feature (password-database lookup) that we deliberately do not
+    // implement: fail with an actionable message instead of a literal `~user`.
+    let rest = &raw[1..];
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return Err(format!(
+            "Unsupported '~user' path expansion: '{raw}'. Use '~/' or an absolute path."
+        ));
+    }
+
+    // An empty `HOME` is treated as unset: `Path::new("").join(tail)` would
+    // otherwise produce a CWD-relative path and silently resolve `~/x` against
+    // the current directory instead of failing with the documented error.
+    let home = home.filter(|h| !h.is_empty()).ok_or_else(|| {
+        "HOME is not set; use an absolute path instead of a '~' prefix.".to_string()
+    })?;
+    let home_path = Path::new(home);
+    let tail = rest.trim_start_matches('/');
+    if tail.is_empty() {
+        Ok(home_path.to_path_buf())
+    } else {
+        Ok(home_path.join(tail))
+    }
+}
+
+/// Validates that an explicitly provided input file exists and is a readable
+/// regular file, returning its resolved absolute path on success.
+///
+/// `flag` is the spelling of the originating option (e.g. `--model`) and is
+/// included in the error message so the user knows which argument is at fault.
+pub fn validate_readable_file(flag: &str, path: &Path) -> Result<PathBuf, String> {
+    // `absolute` makes the path absolute (relative to the CWD) without resolving
+    // symlinks and without requiring the path to exist, so the error message
+    // always shows the fully resolved location the user actually meant.
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let meta = std::fs::metadata(&abs).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{flag}: file not found: '{}'. Check the path; '~' is only expanded at the start of the argument.",
+            abs.display()
+        ),
+        _ => format!("{flag}: cannot access '{}': {e}", abs.display()),
+    })?;
+    if !meta.is_file() {
+        return Err(format!(
+            "{flag}: '{}' is not a regular file (a directory was given?).",
+            abs.display()
+        ));
+    }
+    std::fs::File::open(&abs)
+        .map_err(|e| format!("{flag}: cannot read '{}': {e}", abs.display()))?;
+    Ok(abs)
+}
+
+/// Resolves the capture output directory for `--record`.
+///
+/// Precedence (first match wins):
+/// 1. an explicit `--record-dir` path;
+/// 2. `$XDG_MUSIC_DIR/NAM-Audio-Pipe` when `XDG_MUSIC_DIR` is set and non-empty;
+/// 3. `$HOME/Music/NAM-Audio-Pipe` when `HOME` is set and non-empty;
+/// 4. the current working directory `cwd` — the returned `bool` is `true` to
+///    signal this last-resort fallback so `main` can warn the user.
+///
+/// Pure (every environment value is injected), so the precedence matrix is
+/// unit-testable without touching the process environment.
+pub fn resolve_record_dir(
+    explicit: Option<&Path>,
+    xdg_music: Option<&OsStr>,
+    home: Option<&OsStr>,
+    cwd: &Path,
+) -> (PathBuf, bool) {
+    if let Some(dir) = explicit {
+        return (dir.to_path_buf(), false);
+    }
+    if let Some(music) = xdg_music.filter(|v| !v.is_empty()) {
+        return (Path::new(music).join("NAM-Audio-Pipe"), false);
+    }
+    if let Some(home) = home.filter(|v| !v.is_empty()) {
+        return (Path::new(home).join("Music").join("NAM-Audio-Pipe"), false);
+    }
+    (cwd.to_path_buf(), true)
+}
+
+/// Validates the presence/readability of every explicitly provided input file.
+///
+/// This is an *argument* validation (legitimate `exit_with_error` territory):
+/// it runs right after parsing, before any PipeWire connection or allocation,
+/// so a typo in `--model`/`--cab` fails fast with a clear path.
+///
+/// `--cab` is the one exception: when `--cab-optional` is set, a missing or
+/// unreadable IR is left for the loader, which warns and continues without
+/// cab-sim (the same contract as a load failure). Only the default fatal mode
+/// rejects an unusable `--cab` here (R-2).
+pub fn validate_cli_inputs(args: &CliArgs) -> Result<(), String> {
+    if let Some(model) = &args.model_path {
+        validate_readable_file("--model", model)?;
+    }
+    if let Some(cab) = &args.cab_path
+        && !args.cab_optional
+    {
+        validate_readable_file("--cab", cab)?;
+    }
+    Ok(())
+}
 
 /// Prints usage instructions and help in the terminal.
 pub fn print_help() {
-    println!(
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "{}",
         format!(
             "🎸 NAM-Audio-Pipe v{} — Neural Amp Modeler",
@@ -144,50 +283,124 @@ pub fn print_help() {
         .bright_green()
         .bold()
     );
-    println!("\n{}", "Usage:".yellow().bold());
-    println!("  nam-audio-pipe [OPTIONS]");
-    println!("\n{}", "Options:".yellow().bold());
-    println!("  -m, --model <FILE>      Path to the model (.nam or .namb). Supports ~, ../, etc.");
-    println!("  -c, --cab <FILE>        Path to the cab-sim IR (.wav). Supports ~, ../, etc.");
-    println!("  -i, --input-gain <DB>   Input gain in dB (e.g. -3.5, 12, 0) [default: 0]");
-    println!("  -o, --output-gain <DB>  Output gain in dB (e.g. 5.0, -10) [default: 0]");
-    println!(
+    let _ = writeln!(out, "\n{}", "Usage:".yellow().bold());
+    let _ = writeln!(out, "  nam-audio-pipe [OPTIONS]");
+    let _ = writeln!(out, "\n{}", "Options:".yellow().bold());
+    let _ = writeln!(
+        out,
+        "  -m, --model <FILE>      Path to the model (.nam or .namb). Supports ~, ../, etc."
+    );
+    let _ = writeln!(
+        out,
+        "  -c, --cab <FILE>        Path to the cab-sim IR (.wav). Supports ~, ../, etc."
+    );
+    let _ = writeln!(
+        out,
+        "      --cab-optional      Continue without cab-sim when --cab is missing \
+         or fails to load (default: a bad --cab is fatal)"
+    );
+    let _ = writeln!(
+        out,
+        "  -i, --input-gain <DB>   Input gain in dB (e.g. -3.5, 12, 0) [default: 0]"
+    );
+    let _ = writeln!(
+        out,
+        "  -o, --output-gain <DB>  Output gain in dB (e.g. 5.0, -10) [default: 0]"
+    );
+    let _ = writeln!(
+        out,
         "  -b, --buffer-size <SAMPLES> Fixed block size: 0 for auto, or a power of two in [16, 8192] (e.g. 64, 256, 512) [default: 256]"
     );
-    println!(concat!(
-        "      --cabsim-partition <N> Cab-sim UPOLS partition: 32, 64, 128 or 256 samples —\n",
-        "                           fixes the IR latency (N samples; lower = less latency,\n",
-        "                           more CPU) [default: 128]"
-    ));
-    println!("      --diagnose          Print technical support block and exit");
-    println!("      --diagnose-full     Print technical support block with raw paths and exit");
-    println!(
+    let _ = writeln!(
+        out,
+        concat!(
+            "      --cabsim-partition <N> Cab-sim UPOLS partition: 32, 64, 128 or 256 samples —\n",
+            "                           fixes the IR latency (N samples; lower = less latency,\n",
+            "                           more CPU) [default: 128]"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "      --diagnose          Print technical support block and exit"
+    );
+    let _ = writeln!(
+        out,
+        "      --diagnose-full     Print technical support block with raw paths and exit"
+    );
+    let _ = writeln!(
+        out,
+        "      --pause             Wait for Enter before exiting an immediate-exit \
+         invocation (--diagnose) on a terminal"
+    );
+    let _ = writeln!(
+        out,
         "      --slim auto|full|lite  Adaptive Compute (downgrades the active model) Auto = Under CPU Pressure [default: auto]"
     );
-    println!(
+    let _ = writeln!(
+        out,
         "      --oversample off|2x|4x Half-band oversampling around neural stage [default: off]"
     );
-    println!(
+    let _ = writeln!(
+        out,
         "      --activation MODE    Activation precision: standard (default, exact-grade) or fast"
     );
-    println!(concat!(
-        "      --gate MODE          Silence gate: 'on' (-70 dB default), 'off' (disabled),\n",
-        "                           or explicit threshold in dB (e.g. -60, -45dB) [default: on]"
-    ));
-    println!("      --cpu INDEX          Pin RT audio thread to explicit CPU core index");
-    println!("      --record             Record raw PipeWire input to a WAV file");
-    println!(
+    let _ = writeln!(
+        out,
+        concat!(
+            "      --gate MODE          Silence gate: 'on' (-70 dB default), 'off' (disabled),\n",
+            "                           or explicit threshold in dB (e.g. -60, -45dB) [default: on]"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "      --cpu INDEX          Pin RT audio thread to explicit CPU core index"
+    );
+    let _ = writeln!(
+        out,
+        "      --color WHEN         Colorize output: 'auto' (TTY-based), 'always', 'never' [default: auto]"
+    );
+    let _ = writeln!(
+        out,
+        "      --record             Record raw PipeWire input to a WAV file"
+    );
+    let _ = writeln!(
+        out,
+        concat!(
+            "      --record-dir <DIR>   Directory for WAV captures (created if missing)\n",
+            "                           [default: $XDG_MUSIC_DIR/NAM-Audio-Pipe, else\n",
+            "                           ~/Music/NAM-Audio-Pipe, else the current directory]"
+        )
+    );
+    let _ = writeln!(
+        out,
         "      --fail-fast          Disable the bounded backend reconnect cycle: \
          exit with an error on the first PipeWire stream failure"
     );
-    println!("  -h, --help              Show this help message and exit");
+    let _ = writeln!(
+        out,
+        concat!(
+            "      --reconnect-timeout <SECS>\n",
+            "                           Cap the per-episode reconnect backoff budget in\n",
+            "                           seconds (default: 11.75 s over 6 attempts)"
+        )
+    );
+    let _ = writeln!(
+        out,
+        "  -h, --help              Show this help message and exit"
+    );
+    write_stdout(&out);
 }
 
-/// Displays a styled error message and exits the process with code 1.
+/// Displays a styled *argument* error and exits with the usage code
+/// ([`ExitKind::Usage`](crate::standalone::exit::ExitKind::Usage)).
+///
+/// Argument errors keep their own wording because they are the only failures
+/// where reading the help screen is the remediation; runtime failures use
+/// [`exit_runtime_error`](crate::standalone::exit::exit_runtime_error) instead.
 pub fn exit_with_error(msg: impl std::fmt::Display) -> ! {
     eprintln!("{} {}", "❌ Argument error:".red().bold(), msg);
     eprintln!("{}", "👉 Use '-h' to show the help screen".yellow());
-    std::process::exit(1);
+    std::process::exit(crate::standalone::exit::ExitKind::Usage.code());
 }
 
 /// Silence gate configuration for monitoring and recording.
@@ -320,6 +533,10 @@ pub struct CliArgs {
     pub model_path: Option<PathBuf>,
     /// Path to the cab-sim impulse response (.wav) file.
     pub cab_path: Option<PathBuf>,
+    /// When set (`--cab-optional`), a failed cab-sim IR load is non-fatal:
+    /// the host warns and continues without cab-sim. Without it, an explicitly
+    /// requested IR that cannot be loaded aborts the process (F-UX-07).
+    pub cab_optional: bool,
     /// Input gain in dB.
     pub input_gain: f32,
     /// Output gain in dB.
@@ -346,24 +563,49 @@ pub struct CliArgs {
     pub cpu: Option<usize>,
     /// Enable WAV recording of the raw PipeWire capture stream.
     pub record: bool,
+    /// Output directory for WAV captures (`--record-dir`). `None` resolves to
+    /// the platform music directory at startup (`$XDG_MUSIC_DIR/NAM-Audio-Pipe`,
+    /// else `$HOME/Music/NAM-Audio-Pipe`, else the current directory).
+    pub record_dir: Option<PathBuf>,
     /// Disable the bounded backend reconnect cycle (`--fail-fast`): the first
     /// PipeWire stream failure triggers fail-fast teardown instead of
     /// a bounded reconnection attempt.
     pub fail_fast: bool,
+    /// Optional per-episode reconnect backoff budget (`--reconnect-timeout <s>`).
+    /// `None` uses the production schedule (6 attempts, 250 ms → 4 s,
+    /// cumulative 11.75 s). Ignored under `--fail-fast`.
+    pub reconnect_timeout: Option<Duration>,
     /// Noise gate configuration: `Off`, or `Threshold { open, close }` in dBFS
     /// (defaults to [`GateConfig::default_on`] = open at `-70.0 dB`).
     pub gate: GateConfig,
+    /// Terminal color policy from `--color` (defaults to [`ColorFlag::Auto`]).
+    pub color: ColorFlag,
+    /// Wait for Enter before exiting after a terminal-only, exit-immediate
+    /// invocation (`--diagnose`; F-UX-05 `.desktop` "Diagnostics" action) when
+    /// stdout is a terminal. Ignored for the long-running audio host.
+    pub pause: bool,
 }
 
-/// Parses command-line arguments.
+/// Parses command-line arguments and validates any explicitly provided input files.
+///
+/// `--diagnose`/`--diagnose-full` skip the file validation (they must work
+/// without the referenced models/IRs).
 pub fn parse_args() -> CliArgs {
-    parse_args_from(lexopt::Parser::from_env())
+    let args = parse_args_from(lexopt::Parser::from_env());
+    if !args.diagnose
+        && !args.diagnose_full
+        && let Err(e) = validate_cli_inputs(&args)
+    {
+        exit_with_error(e);
+    }
+    args
 }
 
 /// Helper parsing function that accepts any lexopt::Parser to facilitate testing.
 pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut model_path = None;
     let mut cab_path = None;
+    let mut cab_optional = false;
     let mut input_gain = 0.0;
     let mut output_gain = 0.0;
     let mut buffer_size = 256;
@@ -375,8 +617,12 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut activation = None;
     let mut cpu = None;
     let mut record = false;
+    let mut record_dir = None;
     let mut fail_fast = false;
+    let mut reconnect_timeout = None;
     let mut gate = GateConfig::default_on();
+    let mut color = ColorFlag::Auto;
+    let mut pause = false;
     let mut has_args = false;
 
     while let Some(arg) = parser.next().unwrap_or_else(|e| exit_with_error(e)) {
@@ -395,8 +641,39 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
             Long("record") => {
                 record = true;
             }
+            Long("pause") => {
+                pause = true;
+            }
+            Long("record-dir") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let p_str = val.into_string().unwrap_or_else(|_| {
+                    exit_with_error("Invalid recording directory path (UTF-8).")
+                });
+                let home = std::env::var_os("HOME");
+                record_dir = Some(
+                    expand_user_path(&p_str, home.as_deref())
+                        .unwrap_or_else(|e| exit_with_error(e)),
+                );
+            }
+            Long("cab-optional") => {
+                cab_optional = true;
+            }
             Long("fail-fast") => {
                 fail_fast = true;
+            }
+            Long("reconnect-timeout") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val.into_string().unwrap_or_else(|_| {
+                    exit_with_error("Invalid reconnect timeout value (expected seconds).")
+                });
+                let secs = val_str.parse::<u64>().unwrap_or_else(|_| {
+                    exit_with_error(format!(
+                        "Invalid reconnect timeout: '{}'. Must be a non-negative integer \
+                         number of seconds.",
+                        val_str
+                    ))
+                });
+                reconnect_timeout = Some(Duration::from_secs(secs));
             }
             Long("gate") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -404,6 +681,24 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                     .into_string()
                     .unwrap_or_else(|_| exit_with_error("Invalid gate mode value."));
                 gate = parse_gate_mode(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
+            Long("color") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid color mode value."));
+                color = match val_str.to_lowercase().as_str() {
+                    "auto" => ColorFlag::Auto,
+                    "always" => ColorFlag::Always,
+                    "never" => ColorFlag::Never,
+                    other => exit_with_error(format!(
+                        "Invalid color mode: '{}'. Expected 'auto', 'always', or 'never'.",
+                        other
+                    )),
+                };
+                // Applied immediately: any output produced after this point
+                // (including `--help`) uses the explicit policy.
+                crate::standalone::colors::apply_flag(color);
             }
             Long("cpu") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -467,35 +762,22 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                 let p_str = val
                     .into_string()
                     .unwrap_or_else(|_| exit_with_error("Invalid model path (UTF-8)."));
-
-                // Simplified tilde expansion implementation
-                let expanded = if p_str.starts_with("~/") {
-                    if let Ok(home) = std::env::var("HOME") {
-                        p_str.replacen("~", &home, 1)
-                    } else {
-                        p_str
-                    }
-                } else {
-                    p_str
-                };
-                model_path = Some(PathBuf::from(expanded));
+                let home = std::env::var_os("HOME");
+                model_path = Some(
+                    expand_user_path(&p_str, home.as_deref())
+                        .unwrap_or_else(|e| exit_with_error(e)),
+                );
             }
             Short('c') | Long("cab") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
                 let p_str = val
                     .into_string()
                     .unwrap_or_else(|_| exit_with_error("Invalid cab IR path (UTF-8)."));
-
-                let expanded = if p_str.starts_with("~/") {
-                    if let Ok(home) = std::env::var("HOME") {
-                        p_str.replacen("~", &home, 1)
-                    } else {
-                        p_str
-                    }
-                } else {
-                    p_str
-                };
-                cab_path = Some(PathBuf::from(expanded));
+                let home = std::env::var_os("HOME");
+                cab_path = Some(
+                    expand_user_path(&p_str, home.as_deref())
+                        .unwrap_or_else(|e| exit_with_error(e)),
+                );
             }
             Short('i') | Long("input-gain") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -567,13 +849,17 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     }
 
     if !has_args {
-        print_help();
-        std::process::exit(0);
+        // F-UX-05: the installed `.desktop` launcher runs the binary with no
+        // arguments on a `Terminal=true` window. Pause before exiting in that
+        // interactive case so the user can read the help; every non-interactive
+        // invocation still exits immediately.
+        crate::standalone::launcher::handle_empty_invocation();
     }
 
     CliArgs {
         model_path,
         cab_path,
+        cab_optional,
         input_gain,
         output_gain,
         buffer_size,
@@ -585,8 +871,12 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         activation,
         cpu,
         record,
+        record_dir,
         fail_fast,
+        reconnect_timeout,
         gate,
+        color,
+        pause,
     }
 }
 

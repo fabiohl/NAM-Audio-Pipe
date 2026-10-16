@@ -128,6 +128,10 @@ pub(crate) struct FaultInjectingWriter {
     ok_calls: usize,
     /// Number of `sync_all` invocations.
     sync_calls: usize,
+    /// Fail every subsequent `sync_all` after this many successful syncs
+    /// (`Some(0)` fails the very first one). Used to inject a periodic
+    /// checkpoint failure without disturbing the write path.
+    fail_sync_after: Option<usize>,
 }
 
 #[cfg(test)]
@@ -141,6 +145,7 @@ impl FaultInjectingWriter {
             write_calls: 0,
             ok_calls: 0,
             sync_calls: 0,
+            fail_sync_after: None,
         }
     }
 
@@ -161,6 +166,13 @@ impl FaultInjectingWriter {
     pub(crate) fn fail_after(mut self, ok_calls: usize, kind: io::ErrorKind) -> Self {
         self.fail_after_ok = Some(ok_calls);
         self.fail_kind = Some(kind);
+        self
+    }
+
+    /// Fails every `sync_all` after `ok_syncs` successful syncs (`0` = the very
+    /// first sync fails). Drives the periodic-checkpoint failure path.
+    pub(crate) fn fail_sync_after(mut self, ok_syncs: usize) -> Self {
+        self.fail_sync_after = Some(ok_syncs);
         self
     }
 
@@ -213,6 +225,13 @@ impl WriteAt for FaultInjectingWriter {
     }
 
     async fn sync_all(&mut self) -> io::Result<()> {
+        if let Some(limit) = self.fail_sync_after
+            && self.sync_calls >= limit
+        {
+            // Counted as an attempt even when it fails, matching the syscall.
+            self.sync_calls += 1;
+            return Err(io::Error::other("injected sync fault"));
+        }
         self.sync_calls += 1;
         Ok(())
     }

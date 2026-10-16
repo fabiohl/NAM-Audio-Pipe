@@ -132,8 +132,8 @@ fn test_configure_realtime_thread_cpu_zero_pins() {
         )
     };
     assert_eq!(ret, 0);
-    // SAFETY: `after` is fully initialized and CPU index 0 is within bounds.
     assert!(
+        // SAFETY: `after` is fully initialized and CPU index 0 is within bounds.
         unsafe { libc::CPU_ISSET(0, &after) },
         "thread must be pinned to CPU 0"
     );

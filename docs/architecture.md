@@ -149,10 +149,30 @@ The PipeWire host lifecycle is governed by a thread-safe backend state machine (
 On a fatal connectivity loss the control loop enters the **bounded reconnect cycle** ([`src/standalone/pw_host/reconnect.rs`](../src/standalone/pw_host/reconnect.rs)):
 
 1. The **DSP state** (`CaptureState`: models, resampler, cab-sim, gains, gate configuration) and the **RT-side SPSC channels** (`RtHostChannels`) live in heap `Box`es reached via raw pointers — never moved into the stream closures. Re-instantiating the streams after a daemon restart **preserves every piece of internal state** (models, IRs, recording worker).
-2. A `ReconnectCycle` (production policy: 3 attempts, progressive 250 → 500 → 1000 ms exponential backoff, total ceiling 1.75 s) hands out at most `max_attempts` backoffs and then `None` forever — the retry phase is **strictly bounded in number and time** by construction; no infinite reconnect loop can exist.
+2. A `ReconnectCycle` (production policy: 6 attempts, progressive 250 ms → 4 s exponential backoff, per-episode ceiling 11.75 s) hands out at most `max_attempts` backoffs and then `None` forever — the retry phase is **strictly bounded per episode** by construction; no infinite reconnect loop can exist. The budget is **replenished** after a `STABLE_RESET` window (60 s) of uninterrupted healthy streaming (F-UX-09): isolated drops spread over a long session never accumulate into an exhaustion, while a single incident can never reset its own budget (a failure always clears the healthy window). `--reconnect-timeout <s>` caps the per-episode backoff budget (the attempt count is trimmed to the schedule that fits); a successful recovery logs `🎸 Audio restored after N attempt(s)`. **Worst-case time-to-terminate** after an *unrecoverable* daemon loss is ≈ 11.75 s of backoff plus per-attempt handshake time (previously ≈ 1.75 s); `--reconnect-timeout 2` restores the legacy ~1.75 s budget (3 attempts, 250/500/1000 ms) for watchdogs tuned to the old window. The control loop observes `Running` via the lock-free `SharedBackendStatus::is_running()` mirror, so the per-iteration stability gate never takes the state mutex.
 3. Each attempt re-creates a fresh `ThreadLoop`/`Context`/`Core` and both streams (the old instance is torn down first: `thread_loop.stop()`, R-04 final GC drain, `thread_configured` reset so RT setup re-runs on the new data thread).
 4. On success the streams renegotiate the format and rate; the existing rebuild handlers re-sync sample rates and audio resumes. On budget exhaustion the host falls back to the **fail-fast path**: integral teardown (RT stop, GC drain, recording `StreamStop` + bounded join) and a non-zero process exit (see [`src/run.rs`](../src/run.rs)).
-5. `--fail-fast` disables the cycle entirely (first failure → immediate teardown). The backoff sleep is interruptible in 25 ms slices so SIGINT/SIGTERM is honored even while waiting for the daemon.
+5. `--fail-fast` disables the cycle entirely (first failure → immediate teardown). The backoff sleep is interruptible in 25 ms slices so SIGINT/SIGTERM is honored even while waiting for the daemon. The stability window is fed by the control loop on every healthy iteration (`BackendState::Running`), so it never counts time spent disconnected.
+
+### 3.3 Termination Signal Handling & Broken-Pipe Tolerance
+
+Termination is unified in [`src/standalone/signals.rs`](../src/standalone/signals.rs):
+
+- One async-signal-safe C-ABI handler is installed for **`SIGINT`** (Ctrl+C), **`SIGTERM`** (`systemctl stop`, containers, orchestrators), **`SIGHUP`** (closing a `Terminal=true` launcher window — the default action would otherwise kill the process with no WAV finalization) and **`SIGQUIT`**; all four share the same staged state machine and grace window. `SIGHUP` is the everyday path for a launcher-driven user, so leaving it at the default disposition was the difference between a coherent capture and a corrupt one.
+- The first delivery cooperatively sets the process-global `SHUTDOWN` flag (Release) and opens a grace window in a single packed atomic word (stage + monotonic timestamp). Further signals inside the window are swallowed (exactly one graceful shutdown runs); a signal at or after the window boundary force-exits via `_exit(1)`, writing a static `forced exit: capture may be incomplete` line to `stderr` first. The window length is a **live atomic**: `500 ms` normally, widened to `5000 ms` (`RECORDING_GRACE_WINDOW_MS`) by `main` once the recording handshake succeeds and disarmed by the recording worker's teardown — so a second Ctrl+C arriving while a capture is drained, its header rewritten and `fsync`ed is swallowed instead of force-exiting mid-finalization (F-UX-04). The handler touches only atomics, `clock_gettime(CLOCK_MONOTONIC)` and `_exit` — never allocation, locks or logging.
+- Every `libc::sigaction` install is formally validated (non-zero return aborts startup), and the test-only `HandlerRestoreGuard` saves/restores all four dispositions.
+- **Broken-pipe tolerance:** `print_help` and the `--diagnose` bundle are written through `cli::write_stdout`, which writes to a locked `stdout` and tolerates `BrokenPipe` (e.g. `nam-audio-pipe --help | head -1`) instead of panicking like `println!`.
+- **Color policy:** ANSI sequences are emitted only when the process-global flag in [`src/standalone/colors.rs`](../src/standalone/colors.rs) is set — resolved from `NO_COLOR`/`CLICOLOR_FORCE`/`TERM=dumb` and TTY detection at startup, overridable by `--color auto|always|never`. Redirected output (pipes, `2> log.txt`) therefore stays free of escape sequences.
+
+### 3.4 Runtime Error Classes & Process Exit Codes
+
+Startup and runtime failures are classified so scripts and support can tell them apart by exit status ([`src/standalone/exit.rs`](../src/standalone/exit.rs)):
+
+- **Argument errors** (`cli::exit_with_error`, exit `2`) keep the `❌ Argument error:` wording and the `👉 Use '-h'` pointer — reading the help screen is the remediation. An explicitly provided `--model`, or a `--cab` without `--cab-optional`, that does not resolve to a readable regular file is caught here, *before* any PipeWire connection.
+- **Runtime errors** (`exit::exit_runtime_error`) print `❌ <Class> error:` plus an actionable `💡` hint and exit with the class code: `3` model, `4` cab IR, `5` backend/host, `6` recording. The recording worker's `RecordingWorkerOutcome::exit_code()` delegates to the same table (code `6`); code `1` is reserved for uncategorized failures and the second-signal force-exit path.
+- **Model load errors** are mapped from the engine's typed `LoadError` (via `LoadError::code`, never string parsing): I/O, unsupported version, unsupported architecture and JSON-parse roots each carry their own remediation hint.
+- **Cab-sim IR errors:** an explicitly requested `--cab` is fatal by default — a missing/unreadable path as a usage error (exit `2`), an unloadable IR (exit `4`); `--cab-optional` restores the graceful `warn` + continue-without-cab contract for both cases.
+- **First-connection backend failures** (the two `context.connect` / stream-setup `return Err` points reached before the reconnect loop) emit a `NamDiagnostic` with `phase=startup` and a stage-specific hint (daemon unreachable vs. stream creation) before `main` exits with `5`. The former fatal `expect()` calls on logger and CPU-receipt initialization now follow the same classified path, so a user never sees a raw Rust panic backtrace.
 
 ---
 
@@ -188,6 +208,60 @@ To guarantee glitch-free audio processing at quantum sizes down to 64 samples (1
 ### 4.5 TSC Clock Calibration (`calibrate_tsc`)
 
 - Calibrates the CPU Time Stamp Counter (`rdtsc`) against the monotonic clock via `rt_setup::calibrate_tsc()` (re-exported in [`src/standalone/rt_setup/mod.rs`](../src/standalone/rt_setup/mod.rs) from `neural_amp_modeler_rs::common::tsc`), measuring real-time DSP cycle consumption with sub-nanosecond precision.
+
+### 4.6 Host Calibration & Maximum Kernel-Level CPU Isolation
+
+To achieve deterministic sub-millisecond roundtrips and zero-jitter audio callback execution (as verified by the real-time compliance suite in [`tests/rt_metrics.rs`](../tests/rt_metrics.rs)), the host platform should be calibrated for strict kernel-level core isolation.
+
+#### Recommended Linux Kernel Command Line (`/etc/default/grub`)
+
+Configure `GRUB_CMDLINE_LINUX_DEFAULT` with the canonical isolation parameters (example for dedicated audio core 8 and sibling 9 on a 16-thread host):
+
+```text
+isolcpus=managed_irq,domain,8,9 nohz_full=8,9 rcu_nocbs=8,9 irqaffinity=0-7,10-15 nmi_watchdog=0 skew_tick=1
+```
+
+- **`isolcpus=managed_irq,domain,8,9`**: Completely removes cores 8 and 9 from kernel process scheduler balancing (`domain`) and isolates kernel-managed IRQ vectors (`managed_irq`).
+- **`nohz_full=8,9`**: Suspends the kernel scheduling timer tick when a single task runs on the core (full adaptive tickless mode).
+- **`rcu_nocbs=8,9`**: Delegates RCU callback processing from isolated cores to housekeeping cores (0-7, 10-15), eliminating softirq preemption.
+- **`irqaffinity=0-7,10-15`**: Sets default hardware device interrupt routing exclusively to housekeeping cores.
+- **`nmi_watchdog=0`**: Disables Non-Maskable Interrupt watchdog periodic ticks.
+- **`skew_tick=1`**: Desynchronizes timer ticks across CPUs to prevent synchronized cache line thrashing.
+
+#### Runtime Host Preparation & Isolation Commands
+
+```bash
+# 1. Disable the SMT sibling thread (core 9) to eliminate hyperthreading contention:
+echo 0 | sudo tee /sys/devices/system/cpu/cpu9/online
+
+# 2. Lock CPU frequency governor to 'performance' (prevents DVFS transition latency):
+echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+
+# 3. Disable dynamic frequency boost for benchmark/DSP clock determinism:
+echo 0 | sudo tee /sys/devices/system/cpu/cpufreq/boost
+
+# 4. Route hardware IRQs away from cores 8 and 9 (mask fcff for 16 threads):
+echo fcff | sudo tee /proc/irq/default_smp_affinity
+for irq in /proc/irq/[0-9]*/smp_affinity_list; do
+    [ -f "$irq" ] && echo 0-7,10-15 | sudo tee "$irq" >/dev/null 2>&1 || true
+done
+
+# 5. Enable PMU hardware counter sampling without root:
+echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+# 6. Ensure real-time priority permissions (ulimit -r 95) and memory locking (ulimit -l):
+ulimit -r 95
+ulimit -l unlimited
+```
+
+#### Real-Time Host Execution
+
+Run NAM-Audio-Pipe pinned to the isolated core under real-time FIFO scheduling:
+
+```bash
+# Pinned execution with SCHED_FIFO priority 80:
+chrt -f 80 taskset -c 8 nam-audio-pipe --model /path/to/model.nam --ir /path/to/ir.wav
+```
 
 ---
 
@@ -383,9 +457,13 @@ The wiring abstraction lives in [`src/recording/transport.rs`](../src/recording/
 - **Overrun Accounting in Blocks and Frames:** When the pool is exhausted (all 256 slots in flight — the pool's analog of a full ring) or a block exceeds `MAX_BLOCK_SIZE`, `OVERRUN_COUNT` (blocks) **and** `OVERRUN_FRAMES_COUNT` (frames) are incremented atomically; audio playback is never blocked. At shutdown the worker reports `lost blocks: N (frames: M)`, so the invariant `captured_frames == enqueued_frames + lost_frames` can be reconciled. Enqueueing is zero-alloc/zero-dealloc on the RT thread (heap-audit gated, `get_dealloc_count() == 0`).
 - **Startup Handshake & Fail-Fast:** When launched with `--record`, the main thread blocks on a `tokio::sync::oneshot` handshake until the worker confirms `io_uring` is available and the output directory is a real writable directory (`validate_output_dir` probe file). An invalid/no-permission directory or an unavailable `io_uring` aborts the process with a clear message **before** any PipeWire stream connects — recording can never fail silently while audio is discarded.
 - **Runtime Failure Propagation:** On a fatal mid-stream error (`EIO`, `ENOSPC`), the worker transitions the observable `RecordingStatus` to `Failed` and raises an atomic flag the RT callback polls to suspend enqueueing without panics; the error is logged visibly.
+- **Visible Runtime Failure Alert (F-UX-02a):** The observable `RecordingStatus` is handed to the host (`PipewireHostConfig::recording_status`) and polled every control-loop iteration by `RecordingAlert` (`src/recording/alert.rs`) with `try_lock` only — the loop never blocks on the worker's mutex and the RT path is untouched. An `Active → Failed` transition (or a *changed* reason) emits a red multi-line alert immediately, then reminds every `ALERT_REMINDER_INTERVAL` (`30 s`) while the condition persists; a resolved condition clears the latch so a recurrence re-alerts. The clock is injectable, so the cadence is proven deterministically.
+- **Disk-Space Estimate & Pre-Warning (F-UX-02b):** `src/recording/space.rs` wraps `libc::statvfs` behind the injectable `FreeSpace` trait. When the first segment opens the worker logs `≈ N min writable at <rate> Hz / <ch> ch` and, every `SPACE_CHECK_INTERVAL` (`60 s`) and on every new segment, publishes a low-space warning (below `1 GiB` or `< 5 min` remaining) on `RecordingStatus::Active.space_warning`. The warning is rendered by the same `RecordingAlert` path as a failure, unifying the output; a probe error only suppresses the warning and never breaks the capture.
+- **Output Directory & Session Summary (F-UX-11):** `--record-dir <DIR>` (with `~` expansion; default `$XDG_MUSIC_DIR/NAM-Audio-Pipe` → `~/Music/NAM-Audio-Pipe` → CWD with a warning) is created eagerly by `main` before the fail-fast probe, so a read-only mount (`EROFS`)/permission error (`EACCES`) surfaces with an actionable hint instead of a bare probe failure. When the capture finalizes, the worker sums every `_partN` segment and logs `💾 Capture saved: <dir> (<duration> across N segments)` (`src/recording/summary.rs`), so the operator knows where the take landed and how big it is. The Flatpak manifest grants `--filesystem=xdg-music` so the packaged launcher can write.
 - **Header Finalization Protocol (R-13):** During shutdown, `thread_loop.stop()` halts the audio thread first. The main thread then exclusively pushes `ControlPayload::StreamStop` (bounded retry), explicitly drops the recording sender (control producer + pool producer), and joins the I/O thread (bounded by 5 seconds). The I/O thread rewrites the initial 44-byte WAV header at offset 0 with the exact `data` byte count and executes `fsync` before file close.
+- **Periodic Header Checkpoints (F-UX-01, R-13 extension):** Finalizing the header only on `StreamStop` means any *ungraceful* death (SIGKILL, OOM-killer, power loss, a stuck second Ctrl+C) leaves a `.wav` whose `data` chunk declares `0` bytes even with gigabytes on disk — unrecoverable by every standard reader. The disk worker therefore rewrites the header with the running byte count and `fsync`s it every `CHECKPOINT_INTERVAL_SECS` (`3 s`) of audio, strictly between blocks; a crash loses at most one window (~1.1 MiB at 48 kHz/2 ch/32-bit float) instead of the whole take. Checkpointing never advances the data offsets or the byte accounting, is fatal on error (same treatment as `write_block`: `Failed` + RT flag), and `CHECKPOINT_INTERVAL_SECS = 0` disables it (rollback).
 - **Lifecycle Decoupling & Integral Drain:** The disk worker **never** observes the process-global `SHUTDOWN` flag — a SIGINT arriving while the channels are momentarily empty must not finalize the capture while the RT callback can still emit (up to one main-loop iteration). The worker terminates only when (1) it consumes the `StreamStop` token, pushed exclusively after `thread_loop.stop()` confirmed the RT loop stopped (draining every pending pool descriptor first), or (2) the sender was dropped (both producers gone) **and** every channel is fully drained. Both paths drain every pending block, rewrite the header and `fsync` before returning, so the recording tail is never truncated and the WAV is always coherent. No ABA / double-return: slot ownership is `FREE→RT→IN-FLIGHT→I/O→FREE` through two strict SPSC FIFOs.
-- **RAII Worker Custody & Observable Join:** The worker thread, its transport sender (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see [`src/recording/guard.rs`](../src/recording/guard.rs)). The guard owns the `JoinHandle` and the sender, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → sender drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — silent failure suppression is eliminated. **Loss observability:** a clean join with ring overruns counted on the capture path (`OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT`) is promoted to `RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }` and also exits **non-zero** with an explicit message — `captured_frames == enqueued_frames + lost_frames` stays reconcilable and is never silent (`RecordingWorkerOutcome::exit_code()`: `Success` → 0, every other variant → 1).
+- **RAII Worker Custody & Observable Join:** The worker thread, its transport sender (the stop channel) and the RT failure flag travel together in a `RecordingWorkerGuard` (see [`src/recording/guard.rs`](../src/recording/guard.rs)). The guard owns the `JoinHandle` and the sender, so **every** exit path — normal shutdown, an early `?` return inside the host, or a panic unwinding during initialization — signals the worker (`StreamStop` → sender drop) and joins it with a bounded timeout: zero zombie threads or open WAV descriptors. The join result is formally inspected: a worker `Err` (failed header rewrite/`fsync`, `EIO`, `ENOSPC`), a panic payload or a join timeout is returned as a `RecordingWorkerOutcome` and propagated to `main()`, turning any recording failure into a **non-zero process exit code** — silent failure suppression is eliminated. **Loss observability:** a clean join with ring overruns counted on the capture path (`OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT`) is promoted to `RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }` and also exits **non-zero** with an explicit message — `captured_frames == enqueued_frames + lost_frames` stays reconcilable and is never silent (`RecordingWorkerOutcome::exit_code()`: `Success` → 0, every other variant → the recording class code `6`).
 
 ---
 
@@ -415,17 +493,32 @@ report, and crash/panic reports (`~/.cache/neural-amp-modeler-rs/crash-*.txt`). 
 populate the `NamLogger` ring buffer, so they remain part of future support bundles and crash
 reports.
 
+**Consolidated status banner & log-noise control (F-UX-13).** Instead of scattering the
+session's key facts across many `info` lines, the control loop emits **one** status banner
+(`src/standalone/banner.rs`, pure `render_banner`) right after the first processed audio
+quantum (the RT thread is configured in that same callback, so `SCHED_FIFO`/`mlockall` are
+already visible; the gate is the effective quantum, not `active_rate`, which is only
+published on a resampler swap): model/bypass, cab-sim
+state (including the `--cab-optional` skip), sample rate, quantum, DSP + total latency,
+`SCHED_FIFO`/`policy` + `mlockall` (the latter latched in `rt_setup::thread`), and the
+recording path. Every fact is read from already-published atomics — no `log::*` is added to
+the audio callback. An analogous session summary (`render_session_summary`: xruns, bridge
+dropped frames, recording) is emitted on clean shutdown. The gate transition logs (Silent
+Mode / Audio Signal Detected / Fade) are rate-limited to at most one `info` line per second by
+`GateTransitionThrottle` (injectable clock; suppressed transitions fold into the next line as
+`(×N)`), so a threshold near the noise floor can no longer bury `E23xx` errors under a burst.
+
 ### 9.1 Error Catalog Summary (`NamErrorCode`)
 
 Typed diagnostic error codes (`NamErrorCode`) provide structured error categorization:
 
-| Range   | Category            | Representative Error Codes                                                                                                                                                                                                                                                                                                          |
-|:------- |:------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                                                                                                                                                                                                  |
+| Range   | Category            | Representative Error Codes                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+|:------- |:------------------- |:----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E1xxx` | Model Loading & I/O | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1300` UNSUPPORTED_ARCHITECTURE                                                                                                                                                                                                                                                                                                                                                                       |
 | `E2xxx` | Audio & Real-Time   | `E2001` DEADLINE_EXCEEDED, `E2004` OS_SCRATCH_CAPACITY, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH |
-| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED                                                                                                                                                                                                |
-| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                                                                                                                                                                                                                                                              |
-| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                                                                                |
+| `E3xxx` | SPSC / Lock-Free GC | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED                                                                                                                                                                                                                                                                                                                                                     |
+| `E4xxx` | Runtime & CLI       | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `E5xxx` | System Resources    | `E5000` OUT_OF_MEMORY                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 
 > Affinity/topology environmental degradation (unreadable `/proc/interrupts` or `/sys/devices/system/cpu`, failed `sched_getaffinity`) is reported by the engine's host-agnostic `rt_hardening` layer via generic `log::warn!` records rather than host-specific `E21xx` codes, since the selection code is shared across hosts. Power-QoS and hardware-sink probe codes remain Pipe-specific.
 
@@ -471,6 +564,7 @@ With **Rust 1.99** stabilizing C-ABI variadic functions (`unsafe extern "C" fn(.
 
 1. **Pure Rust C-ABI Variadic Callbacks:**
    The `spa_log_methods` table registers Rust functions declared with C variadics:
+
    ```rust
    pub unsafe extern "C" fn nam_pw_log(
        _object: *mut c_void,
@@ -482,13 +576,15 @@ With **Rust 1.99** stabilizing C-ABI variadic functions (`unsafe extern "C" fn(.
        args: ...,
    )
    ```
+
    Rust 1.99 natively compiles this signature according to the target's C calling convention (System V AMD64 ABI on `x86-64`), passing `args: VaList` cleanly to standard C formatting primitives.
 
 2. **Dual-Path Calling Convention Support:**
    PipeWire dispatches logs through two distinct conventions depending on the invocation source:
+
    - Direct macro invocations (`spa_log_log`, `spa_log_logt`) invoke the variadic `log` and `logt` callbacks.
    - High-level wrappers (`pw_log_log`, `pw_log_logt`) pack variadic arguments into a platform `va_list` structure and dispatch to `logv` and `logtv`.
-   Implementing all four entry points (`nam_pw_log`, `nam_pw_logt`, `nam_pw_logv`, `nam_pw_logtv`) guarantees comprehensive coverage across all PipeWire versions and plugin modules.
+     Implementing all four entry points (`nam_pw_log`, `nam_pw_logt`, `nam_pw_logv`, `nam_pw_logtv`) guarantees comprehensive coverage across all PipeWire versions and plugin modules.
 
 3. **Hard Real-Time Safety & Zero Heap Allocations:**
    Formatting executes inside an isolated 1024-byte stack buffer (`[0u8; 1024]`) via `vsnprintf` (`__vsnprintf`). No dynamic memory allocation (`malloc`, `String`, `Vec`, `Box`), heap drops, or thread synchronization locks occur on the log formatting path. If a log message exceeds 1023 bytes, it is safely truncated without undefined behavior or heap escalation.
@@ -549,7 +645,8 @@ Executing real-time DSP applications inside an unprivileged Linux container sand
 
 The packaging directory (`packaging/flatpak/`) provides standard XDG desktop integration assets:
 
-- **Desktop Entry (`io.github.fabiohl.NAMAudioPipe.desktop`):** Registers `NAM-Audio-Pipe` in application menus under the `Audio;AudioVideo;` categories with terminal execution support (`Terminal=true`).
+- **Desktop Entry (`io.github.fabiohl.NAMAudioPipe.desktop`):** Registers `NAM-Audio-Pipe` in application menus under the `Audio;AudioVideo;` categories with terminal execution support (`Terminal=true`). It also declares `Actions=`: **Run in bypass (no model)** (`--gate off`, no `--model`) and **Diagnostics** (`--diagnose --pause`).
+- **First-run launcher (`src/standalone/launcher.rs`, F-UX-05):** invoked with no arguments on a terminal, the program prints the help and waits for Enter (`StartupMode::PauseBeforeExit`) so the `Terminal=true` window does not vanish; redirected invocations exit immediately (`StartupMode::ExitImmediately`). The decision is a pure function (`startup_mode(args_empty, stdin_tty, stdout_tty)`), so it is unit-tested independently of the real streams. `--pause` extends the same wait to `--diagnose` for the desktop Diagnostics action.
 - **AppStream Metainfo (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`):** Provides catalog metadata for graphical package managers (GNOME Software, KDE Discover), documenting capabilities, URLs, release tags, and developer identity (`io.github.fabiohl`).
 - **Hicolor Icon Hierarchy (`icons/hicolor/`):** Full icon suite including scalable vector (`scalable/apps/io.github.fabiohl.NAMAudioPipe.svg`) and high-resolution rasterized assets (`64x64`, `128x128`, `256x256`, `512x512` PNGs generated via `render-icons.py`).
 
@@ -606,6 +703,7 @@ When packaging, deploying, and inspecting the standalone `NAM-Audio-Pipe` Flatpa
 #### 1. Standalone Application vs. Audio Plugin Extension Model
 
 - **Explicit Sandbox Isolation:** Unlike audio plugin extensions (`type="addon"`), which run unconfined within host DAW containers and possess zero standalone permissions, `NAM-Audio-Pipe` is an autonomous desktop application (`<component type="desktop-application">`, ref `app/io.github.fabiohl.NAMAudioPipe/x86_64/stable`).
+
 - **Verifiable Sandbox Policy:** Because it is an application, its sandbox permissions are directly queryable by the host system. Running `flatpak info --show-permissions io.github.fabiohl.NAMAudioPipe` explicitly prints the active security grants:
 
   ```text

@@ -8,6 +8,8 @@
 #![cfg(feature = "testing")]
 
 use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
 
 use nam_audio_pipe::receipt::LONG_ROSTER;
 use nam_audio_pipe::receipt::jsonl::{derived_status, verify_long_jsonl, verify_long_jsonl_strict};
@@ -170,4 +172,84 @@ fn text_and_jsonl_verdicts_agree_on_a_gapped_run() {
     let receipt = parse_long_receipt(&text).unwrap();
     assert!(receipt.audit().is_ok());
     assert!(receipt.verify_release_certification().is_err());
+}
+
+/// Long-audit evidence integrity (D1): `utils/tests-long.sh --simulate` is the
+/// sanctioned non-executing structural surface and must NEVER destroy the
+/// artifacts of a real audit. This test stages a synthetic real run under a
+/// hermetic `NAM_LOG_ROOT`, invokes `--simulate`, and asserts the real phase
+/// logs and both receipts are byte-identical while the planned placeholders are
+/// registered only under `<root>/simulate/`.
+#[test]
+fn simulate_never_touches_real_audit_artifacts() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let tmp = std::env::temp_dir().join(format!(
+        "pipe-simulate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let logs = tmp.join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+
+    let artifacts = [
+        "phase1-soak.log",
+        "phase2-heap-audit.log",
+        "phase3-rt-deadline.log",
+        "phase4-rt-jitter.log",
+        "phase5-concurrency.log",
+        "phase6-endurance.log",
+        "phase7-pw-resilience.log",
+        "long-receipt.txt",
+        "long-audit-receipt.jsonl",
+    ];
+    for name in artifacts {
+        std::fs::write(logs.join(name), format!("REAL-EVIDENCE {name}\n")).unwrap();
+    }
+    let before: Vec<(&str, Vec<u8>)> = artifacts
+        .iter()
+        .map(|name| (*name, std::fs::read(logs.join(name)).unwrap()))
+        .collect();
+
+    let out = Command::new(root.join("utils/tests-long.sh"))
+        .arg("--simulate")
+        .current_dir(&root)
+        .env("NAM_LOG_ROOT", &logs)
+        .env_remove("NAM_RT_STRICT")
+        .output()
+        .expect("failed to execute utils/tests-long.sh --simulate");
+    assert!(
+        out.status.success(),
+        "--simulate must exit 0 (got {:?}); stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    for (name, bytes) in &before {
+        let now = std::fs::read(logs.join(name))
+            .unwrap_or_else(|e| panic!("real artifact {name} vanished: {e}"));
+        assert_eq!(
+            &now, bytes,
+            "real artifact {name} must be byte-identical after --simulate"
+        );
+    }
+
+    // The planned phases are registered only in the isolated simulate dir.
+    let sim_receipt =
+        std::fs::read_to_string(logs.join("simulate/long-receipt.txt")).expect("simulate receipt");
+    assert!(
+        sim_receipt.contains("MODE: simulate"),
+        "simulate receipt must record MODE: simulate"
+    );
+    for name in artifacts {
+        let sim_path = logs.join("simulate").join(name);
+        assert!(
+            sim_path.exists(),
+            "expected simulate placeholder {name} in the isolated dir"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

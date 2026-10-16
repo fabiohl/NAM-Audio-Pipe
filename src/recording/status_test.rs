@@ -16,6 +16,7 @@ fn recording_status_derives_debug_clone_partial_eq() {
     let starting = RecordingStatus::Starting;
     let active = RecordingStatus::Active {
         path: PathBuf::from("/tmp/capture_20260826_000000.wav"),
+        space_warning: None,
     };
     let failed = RecordingStatus::Failed {
         reason: "ENOSPC".into(),
@@ -29,7 +30,8 @@ fn recording_status_derives_debug_clone_partial_eq() {
     assert_eq!(
         active,
         RecordingStatus::Active {
-            path: PathBuf::from("/tmp/capture_20260826_000000.wav")
+            path: PathBuf::from("/tmp/capture_20260826_000000.wav"),
+            space_warning: None,
         }
     );
     assert_eq!(
@@ -66,6 +68,7 @@ fn record_failure_transitions_status_and_raises_flag() {
 fn record_failure_is_idempotent_and_raises_flag_even_when_poisoned() {
     let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Active {
         path: PathBuf::from("/tmp/x"),
+        space_warning: None,
     }));
     // Poison the mutex: panic while holding the guard.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

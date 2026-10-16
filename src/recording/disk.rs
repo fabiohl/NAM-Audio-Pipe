@@ -48,6 +48,20 @@
 //! I/O error during the drain propagates as `Failed` and the partial file is
 //! preserved on disk for recovery.
 //!
+//! ## Durable capture: periodic header checkpoints
+//!
+//! Rewriting the header only on `finalize` means *any* ungraceful death
+//! (SIGKILL, OOM-killer, power loss, `SIGHUP` before T1.3, a stuck second
+//! Ctrl+C) leaves a `.wav` whose `data` chunk declares `0` bytes even with
+//! gigabytes already on disk — the whole take is unrecoverable by every
+//! standard reader (F-UX-01). The writer therefore rewrites the header with the
+//! running byte count and `fsync`s it every [`CHECKPOINT_INTERVAL_SECS`] seconds
+//! of audio, from the disk thread, between blocks. A crash can then lose at
+//! most one checkpoint window (≤ `CHECKPOINT_INTERVAL_SECS` s) instead of the
+//! entire recording. Checkpointing never advances the data offsets or the byte
+//! accounting, and is disabled by setting [`CHECKPOINT_INTERVAL_SECS`] to `0`
+//! (rollback).
+//!
 //! # Known Limitation: Maximum WAV file size
 //! The RIFF/WAV format uses `u32` fields for chunk sizes, limiting the data payload
 //! to `u32::MAX - (header_len - 8)` (~4 GiB — the 8-byte `RIFF`+size envelope is
@@ -63,6 +77,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::recording::buffer::{
     AlignedBlock, AudioMetadata, ControlPayload, MAX_BLOCK_SIZE, OVERRUN_COUNT,
@@ -71,9 +86,14 @@ use crate::recording::buffer::{
 use crate::recording::io::{WriteAt, write_all_at};
 use crate::recording::pool::{POOL_CAPACITY, PoolConsumer};
 use crate::recording::probe::{IoUringSupport, probe_io_uring};
-use crate::recording::status::{
-    RecordingInit, RecordingStatus, SharedRecordingStatus, record_failure,
+use crate::recording::space::{
+    FreeSpace, SPACE_CHECK_INTERVAL, StatvfsFreeSpace, estimate_message, low_space_warning,
 };
+use crate::recording::status::{
+    RecordingInit, RecordingStatus, SharedRecordingStatus, mark_active, publish_space_warning,
+    record_failure,
+};
+use crate::recording::summary::CaptureSummary;
 use crate::recording::transport::RecordingReceiver;
 use crate::recording::wav_header::{build_wav_header, capture_filename, current_capture_timestamp};
 
@@ -87,6 +107,36 @@ use crate::recording::wav_header::{build_wav_header, capture_filename, current_c
 /// counter keeps every probe name unique per process while staying allocation-free
 /// on the probe path.
 static OUTPUT_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Interval, in seconds of captured audio, between periodic WAV-header
+/// checkpoints.
+///
+/// Every window the header is rewritten with the current `data_bytes_written`
+/// and `fsync`ed, bounding the audio a crash can lose (F-UX-01). The value is
+/// a policy choice from the finding's suggested 2–5 s range, not a measured
+/// threshold. `0` disables checkpointing (the header is then only corrected on
+/// `finalize`, i.e. the pre-fix behavior) — the documented rollback.
+///
+/// The trigger is derived per-format as
+/// `CHECKPOINT_INTERVAL_SECS × sample_rate × channels × (bit_depth / 8)`
+/// bytes: at 48 kHz / 2 ch / 32-bit float one window is exactly 1 152 000 bytes
+/// (~1.1 MiB) of audio. The wall-clock cost of the periodic `fdatasync` on
+/// SSD/HDD/USB is the operator-executed measurement E-02 (T6.2).
+pub const CHECKPOINT_INTERVAL_SECS: u64 = 3;
+
+/// Audio-data bytes accumulated per checkpoint window for `metadata`.
+///
+/// Returns `0` when [`CHECKPOINT_INTERVAL_SECS`] is `0` (checkpointing
+/// disabled). Recomputed per writer, so a mid-stream rate/format change — which
+/// always opens a fresh `_partN` writer — picks up the new cadence.
+fn checkpoint_interval_bytes(metadata: &AudioMetadata) -> u64 {
+    if CHECKPOINT_INTERVAL_SECS == 0 {
+        return 0;
+    }
+    let bytes_per_sec =
+        metadata.sample_rate as f64 * metadata.channels as f64 * (metadata.bit_depth as f64 / 8.0);
+    (CHECKPOINT_INTERVAL_SECS as f64 * bytes_per_sec) as u64
+}
 
 // Silence trimming is performed in the RT thread (process.rs): audio blocks are only
 // enqueued when the noise gate is open (n_pw > 0). The disk writer receives only
@@ -116,6 +166,13 @@ struct AsyncWavWriter<W: WriteAt> {
     data_bytes_written: u32,
     /// Current write offset in the file (header + data already written).
     current_offset: u64,
+    /// Audio-data bytes accumulated since the last periodic header checkpoint.
+    /// When it reaches `checkpoint_interval_bytes` the header is rewritten and
+    /// `fsync`ed, bounding the audio a crash can lose (F-UX-01).
+    bytes_since_checkpoint: u64,
+    /// Checkpoint trigger in audio-data bytes (`CHECKPOINT_INTERVAL_SECS` of
+    /// audio at the current format). `0` disables checkpointing.
+    checkpoint_interval_bytes: u64,
     /// Reusable I/O buffer for f32→bytes conversion before writing via io_uring.
     /// `tokio_uring` requires ownership of the buffer; after writing, the buffer is returned
     /// and reused on the next block, eliminating repeated allocations.
@@ -206,6 +263,8 @@ impl<W: WriteAt> AsyncWavWriter<W> {
             header_len,
             data_bytes_written: 0,
             current_offset: header_len,
+            bytes_since_checkpoint: 0,
+            checkpoint_interval_bytes: checkpoint_interval_bytes(&metadata),
             // Pre-sized to MAX_BLOCK_SIZE * 4 bytes (f32 -> little-endian bytes).
             // Guarantees reserve() in write_block() is always a no-op, even across
             // PipeWire quantum renegotiations that may deliver larger blocks.
@@ -250,6 +309,7 @@ impl<W: WriteAt> AsyncWavWriter<W> {
 
         self.data_bytes_written += bytes_len as u32;
         self.current_offset += bytes_len as u64;
+        self.bytes_since_checkpoint += bytes_len as u64;
 
         Ok(())
     }
@@ -269,22 +329,49 @@ impl<W: WriteAt> AsyncWavWriter<W> {
             .is_none_or(|total| total > max_data_payload)
     }
 
-    /// Finalizes the WAV file by rewriting the header with the final data size,
-    /// and performing an explicit `fsync` to ensure data persistence on disk.
-    async fn finalize(&mut self) -> Result<()> {
-        let header = build_wav_header(&self.metadata, self.data_bytes_written)?;
-        // Rewrite the header at the origin (offset 0) — short-write safe.
-        let (res, _buf) = write_all_at(&mut self.file, header, 0).await;
-        res.context("Failed to rewrite WAV header during finalization")?;
+    /// Returns `true` when a periodic header checkpoint is due.
+    fn checkpoint_due(&self) -> bool {
+        self.checkpoint_interval_bytes > 0
+            && self.bytes_since_checkpoint >= self.checkpoint_interval_bytes
+    }
 
-        // Ensure synchronization with the hardware state
+    /// Rewrites the header at offset 0 with the current byte count and `fsync`s
+    /// the file (short-write safe). Shared by the periodic checkpoint and the
+    /// terminal finalize so their durability behavior can never drift apart.
+    ///
+    /// Never advances `current_offset` or `data_bytes_written`: the header
+    /// reflects persisted data, it does not move the stream.
+    async fn rewrite_header_and_sync(&mut self, context: &str) -> Result<()> {
+        let header = build_wav_header(&self.metadata, self.data_bytes_written)?;
+        let (res, _buf) = write_all_at(&mut self.file, header, 0).await;
+        res.with_context(|| context.to_string())?;
         self.file
             .sync_all()
             .await
-            .context("Failed to fsync the WAV file")?;
-
-        // `tokio_uring::fs::File` is automatically closed when dropped
+            .with_context(|| context.to_string())?;
         Ok(())
+    }
+
+    /// Rewrites the header with the current `data_bytes_written` and `fsync`s
+    /// the file, without advancing the data offsets or the byte accounting.
+    ///
+    /// Called strictly between blocks (never inside [`Self::write_block`]), so
+    /// it can never interleave with an in-flight audio write. A failure is a
+    /// fatal recording error, handled exactly like a `write_block` failure.
+    async fn checkpoint(&mut self) -> Result<()> {
+        self.rewrite_header_and_sync("Failed to write the WAV header during checkpoint")
+            .await?;
+        self.bytes_since_checkpoint = 0;
+        Ok(())
+    }
+
+    /// Finalizes the WAV file by rewriting the header with the final data size,
+    /// and performing an explicit `fsync` to ensure data persistence on disk.
+    ///
+    /// `tokio_uring::fs::File` is automatically closed when dropped.
+    async fn finalize(&mut self) -> Result<()> {
+        self.rewrite_header_and_sync("Failed to write the WAV file during finalization")
+            .await
     }
 }
 
@@ -301,6 +388,19 @@ trait WavSink {
     /// Creates a new capture writer for segment `part` with `metadata`,
     /// returning the writer and the actual file path.
     async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)>;
+
+    /// Returns the bytes available to the capture writer for `metadata`.
+    ///
+    /// `None` means "unknown": either the sink has no probe (test sinks) or the
+    /// probe itself failed (e.g. a transient `statvfs` error). Callers must
+    /// distinguish this from a *successful* probe reporting comfortable headroom
+    /// so a transient failure never clears an active low-space warning.
+    ///
+    /// The production [`TokioUringSink`] overrides this with `statvfs`; the
+    /// default keeps non-production sinks space-agnostic (T4.2).
+    fn free_bytes(&self, _metadata: &AudioMetadata) -> Option<u64> {
+        None
+    }
 }
 
 /// Minimal per-file surface the drain loop needs from a live WAV writer.
@@ -314,6 +414,13 @@ trait WavWriter {
 
     /// Persists one audio block fully (short-write safe).
     async fn write_block(&mut self, block: &AlignedBlock<MAX_BLOCK_SIZE>) -> Result<()>;
+
+    /// Returns `true` when a periodic header checkpoint is due.
+    fn checkpoint_due(&self) -> bool;
+
+    /// Rewrites the header with the running byte count and `fsync`s it, without
+    /// advancing the write offsets or the byte accounting (F-UX-01).
+    async fn checkpoint(&mut self) -> Result<()>;
 
     /// Rewrites the header with the final byte count and issues `fsync`.
     async fn finalize(&mut self) -> Result<()>;
@@ -332,6 +439,14 @@ impl<W: WriteAt> WavWriter for AsyncWavWriter<W> {
         AsyncWavWriter::<W>::write_block(self, block).await
     }
 
+    fn checkpoint_due(&self) -> bool {
+        AsyncWavWriter::<W>::checkpoint_due(self)
+    }
+
+    async fn checkpoint(&mut self) -> Result<()> {
+        AsyncWavWriter::<W>::checkpoint(self).await
+    }
+
     async fn finalize(&mut self) -> Result<()> {
         AsyncWavWriter::<W>::finalize(self).await
     }
@@ -342,6 +457,8 @@ impl<W: WriteAt> WavWriter for AsyncWavWriter<W> {
 struct TokioUringSink<'a> {
     /// Output directory for capture files.
     base_dir: &'a Path,
+    /// Injectable free-space probe used for the low-space pre-warning (T4.2).
+    space: &'a dyn FreeSpace,
 }
 
 impl WavSink for TokioUringSink<'_> {
@@ -349,6 +466,10 @@ impl WavSink for TokioUringSink<'_> {
 
     async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)> {
         AsyncWavWriter::create(self.base_dir, part, metadata).await
+    }
+
+    fn free_bytes(&self, _metadata: &AudioMetadata) -> Option<u64> {
+        self.space.available_bytes(self.base_dir).ok()
     }
 }
 
@@ -396,39 +517,51 @@ pub async fn disk_writer_loop(
     // directory is confirmed writable. Notify the main thread that it is safe
     // to start PipeWire with `--record`.
     let _ = handshake.send(Ok(base_dir.clone()));
-    if let Ok(mut guard) = status.lock() {
-        *guard = RecordingStatus::Active {
-            path: base_dir.clone(),
-        };
-    }
+    mark_active(&status, base_dir.clone());
     log::info!(
         "🎙️  Recording worker ready — capture directory: {}",
         base_dir.display()
     );
 
+    let space = StatvfsFreeSpace;
     let sink = TokioUringSink {
         base_dir: &base_dir,
+        space: &space,
     };
     let result =
         disk_writer_loop_inner(&sink, &mut receiver, recording_data_available, &status).await;
 
-    match &result {
+    publish_worker_result(&result, &status, &failed_flag);
+
+    result
+}
+
+/// Publishes the terminal worker result on the observable status.
+///
+/// `Ok(())` → [`RecordingStatus::Stopped`]; any `Err` (a fatal `write_block`
+/// failure, a periodic checkpoint failure, a failed header rewrite/`fsync`,
+/// `EIO`, `ENOSPC`, ...) → [`record_failure`], which transitions the status to
+/// `Failed` and raises the RT-observable failure flag the audio callback polls
+/// to suspend enqueueing without panics.
+///
+/// Extracted so the failure→status mapping is unit-testable without a real
+/// `io_uring` runtime (the production worker enters one, tests do not).
+fn publish_worker_result(
+    result: &anyhow::Result<()>,
+    status: &SharedRecordingStatus,
+    failed_flag: &AtomicBool,
+) {
+    match result {
         Ok(()) => {
             if let Ok(mut guard) = status.lock() {
                 *guard = RecordingStatus::Stopped;
             }
         }
         Err(e) => {
-            // Fatal runtime error (EIO, ENOSPC, ...): publish Failed and raise
-            // the RT-observable flag so the audio callback suspends enqueueing
-            // without panics. The caller (`spawn_recording_worker`) logs the
-            // final visible error report.
             let reason = format!("{e:#}");
-            record_failure(&status, &failed_flag, &reason);
+            record_failure(status, failed_flag, &reason);
         }
     }
-
-    result
 }
 
 /// Validates that `base_dir` is a real directory and that the worker can
@@ -513,12 +646,30 @@ async fn disk_writer_loop_inner<S: WavSink>(
     recording_data_available: Option<Arc<AtomicBool>>,
     status: &SharedRecordingStatus,
 ) -> Result<()> {
+    // One summary per session, populated as segments open and blocks land,
+    // rendered once when the capture is finalized (F-UX-11).
+    let mut summary = CaptureSummary::default();
     match receiver {
         RecordingReceiver::Pool { control, pool } => {
-            disk_writer_loop_pool(sink, control, pool, recording_data_available, status).await
+            disk_writer_loop_pool(
+                sink,
+                control,
+                pool,
+                recording_data_available,
+                status,
+                &mut summary,
+            )
+            .await
         }
         RecordingReceiver::Inline(consumer) => {
-            disk_writer_loop_inline(sink, consumer, recording_data_available, status).await
+            disk_writer_loop_inline(
+                sink,
+                consumer,
+                recording_data_available,
+                status,
+                &mut summary,
+            )
+            .await
         }
     }
 }
@@ -557,6 +708,7 @@ async fn handle_control_barrier<S: WavSink>(
     wav_writer: &mut Option<S::Writer>,
     part_counter: &mut u32,
     status: &SharedRecordingStatus,
+    summary: &mut CaptureSummary,
     control: &mut Consumer<ControlPayload>,
     barrier_seq: u16,
 ) -> Result<()> {
@@ -567,7 +719,8 @@ async fn handle_control_barrier<S: WavSink>(
                 let diff = barrier_seq.wrapping_sub(seq);
                 if diff == 0 {
                     if let Ok(ControlPayload::Metadata { meta, .. }) = control.pop() {
-                        open_new_part(sink, wav_writer, part_counter, status, meta).await?;
+                        open_new_part(sink, wav_writer, part_counter, status, summary, meta)
+                            .await?;
                     }
                     return Ok(());
                 } else if diff < 0x8000 {
@@ -598,9 +751,11 @@ async fn disk_writer_loop_pool<S: WavSink>(
     pool: &mut PoolConsumer<POOL_CAPACITY>,
     recording_data_available: Option<Arc<AtomicBool>>,
     status: &SharedRecordingStatus,
+    summary: &mut CaptureSummary,
 ) -> Result<()> {
     let mut wav_writer: Option<S::Writer> = None;
     let mut part_counter: u32 = 0;
+    let mut last_space_check = Instant::now();
 
     loop {
         // 1. Audio pool first — drains in strict FIFO order.
@@ -613,6 +768,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                     &mut wav_writer,
                     &mut part_counter,
                     status,
+                    summary,
                     control,
                     in_flight.barrier_seq(),
                 )
@@ -623,6 +779,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                     &mut wav_writer,
                     &mut part_counter,
                     status,
+                    summary,
                     in_flight.block(),
                 )
                 .await?;
@@ -650,6 +807,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                                 &mut wav_writer,
                                 &mut part_counter,
                                 status,
+                                summary,
                                 control,
                                 in_flight.barrier_seq(),
                             )
@@ -660,6 +818,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                                 &mut wav_writer,
                                 &mut part_counter,
                                 status,
+                                summary,
                                 in_flight.block(),
                             )
                             .await?;
@@ -683,6 +842,7 @@ async fn disk_writer_loop_pool<S: WavSink>(
                             "⏹️  Audio source stopped. WAV file safely closed and ready for use.",
                         );
                     }
+                    log_capture_summary(summary);
                     report_overruns(pool.leaked_slots());
                     break;
                 }
@@ -717,11 +877,13 @@ async fn disk_writer_loop_pool<S: WavSink>(
                     .context("Failed to finalize WAV file after recording producer was dropped")?;
                 log::info!("⏹️  Recording producer disconnected; capture finalized.");
             }
+            log_capture_summary(summary);
             report_overruns(pool.leaked_slots());
             break;
         }
 
         // 4. Idle poll (see the inline loop for the hint-flag rationale).
+        maybe_check_space(sink, &wav_writer, status, &mut last_space_check);
         if let Some(ref flag) = recording_data_available {
             flag.store(false, Ordering::Relaxed);
         }
@@ -738,15 +900,25 @@ async fn disk_writer_loop_inline<S: WavSink>(
     consumer: &mut Consumer<RingPayload<MAX_BLOCK_SIZE>>,
     recording_data_available: Option<Arc<AtomicBool>>,
     status: &SharedRecordingStatus,
+    summary: &mut CaptureSummary,
 ) -> Result<()> {
     let mut wav_writer: Option<S::Writer> = None;
     let mut part_counter: u32 = 0;
+    let mut last_space_check = Instant::now();
 
     loop {
         if let Ok(payload) = consumer.pop() {
             match payload {
                 RingPayload::Metadata(meta) => {
-                    open_new_part(sink, &mut wav_writer, &mut part_counter, status, meta).await?;
+                    open_new_part(
+                        sink,
+                        &mut wav_writer,
+                        &mut part_counter,
+                        status,
+                        summary,
+                        meta,
+                    )
+                    .await?;
                 }
                 RingPayload::Audio(block) => {
                     write_block_with_overflow_rollover(
@@ -754,6 +926,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
                         &mut wav_writer,
                         &mut part_counter,
                         status,
+                        summary,
                         &block,
                     )
                     .await?;
@@ -771,6 +944,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
                             "⏹️  Audio source stopped. WAV file safely closed and ready for use.",
                         );
                     }
+                    log_capture_summary(summary);
                     report_overruns(0);
                     break;
                 }
@@ -787,9 +961,12 @@ async fn disk_writer_loop_inline<S: WavSink>(
                     .context("Failed to finalize WAV file after recording producer was dropped")?;
                 log::info!("⏹️  Recording producer disconnected; capture finalized.");
             }
+            log_capture_summary(summary);
             report_overruns(0);
             break;
         } else {
+            // Low-space re-check (T4.2) strictly off the RT path, before sleeping.
+            maybe_check_space(sink, &wav_writer, status, &mut last_space_check);
             // Check hint flag before sleeping to reduce unnecessary poll latency.
             // The flag is set Relaxed by the RT producer; we reset it here before sleeping
             // to avoid missing a notification that arrives during the sleep window.
@@ -817,6 +994,7 @@ async fn open_new_part<S: WavSink>(
     wav_writer: &mut Option<S::Writer>,
     part_counter: &mut u32,
     status: &SharedRecordingStatus,
+    summary: &mut CaptureSummary,
     meta: AudioMetadata,
 ) -> Result<()> {
     // Finalize the previous WAV if the format changed mid-stream.
@@ -834,13 +1012,79 @@ async fn open_new_part<S: WavSink>(
     log::info!("🎬 Created file: {}", filename.display());
     log::info!("🎧 Started writing strict PipeWire source audio...");
 
-    // Keep the observable status pointed at the live capture file.
-    if let Ok(mut guard) = status.lock() {
-        *guard = RecordingStatus::Active { path: filename };
+    // Register the new segment for the end-of-session summary (F-UX-11).
+    if summary.directory.as_os_str().is_empty()
+        && let Some(parent) = filename.parent()
+    {
+        summary.directory = parent.to_path_buf();
     }
+    summary.push_segment(crate::recording::summary::CaptureSegment {
+        path: filename.clone(),
+        data_bytes: 0,
+        frames: 0,
+        sample_rate: meta.sample_rate as u32,
+    });
+
+    // Keep the observable status pointed at the live capture file.
+    mark_active(status, filename);
+
+    // T4.2: startup estimate + low-space pre-warning at format-known time.
+    publish_space_status(sink, &meta, status, true);
 
     *wav_writer = Some(writer);
     Ok(())
+}
+
+/// Publishes the low-space warning (and, when `with_estimate`, the writable-time
+/// estimate) for the current format on the shared status (T4.2).
+fn publish_space_status<S: WavSink>(
+    sink: &S,
+    meta: &AudioMetadata,
+    status: &SharedRecordingStatus,
+    with_estimate: bool,
+) {
+    if let Some(free) = sink.free_bytes(meta) {
+        if with_estimate {
+            log::info!("{}", estimate_message(free, meta));
+        }
+        publish_space_warning(status, low_space_warning(free, meta));
+    } else {
+        // No probe (test sink) or a probe error: never leave a stale warning.
+        publish_space_warning(status, None);
+    }
+}
+
+/// Periodic low-space re-check on the disk loop's idle path (T4.2).
+///
+/// Runs at most once per [`SPACE_CHECK_INTERVAL`] and only while a segment is
+/// open. A probe failure leaves the previous warning untouched: only a
+/// *successful* [`WavSink::free_bytes`] probe may refresh or clear the published
+/// state, so a transient `statvfs` error can never mask an active low-space
+/// alert.
+fn maybe_check_space<S: WavSink>(
+    sink: &S,
+    wav_writer: &Option<S::Writer>,
+    status: &SharedRecordingStatus,
+    last_check: &mut Instant,
+) {
+    if last_check.elapsed() < SPACE_CHECK_INTERVAL {
+        return;
+    }
+    *last_check = Instant::now();
+    if let Some(writer) = wav_writer {
+        let meta = writer.metadata();
+        if let Some(free) = sink.free_bytes(&meta) {
+            publish_space_warning(status, low_space_warning(free, &meta));
+        }
+    }
+}
+
+/// Logs the end-of-session capture summary once the worker finalizes (F-UX-11).
+fn log_capture_summary(summary: &CaptureSummary) {
+    let line = summary.render();
+    if !line.is_empty() {
+        log::info!("{line}");
+    }
 }
 
 /// Writes one audio block through the shared overflow-rollover logic used by
@@ -852,6 +1096,7 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
     wav_writer: &mut Option<S::Writer>,
     part_counter: &mut u32,
     status: &SharedRecordingStatus,
+    summary: &mut CaptureSummary,
     block: &AlignedBlock<MAX_BLOCK_SIZE>,
 ) -> Result<()> {
     let overflow_detected = wav_writer
@@ -863,27 +1108,30 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
              and starting part {}.",
             *part_counter + 1
         );
-        if let Some(mut old_writer) = wav_writer.take() {
-            let meta = old_writer.metadata();
-            old_writer
-                .finalize()
-                .await
-                .context("Failed to finalize previous WAV segment on overflow")?;
-
-            *part_counter += 1;
-            let (new_writer, filename) = sink.create(*part_counter, meta).await?;
-            log::info!("🎬 Continuing capture in: {}", filename.display());
-
-            if let Ok(mut guard) = status.lock() {
-                *guard = RecordingStatus::Active { path: filename };
-            }
-
-            *wav_writer = Some(new_writer);
+        if let Some(meta) = wav_writer.as_ref().map(|w| w.metadata()) {
+            // Reuse the segment-open path: it finalizes the previous writer,
+            // opens the sequential `_partN` file, registers it in the summary,
+            // republishes the observable status and re-checks free space.
+            open_new_part(sink, wav_writer, part_counter, status, summary, meta).await?;
+            log::info!("🎬 Continuing capture in the new segment.");
         }
     }
 
     if let Some(writer) = &mut *wav_writer {
         writer.write_block(block).await?;
+        // Summary accounting (F-UX-11): stereo f32 => frames = samples/2,
+        // payload bytes = samples*4.
+        let samples = block.valid_len() as u64;
+        summary.add_block(samples / 2, samples * 4);
+        // Periodic durability checkpoint, strictly between blocks (never inside
+        // `write_block`): bounds the audio a crash can lose. A failure here is a
+        // fatal recording error, propagated exactly like a `write_block` error.
+        if writer.checkpoint_due() {
+            writer
+                .checkpoint()
+                .await
+                .context("Periodic WAV header checkpoint failed")?;
+        }
     }
     Ok(())
 }

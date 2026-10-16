@@ -462,3 +462,50 @@ fn mandatory_gate_sets_cover_all_families() {
     assert!(coverage.recording.is_empty());
     assert!(coverage.gate.is_empty());
 }
+
+#[test]
+fn parse_cli_rejects_missing_value_without_panicking() {
+    // `--seconds` with no following token must yield a typed usage error (which
+    // the CLI wrapper turns into exit code 2), never a panic.
+    let err = parse_cli_from(vec!["--seconds".to_string()]).unwrap_err();
+    assert!(
+        err.contains("--seconds"),
+        "typed error must name the offending flag: {err}"
+    );
+}
+
+#[test]
+fn parse_cli_rejects_unknown_argument_and_bad_gate() {
+    assert!(
+        parse_cli_from(vec!["--nope".to_string()])
+            .unwrap_err()
+            .contains("unknown argument")
+    );
+    assert!(
+        parse_cli_from(vec!["--gate".to_string(), "maybe".to_string()])
+            .unwrap_err()
+            .contains("--gate")
+    );
+}
+
+#[test]
+fn parse_cli_accepts_valid_values() {
+    let cli = parse_cli_from(vec![
+        "--gate".to_string(),
+        "on".to_string(),
+        "--seconds".to_string(),
+        "2.5".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(cli.gate, GateArg::On);
+    assert!((cli.seconds - 2.5).abs() < 1e-9);
+}
+
+#[test]
+fn parse_cli_rejects_non_finite_seconds() {
+    // `f64::from_str` accepts "NaN"/"inf"; the guard must stay fail-closed. The
+    // pre-refactor `assert!(seconds > 0.0)` rejected NaN (`NaN > 0.0 == false`),
+    // and NaN would otherwise propagate into the block/seconds sizing.
+    assert!(parse_cli_from(vec!["--seconds".to_string(), "NaN".to_string()]).is_err());
+    assert!(parse_cli_from(vec!["--seconds".to_string(), "inf".to_string()]).is_err());
+}

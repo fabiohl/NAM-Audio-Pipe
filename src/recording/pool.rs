@@ -218,6 +218,9 @@ impl<const N: usize> RecordingPool<N> {
             let mut boxed = Box::<[UnsafeCell<AlignedBlock<MAX_BLOCK_SIZE>>; N]>::new_uninit();
             let ptr = boxed.as_mut_ptr() as *mut UnsafeCell<AlignedBlock<MAX_BLOCK_SIZE>>;
             for i in 0..N {
+                // SAFETY: `i < N` and `ptr` addresses the `[_; N]` allocation, so
+                // `ptr.add(i)` stays in bounds; each slot is written exactly once
+                // before `assume_init`.
                 unsafe {
                     ptr.add(i)
                         .write(UnsafeCell::new(AlignedBlock::<MAX_BLOCK_SIZE>::new_uninit()))

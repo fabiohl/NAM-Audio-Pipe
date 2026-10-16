@@ -136,6 +136,10 @@ pub struct SharedBackendStatus {
     teardown_in_progress: AtomicBool,
     capture_active: AtomicBool,
     playback_active: AtomicBool,
+    /// Lock-free mirror of `state == Running`, refreshed inside the state lock
+    /// by every transition so the control loop can gate its reconnect
+    /// stability feed without acquiring the mutex every iteration.
+    running: AtomicBool,
     state: Mutex<BackendState>,
     failure_detail: Mutex<Option<BackendFailureDetail>>,
     rt_status: Option<Arc<RtStatusFlags>>,
@@ -150,6 +154,7 @@ impl Default for SharedBackendStatus {
             teardown_in_progress: AtomicBool::new(false),
             capture_active: AtomicBool::new(false),
             playback_active: AtomicBool::new(false),
+            running: AtomicBool::new(false),
             state: Mutex::new(BackendState::Starting),
             failure_detail: Mutex::new(None),
             rt_status: None,
@@ -166,6 +171,7 @@ impl std::fmt::Debug for SharedBackendStatus {
             .field("teardown_in_progress", &self.teardown_in_progress)
             .field("capture_active", &self.capture_active)
             .field("playback_active", &self.playback_active)
+            .field("running", &self.running.load(Ordering::Relaxed))
             .field("state", &self.lock_state())
             .field("has_rt_status", &self.rt_status.is_some())
             .field("has_wakeup", &self.wakeup.is_some())
@@ -277,6 +283,25 @@ impl SharedBackendStatus {
         self.lock_state().clone()
     }
 
+    /// Lock-free fast-path poll of the `Running` gate.
+    ///
+    /// Mirror of `state() == BackendState::Running`, refreshed inside the state
+    /// lock by every transition ([`set_state_locked`](Self::set_state_locked)),
+    /// so the main control loop can feed the reconnect stability window without
+    /// acquiring the mutex on every iteration.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
+    }
+
+    /// Assigns `state` under an already-held state lock and refreshes the
+    /// lock-free [`is_running`](Self::is_running) mirror in the same critical
+    /// section, so the fast-path can never drift from the detailed state.
+    fn set_state_locked(&self, guard: &mut BackendState, state: BackendState) {
+        *guard = state;
+        self.running
+            .store(matches!(*guard, BackendState::Running), Ordering::Release);
+    }
+
     /// Returns the sticky failure detail `(stream, reason)` once the backend
     /// failed; `None` while the backend is healthy.
     pub fn failure(&self) -> Option<(&'static str, String)> {
@@ -335,12 +360,12 @@ impl SharedBackendStatus {
                 *guard,
                 BackendState::Starting | BackendState::Reconnecting { .. }
             ) {
-                *guard = BackendState::Running;
+                self.set_state_locked(&mut guard, BackendState::Running);
                 drop(guard);
                 self.notify_wakeup();
             }
         } else if matches!(*guard, BackendState::Running) {
-            *guard = BackendState::Starting;
+            self.set_state_locked(&mut guard, BackendState::Starting);
             drop(guard);
             self.notify_wakeup();
         }
@@ -355,7 +380,7 @@ impl SharedBackendStatus {
         if self.failed.load(Ordering::Acquire) {
             return;
         }
-        *guard = BackendState::Running;
+        self.set_state_locked(&mut guard, BackendState::Running);
         drop(guard);
         self.notify_wakeup();
     }
@@ -367,9 +392,12 @@ impl SharedBackendStatus {
         if self.failed.load(Ordering::Acquire) {
             return;
         }
-        *guard = BackendState::Degraded {
-            reason: reason.into(),
-        };
+        self.set_state_locked(
+            &mut guard,
+            BackendState::Degraded {
+                reason: reason.into(),
+            },
+        );
         drop(guard);
         self.notify_wakeup();
     }
@@ -379,10 +407,13 @@ impl SharedBackendStatus {
     pub fn mark_failed(&self, stream: &'static str, reason: impl Into<String>) {
         let reason = reason.into();
         let mut guard = self.lock_state();
-        *guard = BackendState::Failed {
-            stream,
-            reason: reason.clone(),
-        };
+        self.set_state_locked(
+            &mut guard,
+            BackendState::Failed {
+                stream,
+                reason: reason.clone(),
+            },
+        );
         *self.lock_failure_detail() = Some(BackendFailureDetail { stream, reason });
         self.failed.store(true, Ordering::Release);
         drop(guard);
@@ -391,7 +422,9 @@ impl SharedBackendStatus {
 
     /// Marks the backend [`BackendState::Terminated`] after teardown finished.
     pub fn mark_terminated(&self) {
-        *self.lock_state() = BackendState::Terminated;
+        let mut guard = self.lock_state();
+        self.set_state_locked(&mut guard, BackendState::Terminated);
+        drop(guard);
         self.capture_active.store(false, Ordering::Release);
         self.playback_active.store(false, Ordering::Release);
         crate::standalone::pw_host::output_pw::mark_stream_active(
@@ -424,11 +457,14 @@ impl SharedBackendStatus {
             false,
         );
         *self.lock_failure_detail() = None;
-        *guard = BackendState::Reconnecting {
-            attempt,
-            total_attempts,
-            next_backoff,
-        };
+        self.set_state_locked(
+            &mut guard,
+            BackendState::Reconnecting {
+                attempt,
+                total_attempts,
+                next_backoff,
+            },
+        );
         drop(guard);
         self.notify_wakeup();
     }

@@ -31,6 +31,8 @@ fn test_dsp_bridge_concurrent_access() {
     // This avoids creating a whole-struct `&DspBridge` reference, preserving unique provenance
     // over the buffer payload memory under Stacked Borrows / Tree Borrows.
     let generation: &'static AtomicU64 = unsafe { &(*bridge_ptr).generation };
+    // SAFETY: same single-atomic borrow of the same live bridge allocation, keeping
+    // unique provenance over the buffer payload memory.
     let consumed_gen: &'static AtomicU64 = unsafe { &(*bridge_ptr).consumed_gen };
 
     let stop = Arc::new(AtomicBool::new(false));

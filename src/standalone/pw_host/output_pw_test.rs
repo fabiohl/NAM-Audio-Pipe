@@ -584,6 +584,8 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
     let stream_status = StreamStatusFlags::new();
 
     let silence_bytes = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
+    // SAFETY: the left/right vectors and both chunks remain live and non-overlapping
+    // for the whole synchronous fail-closed deliver call.
     let frames = unsafe {
         deliver_silence_pair_fail_closed(
             l.as_ptr() as usize,

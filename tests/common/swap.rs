@@ -350,22 +350,20 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
     // owned slots (shallow borrows of `h` end inside each iteration).
     let mut tip_l = [[0.0f32; VALIDATION_TIP_SAMPLES]; 2];
     let mut tip_r = [[0.0f32; VALIDATION_TIP_SAMPLES]; 2];
-    for (slot, (slot_l, slot_r)) in tip_l.iter_mut().zip(tip_r.iter_mut()).enumerate() {
-        if slot > 0 {
-            // A callbacks-skipped quantum must not confirm "steady": a skipped
-            // write keeps the previous bridge content bit-identical, which a
-            // naive snapshot would classify as stability.
-            let frames_before = h.frame_count();
-            let mut l = [dc_l; BLOCK];
-            let mut r = [dc_r; BLOCK];
-            let written = h.run_callback(&mut l, &mut r, BLOCK);
-            let n2 = h.current_n_pw();
-            if n2 != n || h.frame_count() == frames_before || written == 0 || written != n {
-                // The quantum itself changed mid-window (renegotiation,
-                // pipeline transition or a skipped write): not settled —
-                // bounded retry.
-                return false;
-            }
+    for (slot_l, slot_r) in tip_l.iter_mut().zip(tip_r.iter_mut()) {
+        // Run a dedicated callback for each slot to ensure two distinct, consecutive
+        // quantums are evaluated. A skipped write or stalled frame keeps the previous
+        // bridge content identical, which naive reading would classify as false stability.
+        let frames_before = h.frame_count();
+        let mut l = [dc_l; BLOCK];
+        let mut r = [dc_r; BLOCK];
+        let written = h.run_callback(&mut l, &mut r, BLOCK);
+        let n2 = h.current_n_pw();
+        if n2 != n || h.frame_count() == frames_before || written == 0 || written != n {
+            // The quantum itself changed mid-window (renegotiation,
+            // pipeline transition or a skipped write): not settled —
+            // bounded retry.
+            return false;
         }
         let out_l = h.out_l();
         let out_r = h.out_r();
@@ -376,6 +374,28 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
         slot_l.copy_from_slice(&out_l[tip..n]);
         slot_r.copy_from_slice(&out_r[tip..n]);
     }
+
+    // Residual silence / dither rejection: if the output buffer contains
+    // only gate-closed silence or priming denormal dither (e.g. -1e-11), the
+    // pipeline is still in transient ramp-up or unprimed. A bit-identical
+    // silence tail would falsely pass the stationarity check below and panic
+    // at the oracle, instead of letting the harness retry within its budget.
+    let is_dither_silence = |tip: &[f32]| {
+        tip.iter()
+            .all(|&s| s.abs() < 1e-4 || (s + 1.0e-11).abs() < 1e-7)
+    };
+    if is_dither_silence(&tip_l[0])
+        || is_dither_silence(&tip_r[0])
+        || is_dither_silence(&tip_l[1])
+        || is_dither_silence(&tip_r[1])
+    {
+        eprintln!(
+            "validating window still in silence/priming dither — {}",
+            validation_state_debug(h)
+        );
+        return false;
+    }
+
     if tip_l[0] != tip_l[1] || tip_r[0] != tip_r[1] {
         eprintln!(
             "validating window not settled — {}",

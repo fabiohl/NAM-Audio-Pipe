@@ -19,7 +19,47 @@ use crate::standalone::pw_host::StreamStatusFlags;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Minimum spacing between gate-transition `info` lines (F-UX-13).
+///
+/// A gate threshold sitting near the guitar's noise floor can flap at the poll
+/// rate (≤ 10 Hz), burying real errors under a burst of "Silent Mode"/"Audio
+/// Signal Detected" lines. Gate transitions are therefore rate-limited to one
+/// line per second; suppressed transitions are counted and folded into the next
+/// emitted line as "(×N)".
+pub const GATE_LOG_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Rate limiter for gate-transition logs (deterministic; clock injected as the
+/// `now` argument so tests advance time without sleeping).
+#[derive(Debug, Clone, Default)]
+pub struct GateTransitionThrottle {
+    last_emit: Option<Instant>,
+    suppressed: u32,
+}
+
+impl GateTransitionThrottle {
+    /// Records a gate transition observed at `now`.
+    ///
+    /// Returns `Some(count)` when the line should be logged — `count` is the
+    /// number of transitions folded into this line (`1` = no suppression) — or
+    /// `None` when the transition is suppressed by the rate limit.
+    pub fn observe(&mut self, now: Instant) -> Option<u32> {
+        let allowed = match self.last_emit {
+            None => true,
+            Some(prev) => now.duration_since(prev) >= GATE_LOG_MIN_INTERVAL,
+        };
+        if allowed {
+            self.last_emit = Some(now);
+            let count = self.suppressed.saturating_add(1);
+            self.suppressed = 0;
+            Some(count)
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
+    }
+}
 
 /// Per-signal episode latch.
 ///
@@ -115,6 +155,8 @@ pub struct PollState {
     /// current bring-up window. Caps the window so a stalled playback stream
     /// cannot suppress (and discard) drift drops indefinitely (S6-T4 review fix).
     pub bringup_suppressed_polls: u32,
+    /// Gate-transition log rate limiter (F-UX-13).
+    pub gate_throttle: GateTransitionThrottle,
 }
 
 impl PollState {
@@ -134,6 +176,7 @@ impl PollState {
             pw_log_dropped_last: 0,
             last_bringup_quanta: 0,
             bringup_suppressed_polls: 0,
+            gate_throttle: GateTransitionThrottle::default(),
         }
     }
 }
@@ -711,6 +754,8 @@ pub fn poll_rt_status(
                 ss.record_hist.reset();
                 ss.playback_hist.reset();
                 ss.e2e_hist.reset();
+                #[cfg(any(feature = "testing", feature = "heap-audit"))]
+                ss.e2e_exact.reset();
             }
             rt_status.latency_hist.reset();
 
@@ -796,21 +841,31 @@ pub fn poll_rt_status(
         }
     }
 
-    // Silence transition detection
+    // Silence transition detection. F-UX-13: gate chatter is rate-limited to at
+    // most one `info` line per second (suppressed transitions fold into the next
+    // line as "(×N)") so a threshold near the noise floor cannot bury real
+    // errors under a burst of silent/active lines.
     let current_silent =
         rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_IS_SILENT);
 
     if current_silent != was_silent {
-        if current_silent {
-            log::info!(
+        let message = if current_silent {
+            format!(
                 "{} Silent Mode: Input below threshold (Gate Closed).",
                 "🔇".blue()
-            );
+            )
         } else {
-            log::info!(
+            format!(
                 "{} Audio Signal Detected: DSP processing resumed.",
                 "🔊".green()
-            );
+            )
+        };
+        if let Some(count) = state.gate_throttle.observe(Instant::now()) {
+            if count > 1 {
+                log::info!("{message} (×{count})");
+            } else {
+                log::info!("{message}");
+            }
         }
     }
 
@@ -819,7 +874,14 @@ pub fn poll_rt_status(
         rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_IS_FADING);
 
     if current_fading != was_fading && current_fading {
-        log::info!("{} Signal Transition: Gate in Fade-In/Out.", "🌓".yellow());
+        let message = format!("{} Signal Transition: Gate in Fade-In/Out.", "🌓".yellow());
+        if let Some(count) = state.gate_throttle.observe(Instant::now()) {
+            if count > 1 {
+                log::info!("{message} (×{count})");
+            } else {
+                log::info!("{message}");
+            }
+        }
     }
 
     (current_silent, current_fading)

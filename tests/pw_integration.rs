@@ -101,8 +101,11 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
                 oversample: OversampleFactor::Off,
                 cpu_receipt: common::deterministic_cpu_receipt(),
                 fail_fast: true,
+                reconnect_timeout: None,
                 gate_config: cli::GateConfig::Off,
                 stream_status: Some(stream_status_clone),
+                recording_status: None,
+                banner: Default::default(),
             },
             gc_cons,
             sl_cons,
@@ -147,6 +150,8 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
         .load(Ordering::Relaxed);
     let bringup_discard = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
     stream_status.e2e_hist.reset();
+    #[cfg(any(feature = "testing", feature = "heap-audit"))]
+    stream_status.e2e_exact.reset();
 
     // Measurement window: at least E2E_MEASURE_SAMPLES samples AND at least
     // E2E_MIN_WINDOW of wall clock (bounded by E2E_MAX_WINDOW).
@@ -176,6 +181,22 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     let p99_ns = stream_status.e2e_hist.get_percentile(0.99);
     let p999_ns = stream_status.e2e_hist.get_percentile(0.999);
     let max_ns = stream_status.e2e_hist.get_exact_max();
+
+    // Exact-sample percentiles from the testing-only reservoir. The log-linear
+    // histogram quantises the tail, so on a bucket boundary `p50 == p99 == p999`;
+    // these complement the bucketed fields (parsers keep working) and must stay
+    // distinct when the samples differ. They never feed the gate above. Reporting
+    // `0` without the `testing`/`heap-audit` reservoir keeps the receipt shape
+    // (and the `--no-default-features` compile) intact; this daemon test is
+    // `#[ignore]`d, so that build never reaches here in practice.
+    #[cfg(any(feature = "testing", feature = "heap-audit"))]
+    let (p50_exact_ns, p99_exact_ns, p999_exact_ns) = (
+        stream_status.e2e_exact.percentile_exact(0.50),
+        stream_status.e2e_exact.percentile_exact(0.99),
+        stream_status.e2e_exact.percentile_exact(0.999),
+    );
+    #[cfg(not(any(feature = "testing", feature = "heap-audit")))]
+    let (p50_exact_ns, p99_exact_ns, p999_exact_ns) = (0u64, 0u64, 0u64);
 
     spsc::SHUTDOWN.store(true, Ordering::Relaxed);
 
@@ -215,7 +236,8 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
 
     println!(
         "E2E_METRICS buffer_size={buffer_size} samples={samples} p50_ns={p50_ns} p99_ns={p99_ns} \
-         p999_ns={p999_ns} max_ns={max_ns} starvation={starvation} \
+         p999_ns={p999_ns} max_ns={max_ns} p50_exact_ns={p50_exact_ns} p99_exact_ns={p99_exact_ns} \
+         p999_exact_ns={p999_exact_ns} starvation={starvation} \
          bringup_discard={bringup_discard} steady_dropped={dropped_frames} quantum={quantum} rate={rate}"
     );
 
@@ -555,7 +577,8 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
         .expect("failed to restart private pipewire daemon");
 
     // Phase 3: the tone process died with the daemon. Wait for bounded reconnect
-    // to re-register the fresh capture sink in the new daemon's graph (<= 1.75s backoff budget + settling)
+    // to re-register the fresh capture sink in the new daemon's graph (first attempt
+    // 250 ms backoff + settling, well within the per-episode budget).
     assert!(
         pw.wait_for_nam_sink_pid(child_pid, Duration::from_secs(10)),
         "host never re-registered its capture sink after daemon bounce"
@@ -570,6 +593,8 @@ fn test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart() {
     );
 
     // Orderly cooperative shutdown via SIGTERM
+    // SAFETY: `child_pid` is the live host child tracked by this test and no memory
+    // is dereferenced; the child is reaped by the wait loop below.
     unsafe {
         libc::kill(child_pid as libc::pid_t, libc::SIGTERM);
     }
@@ -657,7 +682,9 @@ fn test_pipewire_reconnect_exhaustion_terminates_with_error() {
     pw.kill_hard();
 
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(10);
+    // The per-episode backoff budget is ~11.75 s (6 attempts, 250 ms → 4 s);
+    // allow generous margin for detection latency and each failed handshake.
+    let deadline = started + Duration::from_secs(20);
     let status = loop {
         match child.0.try_wait() {
             Ok(Some(st)) => break st,

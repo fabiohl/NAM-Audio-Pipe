@@ -21,6 +21,11 @@ pub mod long;
 #[cfg(feature = "testing")]
 pub mod jsonl;
 
+/// Sibling-file carrier for typed long-audit FAIL causes (D3). Testing-only:
+/// it is written by `src/bin/pipe_long_receipt.rs` and the long suite.
+#[cfg(feature = "testing")]
+pub mod fail_reasons;
+
 /// Canonical phase roster of the long-audit suite: `phase1`..`phase7` plus the
 /// terminal `overall` line. Shared by the JSONL emitter/verifier and the tests.
 pub const LONG_ROSTER: [&str; 8] = [

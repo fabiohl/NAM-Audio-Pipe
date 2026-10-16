@@ -57,6 +57,12 @@ const PROVENANCE_REL: &str = "target/logs/release-provenance.json";
 const LONG_SUITE_REL: &str = "utils/tests-long.sh";
 /// Structured long-suite receipt produced by `utils/tests-long.sh`.
 const LONG_RECEIPT_REL: &str = "target/logs/long-receipt.txt";
+/// Receipt produced by the non-executing `--simulate` surface. Since D1 the
+/// dry run writes under an isolated `simulate/` subdirectory and never touches
+/// the real audit artifacts.
+const SIMULATE_RECEIPT_REL: &str = "target/logs/simulate/long-receipt.txt";
+/// Isolated directory owned by the `--simulate` dry run.
+const SIMULATE_DIR_REL: &str = "target/logs/simulate";
 /// The seven canonical long-audit phases (PHASE7 = PipeWire resilience).
 const LONG_PHASE_IDS: [&str; 7] = [
     "PHASE1", "PHASE2", "PHASE3", "PHASE4", "PHASE5", "PHASE6", "PHASE7",
@@ -1749,6 +1755,41 @@ fn long_suite_script_is_executable_and_fully_specified() {
     );
 }
 
+/// (e) Evidence-integrity contract (D1/D2/D3): the runner must isolate the
+/// `--simulate` dry run under `simulate/` (never touching real artifacts),
+/// rotate real artifacts before a new real run, surface a phase-failure tail on
+/// the console, and carry the typed FAIL cause to the sibling
+/// `*.fail-reasons.json` file. This is a structural audit — the suite itself is
+/// never executed.
+#[test]
+fn long_suite_carries_evidence_integrity_contract() {
+    let path = repo_root().join(LONG_SUITE_REL);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    for needle in [
+        "NAM_LOG_ROOT",
+        "LOG_DIR=\"$LOG_ROOT/simulate\"",
+        "rotate_real_logs",
+        "\"$LOG_ROOT/prev\"",
+        "FAIL-TAIL",
+        "tail -n 40",
+        "head -c 4096",
+        "--fail-reason",
+        "fail-reasons.json",
+    ] {
+        assert!(
+            text.contains(needle),
+            "{} must carry the evidence-integrity contract token {needle:?}",
+            path.display()
+        );
+    }
+    assert!(
+        !text.contains("rm -f target/logs/phase"),
+        "{} must not delete the real phase logs unconditionally (D1)",
+        path.display()
+    );
+}
+
 /// (e) Structural audit: `utils/build-release.sh` must enforce a real, strict
 /// long-suite receipt during `--release-ceremony` through the *semantic*
 /// verifier (`long_receipt_check` + `NAM_RT_STRICT: 1` propagation)
@@ -2219,9 +2260,9 @@ fn long_suite_receipt_audit() {
 // the non-executing `--simulate` surface).
 // ---------------------------------------------------------------------------
 
-/// RAII guard that restores the operator's long-audit receipt and phase logs
-/// after a `--simulate` invocation replaced them (the sanctioned CI surface),
-/// and cleans up any simulated files created if they did not exist prior.
+/// RAII guard around a `--simulate` invocation: it preserves the real audit
+/// artifacts byte-for-byte (D1 — the dry run must never touch them) and cleans
+/// up the isolated `target/logs/simulate/` residue afterwards.
 struct LongSimulateGuard {
     backups: Vec<(PathBuf, PathBuf)>,
     created_to_remove: Vec<PathBuf>,
@@ -2269,6 +2310,8 @@ impl Drop for LongSimulateGuard {
         for path in &self.created_to_remove {
             let _ = std::fs::remove_file(path);
         }
+        // Since D1 the dry run owns an isolated directory; clean its residue.
+        let _ = std::fs::remove_dir_all(repo_root().join(SIMULATE_DIR_REL));
     }
 }
 
@@ -2290,7 +2333,7 @@ fn run_tests_long_simulate(args: &[&str]) -> String {
         out.status.code(),
         String::from_utf8_lossy(&out.stderr),
     );
-    let receipt_path = root.join(LONG_RECEIPT_REL);
+    let receipt_path = root.join(SIMULATE_RECEIPT_REL);
     std::fs::read_to_string(&receipt_path).unwrap_or_else(|e| {
         panic!(
             "cannot read generated receipt {}: {e}",

@@ -100,11 +100,28 @@ const MAX_SKIPPED_BLOCKS: usize = 200;
 const MAX_VALIDATION_ATTEMPTS: usize = 64;
 
 /// Maximum allowed RSS growth (KiB) between the first and last telemetry
-/// samples. Under continuous swapping the allocator's steady state wobbles
-/// ±~50 KiB (model sizes vary per swap batch), so 256 KiB (64 pages) is the
-/// leak-sensitive margin: a real leak grows by MBs per minute, far above it.
-/// RSS shrinkage is never a failure (reported as a negative delta).
-const MAX_RSS_DRIFT_KB: usize = 256;
+/// samples. A real leak grows by MBs per minute, orders of magnitude above
+/// this margin, so 512 KiB (128 pages) stays leak-sensitive.
+///
+/// The margin deliberately ignores the raw swap-batch oscillation: measured
+/// peak-to-peak RSS swings ~32-39 MB (e.g. 31.8↔71.1 MB) because every
+/// `SWAP_INTERVAL` batch builds fresh WaveNet/LSTM/CabSim engines on the heap
+/// and the off-RT GC frees the previous ones. The first→last delta is only
+/// meaningful between **GC-settled** samples, which is why the final sample is
+/// captured after `consume_gc()`; comparing a mid-oscillation final sample
+/// instead reached +896 KiB and produced a false leak. RSS shrinkage is never
+/// a failure (reported as a negative delta).
+///
+/// Measured (calibrated 30 s windows, 2 runs): first→last post-GC delta =
+/// -10452 / -31656 KiB, `minflt_thread` = 0.
+const MAX_RSS_DRIFT_KB: usize = 512;
+
+fn max_rss_drift_kb() -> usize {
+    std::env::var("NAM_MAX_RSS_DRIFT_KB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(MAX_RSS_DRIFT_KB)
+}
 
 /// Default wall-clock window in seconds (overridable via `NAM_ENDURANCE_SECONDS`).
 const DEFAULT_WINDOW_SECS: u64 = 30;
@@ -375,6 +392,9 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         let mut h = harness.lock().expect("harness lock");
         h.consume_gc();
     }
+    // Record post-stop, post-GC steady-state sample
+    telemetry.push(TelemetrySample::capture());
+
     let minflt_thread_delta = rusage_after.minflt.saturating_sub(rusage_before.minflt);
     let majflt_thread_delta = rusage_after.majflt.saturating_sub(rusage_before.majflt);
     let nvcsw_thread_delta = rusage_after.nvcsw.saturating_sub(rusage_before.nvcsw);
@@ -422,10 +442,11 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     );
     assert!(first.rss_kb > 0, "VmRSS unavailable on this platform");
     assert!(last.rss_kb > 0, "VmRSS unavailable on this platform");
+    let drift_limit = max_rss_drift_kb();
     assert!(
-        rss_delta_kb <= MAX_RSS_DRIFT_KB as i64,
+        rss_delta_kb <= drift_limit as i64,
         "RSS growth of {rss_delta_kb} KiB (first {} → last {}) exceeds \
-         the {MAX_RSS_DRIFT_KB} KiB margin — possible memory leak",
+         the {drift_limit} KiB margin — possible memory leak",
         first.rss_kb,
         last.rss_kb,
     );

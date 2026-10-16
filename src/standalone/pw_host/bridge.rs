@@ -49,6 +49,8 @@ pub fn allocate_dsp_bridge() -> BridgeRef {
         DspBridge::init_in_place(raw_ptr);
     }
 
+    // SAFETY: `raw_ptr` was just initialized in place by `init_in_place`; the
+    // returned reference is tied to the same live, uniquely owned allocation.
     let bridge_ptr = unsafe { BridgeRef::new(raw_ptr) };
 
     // SAFETY: `raw_ptr` is page-aligned (layout alignment is at least 4096)
@@ -56,6 +58,9 @@ pub fn allocate_dsp_bridge() -> BridgeRef {
     let bridge_void = raw_ptr as *mut libc::c_void;
     let bridge_size = layout.size();
 
+    // SAFETY: `bridge_void`/`bridge_size` describe the live allocation owned by
+    // this function for the whole call; `MADV_DONTFORK` is advisory and cannot
+    // invalidate the mapping on failure.
     let ret = unsafe { libc::madvise(bridge_void, bridge_size, libc::MADV_DONTFORK) };
     if ret != 0 {
         log::warn!(
@@ -66,6 +71,9 @@ pub fn allocate_dsp_bridge() -> BridgeRef {
         );
     }
 
+    // SAFETY: `bridge_void`/`bridge_size` describe the live allocation owned by
+    // this function for the whole call; `MADV_DONTDUMP` is advisory and cannot
+    // invalidate the mapping on failure.
     let ret = unsafe { libc::madvise(bridge_void, bridge_size, libc::MADV_DONTDUMP) };
     if ret != 0 {
         log::warn!(
@@ -96,6 +104,8 @@ mod tests {
             "DspBridge pointer must be page-aligned (4096 bytes)"
         );
 
+        // SAFETY: the raw pointer was produced by `alloc(layout)` in this test and
+        // the layout was verified page-aligned and sized above.
         let bridge = unsafe { &*ptr };
         assert_eq!(
             bridge
@@ -122,6 +132,8 @@ mod tests {
         // SAFETY: single-threaded read of the freshly initialized bridge; the
         // buffers are read race-free through `UnsafeCell::get`.
         assert_eq!(unsafe { (*bridge.buffers[0].get()).n_samples }, 0);
+        // SAFETY: same single-owner read of the second freshly initialized buffer,
+        // race-free through `UnsafeCell::get`.
         assert_eq!(unsafe { (*bridge.buffers[1].get()).n_samples }, 0);
     }
 }

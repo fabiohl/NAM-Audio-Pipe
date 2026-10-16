@@ -9,6 +9,7 @@ use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
 use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 use pipewire as pw;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
 use super::stream_status::StreamStatusFlags;
@@ -85,6 +86,9 @@ pub struct PipewireHostConfig {
     /// `--fail-fast` on the CLI: disables the bounded reconnect cycle —
     /// the first backend failure triggers observable teardown immediately.
     pub fail_fast: bool,
+    /// Optional per-episode reconnect backoff budget (`--reconnect-timeout <s>`).
+    /// `None` uses the production schedule (6 attempts, 250 ms → 4 s).
+    pub reconnect_timeout: Option<Duration>,
     /// Noise gate configuration from the polymorphic CLI flag `--gate MODE`:
     /// [`GateConfig::Off`] keeps the gate FSM permanently open (silence passes
     /// through), while a [`GateConfig::Threshold`] carries the open/close dBFS
@@ -92,6 +96,14 @@ pub struct PipewireHostConfig {
     pub gate_config: GateConfig,
     /// Optional externally-owned stream status flags (for integration testing).
     pub stream_status: Option<std::sync::Arc<StreamStatusFlags>>,
+    /// Optional observable recording status (F-UX-02a): when `--record` is
+    /// active, `main` hands the same handle the recording worker writes so the
+    /// main control loop can turn an `Active → Failed` transition (and the
+    /// low-space pre-warning) into a visible, de-duplicated alert.
+    pub recording_status: Option<crate::recording::SharedRecordingStatus>,
+    /// Static banner facts resolved by `main` (F-UX-13). The control loop emits
+    /// one consolidated status banner once the first RT confirmations arrive.
+    pub banner: crate::standalone::banner::BannerRequest,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).
@@ -183,6 +195,11 @@ pub fn playback_dsp_cycle(
     // asymmetric or overlapping) by raising `RT_STATUS_HOST_CONTRACT_VIOLATION`
     // and silencing both channels, before the mutable `f32` output slices
     // are formed.
+    // SAFETY: `ptr_l`/`ptr_r`/`max_l`/`max_r`/`chunk_l`/`chunk_r` are the SPA buffer
+    // descriptors of the current callback and `src_l`/`src_r` are the live bridge
+    // output blocks; the fail-closed harness validates the whole pair before any
+    // slice is formed, so the call is sound for valid descriptors and returns `None`
+    // (silencing) otherwise.
     let Some(_n_out) = (unsafe {
         deliver_playback_pair_fail_closed(
             ptr_l,
@@ -217,6 +234,11 @@ pub fn playback_dsp_cycle(
                 .e2e_cycle_time
                 .store(e2e_nanos, Ordering::Relaxed);
             stream_status.e2e_hist.record(e2e_nanos);
+            // Mirror the sample into the exact reservoir so the test harness can
+            // report true percentiles. Testing/heap-audit only; absent from the
+            // default/release build.
+            #[cfg(any(feature = "testing", feature = "heap-audit"))]
+            stream_status.e2e_exact.record(e2e_nanos);
         }
     }
 }

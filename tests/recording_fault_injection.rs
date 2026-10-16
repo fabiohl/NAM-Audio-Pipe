@@ -37,6 +37,7 @@
 //! builder, so the harness always contributes to `cargo test --all-targets`.
 
 use nam_audio_pipe::recording::buffer::{AudioMetadata, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT};
+use nam_audio_pipe::recording::disk::CHECKPOINT_INTERVAL_SECS;
 use nam_audio_pipe::recording::pool::POOL_CAPACITY;
 use nam_audio_pipe::recording::transport::RecordingSender;
 use nam_audio_pipe::recording::wav_header::build_wav_header;
@@ -965,8 +966,9 @@ fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {
         rlim_cur: fault_limit,
         rlim_max: prev.rlim_max,
     };
-    // SAFETY: lowering RLIMIT_FSIZE is always permitted; the struct is valid.
     assert_eq!(
+        // SAFETY: lowering RLIMIT_FSIZE is always permitted and `new_limit` is a
+        // valid, fully initialized `libc::rlimit`.
         unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &new_limit) },
         0
     );
@@ -1307,4 +1309,86 @@ fn count_threads() -> usize {
                 .and_then(|value| value.trim().parse().ok())
         })
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Ignored: durability checkpoint (F-UX-01 / T3.1c)
+// ---------------------------------------------------------------------------
+
+/// A capture killed mid-stream must remain readable up to the last periodic
+/// header checkpoint.
+///
+/// The writer rewrites the WAV header with the running byte count and `fsync`s
+/// it every `CHECKPOINT_INTERVAL_SECS` seconds of audio, so an abrupt death
+/// (SIGKILL, OOM-killer, power loss) loses at most one checkpoint window
+/// instead of the entire take. The "crash" is modelled by reading the file from
+/// an independent descriptor while the worker keeps running, without ever
+/// pushing the terminal token: those bytes are exactly what a crash would
+/// leave behind.
+#[test]
+#[ignore = "requires io_uring support"]
+fn crash_after_checkpoint_leaves_readable_wav_without_finalize() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let _sd = ShutdownGuard::new();
+    let dir = temp_dir();
+    let _guard = DirGuard::new(dir.clone());
+
+    const FRAMES: usize = 8192;
+    const BLOCKS: usize = 20;
+    let interval_bytes = CHECKPOINT_INTERVAL_SECS * 48_000 * 2 * 4;
+    let interval_frames = (interval_bytes / 8) as usize; // 8 bytes per stereo frame
+    let total_frames = FRAMES * BLOCKS;
+
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _status, failed_flag) = spawn_ready_worker(receiver, &dir);
+
+    push_meta_or_retry(&mut sender, META);
+    let mut signal = noise_lr(0xD00D_1234);
+    let mut base = 0usize;
+    for _ in 0..BLOCKS {
+        let left: Vec<f32> = (0..FRAMES).map(|i| signal(base + i).0).collect();
+        let right: Vec<f32> = (0..FRAMES).map(|i| signal(base + i).1).collect();
+        base += FRAMES;
+        push_block_or_retry(&mut sender, &left, &right);
+    }
+
+    // Read the on-disk file (a separate fd) until a checkpoint has persisted a
+    // non-zero data size — the state a crash would leave, with no finalize.
+    // `hound` (not the strict RIFF tail validator) is the reader here: mid-stream
+    // the header legitimately declares less data than the file currently holds.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let declared_frames = loop {
+        if let Some(path) = capture_files(&dir).into_iter().next()
+            && let Ok(reader) = hound::WavReader::open(&path)
+            && reader.duration() > 0
+        {
+            break reader.duration() as usize;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no checkpoint was persisted within the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        declared_frames >= total_frames.saturating_sub(interval_frames),
+        "a crash after a checkpoint must leave at least (total - one window) \
+         readable frames: declared={declared_frames}, total={total_frames}, \
+         window={interval_frames}"
+    );
+
+    // The live session still finalizes cleanly for teardown.
+    push_stop_or_retry(&mut sender);
+    let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag));
+    assert_eq!(guard.shutdown(), RecordingWorkerOutcome::Success);
+
+    // The finalized file carries the complete payload (the independent `hound`
+    // reader agrees with the on-disk header).
+    let files = capture_files(&dir);
+    assert_eq!(files.len(), 1, "a single capture must be produced");
+    let reader = hound::WavReader::open(&files[0]).expect("hound must open the finalized WAV");
+    assert_eq!(reader.spec().channels, 2);
+    assert_eq!(reader.spec().sample_rate, 48000);
+    assert_eq!(reader.duration() as usize, total_frames);
 }

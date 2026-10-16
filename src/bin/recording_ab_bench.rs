@@ -995,22 +995,30 @@ fn emit_size_report(
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
-fn parse_args() -> Cfg {
+const USAGE: &str = "usage: recording_ab_bench [--runs N] [--quanta N] \
+                     [--producer-cpu N] [--consumer-cpu N] [--throttle-us µs] \
+                     [--transport inline|pool|both]";
+
+/// Parses the CLI arguments into a [`Cfg`].
+///
+/// Returns a typed usage error (never panics) so the caller can report it and
+/// exit with the conventional usage status `2`.
+fn parse_args_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cfg, String> {
     let mut cfg = Cfg::default();
-    let mut args = std::env::args().skip(1);
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--runs" => {
                 cfg.runs = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--runs <N>");
+                    .ok_or_else(|| "--runs requires a numeric value <N>".to_string())?;
             }
             "--quanta" => {
                 cfg.quanta = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--quanta <N>");
+                    .ok_or_else(|| "--quanta requires a numeric value <N>".to_string())?;
             }
             "--producer-cpu" => {
                 cfg.producer_cpu = args.next().and_then(|v| v.parse().ok());
@@ -1022,25 +1030,25 @@ fn parse_args() -> Cfg {
                 cfg.throttle_us = args
                     .next()
                     .and_then(|v| v.parse().ok())
-                    .expect("--throttle-us <µs>");
+                    .ok_or_else(|| "--throttle-us requires a numeric value <µs>".to_string())?;
             }
             "--transport" => {
                 cfg.transport = match args.next().as_deref() {
                     Some("inline") => TransportFilter::InlineOnly,
                     Some("pool") => TransportFilter::PoolOnly,
                     Some("both") => TransportFilter::Both,
-                    other => panic!("--transport must be inline|pool|both, got {other:?}"),
+                    other => {
+                        return Err(format!(
+                            "--transport must be inline|pool|both, got {other:?}"
+                        ));
+                    }
                 };
             }
             "--help" | "-h" => {
-                eprintln!(
-                    "usage: recording_ab_bench [--runs N] [--quanta N] \
-                     [--producer-cpu N] [--consumer-cpu N] [--throttle-us µs] \
-                     [--transport inline|pool|both]"
-                );
+                eprintln!("{USAGE}");
                 std::process::exit(0);
             }
-            other => panic!("unknown argument {other} (see --help)"),
+            other => return Err(format!("unknown argument {other}")),
         }
     }
     if let Ok(path) = std::env::var(RECEIPT_ENV) {
@@ -1058,9 +1066,26 @@ fn parse_args() -> Cfg {
             .filter(|&c| Some(c) != cfg.producer_cpu)
             .or_else(|| allowed.get(1).copied());
     }
-    assert!(cfg.runs >= 1, "--runs must be >= 1");
-    assert!(cfg.quanta >= 1000, "--quanta must be >= 1000");
-    cfg
+    if cfg.runs < 1 {
+        return Err("--runs must be >= 1".to_string());
+    }
+    if cfg.quanta < 1000 {
+        return Err("--quanta must be >= 1000".to_string());
+    }
+    Ok(cfg)
+}
+
+/// Parses the process arguments, exiting with status `2` and the usage block on
+/// a malformed invocation (never panicking on bad argv).
+fn parse_args() -> Cfg {
+    match parse_args_from(std::env::args().skip(1)) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("recording_ab_bench: {msg}");
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
 }
 
 #[cfg(test)]

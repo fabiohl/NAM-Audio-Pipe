@@ -3,16 +3,39 @@
 
 use super::*;
 use crate::standalone::pw_host::{BackendState, SharedBackendStatus};
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn production_defaults_are_bounded_and_enabled() {
     let policy = ReconnectPolicy::production();
     assert!(policy.enabled);
-    assert_eq!(policy.max_attempts, 3);
+    assert_eq!(policy.max_attempts, 6);
     assert_eq!(policy.initial_backoff, Duration::from_millis(250));
-    assert_eq!(policy.max_backoff, Duration::from_millis(1000));
+    assert_eq!(policy.max_backoff, Duration::from_millis(4000));
     assert!(!policy.is_disabled());
     assert_eq!(ReconnectPolicy::default(), policy);
+}
+
+#[test]
+fn with_backoff_timeout_trims_attempts_to_fit_budget() {
+    // The per-episode backoff budget can be capped from the CLI. The schedule is
+    // kept (250 ms initial, 4 s ceiling) and the attempt count is trimmed to the
+    // largest prefix that fits the timeout.
+    let policy = ReconnectPolicy::with_backoff_timeout(Duration::from_secs(5));
+    assert_eq!(policy.initial_backoff, Duration::from_millis(250));
+    assert_eq!(policy.max_backoff, Duration::from_millis(4000));
+    // 250+500+1000+2000 = 3750 ≤ 5000; adding 4000 would exceed it.
+    assert_eq!(policy.max_attempts, 4);
+    assert!(policy.total_backoff_budget() <= Duration::from_secs(5));
+
+    // A generous timeout keeps the full production schedule.
+    let full = ReconnectPolicy::with_backoff_timeout(Duration::from_secs(30));
+    assert_eq!(full, ReconnectPolicy::production());
+
+    // A timeout below the first backoff still performs exactly one attempt.
+    let tiny = ReconnectPolicy::with_backoff_timeout(Duration::from_secs(0));
+    assert_eq!(tiny.max_attempts, 1);
+    assert!(tiny.enabled);
 }
 
 #[test]
@@ -30,9 +53,11 @@ fn backoff_schedule_follows_progressive_doubling_capped_at_max() {
     assert_eq!(policy.backoff_for_attempt(1), Duration::from_millis(250));
     assert_eq!(policy.backoff_for_attempt(2), Duration::from_millis(500));
     assert_eq!(policy.backoff_for_attempt(3), Duration::from_millis(1000));
-    // The ceiling clamps any further doubling (attempt 4 would be 2000 ms).
-    assert_eq!(policy.backoff_for_attempt(4), Duration::from_millis(1000));
-    assert_eq!(policy.backoff_for_attempt(100), Duration::from_millis(1000));
+    assert_eq!(policy.backoff_for_attempt(4), Duration::from_millis(2000));
+    assert_eq!(policy.backoff_for_attempt(5), Duration::from_millis(4000));
+    // The ceiling clamps any further doubling (attempt 6 would be 8000 ms).
+    assert_eq!(policy.backoff_for_attempt(6), Duration::from_millis(4000));
+    assert_eq!(policy.backoff_for_attempt(100), Duration::from_millis(4000));
 }
 
 #[test]
@@ -64,9 +89,9 @@ fn custom_policy_respects_initial_and_max_backoff() {
 #[test]
 fn total_backoff_budget_is_the_hard_time_ceiling() {
     // The recovery phase must have a strict time ceiling, impeding infinite loops.
-    // Production: 250+500+1000 = 1750 ms.
+    // Production: 250+500+1000+2000+4000+4000 = 11750 ms per episode.
     let policy = ReconnectPolicy::production();
-    assert_eq!(policy.total_backoff_budget(), Duration::from_millis(1750));
+    assert_eq!(policy.total_backoff_budget(), Duration::from_millis(11750));
 }
 
 #[test]
@@ -80,7 +105,10 @@ fn cycle_hands_out_exactly_max_attempts_backoffs_then_none() {
     assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(250)));
     assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(500)));
     assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(1000)));
-    assert_eq!(cycle.attempts_made(), 3);
+    assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(2000)));
+    assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(4000)));
+    assert_eq!(cycle.begin_attempt(), Some(Duration::from_millis(4000)));
+    assert_eq!(cycle.attempts_made(), PRODUCTION_MAX_ATTEMPTS);
 
     assert!(!cycle.can_retry());
     assert_eq!(cycle.begin_attempt(), None);
@@ -97,6 +125,168 @@ fn cycle_with_disabled_policy_never_retries() {
     assert!(!cycle.can_retry());
     assert_eq!(cycle.begin_attempt(), None);
     assert_eq!(cycle.attempts_made(), 0);
+}
+
+/// Manually advanced clock, so the stability-reset cadence is proven without
+/// sleeping (shared with the cycle under test).
+#[derive(Clone)]
+struct ManualClock {
+    now: Arc<Mutex<Instant>>,
+}
+
+impl ManualClock {
+    fn new() -> Self {
+        Self {
+            now: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    fn advance(&self, delta: Duration) {
+        let mut guard = self.now.lock().unwrap();
+        *guard += delta;
+    }
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> Instant {
+        *self.now.lock().unwrap()
+    }
+}
+
+#[test]
+fn stable_streaming_replenishes_budget_after_reset() {
+    // F-UX-09 acceptance: three isolated failures, each separated by more than
+    // STABLE_RESET of healthy streaming, never exhaust the per-episode budget.
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
+
+    for _ in 0..3 {
+        assert!(
+            cycle.begin_attempt().is_some(),
+            "an isolated drop in a replenished episode always retries"
+        );
+        assert_eq!(cycle.attempts_made(), 1);
+
+        // The stream recovers; the first healthy poll confirms the restoration.
+        assert_eq!(
+            cycle.note_stable(),
+            StabilityEvent::Restored { attempts: 1 }
+        );
+
+        // Streaming beyond STABLE_RESET replenishes the episode budget.
+        clock.advance(STABLE_RESET + Duration::from_secs(1));
+        assert_eq!(cycle.note_stable(), StabilityEvent::Replenished);
+        assert_eq!(cycle.attempts_made(), 0);
+        assert!(cycle.can_retry());
+    }
+}
+
+#[test]
+fn failures_within_stable_window_exhaust_budget() {
+    // F-UX-09 acceptance: seven failures inside the same ~10-second window (well
+    // below STABLE_RESET) exhaust the per-episode budget — the reset is strictly
+    // per-episode and cannot be tricked by rapid flapping.
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
+
+    let mut granted = 0u32;
+    for _ in 0..7 {
+        if cycle.begin_attempt().is_some() {
+            granted += 1;
+            // A brief recovery marks the window start, but the ~1.5 s of
+            // streaming per iteration is far below STABLE_RESET.
+            assert_eq!(
+                cycle.note_stable(),
+                StabilityEvent::Restored { attempts: granted }
+            );
+        }
+        clock.advance(Duration::from_millis(1500));
+    }
+
+    assert_eq!(granted, PRODUCTION_MAX_ATTEMPTS);
+    assert_eq!(cycle.attempts_made(), PRODUCTION_MAX_ATTEMPTS);
+    assert!(!cycle.can_retry());
+}
+
+#[test]
+fn note_stable_reports_restored_once_after_recovery() {
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
+
+    // Startup: the very first healthy poll must not claim a restoration.
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+    assert_eq!(cycle.attempts_made(), 0);
+
+    // A drop + recovery: exactly one restoration event, then silence.
+    let _ = cycle.begin_attempt();
+    assert_eq!(
+        cycle.note_stable(),
+        StabilityEvent::Restored { attempts: 1 }
+    );
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+}
+
+#[test]
+fn stable_window_shorter_than_reset_does_not_replenish() {
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
+    let _ = cycle.begin_attempt();
+    assert_eq!(
+        cycle.note_stable(),
+        StabilityEvent::Restored { attempts: 1 }
+    );
+
+    // 59 s < STABLE_RESET: the budget is NOT replenished yet.
+    clock.advance(STABLE_RESET - Duration::from_secs(1));
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+    assert_eq!(cycle.attempts_made(), 1);
+
+    // Crossing the boundary replenishes.
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(cycle.note_stable(), StabilityEvent::Replenished);
+    assert_eq!(cycle.attempts_made(), 0);
+}
+
+#[test]
+fn leaving_streaming_breaks_the_stability_window() {
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
+    let _ = cycle.begin_attempt();
+    assert_eq!(
+        cycle.note_stable(),
+        StabilityEvent::Restored { attempts: 1 }
+    );
+
+    // 30 s of streaming, then a blip that leaves the streaming state without
+    // consuming an attempt (e.g. a transient `Starting` transition).
+    clock.advance(Duration::from_secs(30));
+    cycle.note_unstable();
+    assert_eq!(cycle.attempts_made(), 1, "a blip is not a new attempt");
+
+    // The loop resumes polling immediately: the window restarts from the blip,
+    // so 59 s later there is still no replenishment (and the restoration is NOT
+    // re-announced).
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+    clock.advance(Duration::from_secs(59));
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+    assert_eq!(cycle.attempts_made(), 1);
+
+    // Crossing STABLE_RESET from the resumed stream replenishes.
+    clock.advance(Duration::from_secs(2));
+    assert_eq!(cycle.note_stable(), StabilityEvent::Replenished);
+    assert_eq!(cycle.attempts_made(), 0);
+}
+
+#[test]
+fn fail_fast_cycle_never_replenishes_or_retries() {
+    // `--fail-fast` stays absolute: `note_stable` can never grant an attempt
+    // back, so a disabled policy always reports `can_retry() == false`.
+    let clock = ManualClock::new();
+    let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::fail_fast(), clock.clone());
+    clock.advance(STABLE_RESET + Duration::from_secs(1));
+    assert_eq!(cycle.note_stable(), StabilityEvent::None);
+    assert_eq!(cycle.begin_attempt(), None);
+    assert!(!cycle.can_retry());
 }
 
 #[test]
@@ -129,7 +319,7 @@ fn simulated_reconnect_recovers_without_losing_carried_state() {
         Ok(2),
         "audio resumes with the carried state intact"
     );
-    assert_eq!(attempts, 2, "recovery consumed exactly 2 of the 3 attempts");
+    assert_eq!(attempts, 2, "recovery consumed exactly 2 attempts");
     assert_eq!(cycle.attempts_made(), 2);
     assert!(
         cycle.can_retry(),
@@ -148,7 +338,7 @@ fn simulated_exhaustion_terminates_cleanly_with_error_outcome() {
             break Err("daemon unreachable after all retries");
         };
         attempts += 1;
-        assert!(backoff <= Duration::from_millis(1000));
+        assert!(backoff <= Duration::from_millis(PRODUCTION_MAX_BACKOFF_MS));
         // Simulated failed re-instantiation — keep retrying.
     };
 
@@ -172,14 +362,14 @@ fn simulated_stream_setup_failure_stages_during_reconnect_route_through_budget()
 
         // 2. Disconnection occurs → attempt 1 begins (e.g. daemon dropped)
         let backoff1 = cycle.begin_attempt().expect("attempt 1 backoff");
-        backend_status.begin_reconnect(cycle.attempts_made(), 3, backoff1);
+        backend_status.begin_reconnect(cycle.attempts_made(), PRODUCTION_MAX_ATTEMPTS, backoff1);
         assert_eq!(cycle.attempts_made(), 1);
 
         // 3. Re-instantiation attempt 2 fails during stream setup at specific stage
         let _setup_err = anyhow::anyhow!("simulated {stage} error");
         let backoff2 = match cycle.begin_attempt() {
             Some(b) => {
-                backend_status.begin_reconnect(cycle.attempts_made(), 3, b);
+                backend_status.begin_reconnect(cycle.attempts_made(), PRODUCTION_MAX_ATTEMPTS, b);
                 b
             }
             None => panic!("should have attempt 2"),
@@ -388,7 +578,6 @@ fn without_teardown_latch_peer_stream_unconnected_poisons_reconnect() {
 
 // ── Combined Multi-Cycle Reconnect & Memory Safety Stress Harness (T1.3) ───
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Simulated underlying PipeWire `pw_stream` struct allocated on the heap.
@@ -436,6 +625,8 @@ struct MockStream {
 impl Drop for MockStream {
     fn drop(&mut self) {
         let (name, backend, was_streaming) = {
+            // SAFETY: `self.node` is the live heap allocation owned by this `MockStream`
+            // until the `Box::from_raw` below reclaims it.
             let node = unsafe { &*self.node };
             node.is_destroyed.store(true, Ordering::Release);
             let streaming = node.is_streaming.load(Ordering::Acquire);
@@ -457,6 +648,8 @@ impl Drop for MockStream {
 
         // Deallocate the heap memory (stream_free).
         // If a listener drops after this, it accesses freed heap memory (ASan heap-use-after-free).
+        // SAFETY: `self.node` came from `Box::into_raw` in `create_mock_pair` and is
+        // reclaimed exactly once here; the `MockStream` is not used afterwards.
         unsafe {
             drop(Box::from_raw(self.node));
         }
@@ -509,11 +702,11 @@ fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poiso
     let uaf_counter = Arc::new(AtomicU32::new(0));
     let mut cycle = ReconnectCycle::new(ReconnectPolicy::production());
 
-    // Run 3 consecutive simulated reconnect cycles matching PRODUCTION_MAX_ATTEMPTS.
+    // Run PRODUCTION_MAX_ATTEMPTS consecutive simulated reconnect cycles.
     // Cycle 1: Capture stream suffers a localized disconnect, playback remains streaming.
     // Cycle 2: Playback stream suffers a localized disconnect, capture remains streaming.
-    // Cycle 3: Capture stream suffers a localized disconnect again, playback remains streaming.
-    for attempt_idx in 1..=3 {
+    // Cycle 3 (onwards): Capture stream suffers a localized disconnect again, playback remains streaming.
+    for attempt_idx in 1..=PRODUCTION_MAX_ATTEMPTS {
         // 1. Setup initial active streaming AppState
         let (cap_listener, cap_stream) = create_mock_pair("capture", &backend, &uaf_counter);
         let (play_listener, play_stream) = create_mock_pair("playback", &backend, &uaf_counter);
@@ -564,13 +757,13 @@ fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poiso
 
         // 4. Bounded reconnect begins: consumes attempt budget and clears failed flag
         let backoff = cycle.begin_attempt().expect("attempt within budget");
-        backend.begin_reconnect(attempt_idx, 3, backoff);
+        backend.begin_reconnect(attempt_idx, PRODUCTION_MAX_ATTEMPTS, backoff);
         assert!(
             !backend.is_failed(),
             "Attempt {attempt_idx}: begin_reconnect must clear the failed flag"
         );
 
-        // 5. Drop AppState under teardown guard (models line 584 of run.rs).
+        // 5. Drop AppState under teardown guard (mirrors the production teardown in run.rs).
         // - Listeners drop before streams (F-RB-102): zero UAF.
         // - Surviving peer stream drop emits synchronous Unconnected (F-RB-101).
         // - Teardown latch prevents poisoning!

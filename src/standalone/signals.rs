@@ -3,12 +3,15 @@
 
 //! Unified and safe installation of service termination signal handlers.
 //!
-//! A single staged C-ABI handler is installed for both `SIGINT` (Ctrl+C) and
-//! `SIGTERM` (the default shutdown command of `systemd`/`systemctl stop`,
-//! containers and orchestrators). The first signal flips the process-global
-//! cooperative [`SHUTDOWN`](neural_amp_modeler_rs::common::spsc::SHUTDOWN)
-//! flag so the main control loop in `pw_host::run` can stop the PipeWire loop,
-//! drain the recording ring and finalize WAV headers.
+//! A single staged C-ABI handler is installed for `SIGINT` (Ctrl+C), `SIGTERM`
+//! (the default shutdown command of `systemd`/`systemctl stop`, containers and
+//! orchestrators), `SIGHUP` (the terminal is closed, e.g. a `Terminal=true`
+//! launcher window is dismissed — the default action would otherwise kill the
+//! process with no graceful teardown and no WAV finalization) and `SIGQUIT`.
+//! The first signal flips the process-global cooperative
+//! [`SHUTDOWN`](neural_amp_modeler_rs::common::spsc::SHUTDOWN) flag so the main
+//! control loop in `pw_host::run` can stop the PipeWire loop, drain the
+//! recording ring and finalize WAV headers.
 //!
 //! ## Grace window for near-simultaneous signals
 //!
@@ -30,15 +33,77 @@
 //! exists to protect.
 
 use neural_amp_modeler_rs::common::spsc::SHUTDOWN;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Grace window opened by the first termination signal (in milliseconds).
+/// Default grace window opened by the first termination signal (milliseconds).
 ///
-/// A second `SIGINT`/`SIGTERM` arriving strictly inside this window is
-/// swallowed; one arriving at or after the window boundary escalates to
-/// [`libc::_exit`] (the graceful teardown had 500 ms — three CPU-time orders
-/// of magnitude above a WAV header rewrite — and is evidently stuck).
-const GRACE_WINDOW_MS: u64 = 500;
+/// A second `SIGINT`/`SIGTERM` arriving strictly inside the window is swallowed;
+/// one arriving at or after the boundary escalates to [`libc::_exit`]. The
+/// default (500 ms) is three CPU-time orders of magnitude above a WAV header
+/// rewrite, so it is ample when no recording is in flight.
+pub const DEFAULT_GRACE_WINDOW_MS: u64 = 500;
+
+/// Extended grace window used while a WAV recording is active (milliseconds).
+///
+/// The graceful teardown of an active recording includes draining the SPSC ring,
+/// rewriting the header and `fsync`ing the capture file, which on HDD/USB/NFS
+/// can exceed 500 ms (F-UX-04). With this window a second Ctrl+C arriving while
+/// the file is finalizing is swallowed instead of force-exiting mid-`fsync` and
+/// corrupting the take. The window is restored to
+/// [`DEFAULT_GRACE_WINDOW_MS`] as soon as the recording worker's shutdown
+/// completes.
+pub const RECORDING_GRACE_WINDOW_MS: u64 = 5000;
+
+/// Live grace window (milliseconds).
+///
+/// Read by the async-signal-safe handler with `Relaxed` and written by the main
+/// thread: `RECORDING_GRACE_WINDOW_MS` is armed once the recording handshake
+/// succeeds (`main`) and disarmed when the worker's shutdown completes
+/// (`recording::guard`). Only an atomic is touched — no lock, no allocation —
+/// so the handler stays async-signal-safe.
+static GRACE_WINDOW_MS: AtomicU64 = AtomicU64::new(DEFAULT_GRACE_WINDOW_MS);
+
+/// Sets the live grace window (milliseconds). Clamped to at least `1` so a
+/// misconfigured `0` can never make the window instantaneous.
+pub fn set_grace_window(ms: u64) {
+    GRACE_WINDOW_MS.store(ms.max(1), Ordering::Relaxed);
+}
+
+/// Returns the current live grace window (milliseconds).
+pub fn grace_window_ms() -> u64 {
+    GRACE_WINDOW_MS.load(Ordering::Relaxed)
+}
+
+/// Whether the recording grace window is currently armed.
+///
+/// [`disarm_recording_grace_window`] only restores the default window when a
+/// recording actually armed it, so a recording-less teardown (e.g. a bare
+/// `RecordingWorkerGuard` in a unit test) can never clobber a window another
+/// context is deliberately holding.
+static RECORDING_WINDOW_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Widens the grace window to [`RECORDING_GRACE_WINDOW_MS`] and marks it armed.
+///
+/// Called by `main` once the recording handshake succeeds.
+pub fn arm_recording_grace_window() {
+    GRACE_WINDOW_MS.store(RECORDING_GRACE_WINDOW_MS, Ordering::Relaxed);
+    RECORDING_WINDOW_ARMED.store(true, Ordering::Relaxed);
+}
+
+/// Restores [`DEFAULT_GRACE_WINDOW_MS`] — but only if a recording armed the
+/// window, so it is a no-op when no recording grace window was taken.
+///
+/// Called from the recording worker's teardown once the capture is finalized.
+pub fn disarm_recording_grace_window() {
+    if RECORDING_WINDOW_ARMED.swap(false, Ordering::Relaxed) {
+        GRACE_WINDOW_MS.store(DEFAULT_GRACE_WINDOW_MS, Ordering::Relaxed);
+    }
+}
+
+/// Static, async-signal-safe message written to `stderr` on the forced
+/// `_exit(1)` path when the graceful teardown (possibly finalizing a capture)
+/// is abandoned. A literal byte slice — no formatting, no allocation.
+const FORCED_EXIT_MESSAGE: &[u8] = b"forced exit: capture may be incomplete\n";
 
 /// Handler stages packed into the high bits of one atomic word, with the
 /// monotonic timestamp of the stage entry in the data bits.
@@ -59,12 +124,13 @@ const TIMESTAMP_MASK: u64 = (1u64 << 62) - 1;
 static TERMINATION_STATE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(STAGE_IDLE);
 
-/// The staged, async-signal-safe termination handler for `SIGINT`/`SIGTERM`.
+/// The staged, async-signal-safe termination handler for
+/// `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT`.
 ///
 /// First signal: cooperatively store `SHUTDOWN = true` (Release) so the main
 /// control loop observes the request and performs a graceful teardown, opening
-/// the [`GRACE_WINDOW_MS`] grace window. Further signals inside the window are
-/// swallowed (exactly one graceful shutdown runs, e.g. `systemctl stop`
+/// the live [`grace_window_ms`] grace window. Further signals inside the window
+/// are swallowed (exactly one graceful shutdown runs, e.g. `systemctl stop`
 /// racing an interactive Ctrl+C). A signal at or after the window boundary
 /// means the graceful teardown is stuck: hard `_exit(1)` without running
 /// destructors — the kernel reclaims all open resources.
@@ -93,16 +159,30 @@ extern "C" fn termination_signal_handler(_sig: libc::c_int) {
                 Err(_) => continue,
             }
         }
-        // Grace window already open: decide by elapsed time.
+        // Grace window already open: decide by elapsed time. The window length
+        // is read from the live atomic (Relaxed — async-signal-safe): it is
+        // widened while a recording finalizes and restored afterwards.
         let opened_ms = state & TIMESTAMP_MASK;
-        if now.saturating_sub(opened_ms) >= GRACE_WINDOW_MS {
+        if now.saturating_sub(opened_ms) >= GRACE_WINDOW_MS.load(Ordering::Relaxed) {
             // Diagnostic marker for core/crash triage; `_exit` follows.
             TERMINATION_STATE.store(STAGE_FORCE_EXIT, Ordering::Relaxed);
+            // Async-signal-safe best effort: a raw static literal on stderr so the
+            // operator learns the teardown (and possibly a capture) was abandoned.
+            // SAFETY: `write(2, ...)` is async-signal-safe; the pointer/length
+            // describe a `'static` byte slice that outlives the process.
+            unsafe {
+                libc::write(
+                    2,
+                    FORCED_EXIT_MESSAGE.as_ptr().cast::<libc::c_void>(),
+                    FORCED_EXIT_MESSAGE.len(),
+                );
+            }
             // SAFETY: `_exit` is async-signal-safe and terminates the process
             // immediately; it never runs destructors, so no locks, allocations
-            // or logging are touched from the signal context.
+            // or logging are touched from the signal context. The generic code
+            // is a compile-time constant (no runtime work in the handler).
             unsafe {
-                libc::_exit(1);
+                libc::_exit(crate::standalone::exit::EXIT_GENERIC);
             }
         }
         // Inside the grace window: swallow the repeated delivery — the
@@ -124,6 +204,9 @@ fn monotonic_ms() -> u64 {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    // SAFETY: `ts` is a valid, writable `libc::timespec` and `CLOCK_MONOTONIC`
+    // always exists on the Linux targets of this daemon; the return value is
+    // intentionally ignored (the monotonic read never fails).
     unsafe {
         libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
     }
@@ -177,7 +260,7 @@ pub(crate) fn restore_sigaction(sig: libc::c_int, saved: libc::sigaction) {
 
 /// RAII restore of everything a handler-touching test touches: the packed
 /// handler stage (reset to idle), the cooperative `SHUTDOWN` value and the
-/// `SIGINT`/`SIGTERM` dispositions.
+/// `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` dispositions.
 ///
 /// The signal surface is process-global and shared by every test in the
 /// binary (serialized by [`crate::standalone::SHUTDOWN_TEST_LOCK`]); the guard
@@ -186,20 +269,24 @@ pub(crate) fn restore_sigaction(sig: libc::c_int, saved: libc::sigaction) {
 #[cfg(test)]
 pub(crate) struct HandlerRestoreGuard {
     shutdown: bool,
-    saved_int: libc::sigaction,
-    saved_term: libc::sigaction,
+    grace_window_ms: u64,
+    recording_window_armed: bool,
+    saved: [(libc::c_int, libc::sigaction); 4],
 }
 
 #[cfg(test)]
 impl HandlerRestoreGuard {
-    /// Resets the stage to idle, then captures the current `SHUTDOWN` value
-    /// and `SIGINT`/`SIGTERM` dispositions for restoration on drop.
+    /// Resets the stage to idle, then captures the current `SHUTDOWN` value,
+    /// the live grace window, the armed flag and the termination-signal
+    /// dispositions for restoration on drop.
     pub(crate) fn capture() -> Self {
         reset_termination_stage_for_tests();
+        let sigs = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
         Self {
             shutdown: SHUTDOWN.load(Ordering::Acquire),
-            saved_int: saved_sigaction(libc::SIGINT),
-            saved_term: saved_sigaction(libc::SIGTERM),
+            grace_window_ms: grace_window_ms(),
+            recording_window_armed: RECORDING_WINDOW_ARMED.load(Ordering::Relaxed),
+            saved: sigs.map(|sig| (sig, saved_sigaction(sig))),
         }
     }
 }
@@ -209,8 +296,11 @@ impl Drop for HandlerRestoreGuard {
     fn drop(&mut self) {
         reset_termination_stage_for_tests();
         SHUTDOWN.store(self.shutdown, Ordering::Release);
-        restore_sigaction(libc::SIGINT, self.saved_int);
-        restore_sigaction(libc::SIGTERM, self.saved_term);
+        set_grace_window(self.grace_window_ms);
+        RECORDING_WINDOW_ARMED.store(self.recording_window_armed, Ordering::Relaxed);
+        for (sig, saved) in self.saved {
+            restore_sigaction(sig, saved);
+        }
     }
 }
 
@@ -220,7 +310,8 @@ pub(crate) fn termination_stage_snapshot_for_tests() -> u64 {
     TERMINATION_STATE.load(Ordering::Acquire)
 }
 
-/// Installs the unified [`termination_signal_handler`] for `SIGINT` and `SIGTERM`.
+/// Installs the unified [`termination_signal_handler`] for `SIGINT`, `SIGTERM`,
+/// `SIGHUP` and `SIGQUIT`.
 ///
 /// Every `libc::sigaction` call is formally validated: a non-zero return code
 /// aborts initialization with an [`anyhow::Error`] carrying the last OS error,
@@ -228,7 +319,7 @@ pub(crate) fn termination_stage_snapshot_for_tests() -> u64 {
 ///
 /// # Errors
 ///
-/// Returns an error if the kernel rejects the installation for either signal.
+/// Returns an error if the kernel rejects the installation for any signal.
 pub fn install_termination_signal_handlers() -> anyhow::Result<()> {
     // A zeroed `sigaction` is a fully-defined, valid disposition (SIG_DFL with
     // an empty mask); the handler pointer and SA_RESTART are set immediately
@@ -247,8 +338,10 @@ pub fn install_termination_signal_handlers() -> anyhow::Result<()> {
     unsafe {
         install_one(libc::SIGINT, &sa)?;
         install_one(libc::SIGTERM, &sa)?;
+        install_one(libc::SIGHUP, &sa)?;
+        install_one(libc::SIGQUIT, &sa)?;
     }
-    log::info!("Installed SIGINT/SIGTERM termination handlers (SA_RESTART)");
+    log::info!("Installed SIGINT/SIGTERM/SIGHUP/SIGQUIT termination handlers (SA_RESTART)");
     Ok(())
 }
 

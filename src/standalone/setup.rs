@@ -3,7 +3,7 @@
 
 //! Setup and initialization helpers for off-RT resources and SPSC channels.
 
-use crate::standalone::{cli, colors::Colorize};
+use crate::standalone::{colors::Colorize, exit};
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::{
     ACTIVE_MODEL_INFO, ACTIVE_MODEL_MEMORY_BYTES, ACTIVE_MODEL_NAME, ACTIVE_SAMPLE_RATE,
@@ -41,6 +41,37 @@ pub struct InitialModelSetup {
     pub has_model_r: bool,
     /// Architecture name string (e.g. "WaveNet", "LSTM", "Linear").
     pub architecture: String,
+}
+
+/// Maps a structured loader failure to an actionable remediation hint.
+///
+/// The engine exposes a typed [`loader::LoadError`] with a stable diagnostic
+/// code ([`loader::LoadError::code`]); matching on that code gives each root
+/// cause its own hint without fragile message parsing.
+fn model_load_hint(e: &loader::LoadError) -> &'static str {
+    use neural_amp_modeler_rs::common::diagnostics::NamErrorCode;
+    match e.code() {
+        NamErrorCode::FileReadError => {
+            "The model file could not be read. Check its permissions and that it \
+             is a readable .nam/.namb file."
+        }
+        NamErrorCode::NamJsonUnsupportedVersion | NamErrorCode::NambUnsupportedVersion => {
+            "This model was exported by a newer NAM version. Update NAM-Audio-Pipe \
+             or re-export the model with a supported version."
+        }
+        NamErrorCode::UnsupportedArchitecture | NamErrorCode::NamJsonUnsupportedTopology => {
+            "The model architecture is not supported by this build. Update \
+             NAM-Audio-Pipe or use a supported architecture."
+        }
+        NamErrorCode::NamJsonParseError | NamErrorCode::NambInvalidMagic => {
+            "The model file is not a valid NAM model (corrupted or truncated). \
+             Re-export or re-download it."
+        }
+        _ => {
+            "Verify the model is a valid, supported .nam/.namb file; re-export it \
+             if it was produced by another tool."
+        }
+    }
 }
 
 /// Encapsulates neural model loading, active diagnostics state updates, and SPSC payload dispatch.
@@ -98,7 +129,13 @@ pub fn load_initial_model(
                     sample_rate: loaded.sample_rate,
                 });
             }
-            Err(e) => cli::exit_with_error(format!("Model load failed: {}", e)),
+            Err(e) => {
+                exit::exit_runtime_error(
+                    exit::ExitKind::Model,
+                    format!("Model load failed: {e}"),
+                    model_load_hint(&e),
+                );
+            }
         }
     } else {
         ACTIVE_MODEL_MEMORY_BYTES.store(0, Ordering::Relaxed);
@@ -152,9 +189,18 @@ pub(crate) fn initial_cabsim_partition_size(cabsim_partition: u32) -> usize {
 /// to host rate. The partition comes from the `--cabsim-partition` policy
 /// (never from the host quantum), so the published algorithmic latency is a
 /// startup-stable choice of the user.
+///
+/// # Errors
+///
+/// An explicitly requested IR (`--cab <FILE>`) that fails to load is **fatal**
+/// by default: the caller turns the `Err` into a
+/// [`crate::standalone::exit::ExitKind::CabIr`] exit so a typo never silently
+/// degrades to "amp without cabinet". Passing `true` for `cab_optional`
+/// (`--cab-optional`) restores the graceful `warn` + `Ok(None)` contract.
 pub fn load_initial_cabsim(
     cab_path: Option<&Path>,
     cabsim_partition: u32,
+    cab_optional: bool,
     cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
 ) -> anyhow::Result<Option<InitialCabSimIr>> {
     let Some(cab_path) = cab_path else {
@@ -212,12 +258,17 @@ pub fn load_initial_cabsim(
             }))
         }
         Err(e) => {
-            log::warn!(
-                "{} Cab-sim IR load failed: {} — continuing without cab-sim",
-                "⚠️".yellow(),
-                e
-            );
-            Ok(None)
+            if cab_optional {
+                log::warn!(
+                    "{} Cab-sim IR load failed: {} — continuing without cab-sim \
+                     (--cab-optional)",
+                    "⚠️".yellow(),
+                    e
+                );
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!("Cab-sim IR load failed: {e}"))
+            }
         }
     }
 }
@@ -245,8 +296,50 @@ mod tests {
     #[test]
     fn test_load_initial_cabsim_none() {
         let mut channels = setup_communication_channels().expect("test SPSC setup");
-        let result = load_initial_cabsim(None, 128, &mut channels.cabsim_producer).unwrap();
+        let result = load_initial_cabsim(None, 128, false, &mut channels.cabsim_producer).unwrap();
         assert!(result.is_none());
+    }
+
+    // F-UX-07: an explicitly requested IR that cannot be loaded is fatal by
+    // default (same contract as `--model`); `--cab-optional` restores the
+    // graceful `Ok(None)` path.
+    #[test]
+    fn load_initial_cabsim_missing_path_is_fatal_by_default() {
+        let mut channels = setup_communication_channels().expect("test SPSC setup");
+        let missing = std::path::Path::new("/nonexistent/definitely/missing_ir.wav");
+        let err = load_initial_cabsim(Some(missing), 128, false, &mut channels.cabsim_producer)
+            .err()
+            .expect("a missing --cab must be fatal by default");
+        assert!(
+            err.to_string().contains("Cab-sim IR load failed"),
+            "fatal error must name the failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_initial_cabsim_missing_path_is_optional_with_flag() {
+        let mut channels = setup_communication_channels().expect("test SPSC setup");
+        let missing = std::path::Path::new("/nonexistent/definitely/missing_ir.wav");
+        let result = load_initial_cabsim(Some(missing), 128, true, &mut channels.cabsim_producer)
+            .expect("--cab-optional must keep going without the IR");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn model_load_hint_is_specific_per_root_cause() {
+        use neural_amp_modeler_rs::loader::{JsonError, LoadError};
+        // Unsupported version → re-export/upgrade hint.
+        let version = LoadError::Json(JsonError::UnsupportedVersion {
+            raw: "9.9.9".to_string(),
+            reason: "future schema".to_string(),
+        });
+        assert!(model_load_hint(&version).contains("newer NAM version"));
+        // Unsupported architecture → update/architecture hint.
+        let arch = LoadError::UnsupportedArchitecture("SomeFutureNet".to_string());
+        assert!(model_load_hint(&arch).contains("architecture"));
+        // Read failures → permissions/path hint.
+        let io = LoadError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(model_load_hint(&io).contains("permissions"));
     }
 
     #[test]

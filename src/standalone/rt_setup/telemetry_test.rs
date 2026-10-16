@@ -862,3 +862,55 @@ fn test_playback_bringup_preroll_suppresses_drift() {
         "post-bring-up drops must be accounted"
     );
 }
+
+#[test]
+fn gate_transition_throttle_emits_at_most_one_line_per_second() {
+    use std::time::{Duration, Instant};
+
+    let base = Instant::now();
+    let mut throttle = GateTransitionThrottle::default();
+
+    // First transition always emits immediately (count = 1, no suppression).
+    assert_eq!(throttle.observe(base), Some(1));
+
+    // A 10 Hz flap for 3 s: 29 further transitions arrive inside the window.
+    let mut emitted = 1u32;
+    let mut suppressed = 0u32;
+    for i in 1..=29u32 {
+        let now = base + Duration::from_millis(100 * i as u64);
+        match throttle.observe(now) {
+            Some(_) => emitted += 1,
+            None => suppressed += 1,
+        }
+    }
+    // ~3 s at one line per second: never more than one line per second (+1).
+    assert!(
+        emitted <= 4,
+        "expected ≤ 4 emitted lines over 3 s, got {emitted}"
+    );
+    assert_eq!(
+        emitted + suppressed,
+        30,
+        "every transition is accounted for"
+    );
+
+    // The next line after a suppressed burst carries the "(×N)" count.
+    let after = base + Duration::from_millis(3_200);
+    let count = throttle.observe(after).expect("window elapsed → emit");
+    assert!(count > 1, "suppressed transitions fold into the next line");
+}
+
+#[test]
+fn gate_transition_throttle_does_not_rate_limit_spaced_transitions() {
+    use std::time::{Duration, Instant};
+
+    let base = Instant::now();
+    let mut throttle = GateTransitionThrottle::default();
+    assert_eq!(throttle.observe(base), Some(1));
+    // Exactly one second later the next transition is emitted uncounted.
+    assert_eq!(
+        throttle.observe(base + Duration::from_secs(1)),
+        Some(1),
+        "a transition after the interval is not marked as a repeat"
+    );
+}

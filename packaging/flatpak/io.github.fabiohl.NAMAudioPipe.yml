@@ -12,6 +12,7 @@ finish-args:
   - --share=ipc
   - --device=all
   - --filesystem=home:ro
+  - --filesystem=xdg-music
   - --socket=fallback-x11
   - --socket=wayland
 

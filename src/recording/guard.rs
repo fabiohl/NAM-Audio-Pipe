@@ -28,6 +28,7 @@
 
 use crate::recording::buffer::{OVERRUN_COUNT, OVERRUN_FRAMES_COUNT};
 use crate::recording::transport::RecordingSender;
+use crate::standalone::exit::ExitKind;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -88,16 +89,17 @@ pub enum RecordingWorkerOutcome {
 
 impl RecordingWorkerOutcome {
     /// Exit-code policy: `Success` is the only clean outcome (exit 0).
-    /// Every other variant — including `SuccessWithLoss` — maps to a non-zero
-    /// exit, so a recording that dropped audio never masquerades as a lossless
-    /// capture for automation that checks only the process exit code.
+    /// Every other variant — including `SuccessWithLoss` — maps to the
+    /// recording failure class code ([`ExitKind::Recording`], 6), so a
+    /// recording that dropped audio never masquerades as a lossless capture
+    /// for automation that checks only the process exit code.
     pub fn exit_code(&self) -> i32 {
         match self {
             RecordingWorkerOutcome::Success => 0,
             RecordingWorkerOutcome::SuccessWithLoss { .. }
             | RecordingWorkerOutcome::Failed { .. }
             | RecordingWorkerOutcome::Panicked { .. }
-            | RecordingWorkerOutcome::TimedOut { .. } => 1,
+            | RecordingWorkerOutcome::TimedOut { .. } => ExitKind::Recording.code(),
         }
     }
 }
@@ -287,6 +289,11 @@ fn teardown(
         drop(sender);
     }
     let outcome = join_recording_io(handle, RECORDING_IO_JOIN_TIMEOUT);
+    // The extended recording grace window has served its purpose: the capture
+    // was finalized (or the teardown abandoned it). Disarm it so a subsequent
+    // session is not left with the 5 s recording window armed. Harmless when no
+    // recording ever armed it.
+    crate::standalone::signals::disarm_recording_grace_window();
     (outcome, leaked_slots)
 }
 

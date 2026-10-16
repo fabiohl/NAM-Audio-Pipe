@@ -44,10 +44,17 @@ pub enum RecordingStatus {
     Starting,
     /// The worker initialized the `io_uring` runtime and confirmed the output
     /// directory; `path` is the directory, later updated to the actual capture
-    /// file path once the first WAV is created.
+    /// file path once the first WAV is created. `space_warning` carries the
+    /// current low-disk-space pre-warning (T4.2), `None` while the volume has
+    /// comfortable headroom; it is rendered into the user-facing
+    /// [`crate::recording::alert::RecordingAlert`] on the main control loop so
+    /// failure and space messages share a single output path.
     Active {
         /// Output directory (startup) or currently-open capture file path.
         path: PathBuf,
+        /// Current low-disk-space warning (free bytes / remaining minutes), if
+        /// the capture volume crossed the low-space threshold.
+        space_warning: Option<String>,
     },
     /// A fatal error occurred (startup or runtime: `EIO`, `ENOSPC`, missing
     /// directory, unavailable `io_uring`, ...). Recording is suspended.
@@ -164,6 +171,31 @@ pub fn record_failure(status: &SharedRecordingStatus, failed_flag: &AtomicBool, 
         };
     }
     failed_flag.store(true, Ordering::Release);
+}
+
+/// Transitions the observable status to `Active` pointing at `path`.
+///
+/// A newly opened segment starts with no low-space warning; the worker
+/// republishes it via [`publish_space_warning`] right after (T4.2).
+pub fn mark_active(status: &SharedRecordingStatus, path: PathBuf) {
+    if let Ok(mut guard) = status.lock() {
+        *guard = RecordingStatus::Active {
+            path,
+            space_warning: None,
+        };
+    }
+}
+
+/// Publishes (or clears) the low-disk-space warning on the active status.
+///
+/// No-op unless the worker is currently `Active` (a competing `Failed`/`Stopped`
+/// transition must never be overwritten by a stale space check).
+pub fn publish_space_warning(status: &SharedRecordingStatus, warning: Option<String>) {
+    if let Ok(mut guard) = status.lock()
+        && let RecordingStatus::Active { space_warning, .. } = &mut *guard
+    {
+        *space_warning = warning;
+    }
 }
 
 /// Main-thread side of the recording startup handshake.

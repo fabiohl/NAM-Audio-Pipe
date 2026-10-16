@@ -236,6 +236,8 @@ pub fn setup_playback_stream<'c>(
     // of the synchronous `connect` call below.
     let proc_pod =
         unsafe { latency::build_process_latency_pod(init_samples, init_ns, &mut proc_storage)? };
+    // SAFETY: `lat_storage` remains valid and unmodified for the duration of the
+    // synchronous `connect` call below (same contract as `proc_storage`).
     let lat_pod = unsafe {
         latency::build_latency_pod(
             pw::spa::sys::SPA_DIRECTION_OUTPUT,

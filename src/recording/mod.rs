@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+pub mod alert;
 pub mod buffer;
 pub mod disk;
 pub mod guard;
 mod io;
 pub mod pool;
 pub mod probe;
+pub mod space;
 pub mod status;
+pub mod summary;
 pub mod transport;
 pub mod wav_header;
+
+pub use alert::{ALERT_REMINDER_INTERVAL, Alert, AlertKind, Clock, RecordingAlert, SystemClock};
 
 pub use buffer::{
     AlignedBlock, AudioMetadata, CONTROL_CAPACITY, ControlPayload, MAX_BLOCK_SIZE, OVERRUN_COUNT,
@@ -28,7 +33,11 @@ pub use pool::{
 pub use probe::{IoUringSupport, probe_io_uring};
 pub use status::{
     RECORDING_INIT_TIMEOUT, RecordingInit, RecordingStartupError, RecordingStatus,
-    SharedRecordingStatus, record_failure, wait_for_recording_init,
+    SharedRecordingStatus, mark_active, publish_space_warning, record_failure,
+    wait_for_recording_init,
+};
+pub use summary::{
+    CaptureSegment, CaptureSummary, format_bytes, format_capture_size, format_duration,
 };
 pub use transport::{
     RECORDING_POOL_TRANSPORT, RecordingReceiver, RecordingSender, create_recording_transport,

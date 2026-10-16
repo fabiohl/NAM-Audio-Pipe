@@ -143,6 +143,8 @@ fn test_pipewire_log_captured_in_log_buffer() {
         let file = b"log_redirect_test.rs\0";
         let func = b"test_pipewire_log_captured_in_log_buffer\0";
 
+        // SAFETY: all three C strings are NUL-terminated byte arrays owned by this
+        // test and outlive the synchronous `pw_log_log` call.
         unsafe {
             pipewire::sys::pw_log_log(
                 SPA_LOG_LEVEL_INFO,

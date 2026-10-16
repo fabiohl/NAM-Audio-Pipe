@@ -63,6 +63,39 @@ const STDOUT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// cadence so neither pipe data nor exit status starves the other side.
 const STDOUT_POLL_SLICE: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// Forces `O_NONBLOCK` on `fd` via `fcntl`.
+///
+/// Both calls are best-effort and non-fatal: an `F_GETFL` failure (invalid or
+/// closed descriptor) and an `F_SETFL` failure (the descriptor rejects the
+/// flag merge) are surfaced as an `E2113 | HW_SINK_PROBE_FAILED` log record
+/// instead of aborting the probe, because `poll`-gated readiness still bounds
+/// every read slice regardless.
+fn force_nonblocking(fd: std::os::fd::RawFd) {
+    // SAFETY: `fd` is a descriptor owned by the caller's capture; `F_GETFL` is a
+    // single-argument descriptor operation with no side channels.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        log::warn!(
+            "[E2113 | HW_SINK_PROBE_FAILED] detect_hardware_sink: fcntl(F_GETFL) on the \
+             pw-metadata stdout failed ({}) — capture proceeds with poll-gated reads bound \
+             per slice.",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    // SAFETY: `fd` is the same live descriptor; `F_SETFL` merges `O_NONBLOCK`
+    // into the flags read above and cannot invalidate `fd`.
+    let set_rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if set_rc == -1 {
+        log::warn!(
+            "[E2113 | HW_SINK_PROBE_FAILED] detect_hardware_sink: fcntl(F_SETFL, O_NONBLOCK) on \
+             the pw-metadata stdout failed ({}) — capture proceeds with poll-gated reads bound \
+             per slice.",
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 /// Bounded non-blocking stdout capture consumed concurrently with the child
 /// wait. Reads happen only under [`libc::poll`] readiness on an `O_NONBLOCK`
 /// descriptor (a slice never blocks past its deadline) and are clamped to
@@ -89,20 +122,7 @@ impl StdoutCapture {
         let out = child.stdout.take();
         let fd = out.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
         if let Some(fd) = fd {
-            // SAFETY: `fd` is a live descriptor owned by `out`, kept alive for
-            // the whole capture lifetime; both fcntl calls are single-argument
-            // descriptor operations with no side channels.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            if flags >= 0 {
-                unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-            } else {
-                log::warn!(
-                    "[E2113 | HW_SINK_PROBE_FAILED] detect_hardware_sink: fcntl(O_NONBLOCK) on the \
-                     pw-metadata stdout failed ({}) — capture proceeds with poll-gated reads bound \
-                     per slice.",
-                    std::io::Error::last_os_error()
-                );
-            }
+            force_nonblocking(fd);
         }
         Self {
             out,

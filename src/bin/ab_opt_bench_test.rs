@@ -48,3 +48,34 @@ fn pin_thread_bounds_check() {
         })
     );
 }
+
+#[test]
+fn parse_args_rejects_missing_value_without_panicking() {
+    // `--runs` with no following token must yield a typed usage error (which the
+    // CLI wrapper turns into exit code 2), never a panic.
+    let err = parse_args_from(vec!["--runs".to_string()]).unwrap_err();
+    assert!(
+        err.contains("--runs"),
+        "typed error must name the offending flag: {err}"
+    );
+}
+
+#[test]
+fn parse_args_rejects_unknown_argument_and_bad_enum() {
+    assert!(
+        parse_args_from(vec!["--nope".to_string()])
+            .unwrap_err()
+            .contains("unknown argument")
+    );
+    assert!(
+        parse_args_from(vec!["--oversample".to_string(), "8x".to_string()])
+            .unwrap_err()
+            .contains("--oversample")
+    );
+}
+
+#[test]
+fn parse_args_accepts_valid_values() {
+    let cfg = parse_args_from(vec!["--runs".to_string(), "3".to_string()]).unwrap();
+    assert_eq!(cfg.runs, 3);
+}

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use std::ffi::OsStr;
 
 #[test]
 fn test_parse_args_diagnose() {
@@ -113,6 +114,22 @@ fn test_parse_args_record_keeps_reconnect_enabled() {
     let cli_args = parse_args_from(parser);
     assert!(cli_args.record);
     assert!(!cli_args.fail_fast);
+}
+
+#[test]
+fn test_parse_args_reconnect_timeout_defaults_to_none() {
+    let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.reconnect_timeout, None);
+}
+
+#[test]
+fn test_parse_args_reconnect_timeout_parses_seconds() {
+    let args = vec!["nam-audio-pipe", "--reconnect-timeout", "5"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.reconnect_timeout, Some(Duration::from_secs(5)));
 }
 
 #[test]
@@ -485,4 +502,237 @@ fn parse_args_accepts_cpu_zero() {
     let parser = lexopt::Parser::from_iter(args);
     let cli_args = parse_args_from(parser);
     assert_eq!(cli_args.cpu, Some(0));
+}
+
+// --expand_user_path (F-UX-12) --------------------------------------------
+
+#[test]
+fn expand_user_path_leaves_non_tilde_paths_unchanged() {
+    let home = OsStr::new("/home/tester");
+    assert_eq!(
+        expand_user_path("relative/dir/model.nam", Some(home)).unwrap(),
+        PathBuf::from("relative/dir/model.nam")
+    );
+    assert_eq!(
+        expand_user_path("/abs/path/model.nam", Some(home)).unwrap(),
+        PathBuf::from("/abs/path/model.nam")
+    );
+    // A tilde that is not the leading character is a literal path segment.
+    assert_eq!(
+        expand_user_path("mid~tilde/x", Some(home)).unwrap(),
+        PathBuf::from("mid~tilde/x")
+    );
+}
+
+#[test]
+fn expand_user_path_expands_lone_and_prefixed_tilde() {
+    let home = OsStr::new("/home/tester");
+    assert_eq!(
+        expand_user_path("~", Some(home)).unwrap(),
+        PathBuf::from("/home/tester")
+    );
+    assert_eq!(
+        expand_user_path("~/a/b", Some(home)).unwrap(),
+        PathBuf::from("/home/tester/a/b")
+    );
+    // Spaces must survive verbatim (no shell word-splitting).
+    assert_eq!(
+        expand_user_path("~/dir with spaces/ir.wav", Some(home)).unwrap(),
+        PathBuf::from("/home/tester/dir with spaces/ir.wav")
+    );
+}
+
+#[test]
+fn expand_user_path_rejects_user_expansion() {
+    let home = OsStr::new("/home/tester");
+    let err = expand_user_path("~user/a", Some(home)).unwrap_err();
+    assert!(err.contains("Unsupported '~user'"), "got: {err}");
+}
+
+#[test]
+fn expand_user_path_without_home_is_a_clear_error() {
+    for raw in ["~", "~/a"] {
+        let err = expand_user_path(raw, None).unwrap_err();
+        assert!(err.contains("HOME is not set"), "for '{raw}' got: {err}");
+    }
+    // An empty HOME must be treated as unset, never as a CWD-relative base.
+    for raw in ["~", "~/a"] {
+        let err = expand_user_path(raw, Some(OsStr::new(""))).unwrap_err();
+        assert!(err.contains("HOME is not set"), "for '{raw}' got: {err}");
+    }
+}
+
+// --input file validation (F-UX-12) ---------------------------------------
+
+#[test]
+fn validate_readable_file_accepts_a_regular_file_and_returns_absolute_path() {
+    let file = std::env::temp_dir().join(format!(
+        "nam_cli_validate_{}_{}.nam",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("t")
+    ));
+    std::fs::write(&file, b"stub").unwrap();
+    let resolved = validate_readable_file("--model", &file).expect("existing file must validate");
+    assert!(resolved.is_absolute(), "must resolve to an absolute path");
+    assert!(resolved.exists());
+    let _ = std::fs::remove_file(&file);
+}
+
+#[test]
+fn validate_readable_file_rejects_missing_path() {
+    let missing = std::env::temp_dir().join("nam_cli_definitely_missing_xyz.nam");
+    let _ = std::fs::remove_file(&missing);
+    let err = validate_readable_file("--model", &missing).unwrap_err();
+    assert!(err.contains("not found"), "got: {err}");
+    assert!(
+        err.contains("--model"),
+        "must name the offending flag, got: {err}"
+    );
+}
+
+#[test]
+fn validate_readable_file_rejects_a_directory() {
+    let err = validate_readable_file("--cab", &std::env::temp_dir()).unwrap_err();
+    assert!(err.contains("not a regular file"), "got: {err}");
+}
+
+#[test]
+fn parse_args_color_defaults_to_auto() {
+    let args = vec!["nam-audio-pipe", "--buffer-size", "256"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.color, ColorFlag::Auto);
+}
+
+#[test]
+fn parse_args_accepts_all_color_modes() {
+    for (value, expected) in [
+        ("auto", ColorFlag::Auto),
+        ("always", ColorFlag::Always),
+        ("never", ColorFlag::Never),
+        ("NEVER", ColorFlag::Never),
+    ] {
+        let args = vec!["nam-audio-pipe", "--color", value];
+        let parser = lexopt::Parser::from_iter(args);
+        let cli_args = parse_args_from(parser);
+        assert_eq!(cli_args.color, expected, "value '{value}'");
+    }
+}
+
+#[test]
+fn parse_args_expands_tilde_against_home_env() {
+    // The parser reads the real HOME; only assert the prefix when HOME is set,
+    // since CI sandboxes may clear it.
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let args = vec!["nam-audio-pipe", "--model", "~/models/amp.nam"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    let expected = PathBuf::from(home).join("models/amp.nam");
+    assert_eq!(cli_args.model_path, Some(expected));
+}
+
+#[test]
+fn parse_args_record_dir_is_optional_by_default() {
+    let args = vec!["nam-audio-pipe", "--record"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert!(cli_args.record);
+    assert_eq!(cli_args.record_dir, None);
+}
+
+#[test]
+fn parse_args_record_dir_accepts_a_path() {
+    let args = vec!["nam-audio-pipe", "--record-dir", "/tmp/captures"];
+    let parser = lexopt::Parser::from_iter(args);
+    let cli_args = parse_args_from(parser);
+    assert_eq!(cli_args.record_dir, Some(PathBuf::from("/tmp/captures")));
+}
+
+#[test]
+fn resolve_record_dir_prefers_explicit_path() {
+    let (dir, fallback) = resolve_record_dir(
+        Some(Path::new("/explicit/dir")),
+        Some(OsStr::new("/music")),
+        Some(OsStr::new("/home/u")),
+        Path::new("/cwd"),
+    );
+    assert_eq!(dir, PathBuf::from("/explicit/dir"));
+    assert!(!fallback);
+}
+
+#[test]
+fn resolve_record_dir_uses_xdg_music_before_home() {
+    let (dir, fallback) = resolve_record_dir(
+        None,
+        Some(OsStr::new("/music")),
+        Some(OsStr::new("/home/u")),
+        Path::new("/cwd"),
+    );
+    assert_eq!(dir, PathBuf::from("/music/NAM-Audio-Pipe"));
+    assert!(!fallback);
+}
+
+#[test]
+fn resolve_record_dir_falls_back_to_home_music() {
+    let (dir, fallback) =
+        resolve_record_dir(None, None, Some(OsStr::new("/home/u")), Path::new("/cwd"));
+    assert_eq!(dir, PathBuf::from("/home/u/Music/NAM-Audio-Pipe"));
+    assert!(!fallback);
+}
+
+#[test]
+fn resolve_record_dir_last_resort_is_cwd_with_warning_flag() {
+    let (dir, fallback) = resolve_record_dir(None, None, None, Path::new("/cwd"));
+    assert_eq!(dir, PathBuf::from("/cwd"));
+    assert!(fallback, "the CWD fallback must signal the warning");
+}
+
+#[test]
+fn resolve_record_dir_treats_empty_env_as_unset() {
+    let (dir, fallback) = resolve_record_dir(
+        None,
+        Some(OsStr::new("")),
+        Some(OsStr::new("")),
+        Path::new("/cwd"),
+    );
+    assert_eq!(dir, PathBuf::from("/cwd"));
+    assert!(fallback);
+}
+
+// --cab-optional contract (R-2) --------------------------------------------
+// `--cab-optional` opts out of the fatal-IR contract for *both* a missing path
+// and a load failure: the argument pre-validation must not reject a missing
+// `--cab` as a usage error, letting the loader warn and continue.
+
+#[test]
+fn validate_cli_inputs_cab_optional_skips_missing_cab() {
+    let parser = lexopt::Parser::from_iter([
+        "nam-audio-pipe",
+        "--cab",
+        "/nonexistent/definitely/missing_ir.wav",
+        "--cab-optional",
+    ]);
+    let cli_args = parse_args_from(parser);
+    assert!(cli_args.cab_optional);
+    assert!(
+        validate_cli_inputs(&cli_args).is_ok(),
+        "--cab-optional must not reject a missing --cab as a usage error"
+    );
+}
+
+#[test]
+fn validate_cli_inputs_missing_cab_is_usage_error_without_optional() {
+    let parser = lexopt::Parser::from_iter([
+        "nam-audio-pipe",
+        "--cab",
+        "/nonexistent/definitely/missing_ir.wav",
+    ]);
+    let cli_args = parse_args_from(parser);
+    assert!(!cli_args.cab_optional);
+    assert!(
+        validate_cli_inputs(&cli_args).is_err(),
+        "a missing --cab without --cab-optional must remain a usage error"
+    );
 }

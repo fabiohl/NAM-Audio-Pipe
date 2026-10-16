@@ -3,8 +3,11 @@
 
 //! Modules specific to standalone execution (PipeWire, CLI).
 
+pub mod banner;
 pub mod cli;
 pub mod colors;
+pub mod exit;
+pub mod launcher;
 pub mod pw_host;
 pub mod rt_setup;
 pub mod setup;

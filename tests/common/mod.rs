@@ -381,7 +381,7 @@ pub fn spawn_ready_worker(
         "handshake must confirm the configured output directory"
     );
     match &*status.lock().unwrap() {
-        RecordingStatus::Active { path } => assert!(
+        RecordingStatus::Active { path, .. } => assert!(
             path.as_path() == dir || path.parent() == Some(dir),
             "status must be Active with path in configured output dir, got {path:?}"
         ),

@@ -20,6 +20,7 @@ use std::process::exit;
 use std::str::FromStr;
 
 use nam_audio_pipe::receipt::LONG_ROSTER;
+use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
 use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict};
 use neural_amp_modeler_rs::testing::receipt::{
     LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, count_tests_executed_from_log,
@@ -55,7 +56,7 @@ fn print_help() {
     println!("Usage:");
     println!("  pipe_long_receipt append --phase-id <id> --name <name> --status <STATUS>");
     println!("                      --duration-ms <ms> [--tests-executed <n>] [--log <path>]");
-    println!("                      [--gaps <a,b,...>] [--out <file>]");
+    println!("                      [--gaps <a,b,...>] [--out <file>] [--fail-reason <text>]");
     println!("                      [--oracle-sha256 <hex>] [--fixture-sha256 <hex>]");
     println!("                      [--artifact-sha256 <hex>]");
     println!("  pipe_long_receipt summary [--out <file>]");
@@ -185,6 +186,22 @@ fn cmd_append(args: &[String]) {
         eprintln!("append: failed to write receipt to {out}: {e}");
         exit(1);
     }
+    // Typed FAIL cause: the engine-owned unified schema has no `fail_reason`
+    // field, so it is written to a sibling JSONL (see receipt::fail_reasons).
+    if let Some(reason) = flags.get("fail-reason") {
+        let record = FailReasonRecord {
+            phase_id: receipt.phase_id.clone(),
+            fail_reason: reason.clone(),
+            timestamp: receipt.timestamp.clone(),
+        };
+        if let Err(e) = fail_reasons::append(&out, &record) {
+            eprintln!(
+                "append: failed to write fail reason to {}: {e}",
+                fail_reasons::path(&out).display()
+            );
+            exit(1);
+        }
+    }
     eprintln!(
         "✓ pipe long-audit receipt: {} {} ({} tests, {} ms)",
         receipt.phase_id, receipt.status, receipt.tests_executed, receipt.duration_ms
@@ -254,12 +271,22 @@ fn cmd_validate(args: &[String]) {
     };
     match result {
         Ok(audit) => {
+            // The typed FAIL causes live in a sibling file; absence is valid
+            // (no FAIL, or a legacy receipt), a malformed sibling fails closed.
+            let fail_reasons = match fail_reasons::load(&out) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("validate: {e}");
+                    exit(1);
+                }
+            };
             let label = if strict { "STRICT: PASSED" } else { "VALID" };
             println!(
-                "{label}: {} receipt line(s) in {out} ({} tests, {} ms) | OVERALL: {}",
+                "{label}: {} receipt line(s) in {out} ({} tests, {} ms, {} fail_reason(s)) | OVERALL: {}",
                 audit.phases.len(),
                 audit.tests_executed_total(),
                 audit.duration_ms_total(),
+                fail_reasons.len(),
                 audit.summary_receipt().status.as_str()
             );
             exit(0);

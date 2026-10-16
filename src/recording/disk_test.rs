@@ -428,6 +428,182 @@ async fn would_overflow_accounts_for_riff_envelope() {
 }
 
 // ---------------------------------------------------------------------------
+// Periodic header checkpoints (F-UX-01): durability without finalize
+// ---------------------------------------------------------------------------
+
+/// 256-frame planar stereo block (2048 bytes interleaved).
+fn block_256() -> (Vec<f32>, Vec<f32>) {
+    let left = (0..256).map(|i| i as f32 * 0.001).collect::<Vec<_>>();
+    let right = left.iter().map(|v| -v).collect::<Vec<_>>();
+    (left, right)
+}
+
+#[tokio::test]
+async fn checkpoint_rewrites_header_without_advancing_offsets() {
+    let mock = FaultInjectingWriter::new();
+    let mut writer = AsyncWavWriter::<FaultInjectingWriter>::open(mock, META)
+        .await
+        .expect("open must succeed");
+    // Test override: one checkpoint per 4096 audio bytes (two 256-frame blocks).
+    writer.checkpoint_interval_bytes = 4096;
+
+    let (left, right) = block_256();
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    block.fill_planar(&left, &right);
+
+    writer.write_block(&block).await.expect("first block");
+    assert!(
+        !writer.checkpoint_due(),
+        "one block (2048 bytes) must not reach the 4096-byte cadence"
+    );
+
+    writer.write_block(&block).await.expect("second block");
+    assert!(
+        writer.checkpoint_due(),
+        "two blocks (4096 bytes) must reach the checkpoint cadence"
+    );
+
+    let offset_before = writer.current_offset;
+    let data_before = writer.data_bytes_written;
+    let syncs_before = writer.file.sync_calls();
+
+    writer.checkpoint().await.expect("checkpoint must succeed");
+
+    // A checkpoint reflects persisted data; it must not move the stream.
+    assert_eq!(writer.current_offset, offset_before, "offset must not move");
+    assert_eq!(
+        writer.data_bytes_written, data_before,
+        "data accounting must not change"
+    );
+    assert_eq!(
+        writer.file.sync_calls(),
+        syncs_before + 1,
+        "checkpoint must fsync exactly once"
+    );
+    assert!(
+        !writer.checkpoint_due(),
+        "checkpoint must reset the cadence"
+    );
+
+    // The on-disk header now declares the bytes written so far.
+    let expected_header = build_wav_header(&META, data_before).expect("expected checkpoint header");
+    assert_eq!(
+        &writer.file.disk()[..expected_header.len()],
+        &expected_header[..],
+        "checkpoint must persist the running byte count into the header"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_reflects_last_checkpoint_and_never_exceeds_data_written() {
+    let mock = FaultInjectingWriter::new();
+    let mut writer = AsyncWavWriter::<FaultInjectingWriter>::open(mock, META)
+        .await
+        .expect("open must succeed");
+    writer.checkpoint_interval_bytes = 4096;
+
+    let (left, right) = block_256();
+    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
+    block.fill_planar(&left, &right);
+
+    // Two blocks → one checkpoint at 4096 bytes.
+    writer.write_block(&block).await.expect("block 1");
+    writer.write_block(&block).await.expect("block 2");
+    writer.checkpoint().await.expect("checkpoint");
+
+    let header_len = writer.header_len as usize;
+    let checkpoint_header = build_wav_header(&META, 4096).expect("expected checkpoint header");
+    assert_eq!(
+        &writer.file.disk()[..header_len],
+        &checkpoint_header[..],
+        "on-disk header must reflect the last checkpoint"
+    );
+
+    // One more block (2048 bytes): no new checkpoint, so the on-disk header
+    // still declares 4096 — strictly below the 6144 bytes actually written.
+    writer.write_block(&block).await.expect("block 3");
+    assert_eq!(writer.data_bytes_written, 6144);
+    assert!(
+        !writer.checkpoint_due(),
+        "a partial window must not trigger a checkpoint"
+    );
+    assert_eq!(
+        &writer.file.disk()[..header_len],
+        &checkpoint_header[..],
+        "the header must still reflect the last checkpoint, never exceeding \
+         the live byte count"
+    );
+
+    // Finalize corrects the header to the exact final count.
+    writer.finalize().await.expect("finalize");
+    let final_header = build_wav_header(&META, 6144).expect("final header");
+    assert_eq!(
+        &writer.file.disk()[..header_len],
+        &final_header[..],
+        "finalize must persist the exact final byte count"
+    );
+}
+
+/// Acceptance (F-UX-01 / T3.1): a periodic-checkpoint failure is a fatal
+/// recording error — the worker returns `Err`, the observable status becomes
+/// `Failed`, and the RT failure flag is raised (exactly like a `write_block`
+/// failure), so a disk that cannot persist the header never masquerades as a
+/// live capture.
+#[tokio::test(flavor = "current_thread")]
+async fn checkpoint_failure_transitions_status_to_failed() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let status_for_worker = Arc::clone(&status);
+            let failed_flag = Arc::new(AtomicBool::new(false));
+            let failed_for_check = Arc::clone(&failed_flag);
+
+            let worker = tokio::task::spawn_local(async move {
+                let res = disk_writer_loop_inner(
+                    &FailingCheckpointSink,
+                    &mut receiver,
+                    None,
+                    &status_for_worker,
+                )
+                .await;
+                // Mirror the production wrapper's failure→status mapping.
+                super::publish_worker_result(&res, &status_for_worker, &failed_flag);
+                res
+            });
+
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            assert!(
+                sender.try_push_audio(&[0.25f32; 256], &[-0.25f32; 256]),
+                "audio push must succeed"
+            );
+
+            let res = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+                .await
+                .expect("worker must not hang")
+                .expect("worker task must not panic");
+            assert!(
+                res.is_err(),
+                "a checkpoint failure must surface as a worker error"
+            );
+
+            match &*status.lock().unwrap() {
+                RecordingStatus::Failed { reason } => assert!(
+                    reason.contains("checkpoint"),
+                    "failure reason must point at the checkpoint: {reason}"
+                ),
+                other => panic!("status must be Failed, got {other:?}"),
+            }
+            assert!(
+                failed_for_check.load(Ordering::Acquire),
+                "the RT failure flag must be raised on a checkpoint failure"
+            );
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // Startup handshake, fail-fast directory validation and RT failure flag
 // ---------------------------------------------------------------------------
 
@@ -563,6 +739,9 @@ struct SharedDisk {
 /// Positioned-write backend writing into a [`SharedDisk`] — no io_uring.
 struct SharedDiskWriter {
     disk: SharedDisk,
+    /// Optional artificial delay applied on `sync_all`, modelling a slow
+    /// `fsync` (HDD/USB/NFS) during finalization/checkpoint.
+    finalize_delay: Option<std::time::Duration>,
 }
 
 impl WriteAt for SharedDiskWriter {
@@ -579,6 +758,9 @@ impl WriteAt for SharedDiskWriter {
 
     async fn sync_all(&mut self) -> io::Result<()> {
         self.disk.sync_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(delay) = self.finalize_delay {
+            tokio::time::sleep(delay).await;
+        }
         Ok(())
     }
 }
@@ -587,6 +769,8 @@ impl WriteAt for SharedDiskWriter {
 #[derive(Default)]
 struct MockWavSink {
     disks: Arc<Mutex<Vec<SharedDisk>>>,
+    /// Optional artificial `sync_all` delay propagated to every created writer.
+    finalize_delay: Option<std::time::Duration>,
 }
 
 impl WavSink for MockWavSink {
@@ -595,13 +779,36 @@ impl WavSink for MockWavSink {
     async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)> {
         let disk = SharedDisk::default();
         let writer = AsyncWavWriter::<SharedDiskWriter>::open(
-            SharedDiskWriter { disk: disk.clone() },
+            SharedDiskWriter {
+                disk: disk.clone(),
+                finalize_delay: self.finalize_delay,
+            },
             metadata,
         )
         .await?;
         self.disks.lock().unwrap().push(disk);
         let path = std::env::temp_dir().join(format!("mock_capture_part{part}.wav"));
         Ok((writer, path))
+    }
+}
+
+/// Test [`WavSink`] whose writers fail their first `sync_all` — used to inject a
+/// periodic-checkpoint failure without touching the write path.
+struct FailingCheckpointSink;
+
+impl WavSink for FailingCheckpointSink {
+    type Writer = AsyncWavWriter<FaultInjectingWriter>;
+
+    async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)> {
+        let mock = FaultInjectingWriter::new().fail_sync_after(0);
+        let mut writer = AsyncWavWriter::<FaultInjectingWriter>::open(mock, metadata).await?;
+        // Every block triggers a checkpoint (interval 1 byte), so the first
+        // `sync_all` is the checkpoint's — and it is injected to fail.
+        writer.checkpoint_interval_bytes = 1;
+        Ok((
+            writer,
+            std::env::temp_dir().join(format!("mock_fail_checkpoint_part{part}.wav")),
+        ))
     }
 }
 
@@ -712,7 +919,7 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
             // The observable status tracked the live capture file created on
             // Metadata.
             match &*status_check.lock().unwrap() {
-                RecordingStatus::Active { path } => {
+                RecordingStatus::Active { path, .. } => {
                     assert_eq!(path, &std::env::temp_dir().join("mock_capture_part1.wav"));
                 }
                 other => panic!("status must be Active after Metadata, got {other:?}"),
@@ -805,7 +1012,10 @@ async fn sigterm_sigint_burst_keeps_finalized_wav_consistent() {
             // inside the 10 ms window (raise hands the signal to the calling
             // thread and returns after the handler executed).
             let burst_start = std::time::Instant::now();
+            // SAFETY: `libc::raise` signals the calling thread only; no memory is
+            // dereferenced and the test's signal handler is installed.
             assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            // SAFETY: same single-thread delivery contract for the second signal.
             assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
             let burst = burst_start.elapsed();
             assert!(
@@ -963,6 +1173,133 @@ async fn barrier_pairing_discards_superseded_metadata() {
             let wav_bytes = disks[0].bytes.lock().unwrap();
             let sr = u32::from_le_bytes(wav_bytes[24..28].try_into().unwrap());
             assert_eq!(sr, 48000, "WAV header must have active rate 48000 Hz");
+        })
+        .await;
+}
+
+/// Acceptance (F-UX-04 / T3.2): with an active recording the termination grace
+/// window is widened to `RECORDING_GRACE_WINDOW_MS`; two `SIGINT`s 700 ms apart
+/// are swallowed while a slow `finalize` (~300 ms) runs, so the capture is
+/// finalized intact instead of being force-exited mid-`fsync`.
+// REASON (T-C1): serializing SHUTDOWN-touching tests requires holding the
+// std MutexGuard across `.await`; this is Send-safe because the runtime is
+// `current_thread` (LocalSet), so the guard never crosses threads.
+#[expect(
+    clippy::await_holding_lock,
+    reason = "T-C1 SHUTDOWN test serialization"
+)]
+#[tokio::test(flavor = "current_thread")]
+async fn recording_grace_window_keeps_slow_finalize_cooperative_and_wav_intact() {
+    let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
+        .lock()
+        .expect("shutdown test lock");
+    let _guard = HandlerRestoreGuard::capture();
+    install_termination_signal_handlers().expect("termination handler installation must succeed");
+    crate::standalone::signals::set_grace_window(
+        crate::standalone::signals::RECORDING_GRACE_WINDOW_MS,
+    );
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let sink = MockWavSink {
+                finalize_delay: Some(std::time::Duration::from_millis(300)),
+                ..Default::default()
+            };
+            let disks_handle = Arc::clone(&sink.disks);
+            let worker = tokio::task::spawn_local(async move {
+                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+            });
+
+            // Metadata barrier: the worker consumed it, channels are empty.
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            {
+                let (control_prod, pool_prod) = match &mut sender {
+                    crate::recording::transport::RecordingSender::Pool {
+                        control, pool, ..
+                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
+                    crate::recording::transport::RecordingSender::Inline(_) => {
+                        panic!("pool transport expected")
+                    }
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
+                    || pool_prod.free_available() != POOL_CAPACITY
+                {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "worker never drained the metadata barrier"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            }
+
+            const BLOCK_SAMPLES: usize = 256;
+            let mut expected_payload = Vec::new();
+            for block_idx in 0..4u32 {
+                let left: Vec<f32> = (0..BLOCK_SAMPLES)
+                    .map(|i| (block_idx * BLOCK_SAMPLES as u32 + i as u32) as f32 * 0.001)
+                    .collect();
+                let right: Vec<f32> = left.iter().map(|v| -v).collect();
+                expected_payload.extend_from_slice(&interleave(&left, &right));
+                assert!(
+                    sender.try_push_audio(&left, &right),
+                    "post-metadata audio publish must succeed"
+                );
+            }
+
+            // First termination signal: opens the widened grace window.
+            // SAFETY: `libc::raise` signals the calling thread only; no memory is
+            // dereferenced and the test's signal handler is installed.
+            assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            assert!(
+                SHUTDOWN.load(Ordering::Acquire),
+                "the first signal must cooperatively flip SHUTDOWN"
+            );
+
+            // Graceful shutdown begins: the terminal token starts the slow
+            // finalize (300 ms) in the recording worker.
+            assert!(
+                sender.try_push_stream_stop(),
+                "StreamStop push must succeed"
+            );
+
+            // A second signal 700 ms later lands inside the 5000 ms recording
+            // window and must be swallowed: were the window still 500 ms, the
+            // handler would `_exit(1)` here and the test process would vanish.
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            // SAFETY: `libc::raise` signals the calling thread only; no memory is
+            // dereferenced and the test's signal handler is installed.
+            assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+            assert_eq!(
+                termination_stage_snapshot_for_tests() >> 62,
+                1,
+                "the second signal must remain in the grace stage (no forced exit)"
+            );
+
+            drop(sender);
+
+            let res = tokio::time::timeout(std::time::Duration::from_secs(5), worker)
+                .await
+                .expect("worker must finish finalizing")
+                .expect("worker task must not panic");
+            assert!(
+                res.is_ok(),
+                "the capture must finalize successfully: {res:?}"
+            );
+
+            let disks = disks_handle.lock().unwrap();
+            assert_eq!(disks.len(), 1, "a single capture file must be produced");
+            let mut expected_wav = build_wav_header(&META, expected_payload.len() as u32)
+                .expect("expected header build");
+            expected_wav.extend_from_slice(&expected_payload);
+            assert_eq!(
+                &*disks[0].bytes.lock().unwrap(),
+                &expected_wav[..],
+                "the capture must be finalized intact despite the two signals"
+            );
         })
         .await;
 }

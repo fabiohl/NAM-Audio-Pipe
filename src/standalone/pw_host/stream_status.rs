@@ -8,6 +8,8 @@
 //! belong strictly to the audio streaming host (`NAM-Audio-Pipe`), keeping the core
 //! DSP engine host-agnostic.
 
+#[cfg(any(feature = "testing", feature = "heap-audit"))]
+use neural_amp_modeler_rs::dsp::telemetry::ExactLatencyReservoir;
 use neural_amp_modeler_rs::dsp::telemetry::{AtomicHistogram, LatencyHistogram};
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
@@ -46,6 +48,17 @@ pub struct StreamStatusFlags {
     /// Uses the log-linear [`LatencyHistogram`] (≤ 12.5 % error) so the E2E gate
     /// can be relative to the host quantum instead of snapping to a power of two.
     pub e2e_hist: LatencyHistogram,
+
+    /// Exact-sample companion to [`Self::e2e_hist`], holding the most recent E2E
+    /// samples so the harness can report true percentiles. The log-linear
+    /// histogram quantises the tail (`p50 == p99 == p999` on a bucket boundary);
+    /// this reservoir keeps them distinct. Gated on the same propagated features
+    /// as the engine type (testing/heap-audit), so the default/release build is
+    /// byte-identical. Not gated on `cfg(test)`: a dependency is never built with
+    /// the host crate's test cfg, so `test` here would reference a type the
+    /// engine configured out under `--no-default-features`.
+    #[cfg(any(feature = "testing", feature = "heap-audit"))]
+    pub e2e_exact: ExactLatencyReservoir,
 
     /// Incremented by the playback callback each time the bridge produced no
     /// new DSP block (capture paused, resampler rebuild pending, clock drift or
@@ -134,6 +147,8 @@ impl StreamStatusFlags {
             record_hist: AtomicHistogram::new(),
             playback_hist: AtomicHistogram::new(),
             e2e_hist: LatencyHistogram::new(),
+            #[cfg(any(feature = "testing", feature = "heap-audit"))]
+            e2e_exact: ExactLatencyReservoir::new(),
             playback_bridge_starvation: AtomicU32::new(0),
             bridge_dropped_frames: AtomicU32::new(0),
             playback_quantums: AtomicU32::new(0),
@@ -161,5 +176,36 @@ impl StreamStatusFlags {
             && self.playback_format_ok.load(Ordering::Relaxed) != 0
             && self.capture_active.load(Ordering::Relaxed) != 0
             && self.playback_active.load(Ordering::Relaxed) != 0
+    }
+}
+
+#[cfg(all(test, any(feature = "testing", feature = "heap-audit")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn e2e_exact_reservoir_resolves_distinct_percentiles() {
+        // The log-linear histogram can collapse p50/p99/p999 onto the same bucket
+        // edge; the exact reservoir must keep distinct samples distinct.
+        let status = StreamStatusFlags::new();
+        for v in 1..=1000u64 {
+            status.e2e_exact.record(v);
+        }
+        let p50 = status.e2e_exact.percentile_exact(0.50);
+        let p99 = status.e2e_exact.percentile_exact(0.99);
+        let p999 = status.e2e_exact.percentile_exact(0.999);
+        assert!(
+            p50 < p99 && p99 < p999,
+            "exact percentiles must be distinct when the samples differ: {p50} < {p99} < {p999}"
+        );
+    }
+
+    #[test]
+    fn e2e_exact_reservoir_resets_to_empty() {
+        let status = StreamStatusFlags::new();
+        status.e2e_exact.record(1_000);
+        assert_eq!(status.e2e_exact.len(), 1);
+        status.e2e_exact.reset();
+        assert_eq!(status.e2e_exact.len(), 0);
     }
 }
