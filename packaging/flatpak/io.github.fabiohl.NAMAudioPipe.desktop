@@ -14,9 +14,9 @@ Keywords=audio;dsp;nam;guitar;amp;pipewire;
 StartupNotify=false
 Actions=RunBypass;Diagnostics;
 
-# F-UX-05: a launcher with no arguments prints the help and waits for Enter so
-# the Terminal=true window stays open (see standalone::launcher). The actions
-# below always pass at least one argument so they start (or exit) deterministically.
+# F-UX-05: a launcher with no arguments prints the help and exits immediately
+# (non-interactive CLI by design). The actions below start the host or pause
+# explicitly via --pause (Diagnostics).
 [Desktop Action RunBypass]
 Name=Run in bypass (no model)
 Exec=nam-audio-pipe --gate off

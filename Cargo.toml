@@ -158,6 +158,16 @@ opt-level = 3
 codegen-units = 1
 panic = "unwind"
 
+# Criterion builds (`cargo bench`, `cargo bench --no-run`) inherit `release` by
+# default — fat LTO at a single codegen unit, the largest peak-memory operation
+# in this repository. Thin LTO keeps cross-crate inlining while bounding memory
+# on a 16 GiB host. Consequence: codegen differs from the shipped fat-LTO
+# `release`/`dist` binaries; re-bootstrap Criterion baselines before treating a
+# regression check as authoritative.
+[profile.bench]
+lto = "thin"
+codegen-units = 16
+
 # The shipped profile (see the note on `release` above).
 [profile.dist]
 inherits = "release"

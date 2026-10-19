@@ -20,6 +20,10 @@
 
 set -euo pipefail
 
+# Preserve the original CLI for the memory-guard re-exec below (the option
+# parser consumes "$@" with shift).
+ORIGINAL_ARGS=("$@")
+
 # Parse command line options
 DO_INSTALL_FLATPAK=false
 BUILD_FLATPAK=true
@@ -114,9 +118,23 @@ done
 # NAM_LIB_NO_CD=1 disables the automatic cd inside _lib.sh so we retain full
 # control over the working directory (required by this script's PGO/BOLT paths).
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename "$0")"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR" || { echo "[FATAL] Cannot cd to project root: $PROJECT_DIR" >&2; exit 1; }
 NAM_LIB_NO_CD=1 source "$SCRIPT_DIR/_lib.sh"
+
+# ── Memory guard (OOM containment) ──────────────────────────────────────────
+# PGO/BOLT + fat LTO is the heaviest build in this repository. Re-exec inside a
+# transient, memory-capped systemd scope so a compiler peak is contained in its
+# own cgroup instead of triggering a global OOM that kills the IDE. Fail-open
+# when unavailable. The PGO/BOLT pipeline legitimately needs more headroom than
+# the test suites, so it defaults to a 10G cap; override with NAM_MEM_GUARD_MAX.
+export NAM_MEM_GUARD_MAX="${NAM_MEM_GUARD_MAX:-10G}"
+export NAM_MEM_GUARD_HIGH="${NAM_MEM_GUARD_HIGH:-8G}"
+if [ "${NAM_MEM_GUARD:-0}" != "1" ] && [ "${NAM_NO_MEM_GUARD:-0}" != "1" ]; then
+    export NAM_MEM_GUARD=1
+    exec "$SCRIPT_DIR/mem-guard.sh" "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
+fi
 
 echo -e "${BLUE}${BOLD}========================================================================${NC}"
 echo -e "${BLUE}${BOLD}   nam-audio-pipe Unified Release Build & Optimization Pipeline         ${NC}"

@@ -849,10 +849,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     }
 
     if !has_args {
-        // F-UX-05: the installed `.desktop` launcher runs the binary with no
-        // arguments on a `Terminal=true` window. Pause before exiting in that
-        // interactive case so the user can read the help; every non-interactive
-        // invocation still exits immediately.
+        // No arguments: print help and exit immediately (non-interactive CLI).
         crate::standalone::launcher::handle_empty_invocation();
     }
 

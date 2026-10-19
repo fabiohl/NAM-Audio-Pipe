@@ -29,7 +29,7 @@ The test suite is partitioned into unit tests co-located with module sources and
 - **CLI Parsing ([`src/standalone/cli_test.rs`](../src/standalone/cli_test.rs)):** Validates command-line flag combinations, model and cabinet path parsing, gain limits (`-20.0` to `+20.0` dB), oversampling enum mappings, the polymorphic silence-gate domain, and diagnostic flags (`--diagnose`, `--diagnose-full`). The gate domain contract: mode literals `on`/`true`/`default` map to `GateConfig::default_on()` and `off`/`false`/`0` map to `GateConfig::Off`; numeric dBFS thresholds with optional `db`/`dbfs` suffix (`-60`, `-65.5`, `-45dB`, `-50dbfs`) map to `GateConfig::Threshold`, deriving the close threshold via the 10 dB Schmitt relation `close = max(open − 10 dB, −96 dB)` (`-60` → open `-60.0`/close `-70.0`; `-90` → close clamped at `-96.0`); positive finite values auto-normalize with an off-RT `log::info!` (`60` → `-60.0 dBFS`); out-of-domain (`-120`, `-10`, `10`) and malformed (`abc`, `""`, `NaN`, `-60dBx`) inputs are rejected with didactic `Invalid gate mode` errors. Real-world calibration contexts (single-coil hum/hiss around `-55..-45 dBFS` → `--gate -50`; humbuckers in quiet rooms → default `-70` or `--gate -75`) are documented in the [`README.md`](../README.md). Covers the `--buffer-size` domain contract (`{0} ∪ {2^k | 4 ≤ k ≤ 13}`): `validate_buffer_size` accepts `0, 16, 32, …, 8192` and rejects `1, 2, 8, 15, 63, 100, 500, 8193, 16384, 65536, u32::MAX` with the typed `BufferSizeError` (below-minimum / above-maximum / not-power-of-two, each with an explanatory `Display` message and `std::error::Error`), plus parse-level acceptance of `-b 0` (auto) and `-b 8192`.
 - **Real-Time System Setup & Hardware Sink Detection ([`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)):** Covers the PipeWire-specific bring-up glue: the threaded wrapper (`configure_realtime_thread`, including out-of-bounds/joint-pin/RT-mark behavior) plus PM QoS `/dev/cpu_dma_latency` interaction and default hardware sink detection via `pw-metadata` with a 500 ms watchdog timeout and self-capture node filtering. The host-agnostic CPU affinity selection heuristics (`select_optimal_cpu_with_receipt`), interrupt-load parsing (`parse_interrupts_per_cpu`) and affinity-mask/scheduler-policy invariants are validated by the engine's `rt_hardening` test suite (single source of truth), re-exported here.
 - **Telemetry & Status Polling ([`src/standalone/rt_setup/telemetry_test.rs`](../src/standalone/rt_setup/telemetry_test.rs)):** Validates `PollState` struct lifecycle, hugepage flag synchronization, telemetry throttling, silent and fading transition states, and diagnostic RT status flag clearing during periodic monitoring (`poll_rt_status`). Also covers `TelemetryLatches`/`LatchedSignal` episode semantics (flag and counter signals emit at most once per episode, re-arming only after a clear), the F-UX-13 gate-log rate limiter (`GateTransitionThrottle`: at most one line per `GATE_LOG_MIN_INTERVAL`, the `(×N)` fold count, and a spaced transition not flagged as a repeat — injectable clock, no sleeps) and the bundle-free contract — runtime diagnostics surface as concise `[Exxxx | MNEMONIC]` `log::*` lines and never re-print the `Recent Log Trace` support block.
-- **First-Run Launcher ([`src/standalone/launcher.rs`](../src/standalone/launcher.rs)):** Unit-tests the pure `startup_mode(args_empty, stdin_tty, stdout_tty)` decision matrix (F-UX-05): arguments → run normally; no arguments on a terminal → `PauseBeforeExit`; no arguments with either stream redirected → `ExitImmediately` (automation never blocks on a stdin read). The real stream probing (`IsTerminal`) is confined to `handle_empty_invocation`.
+- **First-Run Launcher ([`src/standalone/launcher.rs`](../src/standalone/launcher.rs)):** Unit-tests the pure `startup_mode(args_empty)` decision matrix (F-UX-05): arguments → run normally; no arguments → `ExitImmediately` (non-interactive CLI contract). Real stream probing (`IsTerminal`) is confined to `--pause` in `pause_if_interactive`.
 - **Session Banner & Summary ([`src/standalone/banner.rs`](../src/standalone/banner.rs)):** Unit-tests the pure `render_banner`/`render_session_summary` (F-UX-13) across every `✓`/`✗` combination — model/bypass, cab (loaded / none / `--cab-optional` skip), rate, quantum, DSP + total latency, `SCHED_FIFO`/policy + `mlockall`, recording — both without ANSI (asserted escape-free) and with ANSI forced, plus the negative-state hints (`ulimit -r`, `ulimit -l`) and the xrun/bridge-drop summary counters.
 - **Shared Memory Bridge Allocation ([`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)):** Validates page-aligned (4096-byte) memory layout allocation, `madvise` memory flags, and initial atomic generation counters in `allocate_dsp_bridge`.
 - **PipeWire Capture Stream Setup ([`src/standalone/pw_host/capture/setup_test.rs`](../src/standalone/pw_host/capture/setup_test.rs)):** Tests capture property dictionary creation, latency string formatting (`node.latency`), and SPA Pod audio format generation.
@@ -238,10 +238,9 @@ Run once per desktop environment (GNOME, KDE Plasma, XFCE) after installing the
 Flatpak bundle:
 
 1. **No-argument launch (primary acceptance).** Open the *NAM Audio Pipe* entry from
-   the application menu. Expected: a terminal opens, the help/usage is shown, and the
-   window **stays open** at `Press Enter to close...` until Enter is pressed (exit 0).
-   No window disappears instantly. → closes the E-04 "does the launcher terminal stay
-   open?" question.
+   the application menu or run from terminal. Expected: the help/usage is printed and
+   the process exits immediately with code 0 (non-interactive CLI by design).
+   Redirected invocation behaves identically.
 2. **Bypass action.** Use the entry's *Run in bypass (no model)* action. Expected: the
    host starts streaming dry (no model) with audio flowing.
 3. **Diagnostics action.** Use the *Diagnostics* action. Expected: the diagnostic bundle
@@ -274,6 +273,36 @@ operator**; the items below are the ones the resilience work depends on. Do
 > measured p95: E-03 is the calibration that can adjust them.
 > `--reconnect-timeout <s>` exists precisely so an operator can tune the
 > per-episode budget without a rebuild.
+
+---
+
+### 3.7 Host Memory Guards (OOM Containment)
+
+The reference host has 16 GiB and no swap. Release test compilation and PGO/BOLT
+builds can exhaust RAM alongside `rust-analyzer` and the IDE, triggering a
+**global OOM**; because Electron's main process carries `oom_score_adj=300`, the
+kernel kills the IDE instead of the compiler. Guards:
+
+- **Parallelism:** `.cargo/config.toml` sets `[build] jobs = 4` (override with
+  `CARGO_BUILD_JOBS` on larger hosts).
+- **Containment:** `utils/tests-quick.sh`, `utils/tests-long.sh`,
+  `utils/miri-audit.sh` and `utils/build-release.sh` re-exec through
+  `utils/mem-guard.sh`, a transient systemd user scope with `MemoryHigh=5G`,
+  `MemoryMax=6G`, `MemorySwapMax=6G` and `oom_score_adj=500` for the build tree
+  (`build-release.sh` uses 8G/10G for PGO/BOLT). It fails open when the user
+  manager/cgroup delegation is unavailable.
+- **Opt-out:** `NAM_NO_MEM_GUARD=1` skips containment. Use it for
+  RT-certification runs where cgroup reclaim could add jitter, keeping swap
+  enabled.
+- **IDE protection:** Lower the running IDE's (Antigravity / VS Code family)
+  `oom_score_adj` (default `-500`; negative values need `sudo`) so a runaway build is targeted first.
+- **Benchmarks:** `utils/tests-performance-regression.sh` and
+  `utils/ab-opt-ceremony.sh` are intentionally **not** auto-guarded (a memory
+  cap could distort timings); wrap them manually with `utils/mem-guard.sh` when
+  RAM is tight.
+- **Bench profile:** `[profile.bench]` uses thin LTO and 16 codegen units.
+  Codegen differs from the shipped fat-LTO `release`/`dist`; re-bootstrap
+  Criterion baselines before treating a regression check as authoritative.
 
 ---
 

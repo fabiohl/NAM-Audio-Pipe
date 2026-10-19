@@ -14,7 +14,7 @@
 # markers.
 
 # >>> NAM-LIB-CORE BEGIN >>>
-# sha256: 8f3720bb5abb0c140fc4b4782aa7b048e28f4b4a2b61fedd29b142856e78dcb4
+# sha256: 390b40ff18c615b1cdf5b382bca2c12efdab155f8fa966c639d562db253f063b
 # Shared canonical block for the NAM ecosystem QA shell library.
 # ---------------------------------------------------------------------------
 # ANSI style helpers
@@ -387,7 +387,11 @@ run_perf_regression_gate() {
     extract_bench_executable() {
         local json_out="$1"
         local rc=0
-        bench_exe=$(printf '%s\n' "$json_out" | grep -F '"executable":' | tail -1 \
+        bench_exe=$(printf '%s\n' "$json_out" \
+            | grep -F '"reason":"compiler-artifact"' \
+            | grep -F "\"name\":\"${bench_suite}\"" \
+            | grep -F '"executable":' \
+            | tail -1 \
             | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p') || rc=$?
         if [ "$rc" -ge 2 ]; then
             die "failed to extract benchmark executable from cargo JSON (rc=$rc)"
@@ -451,10 +455,15 @@ run_perf_regression_gate() {
             die "benchmark execution failed during baseline bootstrap"
         fi
 
-        "$perf_gate" persist-baseline \
+        local persist_out
+        persist_out=$("$perf_gate" persist-baseline \
             --baseline-dir "$baseline_dir" \
             --criterion-root "$criterion_root" \
-            --baseline "$baseline_name"
+            --baseline "$baseline_name")
+        echo "$persist_out"
+        if [[ "$persist_out" =~ "persisted 0 baseline series" ]]; then
+            die "baseline bootstrap failed: 0 series persisted from $criterion_root into $baseline_dir (fail-closed)"
+        fi
         "$perf_gate" probe \
             --out "$fingerprint_file" \
             --bench-core "$bench_core" \
@@ -482,10 +491,15 @@ run_perf_regression_gate() {
         fi
 
         # 2. Restore the persisted Criterion series for the comparison run.
-        "$perf_gate" restore-baseline \
+        local restore_out
+        restore_out=$("$perf_gate" restore-baseline \
             --baseline-dir "$baseline_dir" \
             --criterion-root "$criterion_root" \
-            --baseline "$baseline_name"
+            --baseline "$baseline_name")
+        echo "$restore_out"
+        if [[ "$restore_out" =~ "no top-level" ]]; then
+            die "performance comparison aborted: no top-level '$baseline_name' series found under $baseline_dir"
+        fi
 
         # 3. Pre-build (all cores) then quiesce the pinned core.
         prebuild_benchmark
@@ -533,4 +547,71 @@ run_perf_regression_gate() {
         *) echo "Unknown mode: $mode" >&2; return 2 ;;
     esac
 }
+# ---------------------------------------------------------------------------
+# Host RAM & cgroup memory containment (mem-guard)
+# ---------------------------------------------------------------------------
+# mem_guard_wrap <command> [args...]
+#   Runs <command> inside a transient systemd user scope with MemoryHigh,
+#   MemoryMax, MemorySwapMax and elevated oom_score_adj (default 500) so a
+#   runaway build/test tree is reclaimed within its own cgroup instead of
+#   bringing down the IDE or the desktop session. Fails open gracefully.
+mem_guard_wrap() {
+    if [ "$#" -eq 0 ]; then
+        echo "usage: mem_guard_wrap <command> [args...]" >&2
+        return 2
+    fi
+
+    if [ "${NAM_NO_MEM_GUARD:-0}" = "1" ]; then
+        exec "$@"
+    fi
+
+    local mem_high="${NAM_MEM_GUARD_HIGH:-5G}"
+    local mem_max="${NAM_MEM_GUARD_MAX:-6G}"
+    local swap_max="${NAM_MEM_GUARD_SWAP_MAX:-6G}"
+    local oom_adj="${NAM_MEM_GUARD_OOM_ADJ:-500}"
+
+    if command -v systemd-run >/dev/null 2>&1; then
+        if systemd-run --user --scope --quiet \
+            -p "MemoryHigh=$mem_high" \
+            -p "MemoryMax=$mem_max" \
+            -p "MemorySwapMax=$swap_max" \
+            -- true >/dev/null 2>&1; then
+            export NAM_MEM_GUARD_ACTIVE=1
+            exec systemd-run --user --scope --quiet \
+                -p "MemoryHigh=$mem_high" \
+                -p "MemoryMax=$mem_max" \
+                -p "MemorySwapMax=$swap_max" \
+                -- sh -c 'printf "%s\n" "$1" > /proc/self/oom_score_adj 2>/dev/null || true; shift; exec "$@"' \
+                sh "$oom_adj" "$@"
+        fi
+
+        if systemd-run --user --scope --quiet \
+            -p "MemoryHigh=$mem_high" \
+            -p "MemoryMax=$mem_max" \
+            -- true >/dev/null 2>&1; then
+            export NAM_MEM_GUARD_ACTIVE=1
+            exec systemd-run --user --scope --quiet \
+                -p "MemoryHigh=$mem_high" \
+                -p "MemoryMax=$mem_max" \
+                -- sh -c 'printf "%s\n" "$1" > /proc/self/oom_score_adj 2>/dev/null || true; shift; exec "$@"' \
+                sh "$oom_adj" "$@"
+        fi
+    fi
+
+    echo "[mem-guard] systemd user manager/cgroup delegation unavailable;" \
+         "running WITHOUT memory containment (set NAM_MEM_GUARD_* to tune)." >&2
+    export NAM_MEM_GUARD_ACTIVE=1
+    exec "$@"
+}
+
+# maybe_restart_mem_guard <script_path> [args...]
+#   Re-executes the calling script inside memory containment scope if not already guarded.
+maybe_restart_mem_guard() {
+    if [ "${NAM_MEM_GUARD_ACTIVE:-0}" = "1" ] || [ "${NAM_NO_MEM_GUARD:-0}" = "1" ]; then
+        return 0
+    fi
+    export NAM_MEM_GUARD_ACTIVE=1
+    mem_guard_wrap "$@"
+}
+
 # <<< NAM-LIB-CORE END <<<

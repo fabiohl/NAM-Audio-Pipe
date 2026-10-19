@@ -78,6 +78,17 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 # fail-closed executed-test gates, and pick_bench_core helper.
 source "$SCRIPT_DIR/_lib.sh"
 
+# ── Memory guard (OOM containment) ──────────────────────────────────────────
+# Release test builds and the RT measurement phases run alongside
+# rust-analyzer/IDE; on a 16 GiB host the compile peak can trigger a global OOM.
+# Re-exec inside a transient, memory-capped systemd scope (fail-open when
+# unavailable). For RT measurement fidelity the operator may opt out with
+# NAM_NO_MEM_GUARD=1 (keep swap enabled).
+if [ "${NAM_MEM_GUARD:-0}" != "1" ] && [ "${NAM_NO_MEM_GUARD:-0}" != "1" ]; then
+    export NAM_MEM_GUARD=1
+    exec "$SCRIPT_DIR/mem-guard.sh" "$SCRIPT_PATH" "$@"
+fi
+
 # CPU core pinning for the RT measurement phases (Deadline, Jitter).
 # Resolved deterministically via pick_bench_core:
 #   1. Explicit $NAM_BENCH_CORE

@@ -29,6 +29,15 @@ SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
 PHASE_TOTAL=4
 source "$SCRIPT_DIR/_lib.sh"
 
+# ── Memory guard (OOM containment) ──────────────────────────────────────────
+# Release test builds run alongside rust-analyzer/IDE; on a 16 GiB host that
+# peak can trigger a global OOM. Re-exec inside a transient, memory-capped
+# systemd scope (fail-open when unavailable). Opt out with NAM_NO_MEM_GUARD=1.
+if [ "${NAM_MEM_GUARD:-0}" != "1" ] && [ "${NAM_NO_MEM_GUARD:-0}" != "1" ]; then
+    export NAM_MEM_GUARD=1
+    exec "$SCRIPT_DIR/mem-guard.sh" "$SCRIPT_PATH" "$@"
+fi
+
 SIMULATE=0
 for arg in "$@"; do
     case "$arg" in
