@@ -3,10 +3,9 @@
 
 //! Disk-space estimation and low-space pre-warning (F-UX-02b).
 //!
-//! The recording worker used to detect a full disk only when the write itself
-//! failed with `ENOSPC` (after the fact, and only surfaced by T4.1's alert). A
-//! long take could therefore consume the whole volume and abort mid-session.
-//! This module adds an early warning layer:
+//! The recording worker originally detected a full disk only when the write itself
+//! failed with `ENOSPC` (after the fact). A long take could therefore consume the
+//! whole volume and abort mid-session. This module adds an early warning layer:
 //!
 //! * a startup estimate of how many minutes the current volume can still hold
 //!   (logged when the first segment opens), and

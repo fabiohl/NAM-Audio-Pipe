@@ -7,7 +7,7 @@
 //! until shutdown: the worker transitioned [`RecordingStatus`] to `Failed` and
 //! raised the RT-observable flag, but the main control loop never looked at it,
 //! so the musician kept playing believing the take was being recorded. The same
-//! applied to the disk-space pre-warning (T4.2), which is published through the
+//! applied to the disk-space pre-warning, which is published through the
 //! `Active.space_warning` slot to unify the output path.
 //!
 //! [`RecordingAlert`] closes that gap. The control loop polls the shared status

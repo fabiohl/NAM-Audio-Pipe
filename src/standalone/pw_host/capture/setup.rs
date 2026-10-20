@@ -235,9 +235,8 @@ pub fn setup_capture_stream<'c>(
                             conv_pair,
                         },
                         &mut state.stream,
-                        // T9.4/F-PERF-17: streaming working set only — the
-                        // dead `resamp_mid_l/r` / `model_out_l/r` intermediates
-                        // no longer exist in `CaptureState` (128 KiB saved).
+                        // Streaming working set only — intermediate buffers
+                        // are eliminated in `CaptureState` (128 KiB saved).
                         StreamingDspBuffers {
                             resamp_out_l: &mut *state.resamp_out_l,
                             resamp_out_r: &mut *state.resamp_out_r,

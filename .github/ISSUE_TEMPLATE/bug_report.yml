@@ -34,7 +34,7 @@ body:
       label: Linux Environment & Audio Stack
       description: Provide details about your Linux distribution, kernel, PipeWire version, and CPU.
       placeholder: |
-        - NAM-Audio-Pipe version / commit: 0.4.0 (or commit hash)
+        - NAM-Audio-Pipe version / commit: 1.0.0 (or commit hash)
         - Linux Distribution: Ubuntu 24.04 / Arch Linux / Fedora 40
         - Kernel Version: `uname -r` (e.g. 6.8.0-lowlatency / 6.10-arch1)
         - PipeWire Version: `pipewire --version` (e.g. 1.0.7)
@@ -52,7 +52,7 @@ body:
         - Audio Interface: Focusrite Scarlett 2i2 / MOTU M2 (USB)
         - Sample Rate: 48000 Hz (or 44100 / 96000 Hz)
         - Buffer Size / Quantum: 64 samples (or 32 / 128 / 256 samples)
-        - Command Executed: `nam-audio-pipe --model amp.nam --ir cab.wav -b 64 -r 48000`
+        - Command Executed: `nam-audio-pipe --model amp.nam --cab cab.wav -b 64`
     validations:
       required: true
 
@@ -72,7 +72,7 @@ body:
       description: Exact commands and steps to reproduce.
       placeholder: |
         1. Start PipeWire session
-        2. Run `nam-audio-pipe --model amp.nam --ir cab.wav`
+        2. Run `nam-audio-pipe --model amp.nam --cab cab.wav`
         3. Connect audio ports via Helvum/qpwgraph
         4. Observe behavior / error
     validations:

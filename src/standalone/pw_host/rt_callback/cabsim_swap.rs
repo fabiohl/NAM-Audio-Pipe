@@ -5,7 +5,7 @@
 //! integration. Replaces the active stereo-decoupled convolution pair without
 //! using memory allocation in the critical path.
 //!
-//! T9.5 (F-PERF-20): the hand-rolled 3-phase protocol was migrated to the
+//! The 3-phase swap protocol uses the
 //! engine's canonical scheduler ([`RtSwapDrain`] + [`RtSwapHandler`]) for this
 //! dedicated `Consumer<Box<CabSimSwapPayload>>` channel — a direct
 //! instantiation, not a reimplementation. Only the cold handlers

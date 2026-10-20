@@ -51,7 +51,7 @@
 //! ## Durable capture: periodic header checkpoints
 //!
 //! Rewriting the header only on `finalize` means *any* ungraceful death
-//! (SIGKILL, OOM-killer, power loss, `SIGHUP` before T1.3, a stuck second
+//! (SIGKILL, OOM-killer, power loss, unhandled signals, a stuck second
 //! Ctrl+C) leaves a `.wav` whose `data` chunk declares `0` bytes even with
 //! gigabytes already on disk — the whole take is unrecoverable by every
 //! standard reader (F-UX-01). The writer therefore rewrites the header with the
@@ -121,7 +121,7 @@ static OUTPUT_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// `CHECKPOINT_INTERVAL_SECS × sample_rate × channels × (bit_depth / 8)`
 /// bytes: at 48 kHz / 2 ch / 32-bit float one window is exactly 1 152 000 bytes
 /// (~1.1 MiB) of audio. The wall-clock cost of the periodic `fdatasync` on
-/// SSD/HDD/USB is the operator-executed measurement E-02 (T6.2).
+/// SSD/HDD/USB is an operator-executed measurement.
 pub const CHECKPOINT_INTERVAL_SECS: u64 = 3;
 
 /// Audio-data bytes accumulated per checkpoint window for `metadata`.
@@ -397,7 +397,7 @@ trait WavSink {
     /// so a transient failure never clears an active low-space warning.
     ///
     /// The production [`TokioUringSink`] overrides this with `statvfs`; the
-    /// default keeps non-production sinks space-agnostic (T4.2).
+    /// default keeps non-production sinks space-agnostic.
     fn free_bytes(&self, _metadata: &AudioMetadata) -> Option<u64> {
         None
     }
@@ -457,7 +457,7 @@ impl<W: WriteAt> WavWriter for AsyncWavWriter<W> {
 struct TokioUringSink<'a> {
     /// Output directory for capture files.
     base_dir: &'a Path,
-    /// Injectable free-space probe used for the low-space pre-warning (T4.2).
+    /// Injectable free-space probe used for the low-space pre-warning.
     space: &'a dyn FreeSpace,
 }
 
@@ -965,7 +965,7 @@ async fn disk_writer_loop_inline<S: WavSink>(
             report_overruns(0);
             break;
         } else {
-            // Low-space re-check (T4.2) strictly off the RT path, before sleeping.
+            // Low-space re-check strictly off the RT path, before sleeping.
             maybe_check_space(sink, &wav_writer, status, &mut last_space_check);
             // Check hint flag before sleeping to reduce unnecessary poll latency.
             // The flag is set Relaxed by the RT producer; we reset it here before sleeping
@@ -1028,7 +1028,7 @@ async fn open_new_part<S: WavSink>(
     // Keep the observable status pointed at the live capture file.
     mark_active(status, filename);
 
-    // T4.2: startup estimate + low-space pre-warning at format-known time.
+    // Startup estimate + low-space pre-warning at format-known time.
     publish_space_status(sink, &meta, status, true);
 
     *wav_writer = Some(writer);
@@ -1036,7 +1036,7 @@ async fn open_new_part<S: WavSink>(
 }
 
 /// Publishes the low-space warning (and, when `with_estimate`, the writable-time
-/// estimate) for the current format on the shared status (T4.2).
+/// estimate) for the current format on the shared status.
 fn publish_space_status<S: WavSink>(
     sink: &S,
     meta: &AudioMetadata,
@@ -1054,7 +1054,7 @@ fn publish_space_status<S: WavSink>(
     }
 }
 
-/// Periodic low-space re-check on the disk loop's idle path (T4.2).
+/// Periodic low-space re-check on the disk loop's idle path.
 ///
 /// Runs at most once per [`SPACE_CHECK_INTERVAL`] and only while a segment is
 /// open. A probe failure leaves the previous warning untouched: only a
@@ -1165,7 +1165,7 @@ fn report_overruns(leaked_slots: u64) {
 /// [`crate::recording::transport::create_recording_transport`].
 ///
 /// `housekeeping_cpus` is the CPU selection receipt's housekeeping set: the
-/// worker pins itself to it at spawn (T9.1(b)), keeping disk I/O and fsync off
+/// worker pins itself to it at spawn, keeping disk I/O and fsync off
 /// the selected RT core. An empty set is a documented no-op used by tests.
 ///
 /// Returns the thread handle. The worker communicates its startup outcome
@@ -1186,7 +1186,7 @@ pub fn spawn_recording_worker(
     std::thread::Builder::new()
         .name("nam-recording-io".into())
         .spawn(move || {
-            // T9.1(b): the disk-I/O worker is pure housekeeping (io_uring
+            // The disk-I/O worker is pure housekeeping (io_uring
             // submission, WAV encoding, fsync) — pin it to the housekeeping
             // CPU set before any I/O runtime setup so it never migrates onto
             // the selected RT core. An empty set is a documented no-op (tests);

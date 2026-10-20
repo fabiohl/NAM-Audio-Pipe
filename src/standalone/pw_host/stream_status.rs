@@ -73,7 +73,7 @@ pub struct StreamStatusFlags {
     /// Playback quanta delivered since the playback stream last entered
     /// `Streaming` (reset to `0` by the state handler on that transition).
     ///
-    /// Bounds the bring-up window (S6-T4 / F-PR-11): bridge clock-drift drops
+    /// Bounds the bring-up window: bridge clock-drift drops
     /// observed while this counter is below
     /// [`PLAYBACK_BRINGUP_QUANTUMS`](crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS)
     /// are the expected startup ramp (the pre-rolled silence block plus the

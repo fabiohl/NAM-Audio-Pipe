@@ -155,7 +155,7 @@ pub fn run_pipewire_host(
     // it touches them only before `thread_loop.start()` and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
-    // S6-T4 / F-PR-11: off-RT bring-up pre-roll. Before any stream is created,
+    // Off-RT bring-up pre-roll (F-PR-11). Before any stream is created,
     // the main thread holds exclusive access to the bridge (no RT producer or
     // consumer is live), so one quantum of analytical silence can be published
     // safely. The first playback quantum then reads a real silence block
@@ -174,14 +174,14 @@ pub fn run_pipewire_host(
     // request instead of inheriting the host quantum. Read-only after this
     // store (same exclusivity contract as `ir_source_rate`).
     rt_state.cabsim_partition_policy = cabsim_partition as usize;
-    // T9.5: the four dedicated swap channels live inside the engine
+    // The four dedicated swap channels live inside the engine
     // `RtSwapDrain`s (each owns its ring consumer and deferred slot); the
     // mixed param ring stays in `RtHostChannels`.
     rt_state.resampler_drain = Some(super::rt_callback::resampler_swap_drain(resampler_consumer));
     rt_state.cabsim_drain = Some(super::rt_callback::cabsim_swap_drain(cabsim_consumer));
     rt_state.slimmable_drain = Some(super::rt_callback::slimmable_swap_drain(slimmable_consumer));
     rt_state.os_drain = Some(super::rt_callback::os_swap_drain(os_consumer));
-    // T9.4/F-PERF-18: the main-thread oversample rebuild handler gates runtime
+    // The main-thread oversample rebuild handler gates runtime
     // factor upgrades against the scratch capacity sized in `init` (the DSP
     // state becomes RT-owned after this point — the length is captured here,
     // before the raw-pointer handoff).
@@ -466,12 +466,12 @@ pub fn run_pipewire_host(
 
         // 4.2 RT THREAD START (Background)
         //
-        // T9.1(c): pin the PipeWire thread-loop thread to the housekeeping set
+        // Pin the PipeWire thread-loop thread to the housekeeping set
         // via a one-shot event source. The ThreadLoop runs its own internal
         // thread that dispatches the cold-path listeners (`param_changed`,
         // `state_changed`, proxy events) — scheduler noise on that thread must
         // stay off the selected RT core, exactly like the main control-loop
-        // thread (T9.1(a)) and the recording worker (T9.1(b)). The event is
+        // thread and the recording worker. The event is
         // signalled once right after `start()` so its callback executes on the
         // thread-loop thread itself; an `eventfd` signal is cross-thread safe
         // (the same mechanism `pipewire::channel` uses).
@@ -769,7 +769,7 @@ pub fn run_pipewire_host(
         // is alive or accessing the bridge. The main thread is the sole owner of `bridge_ptr`.
         unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
 
-        // S6-T4 / F-PR-11: re-arm the off-RT bring-up pre-roll for the next
+        // Re-arm the off-RT bring-up pre-roll (F-PR-11) for the next
         // reconnect attempt, still under the exclusive-access teardown window
         // (`thread_loop.stop()` above guarantees no live RT Writer/Reader).
         // SAFETY: same exclusive-access contract as `reset_to_silence` above.

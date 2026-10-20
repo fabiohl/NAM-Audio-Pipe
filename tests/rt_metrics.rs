@@ -190,6 +190,20 @@ fn sleep_until_monotonic_raw(deadline_raw_ns: u64) {
     }
 }
 
+/// Cooperative sleep in nanoseconds to yield CPU time back to the kernel scheduler,
+/// replenishing the RT budget (`/proc/sys/kernel/sched_rt_runtime_us`) and preventing
+/// involuntary RT bandwidth throttling preemption (`nivcsw`) during synthetic stress loops.
+fn rt_cooperative_microsleep(ns: u64) {
+    let ts = libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    };
+    // SAFETY: `ts` is a valid timespec and the syscall writes no memory.
+    unsafe {
+        libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &ts, std::ptr::null_mut());
+    }
+}
+
 /// Exact percentile of a sample series (ns), from the engine's
 /// `testing::metrics::percentile_exact` (single source of truth).
 fn percentile_ns(mut samples: Vec<u64>, p: f64) -> u64 {
@@ -316,6 +330,10 @@ fn rt_deadline_gate_10k_quantums() {
 
     let (sig_l, sig_r) = test_signal_blocks(DEADLINE_QUANTUMS);
 
+    // Pre-fault and touch entire synthetic signal vectors so demand paging
+    // is fully resolved before nanosecond timing begins.
+    std::hint::black_box(sig_l.iter().copied().sum::<f32>() + sig_r.iter().copied().sum::<f32>());
+
     // Warm up the signal pathway so instruction and data caches (L1i/L1d)
     // and neural activation tables are hot before starting nanosecond measurement.
     for block in 0..16 {
@@ -326,11 +344,17 @@ fn rt_deadline_gate_10k_quantums() {
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
     }
 
+    // Pre-allocate and commit sample buffers to physical RAM before taking rusage baseline,
+    // eliminating demand paging (minor page faults) and reallocation inside the timed loop.
+    let mut samples = vec![0u64; DEADLINE_QUANTUMS];
+    for s in samples.iter_mut() {
+        *s = 1;
+    }
+
     let rusage_before = read_thread_rusage().ok();
     let pmu = PmuCounters::open();
     pmu.start();
 
-    let mut samples = Vec::with_capacity(DEADLINE_QUANTUMS);
     let mut min_ns = u64::MAX;
     let mut max_ns = 0u64;
     let mut max_block = 0usize;
@@ -345,13 +369,19 @@ fn rt_deadline_gate_10k_quantums() {
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
         let t1 = now_ns();
         let dur = t1 - t0;
-        samples.push(dur);
+        samples[block] = dur;
         min_ns = min_ns.min(dur);
         if dur > max_ns {
             max_ns = dur;
             max_block = block;
         }
         sum_ns += dur as u128;
+
+        // Yield briefly every 250 quantums outside the timed window to replenish
+        // the kernel's RT budget (`sched_rt_runtime_us`) and prevent throttling preemption.
+        if (block + 1) % 250 == 0 {
+            rt_cooperative_microsleep(10_000);
+        }
     }
     h.consume_gc();
     pmu.stop();
@@ -455,6 +485,10 @@ fn rt_deadline_full() {
 
     let (sig_l, sig_r) = test_signal_blocks(DEADLINE_QUANTUMS);
 
+    // Pre-fault and touch entire synthetic signal vectors so demand paging
+    // is fully resolved before nanosecond timing begins.
+    std::hint::black_box(sig_l.iter().copied().sum::<f32>() + sig_r.iter().copied().sum::<f32>());
+
     // Capture and playback working buffers.
     let mut cap_l = [0f32; BLOCK];
     let mut cap_r = [0f32; BLOCK];
@@ -557,15 +591,33 @@ fn rt_deadline_full() {
         }
     }
 
+    // Pre-allocate and commit all sample buffers to physical RAM before taking rusage baseline,
+    // eliminating demand paging (minor page faults) inside the timed callback loop.
+    let mut cap_samples = vec![0u64; DEADLINE_QUANTUMS];
+    let mut dsp_samples = vec![0u64; DEADLINE_QUANTUMS];
+    let mut rec_samples = vec![0u64; DEADLINE_QUANTUMS];
+    let mut pb_samples = vec![0u64; DEADLINE_QUANTUMS];
+    let mut total_samples = vec![0u64; DEADLINE_QUANTUMS];
+
+    for s in cap_samples.iter_mut() {
+        *s = 1;
+    }
+    for s in dsp_samples.iter_mut() {
+        *s = 1;
+    }
+    for s in rec_samples.iter_mut() {
+        *s = 1;
+    }
+    for s in pb_samples.iter_mut() {
+        *s = 1;
+    }
+    for s in total_samples.iter_mut() {
+        *s = 1;
+    }
+
     let rusage_before = read_thread_rusage().ok();
     let pmu = PmuCounters::open();
     pmu.start();
-
-    let mut cap_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
-    let mut dsp_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
-    let mut rec_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
-    let mut pb_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
-    let mut total_samples = Vec::with_capacity(DEADLINE_QUANTUMS);
 
     let mut min_total_ns = u64::MAX;
     let mut max_total_ns = 0u64;
@@ -672,11 +724,11 @@ fn rt_deadline_full() {
             }
         }
 
-        cap_samples.push(dur_cap);
-        dsp_samples.push(dur_dsp);
-        rec_samples.push(dur_rec);
-        pb_samples.push(dur_pb);
-        total_samples.push(dur_total);
+        cap_samples[block] = dur_cap;
+        dsp_samples[block] = dur_dsp;
+        rec_samples[block] = dur_rec;
+        pb_samples[block] = dur_pb;
+        total_samples[block] = dur_total;
 
         min_total_ns = min_total_ns.min(dur_total);
         if dur_total > max_total_ns {
@@ -684,6 +736,12 @@ fn rt_deadline_full() {
             max_block = block;
         }
         sum_total_ns += dur_total as u128;
+
+        // Yield briefly every 250 quantums outside the timed window to replenish
+        // the kernel's RT budget (`sched_rt_runtime_us`) and prevent throttling preemption.
+        if (block + 1) % 250 == 0 {
+            rt_cooperative_microsleep(10_000);
+        }
     }
     h.consume_gc();
     pmu.stop();

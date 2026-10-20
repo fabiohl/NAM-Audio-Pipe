@@ -12,12 +12,12 @@ Fixes #
 
 ## Subsystem & Scope
 <!-- Check all that apply -->
-- [ ] **PipeWire Client & Stream Lifecycle** (`src/stream/`, SPA stream callback, quantum renegotiation)
-- [ ] **Real-Time Audio Loop** (`src/audio/`, SPSC GC, lock-free parameter updates)
-- [ ] **CLI & Option Parsing** (`src/cli/`, command-line arguments, config file parser)
-- [ ] **Asynchronous I/O & Worker** (`src/io/`, io_uring worker, async model loading)
-- [ ] **Telemetry & Terminal UI** (`src/telemetry/`, xrun counter, meters)
-- [ ] **Documentation & Scripts** (`docs/`, `utils/`, `README.md`)
+- [ ] **PipeWire Host & Stream Lifecycle** (`src/standalone/pw_host/`, dual-stream setup, reconnection)
+- [ ] **Real-Time Audio Loop & DSP Bridge** (`src/standalone/pw_host/rt_callback/`, `src/standalone/pw_host/bridge.rs`, SPSC GC, panic containment)
+- [ ] **CLI & Option Parsing** (`src/standalone/cli.rs`, arguments, silence gate parsing, exit codes)
+- [ ] **Asynchronous WAV Recording** (`src/recording/`, io_uring worker, slot pool transport, 4 GiB split)
+- [ ] **Real-Time System Setup & Telemetry** (`src/standalone/rt_setup/`, CPU affinity, PM QoS, status polling)
+- [ ] **Documentation, Packaging & Scripts** (`docs/`, `packaging/`, `utils/`, `README.md`)
 
 ---
 
@@ -43,8 +43,8 @@ Fixes #
 <!-- Run these verification scripts from the repository root before opening or marking PR ready for review: -->
 
 ```bash
-utils/lints.sh        # Static analysis, fmt, clippy (-D warnings), SPDX validation
-utils/tests-quick.sh  # Agile testing, PipeWire mock streams, CLI tests
+utils/mem-guard.sh utils/lints.sh        # Static analysis, fmt, clippy (-D warnings), SPDX validation
+utils/tests-quick.sh                     # Agile testing, PipeWire mock streams, CLI tests (auto-contained)
 ```
 
 - [ ] **`utils/lints.sh` Passed**: 100% clean across all feature permutations (`--all-features`, `--no-default-features`).

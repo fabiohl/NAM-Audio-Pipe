@@ -6,8 +6,7 @@
 # Performance Regression Gate — thin wrapper over the engine `nam_perf_gate`
 # =============================================================================
 #
-# Unified performance governance (Sprint 3 / EC-03; orchestration shared since
-# Sprint 9 / T9.3): this host no longer parses a single `RT_METRICS rt_deadline …`
+# Unified performance governance: this host no longer parses a single `RT_METRICS rt_deadline …`
 # log line. It runs the Criterion `rt_gate` suite (benches/rt_gate.rs promotes
 # the offline rt_deadline real load to per-scenario benchmarks) and delegates
 # every interpretation (environment fingerprint, baseline persistence,

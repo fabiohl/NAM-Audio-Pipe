@@ -45,7 +45,7 @@ pub enum RecordingStatus {
     /// The worker initialized the `io_uring` runtime and confirmed the output
     /// directory; `path` is the directory, later updated to the actual capture
     /// file path once the first WAV is created. `space_warning` carries the
-    /// current low-disk-space pre-warning (T4.2), `None` while the volume has
+    /// current low-disk-space pre-warning, `None` while the volume has
     /// comfortable headroom; it is rendered into the user-facing
     /// [`crate::recording::alert::RecordingAlert`] on the main control loop so
     /// failure and space messages share a single output path.
@@ -176,7 +176,7 @@ pub fn record_failure(status: &SharedRecordingStatus, failed_flag: &AtomicBool, 
 /// Transitions the observable status to `Active` pointing at `path`.
 ///
 /// A newly opened segment starts with no low-space warning; the worker
-/// republishes it via [`publish_space_warning`] right after (T4.2).
+/// republishes it via [`publish_space_warning`] right after.
 pub fn mark_active(status: &SharedRecordingStatus, path: PathBuf) {
     if let Ok(mut guard) = status.lock() {
         *guard = RecordingStatus::Active {

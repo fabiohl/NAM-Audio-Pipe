@@ -853,7 +853,7 @@ fn swap_composite_structural_saturation_bound_measurement() {
         total_installed > 0,
         "structural swaps must be retired to GC"
     );
-    // T9.5 canonical semantics (engine `RtSwapDrain`): under perpetual
+    // Canonical semantics (engine `RtSwapDrain`): under perpetual
     // saturation every channel receives one command per callback while the
     // shared budget allows one structural swap per callback. The earliest
     // drain with a pending command (here: cab-sim, the resampler channel

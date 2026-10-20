@@ -13,7 +13,7 @@
 //! | Dimension            | Values                     | Weight (typical use)                       |
 //! |----------------------|----------------------------|--------------------------------------------|
 //! | Host rate            | 44.1 / 48 / 96 kHz         | 0.25 / **0.50** / 0.25 (PipeWire default)  |
-//! | Quantum (frames)     | 32 / 64 / 128 / 256 / 512 / 1024 | **0.40** / 0.10 / 0.15 / 0.20 / 0.10 / 0.05 (64 dominant; 128 is the PipeWire-common quantum, 32/1024 close the tail coverage gap — Sprint 3b) |
+//! | Quantum (frames)     | 32 / 64 / 128 / 256 / 512 / 1024 | **0.40** / 0.10 / 0.15 / 0.20 / 0.10 / 0.05 (64 dominant; 128 is the PipeWire-common quantum, 32/1024 close the tail coverage gap) |
 //! | Topology             | A1 / A2 / LSTM (WaveNet)   | 1/3 each (mandatory)                       |
 //! | Oversampling         | Off / 2× / 4×              | **0.60** / 0.20 / 0.20 (Live first)        |
 //! | CabSim               | IR / bypass                | **0.70** / 0.30 (IR is the default path)   |

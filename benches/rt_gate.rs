@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Criterion harness for the NAM-Audio-Pipe RT regression gate (Sprint 3 / EC-03).
+//! Criterion harness for the NAM-Audio-Pipe RT regression gate.
 //!
 //! Promotes the offline `rt_deadline` real-load scenario (previously a single
 //! `RT_METRICS rt_deadline …` log line parsed by the old shell gate) to a
@@ -123,7 +123,7 @@ fn bench_host_scenarios(c: &mut Criterion) {
         harness(None, None, false),
     );
 
-    // Per-topology anchors mirroring the ab_opt_bench scenarios (Sprint 3, EC-03),
+    // Per-topology anchors mirroring the ab_opt_bench scenarios,
     // so a single coverage manifest spans the host and A/B-opt envelopes.
     bench_callback(
         c,

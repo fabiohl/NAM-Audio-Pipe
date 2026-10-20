@@ -144,7 +144,7 @@ fn unmarked_thread_routes_synchronously_under_ring_mode() {
         install();
         assert!(is_ring_routing_active());
         // This harness thread was never marked: the offload must keep the
-        // synchronous dispatch route (S3-T2/S3-T3 consult contract).
+        // synchronous dispatch route (consult contract).
         assert!(!rt_is_current_thread_marked());
 
         let marker = "UNMARKED_SYNC_MARKER_XYZ";
@@ -271,7 +271,7 @@ fn try_offload_refuses_route_without_ring_mode_or_mark() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     // Mode off (rollback/pre-install window): even a marked thread follows
-    // the synchronous dispatch (full closure of the S3-T2 route contract).
+    // the synchronous dispatch (full closure of the routing contract).
     super::restore_deactivate();
     assert!(!is_ring_routing_active());
     rt_mark_current_thread();

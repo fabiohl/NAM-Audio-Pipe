@@ -757,7 +757,7 @@ pub fn process_dsp_buffer(
             0
         };
 
-        // T9.4/F-PERF-17: the streaming pipeline never reads
+        // Streaming pipeline: the pipeline never reads
         // `resamp_mid_l/r` / `model_out_l/r` — pass the `StreamingDspBuffers`
         // working set (8 buffers) and let the engine's `Into<DspBuffers>`
         // adapter zero-slice the intermediates, removing 128 KiB of dead

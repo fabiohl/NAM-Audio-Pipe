@@ -326,7 +326,7 @@ trap cleanup EXIT INT TERM HUP
 #   is one of: PGO+BOLT, PGO-ONLY, BOLT-ONLY, PLAIN. `cause` is the detailed
 #   BOLT failure/unavailability reason (empty when BOLT was proven/applied).
 #
-#   `bolt_proof` (S6-T3) certifies that a BOLT win was independently measured:
+#   `bolt_proof` certifies that a BOLT win was independently measured:
 #   it is either `ab-opt-ceremony:<id>` (an ab-opt ceremony receipt proving
 #   p99(bolt) <= p99(pgo) over >= 3 runs) or `MISSING`. Under --strict-release
 #   the certification only claims `PGO+BOLT` when this proof is present.
@@ -354,7 +354,7 @@ gap = os.environ.get("BOLT_GAP")
 if gap:
     doc["optimization"]["gap"] = gap
 
-# LBR BOLT-profile evidence (S6-T3): samples + perf.fdata hash + duration.
+# LBR BOLT-profile evidence: samples + perf.fdata hash + duration.
 lbr_samples = os.environ.get("BOLT_LBR_SAMPLES")
 lbr_sha = os.environ.get("BOLT_LBR_FDATA_SHA256")
 if lbr_samples or lbr_sha:
@@ -459,7 +459,7 @@ if [ "$RELEASE_CEREMONY" = true ]; then
         die "Release ceremony requires a real, strict long suite receipt on disk (target/logs/long-receipt.txt is missing).\nPlease ask the human operator to execute:\n  ./utils/tests-long.sh --strict-pre-release\n(AI agents MUST NEVER execute the long suite directly)."
     fi
 
-    # Unified-schema JSONL receipt (S4-T4.4): both readers must certify the
+    # Unified-schema JSONL receipt: both readers must certify the
     # same run. The JSONL is the machine source of truth; the .txt above is the
     # derived view. A tampered/forged JSONL is rejected fail-closed.
     JSONL_RECEIPT_PATH="$PROJECT_DIR/target/logs/long-audit-receipt.jsonl"
@@ -1109,7 +1109,7 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# PHASE 4.1: LBR BOLT-profile evidence + ceremony proof (S6-T3)
+# PHASE 4.1: LBR BOLT-profile evidence + ceremony proof
 # -----------------------------------------------------------------------------
 # The BOLT win must be independently proven before the receipt may claim
 # `PGO+BOLT`. Two pieces of evidence are gathered here:
@@ -1232,7 +1232,7 @@ write_release_receipt "$BOLT_STATUS" "$BOLT_CAUSE"
 
 
 # -----------------------------------------------------------------------------
-# PHASE 4.5: Filtered DSP Hotspot Report + Static Gates (Sprint 3b/T3.4)
+# PHASE 4.5: Filtered DSP Hotspot Report + Static Gates
 # -----------------------------------------------------------------------------
 # The raw disassembly is a whole-binary dump (serde_json, tokio_uring, anyhow)
 # that also duplicates symbols across pre-BOLT `.bolt.org.text` and optimized
@@ -1240,8 +1240,7 @@ write_release_receipt "$BOLT_STATUS" "$BOLT_CAUSE"
 # primary deliverable (`target/dsp_hotpath.asm`), retains the complete dump
 # as the secondary artifact (`target/dsp_hotpath.full.asm`), and enforces
 # fail-closed static gates via `utils/dsp-hotpath-filter.py`:
-# zero `zmm` (avx512 opt-in policy), zero `libm` calls on the RT path
-# (currently 1 `tanhf` tail — the gate bites by design until Sprint 4),
+# zero `zmm` (avx512 opt-in policy), zero `libm` calls on the RT path,
 # zero `alloc`/`__rust_alloc` calls.
 echo -e "\n${BLUE}${BOLD}[Phase 4.5/7] Generating filtered DSP hotspot report...${NC}"
 
@@ -1249,7 +1248,7 @@ ASM_FULL="$PROJECT_DIR/target/dsp_hotpath.full.asm"
 ASM_TARGET="$PROJECT_DIR/target/dsp_hotpath.asm"
 ASM_SUMMARY="$PROJECT_DIR/target/dsp_hotpath_summary.txt"
 # Hotspot symbol filter: critical DSP loops only, driven by the per-repo
-# symbol profile `utils/codegen-profile.json` (unified NAM codegen filter, T5.2).
+# symbol profile `utils/codegen-profile.json` (unified NAM codegen filter).
 HOTSPOT_PROFILE="$SCRIPT_DIR/codegen-profile.json"
 
 case "$BOLT_STATUS" in
@@ -1725,7 +1724,7 @@ doc = {
             "cpu_baseline": cpu_baseline,
             "pgo": opt_status in ("PGO+BOLT", "PGO-ONLY"),
             "bolt": opt_status in ("PGO+BOLT", "BOLT-ONLY"),
-            # S6-T3: a BOLT transform claim must carry its ceremony proof id
+            # A BOLT transform claim must carry its ceremony proof id
             # (`ab-opt-ceremony:<id>`) or be explicitly MISSING. A
             # certified_release may not claim BOLT while the proof is MISSING.
             "bolt_proof": os.environ.get("BOLT_PROOF") or "MISSING",
@@ -2119,11 +2118,13 @@ PY
     echo -e "  Finalizing Flatpak application sandbox parameters..."
     flatpak build-finish "$FLATPAK_BUILD_DIR" \
         --command=nam-audio-pipe \
+        --socket=pipewire \
         --socket=pulseaudio \
         --filesystem=xdg-run/pipewire-0 \
         --share=ipc \
         --device=all \
         --filesystem=home:ro \
+        --filesystem=xdg-music \
         --socket=fallback-x11 \
         --socket=wayland
 

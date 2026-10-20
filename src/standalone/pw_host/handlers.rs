@@ -872,7 +872,7 @@ fn build_os_pair(
 /// allocation attempt and one `log::error!` per request generation, while a
 /// newer request (higher generation) always survives.
 ///
-/// T9.4/F-PERF-18 capacity gate: the RT-side oversample scratch is sized by
+/// Capacity gate: the RT-side oversample scratch is sized by
 /// `required_scratch_len` for the *initial* factor (zero when Off). A runtime
 /// swap requesting a factor whose scratch (`required_scratch_len(factor,
 /// MAX_RESAMP_BUF)`) exceeds that capacity is rejected here — on the cold main
@@ -900,7 +900,7 @@ pub(super) fn handle_oversample_rebuild(
     }
     let factor_val = rt_status.requested_os_factor.load(Ordering::Relaxed);
     let factor = OversampleFactor::from_f32(factor_val as f32);
-    // T9.4/F-PERF-18 capacity gate (see fn doc).
+    // Capacity gate (see fn doc).
     let required = OversampleEngine::required_scratch_len(factor, MAX_RESAMP_BUF);
     if required > os_scratch_len {
         log::error!(

@@ -20,7 +20,7 @@
 //!   `RT_STATUS_PARAM_QUEUE_BACKLOG` flag records the occurrence for the main
 //!   thread (telemetry only; no command is ever lost).
 //!
-//! # T9.5 (F-PERF-20) — canonical structural-swap scheduler
+//! # Canonical structural-swap scheduler
 //!
 //! The hand-rolled 3-phase protocol previously duplicated here (and in the
 //! resampler/cabsim/slimmable/OS drains) was migrated to the engine's
@@ -100,10 +100,9 @@ fn flag_structural_superseded(rt_status: &RtStatusFlags) {
 }
 
 /// [`SwapTunables`] for the four dedicated structural swap drains
-/// (resampler, cab-sim, slimmable, oversample): historical NAM-Audio-Pipe
-/// tuning preserved through the T9.5 migration (1 shared swap/callback,
-/// 8-pop coalescing window, no backlog flag — the pop-cap truncation flag
-/// reports saturation instead).
+/// (resampler, cab-sim, slimmable, oversample): tuning preserved
+/// (1 shared swap/callback, 8-pop coalescing window, no backlog flag —
+/// the pop-cap truncation flag reports saturation instead).
 pub(crate) const fn structural_swap_tunables() -> SwapTunables {
     SwapTunables {
         pops_per_callback: STRUCTURAL_POPS_PER_CALLBACK,
@@ -115,7 +114,7 @@ pub(crate) const fn structural_swap_tunables() -> SwapTunables {
 /// COMMAND RECEPTION (SPSC Channel)
 /// Processes commands from the command-line interface or control system (volume, model, noise gate).
 ///
-/// T9.5 contract adoption of the engine's canonical 3-phase protocol
+/// Contract adoption of the engine's canonical 3-phase protocol
 /// ([`RtSwapDrain`], adopted verbatim; see the module docs): scalar parameters
 /// are coalesced latest-wins inside the [`MAX_PARAM_BUDGET`] window (handler
 /// side — the canonical "handler owns scalar-coalescing policy" pattern, with

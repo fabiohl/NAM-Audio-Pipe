@@ -1092,7 +1092,7 @@ fn composite_structural_saturation_bound_measurement() {
     let mut total_installed = 0usize;
     let mut total_deferred = 0usize;
 
-    // Set up all 5 SPSC channels (T9.5: four dedicated channels live inside
+    // Set up all 5 SPSC channels (four dedicated channels live inside
     // the engine `RtSwapDrain`s; the param ring stays a raw consumer).
     let (mut resamp_prod, resamp_cons) = rtrb::RingBuffer::<Box<ResamplerSwapPayload>>::new(8);
     let (mut cabsim_prod, cabsim_cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(8);

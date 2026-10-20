@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Empirical end-to-end validation of the T2.3 cab-sim partition policy
+//! Empirical end-to-end validation of the cab-sim partition policy
 //! (`--cabsim-partition`), measured through the REAL RT callback sequence
 //! (`RtSwapHarness` — the full `capture process()` mirror: drains, rate sync,
 //! gate FSM, resampler and `capture_dsp_pipeline_streaming`) with no PipeWire
 //! daemon.
 //!
-//! Invariants proven here (the ones T2.3 publishes for telemetry and delay
+//! Invariants proven here (published for telemetry and delay
 //! compensation):
 //!
 //! 1. **Partition policy is really in effect end-to-end** — feeding
@@ -86,7 +86,7 @@ fn accumulation_prefix(partition: usize, block: usize) -> usize {
     block * (partition.div_ceil(block) - 1)
 }
 
-/// Invariant 1 (T2.3): the partition policy is really in effect end-to-end.
+/// Invariant 1: the partition policy is really in effect end-to-end.
 /// Sample-accurate 16-sample host blocks through the REAL RT callback yield
 /// the documented underrun prefix — which scales strictly with the policy —
 /// followed by the direct causal FIR of the same IR (ESR gate).
@@ -160,7 +160,7 @@ fn cabsim_partition_policy_shapes_the_rt_output_stream() {
     assert_eq!(prev_prefix, 256 - block);
 }
 
-/// Invariant 2 (T2.3 + the T2.1 latent note): with the partition policy below
+/// Invariant 2: with the partition policy below
 /// the host quantum (32 under 512), neither the active path (`process_block`)
 /// nor the gate-closed ring-out (`drain_tail`) raises
 /// `RT_STATUS_CABSIM_CONTRACT_VIOLATION`, and the IR tail is flushed to
@@ -236,7 +236,7 @@ fn partition_below_quantum_never_violates_contract_and_drains_tail() {
     );
 }
 
-/// Invariant 3 (T2.3): the pair state matches the published policy — exact
+/// Invariant 3: the pair state matches the published policy — exact
 /// partition, exact algorithmic latency and the expected partition count at
 /// the top of the CLI domain, under the maximum production quantum (1024).
 #[test]

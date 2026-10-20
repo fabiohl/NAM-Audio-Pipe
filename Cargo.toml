@@ -40,7 +40,7 @@ name = "long_receipt_check"
 path = "src/bin/long_receipt_check.rs"
 
 # Unified-schema (engine `testing::receipt`) emitter/verifier for the
-# machine-readable long receipt (target/logs/long-audit-receipt.jsonl, S4-T4.4).
+# machine-readable long receipt (target/logs/long-audit-receipt.jsonl).
 # Testing-only because it reuses the engine receipt schema.
 [[bin]]
 name = "pipe_long_receipt"
@@ -65,7 +65,7 @@ name = "ab_opt_bench"
 path = "src/bin/ab_opt_bench.rs"
 required-features = ["testing"]
 
-# RT regression gate Criterion harness (Sprint 3 / EC-03): promotes the offline
+# RT regression gate Criterion harness: promotes the offline
 # rt_deadline real-load scenario to a per-scenario Criterion suite consumed by
 # the engine `nam_perf_gate` (coverage + machine verdict). Testing-only, because
 # the RT harness used to drive the callbacks is test-only.
@@ -81,7 +81,7 @@ required-features = ["testing"]
 # Cargo would pull the engine's default features and `--no-default-features`
 # could never reach the lean single-inference path (the engine default is
 # `dual-mono`).
-NeuralAmpModeler-rs = { version = "1.0.0", default-features = false, features = [
+NeuralAmpModeler-rs = { version = "1.0.1", default-features = false, features = [
     "rt-hardening",
 ] }
 pipewire = "0.10"
@@ -91,11 +91,11 @@ rtrb = "0.4.0"
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tokio-uring = "0.5"
 anyhow = "1.0.104"
-libc = "0.2.190"
+libc = "0.2.191"
 log = "0.4.34"
 env_logger = { version = "0.11.11", default-features = false }
-# Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs,
-# D3): the engine-owned unified receipt schema has no `fail_reason` field, so
+# Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs):
+# the engine-owned unified receipt schema has no `fail_reason` field, so
 # the cause is emitted to a sibling `*.fail-reasons.json` JSONL. Already in the
 # dependency tree transitively via NeuralAmpModeler-rs.
 serde_json = "1"

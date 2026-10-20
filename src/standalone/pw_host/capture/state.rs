@@ -34,8 +34,8 @@ use std::sync::atomic::AtomicU32;
 /// callback through a raw pointer — never moved into the stream closures — so
 /// the channels survive a bounded reconnect cycle. The four dedicated swap
 /// channels live inside [`CaptureState`]'s engine `RtSwapDrain`s
-/// (`resampler_drain` / `cabsim_drain` / `slimmable_drain` / `os_drain`,
-/// T9.5) — each drain owns its ring consumer and its deferred slot; the main
+/// (`resampler_drain` / `cabsim_drain` / `slimmable_drain` / `os_drain`) —
+/// each drain owns its ring consumer and its deferred slot; the main
 /// thread only touches its own separate `gc_overflow` handle (an [`Arc`]
 /// clone) during the control loop, so there is never concurrent aliasing of
 /// this struct between the RT callback (exclusive `&mut`) and the main
@@ -65,7 +65,7 @@ pub struct CaptureState {
     pub resamp_out_l: Box<[f32; MAX_RESAMP_BUF]>,
     pub resamp_out_r: Box<[f32; MAX_RESAMP_BUF]>,
     /// Oversampled scratch buffers, sized by
-    /// [`OversampleEngine::required_scratch_len`] (F-PERF-18/T9.4): zero when
+    /// [`OversampleEngine::required_scratch_len`]: zero when
     /// the instance starts with `OversampleFactor::Off`. A runtime oversample
     /// swap that needs more scratch than allocated is rejected by the
     /// main-thread rebuild handler (`handle_oversample_rebuild`), so the RT
@@ -109,15 +109,15 @@ pub struct CaptureState {
     /// rate-only rebuilds preserve the active partition. Written once by the
     /// main thread before the RT handoff, read-only afterwards.
     pub cabsim_partition_policy: usize,
-    /// Dedicated swap channels drained by the engine's generic scheduler
-    /// (T9.5): each `RtSwapDrain` owns its ring consumer AND the single
+    /// Dedicated swap channels drained by the engine's generic scheduler:
+    /// each `RtSwapDrain` owns its ring consumer AND the single
     /// deferred slot (formerly the `deferred_*` fields below). Wired in
     /// `run_pipewire_host` once per process (the rings and parked commands
     /// survive a bounded reconnect cycle); unwrapped by the RT callback.
     pub resampler_drain: Option<ResamplerSwapDrain>,
     pub cabsim_drain: Option<CabSimSwapDrain>,
     /// Deferred structural command slot for the mixed `Consumer<ParamPayload>`
-    /// ring (contract adoption, T9.5 — the unboxed ring has no `RtSwapDrain`).
+    /// ring (contract adoption — the unboxed ring has no `RtSwapDrain`).
     ///
     /// Parks at most one `LoadModel` whose per-callback structural budget
     /// ([`STRUCTURAL_SWAPS_PER_CALLBACK`], shared across all swap drains) was
@@ -203,7 +203,7 @@ impl CaptureState {
         };
 
         // Oversample engines resolve first (with the Off fallback) so the
-        // scratch sizing below uses the *effective* factor (F-PERF-18/T9.4):
+        // scratch sizing below uses the *effective* factor:
         // `required_scratch_len(Off, …) == 0` — with oversampling bypassed the
         // scratch allocates nothing (previously 512 KiB were allocated even
         // with Off).

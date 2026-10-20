@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Sibling-file carrier for typed long-audit FAIL causes (D3).
+//! Sibling-file carrier for typed long-audit FAIL causes.
 //!
 //! The unified-schema receipt (`target/logs/long-audit-receipt.jsonl`) is
 //! engine-owned (`neural_amp_modeler_rs::testing::receipt::LongPhaseReceipt`)

@@ -187,7 +187,7 @@ else
 fi
 
 LONG_RECEIPT="$LOG_DIR/long-receipt.txt"
-# Unified-schema machine-readable receipt (S4-T4.4): the JSONL is the source of
+# Unified-schema machine-readable receipt: the JSONL is the source of
 # truth; LONG_RECEIPT (the .txt) is the derived human view kept for the
 # transition. Both readers are verified by the release ceremony.
 PIPE_JSONL="$LOG_DIR/long-audit-receipt.jsonl"

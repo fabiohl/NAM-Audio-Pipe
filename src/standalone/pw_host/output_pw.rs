@@ -81,7 +81,7 @@ pub struct PipewireHostConfig {
     pub oversample: OversampleFactor,
     /// Pre-computed CPU selection receipt (`--cpu` already resolved by the
     /// caller). Carries the selected RT core for `configure_realtime_thread`
-    /// and the housekeeping set applied to the thread-loop thread (T9.1).
+    /// and the housekeeping set applied to the thread-loop thread.
     pub cpu_receipt: crate::standalone::rt_setup::affinity::CpuSelectionReceipt,
     /// `--fail-fast` on the CLI: disables the bounded reconnect cycle —
     /// the first backend failure triggers observable teardown immediately.

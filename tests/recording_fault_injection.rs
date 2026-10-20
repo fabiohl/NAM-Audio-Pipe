@@ -1312,7 +1312,7 @@ fn count_threads() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Ignored: durability checkpoint (F-UX-01 / T3.1c)
+// Ignored: durability checkpoint (F-UX-01)
 // ---------------------------------------------------------------------------
 
 /// A capture killed mid-stream must remain readable up to the last periodic

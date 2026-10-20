@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 //! Emitter/verifier for the unified-schema long-audit receipt
-//! (`target/logs/long-audit-receipt.jsonl`, S4-T4.4).
+//! (`target/logs/long-audit-receipt.jsonl`).
 //!
 //! `utils/tests-long.sh` appends one machine-readable line per completed phase
 //! using the same engine receipt schema the engine and NAM-Plug emit; the

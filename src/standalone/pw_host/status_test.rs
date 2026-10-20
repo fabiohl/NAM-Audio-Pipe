@@ -191,7 +191,7 @@ fn observe_rt_panic_transitions_backend_to_failed() {
 
 #[test]
 fn repeated_rt_panic_invocations_execute_hook_exactly_once() {
-    // Finding F-RB-105 / Task [T3.3]:
+    // Finding F-RB-105:
     // After an initial panic contained by catch_unwind in `run_rt_callback_body`,
     // the PipeWire data loop continues to invoke the `process()` RT callback at
     // every audio quantum until the main control loop observes

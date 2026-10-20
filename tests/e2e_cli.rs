@@ -665,7 +665,7 @@ fn pipewire_first_connection_failure_exits_backend_with_hint() {
 // A `--record` startup that cannot bring the disk worker up (unusable output
 // directory, unavailable io_uring, ...) must exit with the documented recording
 // code (6), never the legacy generic 1. Regression guard for the exit-code
-// contract in `exit.rs` / `README.md` (T7.1).
+// contract in `exit.rs` / `README.md`.
 
 #[test]
 fn recording_startup_failure_exits_with_recording_code() {

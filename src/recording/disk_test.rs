@@ -544,7 +544,7 @@ async fn checkpoint_reflects_last_checkpoint_and_never_exceeds_data_written() {
     );
 }
 
-/// Acceptance (F-UX-01 / T3.1): a periodic-checkpoint failure is a fatal
+/// Acceptance (F-UX-01): a periodic-checkpoint failure is a fatal
 /// recording error — the worker returns `Err`, the observable status becomes
 /// `Failed`, and the RT failure flag is raised (exactly like a `write_block`
 /// failure), so a disk that cannot persist the header never masquerades as a
@@ -1177,7 +1177,7 @@ async fn barrier_pairing_discards_superseded_metadata() {
         .await;
 }
 
-/// Acceptance (F-UX-04 / T3.2): with an active recording the termination grace
+/// Acceptance (F-UX-04): with an active recording the termination grace
 /// window is widened to `RECORDING_GRACE_WINDOW_MS`; two `SIGINT`s 700 ms apart
 /// are swallowed while a slow `finalize` (~300 ms) runs, so the capture is
 /// finalized intact instead of being force-exited mid-`fsync`.

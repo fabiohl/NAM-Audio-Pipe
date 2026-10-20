@@ -21,7 +21,7 @@ pub mod long;
 #[cfg(feature = "testing")]
 pub mod jsonl;
 
-/// Sibling-file carrier for typed long-audit FAIL causes (D3). Testing-only:
+/// Sibling-file carrier for typed long-audit FAIL causes. Testing-only:
 /// it is written by `src/bin/pipe_long_receipt.rs` and the long suite.
 #[cfg(feature = "testing")]
 pub mod fail_reasons;

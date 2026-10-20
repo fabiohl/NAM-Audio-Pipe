@@ -173,7 +173,7 @@ fn quantum_renegotiation_at_constant_rate_never_rebuilds() {
     }
 }
 
-// ── cabsim_partition_to_request (política --cabsim-partition, T2.3) ────────
+// ── cabsim_partition_to_request (política --cabsim-partition) ──────────────
 
 #[test]
 fn partition_request_preserves_active_pair_partition() {

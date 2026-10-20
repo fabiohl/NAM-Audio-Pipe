@@ -9,7 +9,7 @@
 //! Runs a deterministic, fixed DSP workload (the same cell configuration across
 //! every measured binary) in a tight loop and retains, per run:
 //!
-//! * **Production capture path (T9.3/F-PERF-27):** the cell drives
+//! * **Production capture path:** the cell drives
 //!   [`capture_dsp_pipeline_streaming`] — the exact function the capture
 //!   `process()` callback uses in production — through the
 //!   `StreamingResampleBuffer` adapter, at the production quantum (256 frames).
@@ -78,7 +78,7 @@ const DEFAULT_RECEIPT_JSON: &str = "target/logs/ab-opt-receipt.json";
 const RECEIPT_ENV: &str = "NAM_AB_OPT_RECEIPT";
 
 const DEFAULT_RATE: u32 = 48_000;
-/// Production capture quantum (PipeWire default in NAM-Audio-Pipe). T9.3: the
+/// Production capture quantum (PipeWire default in NAM-Audio-Pipe): the
 /// bench must measure the same block size the audio thread runs at — a 64-frame
 /// quantum reports a different cost envelope than the deployed 256-frame one.
 const DEFAULT_QUANTUM: usize = 256;
@@ -572,7 +572,7 @@ fn run_measured(
         eprintln!("ab_opt_bench: FATAL: resampler {rate}→{model_sr} failed: {e}");
         std::process::exit(1);
     });
-    // T9.3: measure the production pipeline exactly — the capture callback
+    // Measure the production pipeline exactly — the capture callback
     // drives the neural stage through the streaming resampler adapter
     // (`capture_dsp_pipeline_streaming`), never the retired block-wise
     // `capture_dsp_pipeline`. The buffer mirrors `CaptureState::init`
@@ -599,7 +599,7 @@ fn run_measured(
 
     let mut resamp_out_l = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_r = vec![0.0; MAX_RESAMP_BUF];
-    // T9.3: resolve the oversample factor before the scratch sizing and size
+    // Resolve the oversample factor before the scratch sizing and size
     // the oversample scratch exactly like the engine requires
     // (`required_scratch_len`, F-PERF-18 pattern) — the streaming pipeline
     // never reads `resamp_mid_l/r` / `model_out_l/r`, so the bench stops
@@ -671,7 +671,7 @@ fn run_measured(
             conv: None,
             conv_pair: conv.as_mut(),
         };
-        // T9.4: streaming scratch set (`StreamingDspBuffers`) — the production
+        // Streaming scratch set (`StreamingDspBuffers`) — the production
         // capture path never reads `resamp_mid_l/r` / `model_out_l/r`
         // (F-PERF-17), so the bench passes the 8-buffer streaming set and lets
         // the engine's `Into<DspBuffers>` adapter zero-slice the intermediates.

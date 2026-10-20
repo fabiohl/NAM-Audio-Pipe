@@ -8,7 +8,7 @@ use neural_amp_modeler_rs::common::spsc::{
 };
 use std::assert_matches;
 
-/// T9.5: these tests exercise the engine's canonical `RtSwapDrain` through the
+/// These tests exercise the engine's canonical `RtSwapDrain` through the
 /// NAM-Audio-Pipe handler wiring (`drain_cabsims`). The protocol semantics are
 /// the engine scheduler's (verified by its own oracle tests); this suite
 /// validates the family-specific handler (install/discard/GC), the shared

@@ -742,7 +742,7 @@ impl RtSwapHarness {
         state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
 
         let spsc = setup_spsc(neural_amp_modeler_rs::common::spsc::SPSC_CAPACITY)?;
-        // T9.5: the dedicated swap channels live inside the engine `RtSwapDrain`s.
+        // Dedicated swap channels live inside the engine `RtSwapDrain`s.
         state.resampler_drain = Some(resampler_swap_drain(spsc.resampler_consumer));
         state.cabsim_drain = Some(cabsim_swap_drain(spsc.cabsim_consumer));
         state.slimmable_drain = Some(slimmable_swap_drain(spsc.slimmable_consumer));

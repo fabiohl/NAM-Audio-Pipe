@@ -110,8 +110,8 @@ pub struct TelemetryLatches {
     pub slimmable_reset_failed: LatchedSignal,
     /// Digital clipping (`RT_STATUS_HAS_CLIPPED`).
     pub clipping: LatchedSignal,
-    /// Non-finite input containment (`RT_STATUS_NON_FINITE_INPUT_DETECTED`,
-    /// T9.4/F-PERF-16): the engine detected NaN/Inf entering the pipeline and
+    /// Non-finite input containment (`RT_STATUS_NON_FINITE_INPUT_DETECTED`):
+    /// the engine detected NaN/Inf entering the pipeline and
     /// sanitized both the inputs and the delivered outputs.
     pub non_finite_input: LatchedSignal,
     /// SPA format contract violation (`RT_STATUS_HOST_CONTRACT_VIOLATION`).
@@ -149,11 +149,11 @@ pub struct PollState {
     /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
     pub pw_log_dropped_last: u64,
     /// Last observed `playback_quantums` value; used to re-arm the bridge
-    /// bring-up suppression budget whenever playback makes progress (S6-T4).
+    /// bring-up suppression budget whenever playback makes progress.
     pub last_bringup_quanta: u32,
     /// Number of consecutive polls spent suppressing bridge drift drops in the
     /// current bring-up window. Caps the window so a stalled playback stream
-    /// cannot suppress (and discard) drift drops indefinitely (S6-T4 review fix).
+    /// cannot suppress (and discard) drift drops indefinitely.
     pub bringup_suppressed_polls: u32,
     /// Gate-transition log rate limiter (F-UX-13).
     pub gate_throttle: GateTransitionThrottle,
@@ -337,7 +337,7 @@ pub fn poll_rt_status(
         );
     }
 
-    // 3.25 NON-FINITE INPUT CONTAINMENT (T9.4/F-PERF-16):
+    // 3.25 NON-FINITE INPUT CONTAINMENT:
     // The engine's energy/gain passes detected a NaN/Inf entering the
     // pipeline (e.g. a buggy or malicious PipeWire client feeding corrupt
     // floats) and sanitized the inputs in place; the output stage keeps
@@ -378,7 +378,7 @@ pub fn poll_rt_status(
     // 4. REAL-TIME PRIORITY & ATOMIC ERRORS:
     // Reads error flags set atomically by configure_realtime_thread during the
     // first quantum of the fresh RT data thread (see
-    // `rt_setup/thread.rs::configure_realtime_thread` for the T9.2 correction:
+    // `rt_setup/thread.rs::configure_realtime_thread`:
     // PipeWire listeners dispatch on the thread-loop thread, so the first
     // `process()` invocation is the only consumer-owned hook on the data
     // thread) and emits the corresponding
@@ -615,7 +615,7 @@ pub fn poll_rt_status(
     // some small audio chunks to maintain synchronization.
     // Latched: a sustained drift episode warns once.
     //
-    // S6-T4 / F-PR-11: during the first few playback quanta after entering
+    // During the first few playback quanta after entering
     // `Streaming`, the bridge legitimately reports drops while the off-RT
     // pre-rolled silence block is consumed and the capture producer's first
     // blocks land (startup ramp, not drift). Those drops are suppressed here —

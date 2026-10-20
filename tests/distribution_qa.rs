@@ -84,6 +84,10 @@ const LONG_PHASE_NAMES: [&str; 7] = [
 /// half-replaced receipt.
 static LONG_RECEIPT_MUTEX: Mutex<()> = Mutex::new(());
 
+fn lock_long_receipt_mutex() -> std::sync::MutexGuard<'static, ()> {
+    LONG_RECEIPT_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -889,7 +893,7 @@ fn validate_provenance_receipt(path: &Path) -> Result<usize, String> {
         return Err(format!("invalid certification_status: {status:?}"));
     }
 
-    // 4b. BOLT certification proof (S6-T3): a receipt claiming a BOLT
+    // 4b. BOLT certification proof: a receipt claiming a BOLT
     //     transform must carry a boolean `bolt` flag and a well-formed proof
     //     id — `ab-opt-ceremony:<id>` or `perf-gate:<id>` — or the explicit
     //     `MISSING` sentinel. `MISSING` may never be certified, and the proof
@@ -1239,7 +1243,7 @@ fn provenance_validator_rejects_measured_performance_claims() {
 
 /// (c) Negative: a receipt claiming a BOLT transform without any proof field is
 /// rejected, and a `certified_release` claiming BOLT with `bolt_proof: MISSING`
-/// is rejected fail-closed (S6-T3).
+/// is rejected fail-closed.
 #[test]
 fn provenance_validator_requires_bolt_proof_for_bolt_claims() {
     // Missing proof field entirely.
@@ -1578,7 +1582,7 @@ fn provenance_receipt_integrity() {
     // restore) via `utils/tests-long.sh --simulate`. Serialize against those
     // destructive replacements so a concurrent read never hashes a half- or
     // temporarily-replaced artifact (same rationale as long_suite_receipt_audit).
-    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _lock = lock_long_receipt_mutex();
     let path = repo_root().join(PROVENANCE_REL);
     if !path.is_file() {
         eprintln!(
@@ -2222,15 +2226,20 @@ OVERALL: SIMULATED
 /// green gate always implies a valid long-suite receipt was on disk.
 #[test]
 fn long_suite_receipt_audit() {
-    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
-    let path = repo_root().join(LONG_RECEIPT_REL);
-    if !path.is_file() {
+    let _lock = lock_long_receipt_mutex();
+    let real_path = repo_root().join(LONG_RECEIPT_REL);
+    let sim_path = repo_root().join(SIMULATE_RECEIPT_REL);
+    let path = if real_path.is_file() {
+        real_path
+    } else if sim_path.is_file() {
+        sim_path
+    } else {
         eprintln!(
             "TEST_RESULT[long_receipt_audit]=SKIP:receipt_not_found ({} absent; register the planned phases with ./utils/tests-long.sh --simulate or ask the human operator to execute the full audit)",
-            path.display()
+            real_path.display()
         );
         return;
-    }
+    };
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read long receipt {}: {e}", path.display()));
     let receipt = parse_long_receipt(&text)
@@ -2348,7 +2357,7 @@ fn run_tests_long_simulate(args: &[&str]) -> String {
 /// ceremony requires). No long-suite test is executed.
 #[test]
 fn strict_pre_release_propagates_nam_rt_strict() {
-    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _lock = lock_long_receipt_mutex();
     let _guard = LongSimulateGuard::new();
 
     let text = run_tests_long_simulate(&["--simulate", "--strict-pre-release"]);
@@ -2376,7 +2385,7 @@ fn strict_pre_release_propagates_nam_rt_strict() {
 /// the propagation is a strict-only behavior, never inherited by accident.
 #[test]
 fn non_strict_simulate_records_nam_rt_strict_zero() {
-    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _lock = lock_long_receipt_mutex();
     let _guard = LongSimulateGuard::new();
 
     let text = run_tests_long_simulate(&["--simulate"]);
@@ -2480,7 +2489,7 @@ OVERALL: PASSED
 /// executed.
 #[test]
 fn simulate_receipt_declares_suite_purposes_and_phase6() {
-    let _lock = LONG_RECEIPT_MUTEX.lock().expect("long receipt mutex");
+    let _lock = lock_long_receipt_mutex();
     let _guard = LongSimulateGuard::new();
 
     let text = run_tests_long_simulate(&["--simulate"]);

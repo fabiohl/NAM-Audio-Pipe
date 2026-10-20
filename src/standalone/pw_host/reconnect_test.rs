@@ -576,7 +576,7 @@ fn without_teardown_latch_peer_stream_unconnected_poisons_reconnect() {
     );
 }
 
-// ── Combined Multi-Cycle Reconnect & Memory Safety Stress Harness (T1.3) ───
+// ── Combined Multi-Cycle Reconnect & Memory Safety Stress Harness ───────────
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -681,7 +681,7 @@ fn create_mock_pair(
 
 #[test]
 fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poisoning() {
-    // Finding F-RB-101 + F-RB-102 Combined Gate (Task T1.3):
+    // Finding F-RB-101 + F-RB-102 Combined Gate:
     // 1. Simulates multiple reconnect cycles under localized stream failures (peer stream remains connected).
     // 2. In each cycle, Section 6 teardown drops `AppState` under `enter_teardown()`.
     // 3. Proves:

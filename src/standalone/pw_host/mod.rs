@@ -109,14 +109,14 @@ pub use wakeup::ControlPlaneWakeup;
 /// ramp (the off-RT pre-rolled silence block plus the capture producer's first
 /// blocks) rather than real drift. Within this window the telemetry loop
 /// suppresses the `Drifting detected` warning and does not account the drops
-/// (S6-T4 / F-PR-11).
+/// (F-PR-11).
 pub const PLAYBACK_BRINGUP_QUANTUMS: u32 = 4;
 
 /// Hard cap on consecutive telemetry polls that may suppress bridge drift
 /// drops while inside the bring-up window. If playback stalls before reaching
 /// [`PLAYBACK_BRINGUP_QUANTUMS`], the budget is exhausted and drift drops are
 /// accounted/warned normally, so suppression can never be indefinite
-/// (S6-T4 review fix). Re-armed whenever `playback_quantums` advances.
+/// Re-armed whenever `playback_quantums` advances.
 pub const MAX_BRINGUP_SUPPRESSED_POLLS: u32 = 32;
 
 /// Offline RT swap-stress harness — full capture-callback drain

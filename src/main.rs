@@ -115,7 +115,7 @@ fn main() -> anyhow::Result<()> {
 
     // 2.5 CPU AFFINITY RECEIPT (single computation, shared by every consumer).
     // Selects the RT core (or honors `--cpu`) and derives the housekeeping set.
-    // T9.1: the receipt is applied de facto from here on — the main control
+    // The receipt is applied de facto from here on — the main control
     // loop thread is pinned to the housekeeping set below, the recording
     // worker pins itself at spawn, the PipeWire thread-loop thread pins via
     // its event source and the RT data thread keeps `configure_realtime_thread`.
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
              cannot start without an RT-core decision.",
         );
     };
-    // T9.1(a): the main thread runs the control loop, GC drains, handlers and
+    // The main thread runs the control loop, GC drains, handlers and
     // telemetry — pure housekeeping work. Pin it away from the RT core so the
     // DSP data thread stays exclusive. A kernel rejection is logged inside the
     // helper and is a non-fatal optimization loss.
@@ -244,7 +244,7 @@ fn main() -> anyhow::Result<()> {
                 "{} Fast activation (Padé) with LSTM architecture is NOT recommended — \
                  measured degradation is ~−13 dB ESR (clearly audible). \
                  Standard (exact-grade) activation is the universal default and costs only \
-                 +10–15% CPU for LSTM models. See docs/audio_fidelity_map.md §2.",
+                 +10–15% CPU for LSTM models. See NeuralAmpModeler-rs/docs/audio_fidelity_map.md §2.",
                 "⚠️".yellow(),
             );
         }
@@ -321,7 +321,7 @@ fn main() -> anyhow::Result<()> {
         // The JoinHandle is retained by the guard and formally joined (bounded)
         // during shutdown so the WAV header is finalized before PipeWire is
         // deinitialized and recording failures surface as a non-zero exit.
-        // T9.1(b): the worker pins itself to the housekeeping set at spawn
+        // The worker pins itself to the housekeeping set at spawn
         // (empty set = documented no-op for tests).
         let housekeeping_for_worker = cpu_receipt.housekeeping_cpus.clone();
         let io_handle = match recording::spawn_recording_worker(

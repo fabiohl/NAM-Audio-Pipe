@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Coherence and tamper-rejection tests for the two long-receipt readers
-//! (S4-T4.4): the unified-schema JSONL (engine `testing::receipt`) and the
+//! Coherence and tamper-rejection tests for the two long-receipt readers:
+//! the unified-schema JSONL (engine `testing::receipt`) and the
 //! human `.txt` receipt (`receipt::long`). Both must certify the same valid run
 //! and both must reject a forged/tampered one.
 #![cfg(feature = "testing")]

@@ -5,117 +5,293 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 # Automated Test Suite & Verification Architecture - `NAM-Audio-Pipe`
 
-This document details the automated test suite, integration harness, verification scripts, and compiler optimization pipeline for **NAM-Audio-Pipe** ([`../`](../)).
+This document details the automated testing architecture, verification suites, regression gates, and compiler optimization pipeline for **NAM-Audio-Pipe** ([`../`](../)).
+
+> **Documentation Philosophy**: Source code is the primordial source of truth. This guide does not transcribe implementation details line-by-line; instead, it establishes the testing architecture, explains the *why* behind design invariants, defines critical real-time contracts, and guides developers on running and extending test suites safely.
 
 ---
 
 ## 1. Scope & Crate Features Taxonomy
 
-`NAM-Audio-Pipe` testing relies on feature flags configured in [`Cargo.toml`](../Cargo.toml):
+`NAM-Audio-Pipe` testing relies on feature flags defined in [`Cargo.toml`](../Cargo.toml):
 
-| Feature Flag  | Description                                                                                            | Test Usage Scope                                                |
-|:------------- |:------------------------------------------------------------------------------------------------------ |:--------------------------------------------------------------- |
-| **`default`** | Standard empty feature set for standalone production builds.                                           | Standard release builds and baseline compilation checks.        |
-| **`testing`** | Propagates `NeuralAmpModeler-rs/testing`, enabling internal fixtures, mock controls, and test helpers. | Mandatory flag when executing unit and integration test suites. |
+| Feature Flag     | Purpose                                                                | Operational Scope                                                  |
+|:---------------- |:---------------------------------------------------------------------- |:------------------------------------------------------------------ |
+| **`default`**    | Empty feature set for standalone production binaries.                  | Production builds and baseline compilation checks.                 |
+| **`testing`**    | Propagates `NeuralAmpModeler-rs/testing`, exposing mocks and fixtures. | Mandatory for executing unit, integration, and verification tests. |
+| **`heap-audit`** | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in Phase 2 of the long audit and RT callback safety tests.    |
 
 ---
 
 ## 2. Automated Test Inventory
 
-The test suite is partitioned into unit tests co-located with module sources and integration tests under [`tests/`](../tests/):
+The test architecture separates fast unit tests (verifying isolated module contracts) from integration tests (exercising the full audio graph, disk I/O, IPC, and operating system interfaces).
+
+```text
+NAM-Audio-Pipe Test Hierarchy
+├── Unit Tests (src/...)
+│   ├── CLI & Validation           -> Argument parsing, buffer size & gate domains
+│   ├── Real-Time Setup & Hardware -> Thread priority, CPU affinity, PM QoS
+│   ├── Audio Callback (RT)        -> DSP staging, panic containment, zero-alloc
+│   ├── SPSC Resource Swaps        -> Lock-free dynamic model/IR/resampler updates
+│   ├── Host FSM & Reconnect       -> Stream state transitions, bounded exponential backoff
+│   └── Asynchronous Recording     -> Lock-free slot pool, worker lifecycle, disk serialization
+└── Integration Tests (tests/...)
+    ├── e2e_cli.rs                 -> Black-box subprocess CLI validation & exit codes
+    ├── recording*.rs              -> Bit-exact WAV persistence, fault-injection & io_uring
+    ├── pw_integration.rs          -> Live PipeWire context, stream binding & reconnect
+    ├── service_resilience.rs      -> POSIX signal bursts, graceful finalization & fail-closed FSM
+    ├── stereo_fidelity.rs         -> Bit-identical L/R channel processing & SNR oracles
+    ├── swap_stress.rs             -> Multi-producer lock-free swap stress under RT load
+    ├── soak_extended.rs           -> Accelerated-timeline soak (320k blocks, RSS stability)
+    ├── endurance.rs               -> Real wall-clock endurance (fail-closed validation windows)
+    ├── rt_metrics.rs              -> Nanosecond deadline & inter-callback jitter profiling
+    └── distribution_qa.rs         -> AppStream XML, release provenance & receipt audits
+```
+
+---
 
 ### 2.1 Unit Tests (Module-Level)
 
-- **CLI Parsing ([`src/standalone/cli_test.rs`](../src/standalone/cli_test.rs)):** Validates command-line flag combinations, model and cabinet path parsing, gain limits (`-20.0` to `+20.0` dB), oversampling enum mappings, the polymorphic silence-gate domain, and diagnostic flags (`--diagnose`, `--diagnose-full`). The gate domain contract: mode literals `on`/`true`/`default` map to `GateConfig::default_on()` and `off`/`false`/`0` map to `GateConfig::Off`; numeric dBFS thresholds with optional `db`/`dbfs` suffix (`-60`, `-65.5`, `-45dB`, `-50dbfs`) map to `GateConfig::Threshold`, deriving the close threshold via the 10 dB Schmitt relation `close = max(open − 10 dB, −96 dB)` (`-60` → open `-60.0`/close `-70.0`; `-90` → close clamped at `-96.0`); positive finite values auto-normalize with an off-RT `log::info!` (`60` → `-60.0 dBFS`); out-of-domain (`-120`, `-10`, `10`) and malformed (`abc`, `""`, `NaN`, `-60dBx`) inputs are rejected with didactic `Invalid gate mode` errors. Real-world calibration contexts (single-coil hum/hiss around `-55..-45 dBFS` → `--gate -50`; humbuckers in quiet rooms → default `-70` or `--gate -75`) are documented in the [`README.md`](../README.md). Covers the `--buffer-size` domain contract (`{0} ∪ {2^k | 4 ≤ k ≤ 13}`): `validate_buffer_size` accepts `0, 16, 32, …, 8192` and rejects `1, 2, 8, 15, 63, 100, 500, 8193, 16384, 65536, u32::MAX` with the typed `BufferSizeError` (below-minimum / above-maximum / not-power-of-two, each with an explanatory `Display` message and `std::error::Error`), plus parse-level acceptance of `-b 0` (auto) and `-b 8192`.
-- **Real-Time System Setup & Hardware Sink Detection ([`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)):** Covers the PipeWire-specific bring-up glue: the threaded wrapper (`configure_realtime_thread`, including out-of-bounds/joint-pin/RT-mark behavior) plus PM QoS `/dev/cpu_dma_latency` interaction and default hardware sink detection via `pw-metadata` with a 500 ms watchdog timeout and self-capture node filtering. The host-agnostic CPU affinity selection heuristics (`select_optimal_cpu_with_receipt`), interrupt-load parsing (`parse_interrupts_per_cpu`) and affinity-mask/scheduler-policy invariants are validated by the engine's `rt_hardening` test suite (single source of truth), re-exported here.
-- **Telemetry & Status Polling ([`src/standalone/rt_setup/telemetry_test.rs`](../src/standalone/rt_setup/telemetry_test.rs)):** Validates `PollState` struct lifecycle, hugepage flag synchronization, telemetry throttling, silent and fading transition states, and diagnostic RT status flag clearing during periodic monitoring (`poll_rt_status`). Also covers `TelemetryLatches`/`LatchedSignal` episode semantics (flag and counter signals emit at most once per episode, re-arming only after a clear), the F-UX-13 gate-log rate limiter (`GateTransitionThrottle`: at most one line per `GATE_LOG_MIN_INTERVAL`, the `(×N)` fold count, and a spaced transition not flagged as a repeat — injectable clock, no sleeps) and the bundle-free contract — runtime diagnostics surface as concise `[Exxxx | MNEMONIC]` `log::*` lines and never re-print the `Recent Log Trace` support block.
-- **First-Run Launcher ([`src/standalone/launcher.rs`](../src/standalone/launcher.rs)):** Unit-tests the pure `startup_mode(args_empty)` decision matrix (F-UX-05): arguments → run normally; no arguments → `ExitImmediately` (non-interactive CLI contract). Real stream probing (`IsTerminal`) is confined to `--pause` in `pause_if_interactive`.
-- **Session Banner & Summary ([`src/standalone/banner.rs`](../src/standalone/banner.rs)):** Unit-tests the pure `render_banner`/`render_session_summary` (F-UX-13) across every `✓`/`✗` combination — model/bypass, cab (loaded / none / `--cab-optional` skip), rate, quantum, DSP + total latency, `SCHED_FIFO`/policy + `mlockall`, recording — both without ANSI (asserted escape-free) and with ANSI forced, plus the negative-state hints (`ulimit -r`, `ulimit -l`) and the xrun/bridge-drop summary counters.
-- **Shared Memory Bridge Allocation ([`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)):** Validates page-aligned (4096-byte) memory layout allocation, `madvise` memory flags, and initial atomic generation counters in `allocate_dsp_bridge`.
-- **PipeWire Capture Stream Setup ([`src/standalone/pw_host/capture/setup_test.rs`](../src/standalone/pw_host/capture/setup_test.rs)):** Tests capture property dictionary creation, latency string formatting (`node.latency`), and SPA Pod audio format generation.
-- **Process Callback & Gain Staging ([`src/standalone/pw_host/rt_callback/process_test.rs`](../src/standalone/pw_host/rt_callback/process_test.rs)):** Tests the RT audio processing callback, channel extraction, gain multiplier smoothing, noise gate envelope evaluation, gate pass-through (`GateConfig::Off`) vs active FSM, recording queue dispatch, and silence trimming. Additions: capacity-domain boundaries (2048/2049/8192-frame quantums all pushed whole), overrun accounting in blocks **and** frames (`OVERRUN_COUNT` + `OVERRUN_FRAMES_COUNT`), the reconciliation invariant `captured_frames == enqueued_frames + lost_frames`, and a heap-audit gate (`recording_audio_enqueue_zero_alloc_dealloc`, `feature = "heap-audit"`) proving the recording enqueue path performs zero allocations/deallocations on the RT thread. Capture path classifies SPA chunk metadata via `ChunkWindow` (`Valid`/`Absent`/`Malformed`) — a non-null chunk with `stride != 4` or `SPA_CHUNK_FLAG_CORRUPTED` raises `RT_STATUS_HOST_CONTRACT_VIOLATION` (E2304) and silences both channels instead of degrading silently to `(0, 0)` (`spa_corrupted_chunk_raises_contract_violation`, `spa_bad_stride_raises_contract_violation`), while a legitimate zero window stays silent without a violation (`spa_absent_chunk_stays_silent_no_violation`).
-- **RT Panic Containment ([`src/standalone/pw_host/rt_callback/mod.rs`](../src/standalone/pw_host/rt_callback/mod.rs)):** `run_rt_callback_body` executes every RT `process` closure body (capture and playback) under `catch_unwind(AssertUnwindSafe)` — one guard per quantum, outside the inner sample loops — so a panic never reaches the `pipewire` crate's `extern "C"` trampoline (no `abort` with a corrupted capture). On a captured panic the fatal `RT_STATUS_PANIC_CAPTURED` latch (free bit 31 of the shared `RtStatusFlags::status_bits`) is raised and the closure returns without processed audio. Subsequent callback invocations check the latch via a single Relaxed atomic load before invoking the closure body and return `false` immediately, ensuring the callback body and panic hooks never execute repeatedly while waiting for the control loop to shut down the thread loop. **The latch is effective in the shipped artifact too:** `[profile.dist]` inherits `panic = "unwind"` from `release` — under `panic = "abort"` `catch_unwind` could never catch, nullifying the containment. The control loop treats a contained panic as **terminal**: it fails fast without entering the bounded reconnect cycle (the latch persists, so reconnects would be guaranteed-futile) and re-checks the latch once after the loop so a panic captured in the same window as a SIGINT can never be swallowed by a clean exit 0 (`run.rs`). Tests: `rt_panic_captured_sets_fatal_flag_no_abort` (flag raised, no propagation), `rt_panic_captured_latch_prevents_body_reexecution`, `rt_subsequent_callbacks_suppressed_after_first_panic`, `rt_callback_body_completes_without_flag`, and the heap-audit gate `rt_callback_catch_unwind_wrapper_zero_alloc` (`feature = "testing heap-audit"`: alloc=0, dealloc=0, realloc=0 across 1000 `catch_unwind` cycles).
-- **SPSC Resource Swaps & Command Handling ([`src/standalone/pw_host/rt_callback/commands.rs`](../src/standalone/pw_host/rt_callback/commands.rs), [`src/standalone/pw_host/rt_callback/cabsim_swap.rs`](../src/standalone/pw_host/rt_callback/cabsim_swap.rs), [`src/standalone/pw_host/rt_callback/resampler_swap.rs`](../src/standalone/pw_host/rt_callback/resampler_swap.rs)):** Validates zero-alloc dynamic swaps for neural models, cabinet IR convolution engines (`drain_cabsims`), sample rate converters (`drain_resamplers`), and oversampling engines (`drain_os_engines`), asserting correct GC cascades and RT parking lot dirty flag updates.
-- **Off-RT Rebuild Handlers ([`src/standalone/pw_host/handlers_test.rs`](../src/standalone/pw_host/handlers_test.rs)):** Validates dynamic resampler reconstruction, cabinet IR convolution updates, slimmable container swaps, and oversampling filter rebuilds triggered by sample rate changes.
-- **Backend State Machine & Fail-Fast ([`src/standalone/pw_host/status_test.rs`](../src/standalone/pw_host/status_test.rs)):** Validates `BackendState`/`SharedBackendStatus` lifecycle transitions (Starting → Running → Degraded/Failed → Terminated), the sticky-failure invariant (`mark_running`/`mark_degraded` are no-ops after `mark_failed`), the `observe_stream_state` mapping for capture/playback (`StreamState::Error` and post-streaming `Unconnected` → Failed; initial `Unconnected` → no-op; `Streaming` → Running), and the fail-fast SLA: a control-loop poller mirroring `run.rs` observes a `mark_failed` transition and exits in under 200 ms. Reconnection transitions: `begin_reconnect` clears the sticky failure and publishes the observable `Reconnecting { attempt, total_attempts, next_backoff }` transition, and a successful reconnection returns the backend to `Running` while a second daemon death is observed as a fresh failure. Contained panic observation & repeat suppression: `observe_rt_panic` — the control-loop observation of a contained RT panic (`RT_STATUS_PANIC_CAPTURED`) transitions the backend to `Failed` (stream `"rt_callback"`) so the ordered teardown (with WAV finalization) runs instead of an `abort`. Validated by `observe_rt_panic_transitions_backend_to_failed` and `repeated_rt_panic_invocations_execute_hook_exactly_once` (proves with an instrumented panic hook that across 60+ repeated RT callback invocations before and during `thread_loop.stop()`, the panic hook executes exactly once).
-- **Bounded Reconnect Policy & Cycle ([`src/standalone/pw_host/reconnect_test.rs`](../src/standalone/pw_host/reconnect_test.rs)):** Validates `ReconnectPolicy` (production defaults: 6 attempts with progressive 250 → 500 → 1000 → 2000 → 4000 → 4000 ms exponential backoff, per-episode backoff ceiling 11750 ms; `fail_fast()` disables reconnection entirely; `with_backoff_timeout` trims the attempt count to fit `--reconnect-timeout <s>` while keeping at least one attempt), the strict per-episode time ceiling (`total_backoff_budget`) and the non-blocking guarantee (saturating arithmetic — the schedule can never wrap to zero nor overflow, for any attempt number). `ReconnectCycle` hands out exactly `max_attempts` backoffs and then `None` forever — a daemon that stays inaccessible exhausts the budget and the caller fails fast, while a momentary drop is recovered with the carried DSP state intact. The **stability reset** (F-UX-09) is proven with an injected manual clock (`note_stable`): the per-episode budget is replenished after 60 s (`STABLE_RESET`) of uninterrupted healthy streaming, so three isolated drops spaced beyond `STABLE_RESET` never exhaust it, while seven failures inside the same ~10 s window still exhaust it (the reset is strictly per-episode), the restoration is reported exactly once after a recovery and never on startup, and `--fail-fast` can never grant a retry back.
-- **Recording Worker Guard & Observable Join ([`src/recording/guard_test.rs`](../src/recording/guard_test.rs)):** Validates the RAII teardown of `nam-recording-io`: premature-drop cleanup with bounded join, bounded retry on `push_stream_stop`, join-timeout detection, formal inspection of the worker `Result` and panic payloads, and the ordered StreamStop → producer drop → join shutdown. Exit-code policy: `RecordingWorkerOutcome::exit_code()`: `Success` → 0; `SuccessWithLoss`/`Failed`/`Panicked`/`TimedOut` → 6 (the recording class code; see the README exit-code table), and loss classification — a clean join with `OVERRUN_COUNT`/`OVERRUN_FRAMES_COUNT` > 0 becomes `SuccessWithLoss { blocks, frames }` (`shutdown_reports_success_with_loss_when_overruns_were_counted`), while zero overruns keep `Success` unchanged (`shutdown_with_zero_overruns_stays_success`). **Exit-code policy:** a recording that lost audio blocks to ring overruns is a **non-zero** exit (`SuccessWithLoss`) with an explicit message — `captured_frames == enqueued_frames + lost_frames` is reconcilable and never silent (see `main.rs` mapping).
-- **PipeWire Log Redirection & Off-RT Log Ring ([`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs), [`src/standalone/pw_host/rt_log_ring.rs`](../src/standalone/pw_host/rt_log_ring.rs), [`src/standalone/rt_setup/rt_log_mark.rs`](../src/standalone/rt_setup/rt_log_mark.rs)):** The pure-Rust SPA log handler (Rust 1.99 C-ABI variadics, zero `.c` shims) formats into a fixed 1024-byte stack buffer with allocation-free UTF-8 validation — a non-UTF-8 payload degrades to the static `<non-utf8>` fallback via `stack_msg_to_str` (`non_utf8_payload_falls_back_without_allocation`; heap-audit gate `stack_msg_to_str_is_zero_alloc_on_valid_invalid_and_corrupt_buffers`: alloc/dealloc/realloc all 0 over valid, invalid and NUL-less buffers). The RT callback thread is marked in the first quantum (`rt_log_mark`, TLS consult O(1) — no lock, no alloc, no syscall; armed in `configure_realtime_thread_with` — `test_configure_realtime_thread_arms_rt_callback_mark`), and events raised on that thread are consumed by the pre-allocated SPSC ring (~344 KiB, `rtrb`) instead of calling `log::*` offline: overflow discards and counts in `pw_log_dropped` (`ring_full_discards_with_exact_counter` — saturated pushes land exactly in the counter), the off-RT daemon drains in original order (`ring_preserves_push_order_across_threads`) and replays through the SAME `emit_decoded_pipewire_log` shape as the synchronous dispatch (`marked_thread_queues_and_drainer_emits_in_log_buffer`, `drained_topic_record_matches_sync_dispatch_shape` — no format drift), saturations surface as a latched telemetry warning from `poll_rt_status` (`test_pw_log_ring_drop_warns_once_per_episode`), and unmarked threads keep the immediate synchronous route under routing mode (`unmarked_thread_routes_synchronously_under_ring_mode`, `try_offload_refuses_route_without_ring_mode_or_mark`). The marked-thread zero-alloc proof for the full consult path (decode + capture + saturation drops, 4096 events) is `marked_thread_offload_is_zero_alloc` (`feature = "heap-audit"`: alloc=0/dealloc=0/realloc=0; see `docs/architecture.md` §9.3). Rollback at (re)initialization: `NAM_PW_LOG_SYNC` (any value) is consulted exactly once by `install()` and keeps the synchronous path for every event (no ring, no drainer); runtime rollback is `restore_pipewire_logging` (immediate gate flip, not re-reading the variable).
-- **Recording transport rollback coverage:** the `Inline` branch behind `RECORDING_POOL_TRANSPORT` (`src/recording/transport.rs`) is **structurally unreachable in production** — the const is hard-coded `true` and nothing flips it at runtime. It has **no coverage on the production surface**, only dedicated unit tests (`transport.rs` `tests` module and the `RecordingReceiver::Inline` arms in `guard_test.rs`/`disk.rs` unit paths). It is kept intentionally as the documented rollback; plan: remove it entirely in a future release if it is never needed (no behavior change when removed — see `RECORDING_POOL_TRANSPORT` doc). **Accidental-use tripwire:** every RT-facing dispatch that can consume an `Inline` sender — the capture-callback audio enqueue (`send_recording_audio`) and `RecordingSender::try_push_metadata`/`try_push_audio`/`try_push_stream_stop` — arms `assert_inline_rollback_build()` (`debug_assert!` on `!RECORDING_POOL_TRANSPORT`): a debug build panics fail-fast on any `Inline` sender reaching those paths while the pool transport compiles as default (`inline_sender_reaching_the_rt_send_path_is_accused_outside_rollback_build`, `inline_sender_metadata_route_is_accused_outside_rollback_build`); the deliberate rollback (const flipped to `false`) renders the guard inert, and release builds compile it away while the rollback arm keeps release-codegen behavioral coverage (`inline_sender_still_routes_into_the_inline_ring_once_the_tripwire_is_compiled_out` — bit-identical payload into the inline ring).
-- **Noise Gate Invariant & Resolution Tests ([`src/standalone/pw_host/capture/gate_property_test.rs`](../src/standalone/pw_host/capture/gate_property_test.rs)):** Executes property-based tests (`proptest`) proving that `GateConfig::Off` (zeroed linear thresholds `0.0`) never transitions out of `GateState::Open` for any arbitrary non-negative energy sequence or sustained digital silence. Validates `CaptureState::init` across all `GateConfig` variants, asserting exact derivation of open/close dBFS values and quadratic energy thresholds (`threshold_open_sq`, `threshold_close_sq`), including 10 dB Schmitt hysteresis clamping at `-96.0 dBFS`.
-- **PipeWire Graph Identity & Client Version ([`src/standalone/pw_host/identity.rs`](../src/standalone/pw_host/identity.rs)):** Centralizes all typed constants for PipeWire node names, stream names, media roles, node group (`nam-audio-pipe-dsp`), link group, and thread loop identifiers (`nam-audio-pipe-loop`), eliminating inline literal duplicates. Validates runtime client library version retrieval via `pw_library_version()`.
-- **Optimization & Recording A/B Benchmark Suites ([`src/bin/ab_opt_bench_test.rs`](../src/bin/ab_opt_bench_test.rs), [`src/bin/recording_ab_bench_test.rs`](../src/bin/recording_ab_bench_test.rs)):** Validates statistical percentile calculations (min, p50, p99, max), percentage delta math, JSON serialization formatting, and the analytical cache-line access proxy (`INLINE_LINE_ACCESSES` vs `POOL_LINE_ACCESSES`) that proves the promoted slot pool transport reduces memory subsystem traffic by ~57% relative to the inline SPSC ring.
-- **Asynchronous Recording Helper Modules ([`src/recording/pool_test.rs`](../src/recording/pool_test.rs), [`src/recording/disk_test.rs`](../src/recording/disk_test.rs), [`src/recording/status_test.rs`](../src/recording/status_test.rs), [`src/recording/io_test.rs`](../src/recording/io_test.rs)):** Validates preallocated slot pool descriptor lifecycles, atomic free-list indexing, I/O worker disk serialization, atomic recording status transitions (`Uninitialized → Running → Draining → Stopped/Failed`), and tokio-uring driver loop initialization.
-- **Recording Transparency Modules ([`src/recording/alert_test.rs`](../src/recording/alert_test.rs), [`src/recording/space_test.rs`](../src/recording/space_test.rs), [`src/recording/summary_test.rs`](../src/recording/summary_test.rs)):** `RecordingAlert` (F-UX-02a) — a failure (or a low-space warning) is emitted once as a first alert, reminds only after `ALERT_REMINDER_INTERVAL` (injected clock, no sleep), a changed reason re-emits immediately, a resolved condition clears the latch, and `poll` never blocks on a held status lock. Disk-space thresholds (F-UX-02b) — `bytes_per_second`, `writable_minutes`, the `1 GiB` / `5 min` low-space thresholds (including the time-threshold-only case) and the human-readable estimate, with an injected `FreeSpace`. Session summary (F-UX-11) — the two-segment acceptance case sums duration/size across `_partN`, accounts for mixed sample rates and renders the `💾 Capture saved` line.
-- **Signal Handling & Process Lifecycle ([`src/standalone/signals_test.rs`](../src/standalone/signals_test.rs)):** Validates POSIX signal handler installation (`SIGINT`, `SIGTERM`), the staged grace-window contract (in-burst repeated signals swallowed; `_exit(1)` escalation only after the 500 ms window expires — proven by a self-spawned subprocess test), and cooperative atomic `SHUTDOWN` flag signaling.
+Each unit test verifies strict architectural invariants directly within the relevant module:
+
+#### CLI & Argument Parsing
+
+- **Location**: [`src/standalone/cli_test.rs`](../src/standalone/cli_test.rs)
+- **Contract**: Parses command-line flags, model/IR paths, gain stages (`[-20.0, +20.0]` dB), oversampling factors, and diagnostic modes (`--diagnose`, `--diagnose-full`).
+- **Key Invariants**:
+  - **Buffer Size Domain**: Strictly `{0} ∪ {2^k | 16 ≤ 2^k ≤ 8192}`. Valid values (`0, 16, 32, ..., 8192`) are accepted; invalid values (non-powers-of-two, below 16, above 8192) fail fast with a typed `BufferSizeError` before any PipeWire connection.
+  - **Silence Gate Domain**: Polymorphic mode handling:
+    - Literals `on`/`true`/`default` map to `GateConfig::default_on()` (open at `-70.0 dBFS`, close at `-80.0 dBFS`).
+    - Literals `off`/`false`/`0` map to `GateConfig::Off` (linear threshold `0.0`, permanently open FSM).
+    - Numeric thresholds `[-96.0, -20.0]` dBFS (with optional `db`/`dbfs` suffix) derive the close threshold via 10 dB Schmitt hysteresis: `close = max(open − 10 dB, −96 dB)`.
+    - Positive finite inputs auto-normalize with a logged warning (`60` → `-60.0 dBFS`).
+    - Out-of-domain or malformed inputs reject immediately with exit code 2.
+
+#### Real-Time Thread Setup & PM QoS
+
+- **Location**: [`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)
+- **Contract**: Configures thread scheduling, CPU affinity, and power management constraints.
+- **Key Invariants**: Interacts with `/dev/cpu_dma_latency` to prevent CPU C-state entry latency spikes during audio streaming. Detects default hardware sinks via `pw-metadata` with a 500 ms watchdog timeout and filters out self-capture loopback nodes. Re-exports core affinity heuristics from the engine's verified `rt_hardening` module.
+
+#### Telemetry & Status Polling
+
+- **Location**: [`src/standalone/rt_setup/telemetry_test.rs`](../src/standalone/rt_setup/telemetry_test.rs)
+- **Contract**: Periodically reads atomic bitmasks (`RtStatusFlags`) from the RT thread and publishes throttled off-RT logs.
+- **Key Invariants**:
+  - **Episode Latches**: Flag and counter signals emit at most once per anomaly episode and re-arm only after the condition clears.
+  - **Gate Log Throttling**: Limits gate transition logs to at most one entry per `GATE_LOG_MIN_INTERVAL`, folding rapid chatters into `(×N)` counters.
+  - **Diagnostic Format**: Emits concise `[Exxxx | MNEMONIC]` lines without dumping bloated log traces.
+
+#### First-Run Launcher & Terminal Presentation
+
+- **Location**: [`src/standalone/launcher.rs`](../src/standalone/launcher.rs), [`src/standalone/banner.rs`](../src/standalone/banner.rs)
+- **Contract**: Controls non-interactive vs interactive execution and terminal UI formatting.
+- **Key Invariants**:
+  - `startup_mode(args_empty)` exits immediately with code 0 when called without arguments, enforcing a strict non-interactive CLI contract.
+  - Interactive pause (`--pause`) prompts for Enter only when standard input is an active TTY.
+  - Banner rendering produces deterministic session summaries across all model/IR/rate/quantum configurations, with and without ANSI escape sequences.
+
+#### Shared Memory Bridge
+
+- **Location**: [`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)
+- **Contract**: Allocates shared memory for zero-copy lock-free ping-pong transfer between PipeWire capture and playback streams.
+- **Key Invariants**: Enforces 4096-byte page alignment, applies `madvise` memory hints, and verifies atomic generation counter progression in `allocate_dsp_bridge`.
+
+#### PipeWire Capture Stream Setup
+
+- **Location**: [`src/standalone/pw_host/capture/setup_test.rs`](../src/standalone/pw_host/capture/setup_test.rs)
+- **Contract**: Builds SPA Pod audio format negotiation objects and stream property dictionaries (`node.latency`, media role, node name).
+
+#### Real-Time Audio Callback & Gain Staging
+
+- **Location**: [`src/standalone/pw_host/rt_callback/process_test.rs`](../src/standalone/pw_host/rt_callback/process_test.rs)
+- **Contract**: Executes per-quantum audio processing on the PipeWire real-time thread.
+- **Key Invariants**:
+  - Zero heap allocation/deallocation on the hot-path (verified under `feature = "heap-audit"`).
+  - Handles buffer quantum sizes up to `MAX_BRIDGE_BUF` (8192 frames) without dropping or truncating blocks.
+  - Tracks overruns in both blocks and frames (`OVERRUN_COUNT` and `OVERRUN_FRAMES_COUNT`), preserving the reconciliation invariant: `captured_frames == enqueued_frames + lost_frames`.
+  - Classifies SPA chunk windows (`Valid`/`Absent`/`Malformed`): corrupt chunks (`SPA_CHUNK_FLAG_CORRUPTED`) or invalid strides raise `RT_STATUS_HOST_CONTRACT_VIOLATION` (E2304) and mute output fail-closed.
+
+#### Real-Time Panic Containment
+
+- **Location**: [`src/standalone/pw_host/rt_callback/mod.rs`](../src/standalone/pw_host/rt_callback/mod.rs)
+- **Contract**: Isolates unexpected panics within the RT callback to prevent crashing the host daemon or triggering C-FFI aborts.
+- **Key Invariants**:
+  - Wraps RT closure bodies in `catch_unwind(AssertUnwindSafe)` once per quantum.
+  - On panic, latches the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` (bit 31) and immediately mutes audio.
+  - Subsequent callback invocations check the latch via a single `Relaxed` load and exit instantly, preventing repetitive panic loops while awaiting graceful teardown.
+  - Release profile inherits `panic = "unwind"`, ensuring unwinding containment remains functional in shipped production artifacts.
+  - The control loop treats a captured panic as terminal, bypassing reconnect cycles and performing clean WAV finalization.
+
+#### Lock-Free SPSC Resource Swaps & Rebuild Handlers
+
+- **Location**: [`src/standalone/pw_host/rt_callback/commands.rs`](../src/standalone/pw_host/rt_callback/commands.rs), [`cabsim_swap.rs`](../src/standalone/pw_host/rt_callback/cabsim_swap.rs), [`resampler_swap.rs`](../src/standalone/pw_host/rt_callback/resampler_swap.rs), [`handlers_test.rs`](../src/standalone/pw_host/handlers_test.rs)
+- **Contract**: Enables non-blocking, zero-allocation runtime swaps of neural models, cabinet IRs, sample rate converters, and oversampling engines.
+- **Key Invariants**: Command rings use bounded SPSC queues. The audio thread drains pending updates without blocking, while old resources are returned to an off-RT garbage collection (GC) queue for safe deallocation.
+
+#### Backend State Machine & Fail-Fast SLA
+
+- **Location**: [`src/standalone/pw_host/status_test.rs`](../src/standalone/pw_host/status_test.rs)
+- **Contract**: Manages host operational state transitions (`Starting` → `Running` → `Degraded`/`Failed` → `Terminated`).
+- **Key Invariants**:
+  - **Sticky Failure**: Once marked `Failed`, the state cannot be reverted to `Running` except through a formal reconnection handshake (`begin_reconnect`).
+  - **Fail-Fast SLA**: The main control loop observes a stream failure and initiates teardown in under 200 ms.
+  - A captured RT panic transitions the backend to `Failed`, allowing clean resource release instead of an abrupt abort.
+
+#### Bounded Reconnection Policy
+
+- **Location**: [`src/standalone/pw_host/reconnect_test.rs`](../src/standalone/pw_host/reconnect_test.rs)
+- **Contract**: Implements automated reconnection to the PipeWire daemon when interrupted.
+- **Key Invariants**:
+  - **Default Policy**: 6 attempts with progressive backoff (250 → 500 → 1000 → 2000 → 4000 → 4000 ms), capped at a total budget of 11,750 ms.
+  - **Fail-Fast Mode**: `--fail-fast` sets attempts to 0, terminating immediately on stream disconnect.
+  - **Stability Reset**: After 60 seconds (`STABLE_RESET`) of uninterrupted healthy streaming, the attempt budget fully replenishes. Isolated transient drops do not exhaust the retry budget over time.
+
+#### Asynchronous Recording Engine & Guard Lifecycle
+
+- **Location**: [`src/recording/`](../src/recording/)
+- **Contract**: Manages lock-free audio capture to disk without blocking the real-time processing thread.
+- **Key Invariants**:
+  - **RAII Teardown**: `RecordingWorkerGuard` guarantees bounded worker joins, stopping worker threads and flushing headers safely on drop.
+  - **Loss Accounting**: If overruns occurred during recording, the process exits with code 6 (`SuccessWithLoss`), detailing lost frames without hiding dropped data.
+  - **Memory Subsystem Efficiency**: The promoted `RecordingPool` slot transport reduces memory subsystem traffic by ~57% compared to traditional inline SPSC rings.
+  - **Disk Space Transparency**: Periodically queries filesystem headroom, emitting warnings when free space drops below 1 GiB or 5 minutes of remaining audio.
+
+#### PipeWire Log Redirection & Off-RT Log Ring
+
+- **Location**: [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs), [`rt_log_ring.rs`](../src/standalone/pw_host/rt_log_ring.rs), [`rt_log_mark.rs`](../src/standalone/rt_setup/rt_log_mark.rs)
+- **Contract**: Intercepts C-ABI PipeWire logs and routes them safely away from the real-time audio thread.
+- **Key Invariants**:
+  - Uses a fixed 1024-byte stack buffer with allocation-free UTF-8 conversion.
+  - Audio threads marked via TLS (`rt_log_mark`) divert log messages into a pre-allocated SPSC ring (~344 KiB), avoiding blocking `log::*` macros on the audio thread.
+  - An off-RT drainer thread consumes the ring and replays messages into the application logger in original order.
+
+#### Signal Handling & Process Lifecycle
+
+- **Location**: [`src/standalone/signals_test.rs`](../src/standalone/signals_test.rs)
+- **Contract**: Coordinates POSIX signal handling (`SIGINT`, `SIGTERM`) for graceful process termination.
+- **Key Invariants**:
+  - Implements a staged 500 ms grace window. Repeated signals within this burst window are coalesced into a single cooperative shutdown.
+  - Hard escalation (`_exit(1)`) occurs only if cleanup hangs beyond the 500 ms window.
+
+---
 
 ### 2.2 Integration Test Suites ([`tests/`](../tests/))
 
-- **CLI Black-Box Smoke Tests ([`tests/e2e_cli.rs`](../tests/e2e_cli.rs)):** Executes the compiled binary (`CARGO_BIN_EXE_nam-audio-pipe`) using `std::process::Command` to verify CLI help screens, diagnostic output formatting, polymorphic `--gate MODE` validation (mode literals `on`/`off` and numeric dBFS thresholds; rejecting invalid options like `--gate invalid` and out-of-domain values like `--gate -120` with the usage exit code 2), and robust error handling for invalid or out-of-range options. Negative acceptances: `-b 100`, `-b 1` and `-b 16384` exit non-zero with an explanatory `Argument error` on stderr *before any PipeWire connection* (validated by asserting the message is absent of PipeWire output). The classified *runtime* error contract (F-UX-06/07/08) is covered by fixtures: unloadable model files (empty / truncated / future-version) exit `3` labelled `Model` (never `Argument error`), an explicit unloadable `--cab` exits `4` labelled `Cab IR`, and an unreachable PipeWire socket (`PIPEWIRE_RUNTIME_DIR` pointing at an empty directory) exits `5` with a reachable remediation hint and no panic backtrace. Recording startup failures (unusable `--record-dir`, unavailable `io_uring`) exit `6` labelled `Recording`, never the legacy generic `1` (R-1). `--cab-optional` accepts a missing `--cab` path without a usage error — the loader warns and continues without cab-sim (R-2).
-- **Asynchronous WAV Recording Suite ([`tests/recording.rs`](../tests/recording.rs)):**
-  - `disk_writer_loop_creates_valid_wav`: Asserts that `disk_writer_loop` consumes ring buffer audio blocks and produces valid 32-bit float stereo WAV files.
-  - `disk_writer_loop_metadata_then_stream_stop_creates_empty_wav`: Validates clean zero-sample WAV creation upon immediate stream stop.
-  - `disk_writer_loop_discards_audio_before_metadata`: Verifies uninitialized audio blocks before stream metadata are safely discarded.
-  - `disk_writer_loop_fails_fast_on_missing_output_dir` / `disk_writer_loop_fails_fast_on_file_as_output_dir`: Fail-fast startup handshake under unusable output directories.
-  - `record_e2e_pipewire_wav_header_matches_bytes` (R-13): Full end-to-end recording test under live PipeWire, asserting that the finalized WAV `data` chunk header exactly matches the PCM bytes written to disk.
-- **Recording Fault-Injection & Byte-by-Byte Harness ([`tests/recording_fault_injection.rs`](../tests/recording_fault_injection.rs)):**
-  - `riff_parser_*`: Hand-rolled independent RIFF/WAVE chunk walker (no `hound`) validating `fmt`, `fact` (when present) and `data` structure, cross-checked against `hound` on real files.
-  - `wav_byte_exact_sine_noise_ramp_roundtrip` / `wav_metadata_change_splits_part2_byte_exact`: Sine, deterministic LCG noise and ramp signals compared sample-by-sample (bit-exact) against the persisted PCM, including mid-stream format-change `_partN` splitting.
-  - `wav_byte_exact_capacity_boundaries_2048_2049_8192`: blocks of exactly 2048 frames (the old drop ceiling), 2049 frames and 8192 frames (`MAX_BRIDGE_BUF`) persisted **integrally** and byte-exact — no quantum accepted with `--record` is discarded at enqueue time.
-  - `enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav`: `RLIMIT_FSIZE`/`EFBIG` fault fired mid-stream — observable `Failed` status, RT failure flag, error surfaced on the join and partial WAV preserved bit-exact up to the fault point.
-  - `sigint_shutdown_under_high_rate_never_truncates` / `sigterm_producer_drop_drains_and_finalizes_byte_exact`: Simulated SIGINT/SIGTERM under high transfer rate must never truncate the tail (100% of samples persisted).
-  - `concurrent_workers_same_dir_atomic_creation_no_clobber`: 20 concurrent instances in one directory at the same instant — every capture distinct, no clobbering (anti-TOCTOU).
-  - `recording_cycles_fd_thread_leak_sweep`: 100 consecutive record/stop cycles returning `/proc/self/fd` and thread counts to the baseline.
-- **PipeWire Live Pipeline Integration ([`tests/pw_integration.rs`](../tests/pw_integration.rs)):** Validates the full PipeWire host lifecycle (context creation, dual-stream setup, SPSC parameter injection, real audio quantum execution `last_n_samples > 0`, and atomic shutdown) against a running PipeWire daemon. A silent-tone driver (`ToneDriver`, `pw-play --target NAM-Audio-Pipe-input`) keeps the capture node deterministically scheduled — a sink without an active stream may never process a quantum, and the tone is inaudible (silent WAV, `--volume 0`). Plus two opt-in disruptive acceptances for the bounded reconnect cycle, run only with `NAM_DAEMON_BOUNCE_TEST=1` (serialized via `TEST_MUTEX`, `#[ignore]`d by default; a staged `restore_pipewire_group` recovers the daemon, pulse bridge and `wireplumber` on drop — even on panic):
-  - `test_pipewire_bounded_reconnect_recovers_audio_after_daemon_restart`: restarts the user's PipeWire daemon (`systemctl --user restart pipewire`) mid-session and proves the host re-instantiated its streams and resumed DSP — the fresh capture sink re-registers in the graph and the reconnected stream clock (`capture_host_ticks`) advances again; no loss of models/IRs/recording state.
-  - `test_pipewire_reconnect_exhaustion_terminates_with_error`: stops the daemon + socket + pulse bridge (the minimal set that keeps it down without crashing `wireplumber`), proving the bounded per-episode budget (6 attempts × progressive backoff, 250 ms → 4 s, ceiling 11.75 s) is exhausted and the host terminates cleanly with an error (fail-fast fallback).
-  - `test_pipewire_fail_fast_stream_error_terminates_within_sla`: black-box subprocess acceptance of the **compiled binary** under `--fail-fast` — a forced backend failure (daemon stop) must tear the host down and exit **non-zero inside the SLA** (never a zombie alive without audio, never a graceful 0); exercises the real process exit code that the in-process acceptances cannot.
-- **Service Resilience Harness ([`tests/service_resilience.rs`](../tests/service_resilience.rs)):** Three live subprocess acceptances (Phase 3, `#[ignore]`d):
-  - `sigterm_subprocess_finalizes_wav_gracefully`: spawns the real `nam-audio-pipe --record` binary under live PipeWire, drives the capture sink with a deterministic tone, sends a real `SIGTERM` via `libc::kill` and proves the child exits **0** while the WAV on disk is 100% readable, carries a valid header with a **closed** `data` chunk and **bit-exact** finite samples (two independent readers — a hand-rolled RIFF walker and `hound` — must decode the exact same bits, and the declared `data` size must equal the file tail).
-  - `sigterm_subprocess_finalizes_wav_gracefully_gate_off`: proves that running `nam-audio-pipe --record --gate off` under live PipeWire preserves un-trimmed audio/silence continuously and finalizes the WAV cleanly upon `SIGTERM` with exit code 0.
-  - `double_signal_burst_within_grace_window_stays_graceful`: two rapid `SIGTERM`s (~10 ms apart, far inside the 500 ms grace window of the staged handler) are swallowed into exactly one cooperative shutdown — the child exits **0**, never `_exit(1)` (which only fires for a signal arriving after the grace window expired, i.e. a stuck teardown, and is certified by the unit-level staged-handler subprocess test) and never a signal death.
-    And three daemon-free acceptances that run in every quick pass (Phases 1 & 2):
-  - `bridge_starvation_emits_analytical_silence_and_recycles_buffers`: the playback starvation kernel must emit bit-exact `0.0f32` analytical silence over the quantum-sized window (silence bounded by the active frame count — never the shared-memory `maxsize`), stamp/recycle the SPA chunks (`offset=0`, `size=frames×4`, `stride=4`) and never stall — soaked over 2000 quantums with honest xrun telemetry (`playback_bridge_starvation` advanced, no fabricated `output_buffer_miss`, no contract flag), including a 64 KiB `maxsize` buffer regression scenario that exceeds `MAX_BRIDGE_BUF × 4` and must NOT raise the fail-closed `E2304` flag.
-  - `spa_format_rejection_signals_contract_violation_fail_closed`: mono, interleaved `F32`, `S16` and surround renegotiations must be rejected with a typed `ContractViolation`, raise `RT_STATUS_HOST_CONTRACT_VIOLATION` and latch the RT mute guard (`format_contract_ok == 0`) — fail-closed — then re-arm on a valid `F32P` stereo renegotiation.
-  - `stream_error_observable_and_shutdown_within_sla`: a forced `StreamState::Error` must publish a **sticky** `Failed` transition observable by the main control loop inside the < 500 ms SLA; the full lifecycle (initial `Unconnected` ≠ failure, `Streaming` → `Running`, post-streaming `Unconnected` → `Failed`, sticky-failure, bounded-reconnect back to `Running`) is proven.
-- **Extended Soak Harness ([`tests/soak_extended.rs`](../tests/soak_extended.rs)):** Accelerated-timeline soak battery executed exclusively by the long-audit suite (`utils/tests-long.sh`, Phase 1) with all tests `#[ignore]`d and single-threaded. Purpose (declared in the receipt as `SOAK_PURPOSE: accelerated_timeline`): the audio timeline is **compressed** — 320.000 continuous audio blocks (~426 s of nominal timeline) firing thousands of simultaneous swaps — neural models (WaveNet, LSTM, Linear with known gain), stereo CabSim IRs and sample-rate calibration, oversampling factors (`Off`/`X2`/`X4`) and continuous input/output gain variation. Periodic linear-window validation is **mandatory and fail-closed**: every reached window must complete within the bounded retry budget, zero vanished windows, zero deferred windows. Zero-frame sentinel skips are counted and bounded, never silently ignored:
-  - `test_soak_320k_multichannel_swaps`: 320.000 continuous audio blocks with thousands of concurrent swaps; validates no channel inversion, no gain asymmetry, no undue (exact) silence.
-  - `test_soak_rss_memory_stability`: **raw** `VmRSS` (`/proc/self/status`), page faults, thread and FD counts captured periodically must show no post-warmup memory drift beyond the OS page margin (< 256 KiB, raw signed delta — RSS shrinkage is never a failure).
-  - `swap_soak_extended_concurrent_stress`: 10× concurrent soak (40.000 swaps / 120.000 callbacks) closing the Phase 1 concurrency gate.
-    The deterministic builders, synthetic signal factories, the shared swap-batch cadence and the fail-closed Linear validation window live in [`tests/common/swap.rs`](../tests/common/swap.rs); the `/proc` telemetry readers (RSS/faults/threads/FDs) live in [`tests/common/proc.rs`](../tests/common/proc.rs) — single source of truth, so the accelerated-soak and real-endurance harnesses can never drift apart.
-- **Real Wall-Clock Endurance Suite ([`tests/endurance.rs`](../tests/endurance.rs)):** Real-time wall-clock endurance battery executed exclusively by the long-audit suite (`utils/tests-long.sh`, Phase 6) with all tests `#[ignore]`d and single-threaded. Purpose (declared in the receipt as `ENDURANCE_PURPOSE: real_wall_clock`): the timeline is **not** compressed — the suite runs for a real wall-clock window (`NAM_ENDURANCE_SECONDS`, default 30 s, floor 5 s) at BLOCK=64 / 48 kHz with periodic swap batches. Every mandatory validation window is fail-closed (a window that cannot complete within the bounded retry budget is a hard failure); periodic telemetry records **raw** RSS, minor/major page faults (`/proc/self/stat`), thread and FD counts, with zero-leak/zero-fault/zero-descriptor assertions. A fast non-ignored parser gate (`endurance_telemetry_proc_parsers`) runs in every quick pass.
-- **RT Metrics Harness ([`tests/rt_metrics.rs`](../tests/rt_metrics.rs)):** Nanosecond determinism battery (`libc::clock_gettime(CLOCK_MONOTONIC_RAW)` — immune to NTP), all `#[ignore]`d and exclusive to the long-audit suite (Phases 3/4/5). Four gates:
-  - `rt_deadline_gate_10k_quantums`: 10.000 consecutive quantums of real DSP load (WaveNet A1 + A2 + stereo CabSim active); budget `(N/SR)·10⁹·0.85`; metrics min/mean/p99/max; fail-closed typed marker `TEST_RESULT[rt_deadline]=PASS max_ns=... budget_ns=... margin_pct=... env=...` or `=GAP:sched_fifo_unavailable` / `=GAP:uncalibrated_environment` on a noisy host. Tries promotion to `SCHED_FIFO` (priority 80 via `libc::sched_setscheduler`) and records calibration evidence (`env=pinned:<0|1>,isolated:<0|1>,fifo:<0|1>,governor:<name>,cpu:<id>,cpu9:<offline|online>`). `NAM_RT_STRICT=1` (propagated by `utils/tests-long.sh --strict-pre-release`) promotes any GAP to a hard failure **and** refuses a silent PASS on an uncalibrated host — a numeric pass below the budget only certifies on a calibrated RT environment (single pinned isolated CPU + `SCHED_FIFO`). Refer to [`architecture.md` §4.6](architecture.md#46-host-calibration--maximum-kernel-level-cpu-isolation) for the exact host kernel command line (`isolcpus=managed_irq,domain,8,9 nohz_full=8,9 rcu_nocbs=8,9 irqaffinity=0-7,10-15 nmi_watchdog=0 skew_tick=1`) and offline SMT sibling commands.
-  - `rt_jitter_gate_10k_callbacks`: 10.000 callbacks at the nominal cadence under 6 contention threads; inter-callback dispersion max/p99/p99.99/std-dev; typed `TEST_RESULT[rt_jitter]=PASS max_jitter_us=... p99_jitter_us=... env=...` or `=GAP:sched_fifo_unavailable` / `=GAP:cpu_not_isolated` (Rollback path). Tries promotion to `SCHED_FIFO` (priority 80); on a calibrated host, a certified tail gate asserts that $p99.99 \le 0.75\cdot T$ ($1000\text{ µs}$ for $T = 1333.3\text{ µs}$, overridable via `NAM_RT_JITTER_TAIL_LIMIT_US`). Measured on the calibrated host (isolated core 8 + `SCHED_FIFO` 80): $p99.99$ = 546/798/810 µs across three runs, so the former $0.25\cdot T$ ($333.3\text{ µs}$) limit sat below the real host dispersion and failed; $0.75\cdot T$ keeps a $\ge 15\%$ margin while staying monotonic with $p99 \le 0.5\cdot T$. Under `NAM_RT_STRICT=1` a PASS likewise requires the calibrated environment. Host calibration must eliminate SMIs, deep C-states, and IRQs from the measured core.
-  - `concurrent_state_model_checking_16_threads`: 16 threads racing swap requests, `observe_stream_state` transitions, simulated reconnect cycles and cooperative `SHUTDOWN`; asserts zero deadlocks, no inconsistent sample-rate reads and no leaked failure state; typed `TEST_RESULT[concurrency_stress]=PASS threads=16 window_ms=3000 dsp_quantums=... swaps_requested=...`. The marker names the harness metric honestly (`dsp_quantums`), never "audio callbacks".
-  - `concurrent_spsc_throughput_swap_accounting`: **state-machine throughput through the production SPSC protocol** — `RtSwapHarness::into_parts` splits the harness into its two production faces, so a single-writer producer thread pushes swap commands through the real bounded ring buffers (no global mutex on the measured path) while the RT side runs continuous DSP quantums with per-callback accounting (`structural_applied`, `param_pops`, `structural_pops`, `commands_remaining`). The producer counts every push (`attempted`/`enqueued`/`dropped`), the RT side reports applied/superseded/deferred/pending — complete swap accounting; typed `TEST_RESULT[spsc_throughput]=PASS dsp_quantums=... swaps_attempted=... swaps_enqueued=... swaps_dropped=... swaps_applied=... swaps_superseded=... swaps_deferred=... swaps_pending=...`. Harness throughput is never labelled "audio callbacks" (the receipt distinguishes state-machine throughput from RT audio throughput).
-- **Stereo Fidelity Harness ([`tests/stereo_fidelity.rs`](../tests/stereo_fidelity.rs)):** Proves that the unified stereo DSP pipeline (`capture_dsp_pipeline`) processes each channel bit-identically to an isolated, independent mono pipeline fed only that channel. Evaluated across complex, deterministic synthetic sources: independent L/R white noise (xorshift64* seeds), quadrature chirps (preventing false mono folding), and Karplus-Strong plucked-string synthesis. Acceptance is strictly fail-closed: requires bit-exact equality with `MSE == 0.0` and `SNR > 120 dB`.
-- **Concurrency & Swap-Soak Stress Harness ([`tests/swap_stress.rs`](../tests/swap_stress.rs)):** Drives the full RT capture-callback drain sequence (`RtSwapHarness`) under concurrent swap load. Multiple producer threads fire continuous bursts of slimmable model pairs, full `LoadModel` commands, CabSim IR swaps, polyphase oversampling engine swaps (`Off`/`2x`/`4x`), and input/output gains while the RT audio thread processes audio. Verifies that channel counts never desync (atomic L/R pairing), channel assignment is never inverted (linear gain tag proof), output gains remain symmetric, frame counters keep advancing without deadlock or starvation, and zero allocations occur on the RT thread (`feature = "heap-audit"`).
-- **Distribution QA & Release Audit Harness ([`tests/distribution_qa.rs`](../tests/distribution_qa.rs)):** Certifies release and packaging integrity — every QA/test/optimization/packaging gate operates fail-closed and no silent failure, undocumented skip or invalid metadata is accepted. Runs in every quick pass (Phases 1 & 2). Four acceptance groups:
-  - *(a) AppStream structural validation:* the metainfo XML (`packaging/flatpak/io.github.fabiohl.NAMAudioPipe.metainfo.xml`) is parsed with a strict XML parser (quick-xml, end-tag/comment checking on) and must be well-formed, carry exactly one `<release>` whose `version` equals the crate version, and have the mandatory `date` attribute. Negative tests prove that malformed documents — including duplicated closing tags and truncated (unclosed-root) documents — are detected and rejected.
-  - *(b) Typed test-receipt validator:* a fail-closed libtest-log parser (mirroring `utils/_lib.sh::assert_ran_target` and the Phase 4 `TEST_RESULT[...]=SKIP:` contract) must detect a removed/renamed mandatory target (no `Running <target>` banner), a target section that executed zero tests (100% `#[ignore]` selection), and free-text `SKIP:` markers that are not typed `TEST_RESULT[...]=SKIP:reason` — none of these may ever produce PASS.
-  - *(c) Provenance integrity:* `target/logs/release-provenance.json` is read and every artifact referenced under `artifacts` must exist on disk with a computed SHA-256 and size matching the recorded values byte-for-byte; identity fields are mandatory — `build.profile`, `build.features` (active features), `build.optimizations.measured_performance_claims` (must be `false`: no harness metric is attributed to the final PGO+BOLT ELF) and the `environment` block (`kernel_release` from `uname -r`, `pw_cli_version`). Every **ELF artifact** must carry a non-null `build_id` (captured by `readelf -n` in `utils/build-release.sh`, which fails the `--release-ceremony` fail-closed if the Build-ID is empty) — a receipt with `build_id: null` or missing for the installed ELF is rejected (`provenance_validator_rejects_null_build_id_on_elf_artifact`, `provenance_validator_rejects_missing_build_id_on_elf_artifact`), and the validator **recomputes the build-id from the artifact's own note** (full width: sha1 = 40 hex, sha256 = 64 hex, ...) so a fabricated or truncated value is also rejected (`provenance_validator_rejects_unverifiable_build_id_on_elf_artifact`). A missing receipt is a *typed* skip (`TEST_RESULT[provenance_integrity]=SKIP:receipt_not_found` — no release was built); a present but corrupt/stale receipt is a hard failure. Negative tests cover a vanished referenced file and a tampered hash.
-  - *(d) Distribution binary smoke:* the `--profile dist` binary (stripped, LTO fat; `panic = "unwind"` so the catch_unwind containment is effective in the shipped artifact) — the exact artifact shipped by `utils/build-release.sh` — is exercised as a subprocess from `target/dist/nam-audio-pipe`, the installed `~/.local/bin/nam-audio-pipe`, or `$NAM_DIST_BIN`: `--diagnose` must exit 0, emit the diagnostic bundle and show no crash artifacts, and `--help` must exit 0. Absence of the artifact is a *typed* skip (`TEST_RESULT[dist_bin_smoke]=SKIP:dist_binary_not_found`).
-  - *(e) Certification infrastructure audit:* the long-audit runner and its receipt are themselves certified. `utils/tests-long.sh` must be `+x` with a `GPL-3.0-or-later` SPDX header, the mandatory AI-safety governance warning (execution reserved for the human operator), all 6 canonical phases declared verbatim and the `--strict-pre-release` / `--simulate` argument parsing; `--help` must exit 0, display the resolved benchmark core (`pick_bench_core`) and `chrt -f 80` capability, and inventory the phases (the sanctioned read-only surface), while an unknown option is rejected fail-closed with exit code 2. A fail-closed parser for `target/logs/long-receipt.txt` — the shared `nam_audio_pipe::receipt::long` module (also used by `src/bin/long_receipt_check.rs`) — validates the typed receipt format (`SUITE:`/`STRICT:`/`NAM_RT_STRICT:`/`MODE:`/`SOAK_PURPOSE:`/`ENDURANCE_PURPOSE:`/`PHASEn:`/`GAP:`/`OVERALL:`), rejects unknown lines, missing `OVERALL:` or truncated phase sets, and cross-checks the `OVERALL:` verdict against the phase/gap evidence (a `PASSED` verdict hiding a GAP is rejected). Requires `NAM_RT_STRICT:` propagation-evidence line, per-suite purpose declarations (`SOAK_PURPOSE: accelerated_timeline`, `ENDURANCE_PURPOSE: real_wall_clock`), calibrated environment evidence on RT phases (`env=pinned:1,isolated:1,fifo:1...`) and `PHASE6: PASS` for strict release certification. The live receipt, when present, is parsed and audited (`TEST_RESULT[long_receipt_audit]=PASS`); absence is a *typed* skip that becomes a fatal GAP under `NAM_QUICK_STRICT=1` — a green release gate always implies a valid long-suite receipt was on disk. The `--strict-pre-release` → `NAM_RT_STRICT=1` propagation itself is validated by running the sanctioned `--simulate` surface (receipt records `STRICT: 1` and `NAM_RT_STRICT: 1`) without ever executing the long suite.
-    The release audit skips are surfaced as typed GAPs in the quick-run receipt (and become fatal under `NAM_QUICK_STRICT=1`), so a green release gate always implies auditable release artifacts were present and validated.
+Integration tests validate full-system behavior against real external interfaces, subprocesses, and filesystems:
+
+```text
+tests/
+├── e2e_cli.rs                   -> Subprocess CLI smoke tests, argument parsing & exit codes
+├── recording.rs                 -> Asynchronous disk writer, zero-sample streams, io_uring
+├── recording_fault_injection.rs -> Byte-exact PCM roundtrips, RIFF chunk walker, leak sweeps
+├── pw_integration.rs            -> Live PipeWire streaming, tone driver & reconnect cycles
+├── service_resilience.rs        -> Real SIGTERM handling, grace windows, fail-closed FSM
+├── stereo_fidelity.rs           -> Bit-exact dual-mono vs stereo pipeline equality (SNR > 120 dB)
+├── swap_stress.rs               -> Concurrent multi-producer swap bursts under RT load
+├── soak_extended.rs             -> Accelerated timeline soak (320k blocks, RSS leak checks)
+├── endurance.rs                 -> Wall-clock real-time endurance testing
+├── rt_metrics.rs                -> Nanosecond deadline & jitter benchmarking (SCHED_FIFO)
+└── distribution_qa.rs           -> AppStream validation, release provenance & receipt audits
+```
+
+#### CLI End-to-End Black-Box Suite
+
+- **File**: [`tests/e2e_cli.rs`](../tests/e2e_cli.rs)
+- **Objective**: Validates user-facing CLI behavior by invoking the compiled binary (`CARGO_BIN_EXE_nam-audio-pipe`).
+- **Verifications**:
+  - Rejection of invalid `--buffer-size` flags (`-b 100`, `-b 1`, `-b 16384`) with clear argument error messages on stderr *before* attempting PipeWire initialization.
+  - Rejection of invalid `--gate` modes (`--gate invalid`, `--gate -120`) with exit code 2.
+  - Typed exit code classification: missing/corrupt model exits 3 (`Model`), invalid IR exits 4 (`Cab IR`), unreachable PipeWire exits 5 (`PipeWire`), and recording setup failure exits 6 (`Recording`).
+  - `--cab-optional` allows startup when `--cab` is missing by issuing a warning and bypassing cabinet simulation.
+
+#### Asynchronous WAV Recording Suite
+
+- **File**: [`tests/recording.rs`](../tests/recording.rs)
+- **Objective**: Asserts that `disk_writer_loop` safely drains ring buffers into valid 32-bit float stereo WAV files.
+- **Verifications**: Correct RIFF/WAVE header formation, clean zero-sample WAV finalization on immediate stop, discard of uninitialized blocks, fail-fast behavior on unusable output directories, and end-to-end byte-size equality (`data` header chunk matches written PCM bytes).
+
+#### Recording Fault-Injection & Anti-Leak Harness
+
+- **File**: [`tests/recording_fault_injection.rs`](../tests/recording_fault_injection.rs)
+- **Objective**: Stress-tests recording persistence under adverse filesystem conditions and abnormal shutdowns.
+- **Verifications**:
+  - **Independent Chunk Parser**: Validates RIFF structures using an internal chunk walker cross-checked against `hound`.
+  - **Bit-Exact Roundtrips**: Verifies sample-by-sample fidelity for sine, deterministic LCG noise, and ramp signals, including mid-stream sample rate changes split into `_partN` files.
+  - **Capacity Boundaries**: Persists full 2048, 2049, and 8192-frame quantums without truncation.
+  - **Fault Resilience**: Mid-stream disk space exhaustion (`EFBIG`/`ENOSPC`) preserves partial WAV files cleanly up to the fault point.
+  - **Resource Leak Sweeps**: Verifies that 100 consecutive start/stop cycles release all file descriptors and threads back to baseline.
+
+#### Live PipeWire Host Pipeline
+
+- **File**: [`tests/pw_integration.rs`](../tests/pw_integration.rs)
+- **Objective**: Tests full audio graph execution against an active PipeWire daemon.
+- **Verifications**: Context creation, dual-stream setup, parameter injection, real audio execution (`last_n_samples > 0`), and atomic shutdown. Uses an inaudible tone driver to keep the capture node actively scheduled. Includes opt-in daemon disruption tests (`NAM_DAEMON_BOUNCE_TEST=1`) proving automatic recovery after daemon restarts.
+
+#### Service Resilience & Signal Harness
+
+- **File**: [`tests/service_resilience.rs`](../tests/service_resilience.rs)
+- **Objective**: Exercises live subprocess termination and degraded stream handling.
+- **Verifications**:
+  - Sends real `SIGTERM` signals to a running recording process, asserting exit code 0 and 100% valid, closed WAV files.
+  - Rapid double-signal bursts within the 500 ms grace window are coalesced into a single graceful exit.
+  - Daemon-free tests verify that playback buffer starvation produces exact analytical silence (`0.0f32`), and unsupported SPA audio formats trigger fail-closed muting with typed contract violations (E2304).
+
+#### Stereo Fidelity & Channel Independence
+
+- **File**: [`tests/stereo_fidelity.rs`](../tests/stereo_fidelity.rs)
+- **Objective**: Verifies that the stereo DSP pipeline processes left and right channels with complete independence and bit-exact fidelity.
+- **Verifications**: Feeds complex test signals (uncorrelated noise, quadrature chirps, Karplus-Strong string synthesis) through both stereo and isolated mono pipelines. Asserts exact bitwise identity (`MSE == 0.0`, `SNR > 120 dB`).
+
+#### Concurrency & Swap Stress Harness
+
+- **File**: [`tests/swap_stress.rs`](../tests/swap_stress.rs)
+- **Objective**: Drives the real-time callback under heavy multi-producer concurrent swap load.
+- **Verifications**: Floods the SPSC command queues with model reloads, CabSim IR updates, oversampling switches, and gain changes while processing audio. Proves that channel assignments never invert, atomic pairings remain consistent, and zero allocations occur on the audio thread.
+
+#### Accelerated Soak & Wall-Clock Endurance Suites
+
+- **Files**: [`tests/soak_extended.rs`](../tests/soak_extended.rs), [`tests/endurance.rs`](../tests/endurance.rs)
+- **Objective**: Certifies memory and state stability over prolonged execution.
+- **Verifications**:
+  - **Accelerated Soak**: Processes 320,000 continuous audio blocks (~426 seconds of compressed audio) with thousands of concurrent swaps. Asserts zero page faults and memory drift within OS page margins (< 256 KiB raw `VmRSS` delta).
+  - **Real Wall-Clock Endurance**: Runs at nominal hardware speed (48 kHz / 64 frames) for a configurable duration (`NAM_ENDURANCE_SECONDS`, default 30 s), asserting fail-closed validation windows and zero descriptor leaks.
+
+#### Nanosecond Real-Time Metrics & Jitter Harness
+
+- **File**: [`tests/rt_metrics.rs`](../tests/rt_metrics.rs)
+- **Objective**: Evaluates deterministic execution timing using monotonic clocks (`CLOCK_MONOTONIC_RAW`).
+- **Verifications**:
+  - **RT Deadline Gate**: 10,000 consecutive quantums under full DSP load (WaveNet + CabSim). Worst-case execution must remain strictly below 85% of quantum budget (`(N/SR) * 10^9 * 0.85`).
+  - **RT Jitter Gate**: Measures callback dispersion under thread contention, verifying tail jitter $p99.99 \le 0.75 \cdot T$ on calibrated real-time kernels.
+  - **Concurrency Stress**: Validates lock-free state transitions and SPSC throughput across 16 competing threads.
+
+#### Distribution QA & Release Audit Harness
+
+- **File**: [`tests/distribution_qa.rs`](../tests/distribution_qa.rs)
+- **Objective**: Certifies packaging, metadata, and build artifact integrity before release.
+- **Verifications**: Strict AppStream XML validation (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`), typed test-receipt parsing, cryptographic provenance verification (`release-provenance.json`), and stripped production binary smoke tests.
 
 ---
 
 ## 3. Verification Scripts & QA Suite (`utils/`)
 
+Executable verification scripts in [`utils/`](../utils/) automate testing across different developer and CI phases:
+
 ### 3.1 Static Analysis Quality Gate ([`utils/lints.sh`](../utils/lints.sh))
 
-Executes comprehensive static quality checks:
+Executes mandatory pre-commit static quality checks:
 
-1. **Code Formatting:** Enforces standard Rust formatting via `cargo fmt --all`.
-2. **Compilation Matrix:** Checks all targets with `--all-features` and `--no-default-features`.
-3. **Strict Clippy:** Executes `cargo clippy -- -D warnings` across all feature permutations.
-4. **SPDX License Headers:** Deterministically verifies that all `.rs` and `.sh` files contain valid `GPL-3.0-or-later` or `MIT` SPDX license identifier headers.
-5. **Clippy Suppression Audit:** Flags any undocumented `#[allow(clippy::...)]` attribute that lacks an explanatory comment.
+1. **Formatting**: Enforces standard Rust formatting via `cargo fmt --all`.
+2. **Compilation Matrix**: Runs `cargo check` across `--all-features`, `--no-default-features`, and release profiles.
+3. **Strict Clippy**: Enforces `cargo clippy -- -D warnings` across all feature configurations.
+4. **SPDX License Headers**: Verifies valid `GPL-3.0-or-later` or `MIT` SPDX headers on all `.rs` and `.sh` files.
+5. **AppStream & Desktop Validation**: Validates Flatpak metadata and desktop entries.
 
 ### 3.2 Agile First Line of Defense ([`utils/tests-quick.sh`](../utils/tests-quick.sh))
 
-A 4-phase agile test runner executing under low CPU/IO priority (`nice -n 19`, `ionice -c 3`) to prevent audio system disruption:
+A lightweight 4-phase agile test runner operating under reduced CPU/IO priority (`nice -n 19`, `ionice -c 3`) to prevent audio dropouts during development:
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -125,338 +301,263 @@ A 4-phase agile test runner executing under low CPU/IO priority (`nice -n 19`, `
 │    - cargo test --features testing --lib --bins --tests                     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 2: Release Verification (Release)                                    │
-│    - cargo test --features testing --test recording --test e2e_cli          │
-│                 --test recording_fault_injection --test service_resilience  │
-│                 --test stereo_fidelity --test swap_stress                   │
-│                 --test endurance --test distribution_qa --release           │
+│    - cargo test --features testing --release --test recording               │
+│                 --test e2e_cli --test recording_fault_injection             │
+│                 --test service_resilience --test stereo_fidelity            │
+│                 --test swap_stress --test endurance --test distribution_qa  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 3: PipeWire Live Integration (Release, Daemon Probe)                 │
 │    - Probes pw-cli info 0 -> Runs tests/pw_integration.rs (asserts DSP run) │
-│      + tests/service_resilience.rs live subprocess acceptances (real        │
-│      SIGTERM WAV finalization + in-burst double-signal stays graceful)      │
-│    - Fail-closed: Daemon failure inside test causes immediate panic         │
+│    - Runs tests/service_resilience.rs live subprocess acceptances           │
+│    - Fail-closed: Daemon errors trigger immediate test failures             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Phase 4: Recording io_uring Capability (Release, Native Probe)             │
 │    - Probes src/bin/io_uring_probe -> Runs ignored recording suites         │
-│      (tests/recording.rs + tests/recording_fault_injection.rs)              │
-│    - Asserts WAV data header byte-size match (R-13) and certification        │
-│      battery (fault injection, byte-by-byte, SIGINT/SIGTERM, leak sweep)    │
+│    - Asserts WAV data header byte-size match (R-13) and certification tests │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Outputs each phase log to `target/logs/quick-phaseN.log`.
-- Generates a machine-readable summary receipt at `target/logs/quick-receipt.txt`.
-- Supports strict mode (`NAM_QUICK_STRICT=1`) to promote any environment GAP to a hard test failure.
-- Release audit gates: typed `TEST_RESULT[...]=SKIP:` markers emitted by `tests/distribution_qa.rs`
-  (release artifacts absent — no release built to audit) are surfaced as typed GAPs in the
-  receipt and become fatal under strict mode. A green release gate therefore implies the release
-  artifacts (dist binary + provenance receipt) were present **and** validated.
-- Quick → long ordering is expected, not a failure: a quick pass runs before the long suite, so
-  the `long_receipt_audit` gate (which needs a long receipt to exist) skips with
-  `TEST_RESULT[long_receipt_audit]=SKIP:receipt_not_found`. The receipt additionally labels this
-  exact gap with `GAP_EXPECTED: distribution_qa:TEST_RESULT[long_receipt_audit]=SKIP:receipt_not_found
-  reason=long_suite_not_run`, with an adjacent console note. The gap is never turned into a PASS:
-  the verdict stays `COMPLETED_WITH_GAPS` and strict mode still promotes it. Running
-  `utils/tests-long.sh` produces the receipt and closes the gap.
+Outputs detailed logs to `target/logs/quick-phaseN.log` and emits a structured receipt to `target/logs/quick-receipt.txt`. Under `NAM_QUICK_STRICT=1`, any environmental gap is promoted to a hard failure.
 
 ---
 
-### 3.3 Nightly / Pre-Release Long Audit Suite ([`utils/tests-long.sh`](../utils/tests-long.sh))
+### 3.3 Pre-Release Long Audit Suite ([`utils/tests-long.sh`](../utils/tests-long.sh))
 
-The companion runner for the claims the quick suite deliberately leaves out. It is a
-**human-operator-only** suite (~30–50 min, requires an isolated calibrated real-time
-environment: dedicated CPU affinity, low background load, optionally `SCHED_FIFO`) and
-carries a mandatory AI-safety governance warning — **AI agents must never execute it
-directly**; structural validation uses the non-executing surfaces (`--help`, `--simulate`)
-and the structural audit in `tests/distribution_qa.rs`.
+The comprehensive long-duration audit suite (~30–50 minutes) validates performance and resilience invariants that cannot be verified in quick passes.
 
-It executes 6 isolated phases (a failure in one never interrupts the rest), each writing to
-`target/logs/phaseN-*.log` and closing with a typed line appended to
-`target/logs/long-receipt.txt` (`PHASEn: PASS|FAIL|GAP log=... duration_ms=...`), followed
-by the `GAP:` reasons and the `OVERALL:` verdict (`PASSED` / `COMPLETED_WITH_GAPS` /
-`FAILED`). The receipt also declares each soak suite's purpose
-(`SOAK_PURPOSE: accelerated_timeline ...` and `ENDURANCE_PURPOSE: real_wall_clock ...`):
+> [!CAUTION]
+> **Human Operator Exclusive**: This suite must be executed exclusively by human operators on calibrated real-time test hardware. AI agents must never run this suite directly; agents perform structural validation using `--help`, `--simulate`, and `tests/distribution_qa.rs`.
 
-| Phase      | Canonical Name                                                 | Harness / Oracle                                                                                                                                                                                                                                                                                                                 | Log                      |
-|:---------- |:-------------------------------------------------------------- |:-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |:------------------------ |
-| **PHASE1** | Accelerated soak (compressed timeline) & swap concurrency      | `tests/soak_extended.rs` (320k multichannel swaps — ~426 s of compressed timeline, fail-closed validation windows, RSS stability) + `tests/swap_stress.rs` ignored soak battery, `--release -- --ignored --test-threads=1`; gated via `assert_ran_target` — a missing target is a hard FAIL, a 0-executed battery is a typed GAP | `phase1-soak.log`        |
-| **PHASE2** | RT-Safety heap-audit (zero-alloc)                              | `cargo test --features "testing heap-audit" --release` (lib unit gates `cabsim_swap::heap_audit_tests` + RT paths) + `tests/swap_stress.rs` heap-audit battery; oracle: `assert_eq!(get_alloc_count(), 0)` and shell greps for `swap_soak_heap_audit`                                                                            | `phase2-heap-audit.log`  |
-| **PHASE3** | RT Deadline gate (nanosecond budget)                           | `tests/rt_metrics.rs` deadline filter, 10k quantums, budget `(N/SR)·10⁹·0.85`; oracle: typed `TEST_RESULT[rt_deadline]=PASS`/`GAP:...` — the shell only maps markers, never reclassifies                                                                                                                                         | `phase3-rt-deadline.log` |
-| **PHASE4** | RT Jitter gate (inter-callback dispersion)                     | `tests/rt_metrics.rs` jitter filter, 10k callbacks under 6 contention threads; oracle: typed `TEST_RESULT[rt_jitter]=PASS max_jitter_us=... p99_jitter_us=...`                                                                                                                                                                   | `phase4-rt-jitter.log`   |
-| **PHASE5** | Concurrency interleaving stress, state resilience & throughput | `tests/rt_metrics.rs` concurrent filter, 16 threads + the production-SPSC throughput gate (`concurrent_spsc_throughput_swap_accounting`, no global mutex); oracle: typed `TEST_RESULT[concurrency_stress]=PASS` / `TEST_RESULT[spsc_throughput]=PASS`/`GAP:...`                                                                  | `phase5-concurrency.log` |
-| **PHASE6** | Real wall-clock endurance & state-machine throughput           | `tests/endurance.rs`: real wall-clock endurance (`NAM_ENDURANCE_SECONDS`, default 30 s), fail-closed validation windows, periodic raw RSS/faults/threads/FD telemetry; oracle: typed `TEST_RESULT[endurance_real]=PASS` (a vanished window or leak is a hard failure)                                                            | `phase6-endurance.log`   |
+The suite executes **7 isolated phases**, recording logs to `target/logs/phaseN-*.log` and generating `target/logs/long-receipt.txt`:
 
-**Execution criteria (human operator):** run from the project root as
-`./utils/tests-long.sh` (or with `--strict-pre-release` to promote every GAP to a
-hard, release-blocking failure). `--strict-pre-release` also exports
-`NAM_RT_STRICT=1`, so Phases 3/4/5 (`tests/rt_metrics.rs`) fail hard on an
-uncalibrated environment instead of certifying a silent pass, and the receipt
-records `NAM_RT_STRICT: 1` as propagation evidence. `--simulate`/`--dry-run`
-registers the planned phases in `target/logs/simulate/` without executing any test,
-and never touches the real audit artifacts — the dry run owns an isolated
-`LOG_ROOT` (overridable via `NAM_LOG_ROOT` for hermetic tests); this is the
-sanctioned surface for AI/CI structural validation. The receipt verdict is
-fail-closed and structurally audited by the certification harness
-(`tests/distribution_qa.rs`, group (e)); an unparseable, truncated or internally
-inconsistent receipt fails the gate and blocks verification.
+| Phase      | Canonical Name                        | Harness & Invariant Evaluated                                                                                             | Output Log File            |
+|:---------- |:------------------------------------- |:------------------------------------------------------------------------------------------------------------------------- |:-------------------------- |
+| **PHASE1** | Accelerated Soak & Swap Concurrency   | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts RSS memory delta < 256 KiB. | `phase1-soak.log`          |
+| **PHASE2** | RT-Safety Heap Audit (Zero-Alloc)     | `cargo test --features "testing heap-audit" --release`; asserts exactly 0 heap allocations on RT paths.                   | `phase2-heap-audit.log`    |
+| **PHASE3** | Real-Time Deadline Gate               | `tests/rt_metrics.rs` (10k quantums, DSP load < 85% budget `(N/SR) * 10^9 * 0.85` under `SCHED_FIFO`).                    | `phase3-rt-deadline.log`   |
+| **PHASE4** | Real-Time Jitter Gate                 | `tests/rt_metrics.rs` (10k callbacks under contention; $p99.99 \le 0.75 \cdot T$ dispersion).                             | `phase4-rt-jitter.log`     |
+| **PHASE5** | Concurrency Interleaving & Throughput | `tests/rt_metrics.rs` (16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks).            | `phase5-concurrency.log`   |
+| **PHASE6** | Real Wall-Clock Endurance             | `tests/endurance.rs` (real-time timeline at 48 kHz/64 frames; asserts fail-closed validation windows & zero leaks).       | `phase6-endurance.log`     |
+| **PHASE7** | PipeWire Resilience & Daemon Bounce   | `tests/pw_integration.rs` executed against an isolated PipeWire instance; asserts automatic stream recovery.              | `phase7-pw-resilience.log` |
 
-**Evidence integrity (sprint R1).** A real run never destroys the previous run's
-evidence: before executing, the runner rotates the existing `phase1..7-*.log`,
-`target/logs/long-receipt.txt` and `target/logs/long-audit-receipt.jsonl` into
-`target/logs/prev/<UTC-timestamp>/` (the 3 most recent snapshots are kept; older
-ones are pruned). A failing phase additionally surfaces its cause on the console
-as a `[PHASEn FAIL-TAIL]` block — the last 40 lines of the phase log with
-`panicked at` / `assertion` / `TEST_RESULT[...]=FAIL` lines highlighted, capped
-at 4 KiB — while the full log stays on disk. The typed cause is mirrored into a
-sibling `target/logs/long-audit-receipt.fail-reasons.json` JSONL (one
-`{"phase_id","fail_reason","timestamp"}` record per failed phase) by
-`pipe_long_receipt append --fail-reason`; the unified-schema JSONL is
-engine-owned and stays untouched, so legacy receipts remain valid when the
-sibling is absent (`pipe_long_receipt validate` reports the record count and
-fails closed on a malformed sibling). The suite dynamically resolves the benchmark CPU core via `pick_bench_core` (precedence: `NAM_BENCH_CORE` -> first online isolated CPU from `/sys/devices/system/cpu/isolated`, preferring core 8 when 8-9 are isolated with cpu9 offline intentional -> fallback `nproc / 2`). When available, RT Phases 3 and 4 are promoted to `SCHED_FIFO` (priority 80 via `chrt -f 80 taskset -c $BENCH_CORE`). Release certification additionally requires `PHASE6: PASS`, both purpose declarations (`SOAK_PURPOSE: accelerated_timeline`, `ENDURANCE_PURPOSE: real_wall_clock`), and calibrated environment evidence on RT phases (`env=` containing `pinned:1`, `isolated:1`, and `fifo:1`).
-
-### 3.4 RT Regression Gate & Baseline Discipline
-
-[`utils/tests-performance-regression.sh`](../utils/tests-performance-regression.sh) is a thin wrapper over the engine binary `nam_perf_gate`, the single statistical authority shared with `NeuralAmpModeler-rs` and `NAM-Plug`. It runs the Criterion suite [`benches/rt_gate.rs`](../benches/rt_gate.rs) — which promotes the offline `rt_deadline` real load (production `RtSwapHarness`: WaveNet A1/A2, LSTM, synthetic CabSim) to per-scenario benchmarks — pinned to a dedicated core, and delegates coverage, environment fingerprint, baseline persistence and the machine regression verdict to the engine gate. The legacy single-`RT_METRICS`-line gate has been fully retired in favor of `nam_perf_gate`.
-
-- **Expected coverage:** [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares the mandatory Criterion groups (`PIPE_Host/*` for the host scenarios, `PIPE_AbOpt/*` anchoring the per-topology envelopes shared with `ab_opt_bench`). A group that did not run, or an executed scenario without a saved baseline series, fails closed (`BASELINE_COVERAGE_GAP`) — never a single-scenario pass.
-- **Modes:** `--check` (default, read-only) and `--bootstrap-baseline` (**human operator only**, on a calibrated host).
-- **Gate resolution:** `NAM_PERF_GATE` (prebuilt binary) → `nam_perf_gate` on `PATH` → a sibling engine checkout (`NAM_ENGINE_DIR`, default `../NeuralAmpModeler-rs`). A gate that cannot be resolved fails closed.
-- **Environment:** `NAM_BENCH_CORE`, `NAM_BASELINE_NAME` (default `ci-baseline`), `NAM_BENCH_MANIFEST`, `NAM_THERMAL_COOLDOWN_S` (default 180 s).
-
-Baselines live in `.performance-baselines/` (gitignored). A missing baseline is `MISSING_BASELINE`; a fingerprint drift (CPU model, ISA, toolchain, governor, pinned core, producing commit) is `INCOMPARABLE_ENVIRONMENT`. Both fail closed — baselines are **never** silently re-created; renewal is an explicit human operation under a calibrated environment (see the engine's `docs/benchmarks.md` §4).
-
-### 3.5 Manual / Desktop-Environment Verification (E-04)
-
-F-UX-05 fixes the "double-click opens and closes instantly" launcher symptom by
-keeping the `Terminal=true` window open (print help, wait for Enter). Because the
-outcome depends on the desktop environment's terminal handling, it is closed by a
-**human operator checklist**; automated coverage certifies only the decision logic
-(`launcher::startup_mode`) and the desktop-entry syntax (`desktop-file-validate`).
-
-Run once per desktop environment (GNOME, KDE Plasma, XFCE) after installing the
-Flatpak bundle:
-
-1. **No-argument launch (primary acceptance).** Open the *NAM Audio Pipe* entry from
-   the application menu or run from terminal. Expected: the help/usage is printed and
-   the process exits immediately with code 0 (non-interactive CLI by design).
-   Redirected invocation behaves identically.
-2. **Bypass action.** Use the entry's *Run in bypass (no model)* action. Expected: the
-   host starts streaming dry (no model) with audio flowing.
-3. **Diagnostics action.** Use the *Diagnostics* action. Expected: the diagnostic bundle
-   is printed and the window stays open until Enter (`--diagnose --pause`).
-4. **Redirected invocation is non-blocking.** From a shell, `nam-audio-pipe </dev/null
-   | cat` (or in a script/`systemd` unit). Expected: help printed and the process exits
-   immediately **without** waiting for input.
-5. **Record from the launcher (Flatpak).** Launch with `--record`; expected: the capture
-   lands under `$XDG_MUSIC_DIR/NAM-Audio-Pipe` (thanks to `--filesystem=xdg-music`), not
-   an `EROFS` failure.
-
-Record the observed result (per environment) in this section; a failure reopens the
-finding. Last verified: *(operator to fill in — DE + version, date, PASS/FAIL)*
-
-### 3.6 Measured Evidence & Operator Calibration (E-01…E-04)
-
-Some evidence can only be produced on real hardware/timelines by a **human
-operator**; the items below are the ones the resilience work depends on. Do
-**not** record fabricated values — an unfilled item stays open.
-
-| Id   | What to measure                                                                                             | How                                                                                                                       | Status |
-| ---- | ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------ |
-| E-01 | Full-suite receipts (`target/logs/*`: accelerated soak, heap-audit, RT deadline/jitter, endurance)          | Operator runs `./utils/tests-long.sh` and hands back `target/logs/`; the auditor re-reads the receipts (never re-runs)    | open   |
-| E-02 | Wall-clock cost of `finalize`/`checkpoint` for a 1 GiB capture on SSD / HDD / USB                           | Operator, using the `recording_ab_bench` harness where applicable; record as `// Measured: finalize=... ms (SSD/HDD/USB)` | open   |
-| E-03 | Real PipeWire resurrection latency after `systemctl --user restart pipewire wireplumber` (20 restarts, p95) | Operator; if p95 > 10 s, recalibrate the reconnect ceiling (`PRODUCTION_MAX_BACKOFF_MS` / attempts)                       | open   |
-| E-04 | `.desktop` launcher behavior on GNOME/KDE/XFCE                                                              | Manual checklist in §3.5                                                                                                  | open   |
-
-> **Note on the reconnect constants.** `STABLE_RESET` (60 s), the 6-attempt budget
-> and the 4 s backoff ceiling are **plan-derived policy** (F-UX-09), not a
-> measured p95: E-03 is the calibration that can adjust them.
-> `--reconnect-timeout <s>` exists precisely so an operator can tune the
-> per-episode budget without a rebuild.
+**Pre-Release Strict Mode**: Running `./utils/tests-long.sh --strict-pre-release` sets `NAM_RT_STRICT=1`, requiring calibrated isolated CPUs (`isolcpus`), pinned affinities, and `SCHED_FIFO` priority. Any uncalibrated environment gap is treated as a release-blocking failure.
 
 ---
 
-### 3.7 Host Memory Guards (OOM Containment)
+### 3.4 Real-Time Regression Gate & Baseline Discipline
 
-The reference host has 16 GiB and no swap. Release test compilation and PGO/BOLT
-builds can exhaust RAM alongside `rust-analyzer` and the IDE, triggering a
-**global OOM**; because Electron's main process carries `oom_score_adj=300`, the
-kernel kills the IDE instead of the compiler. Guards:
+[`utils/tests-performance-regression.sh`](../utils/tests-performance-regression.sh) acts as a wrapper around the shared engine binary `nam_perf_gate`. It runs the Criterion benchmark suite ([`benches/rt_gate.rs`](../benches/rt_gate.rs)) pinned to an isolated core.
 
-- **Parallelism:** `.cargo/config.toml` sets `[build] jobs = 4` (override with
-  `CARGO_BUILD_JOBS` on larger hosts).
-- **Containment:** `utils/tests-quick.sh`, `utils/tests-long.sh`,
-  `utils/miri-audit.sh` and `utils/build-release.sh` re-exec through
-  `utils/mem-guard.sh`, a transient systemd user scope with `MemoryHigh=5G`,
-  `MemoryMax=6G`, `MemorySwapMax=6G` and `oom_score_adj=500` for the build tree
-  (`build-release.sh` uses 8G/10G for PGO/BOLT). It fails open when the user
-  manager/cgroup delegation is unavailable.
-- **Opt-out:** `NAM_NO_MEM_GUARD=1` skips containment. Use it for
-  RT-certification runs where cgroup reclaim could add jitter, keeping swap
-  enabled.
-- **IDE protection:** Lower the running IDE's (Antigravity / VS Code family)
-  `oom_score_adj` (default `-500`; negative values need `sudo`) so a runaway build is targeted first.
-- **Benchmarks:** `utils/tests-performance-regression.sh` and
-  `utils/ab-opt-ceremony.sh` are intentionally **not** auto-guarded (a memory
-  cap could distort timings); wrap them manually with `utils/mem-guard.sh` when
-  RAM is tight.
-- **Bench profile:** `[profile.bench]` uses thin LTO and 16 codegen units.
-  Codegen differs from the shipped fat-LTO `release`/`dist`; re-bootstrap
-  Criterion baselines before treating a regression check as authoritative.
+- **Coverage Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares mandatory scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`). Missing groups or missing historical baselines fail-closed (`BASELINE_COVERAGE_GAP`).
+- **Baseline Storage**: Stored locally in `.performance-baselines/` (gitignored). Baselines are never updated automatically; renewal is an explicit operator action under calibrated host conditions.
+- **Environment Drift**: Detects toolchain, kernel, governor, or CPU frequency shifts, rejecting comparisons when host conditions differ (`INCOMPARABLE_ENVIRONMENT`).
 
 ---
 
-## 4. Compiler Optimization Pipeline ([`utils/build-release.sh`](../utils/build-release.sh))
+### 3.5 Manual Desktop Environment Checklist (E-04)
 
-A multi-stage optimization and packaging pipeline combining Profile-Guided Optimization (PGO), LLVM BOLT, and Flatpak distribution. The pipeline is **fail-closed**: an artifact is only declared PGO/BOLT-optimized with structured, cryptographic evidence:
+Because desktop environments (GNOME, KDE Plasma, XFCE) handle terminal emulators differently, GUI launcher behavior is validated via a manual checklist after Flatpak installation:
 
-1. **Phase 1 (Environment Verification):** Validates required tools (`rustc`, `cargo`, `python3`, `tar`, `zstd`, `flatpak`, `llvm-profdata`, `llvm-bolt`, `perf`) and verifies `x86-64-v3` compiler flags.
-2. **Phase 2 (PGO Workload Profiling — coverage matrix):** Builds `src/bin/pgo_workload.rs` with `-Cprofile-generate`, executes the deterministic **coverage matrix** over the full DSP pipeline (gate → resampler → inference → oversample → cabsim → bridge → recording):
-   - **Host rates:** 44.1 / 48 / 96 kHz (weights 0.25 / 0.50 / 0.25).
-   - **Quantums:** 32 / 64 / 128 / 256 / 512 / 1024 frames (weights 0.10 / **0.40** / 0.15 / 0.20 / 0.10 / 0.05 — 64 stays dominant; 128 closes the PipeWire-common gap, 32/1024 close the tails — Sprint 3b).
-   - **Topologies:** WaveNet A1, WaveNet A2, LSTM (1/3 each, mandatory).
-   - **Oversampling:** Off / 2× / 4× (weights 0.60 / 0.20 / 0.20).
-   - **CabSim:** IR / bypass (weights 0.70 / 0.30).
-   - **Gate mode:** on / off (weights 0.50 / 0.50, `--gate on`/`--gate off`).
-   - **Recording:** with and without the production recording transport (0.50 / 0.50, `--record`/`--no-record`).
-     The workload is fail-fast (any I/O/parse/model/IR failure aborts with exit 1) and emits `target/logs/pgo-workload-receipt.json` (schema v2). The receipt records per-cell block counts, per-dimension coverage and — **per DSP group and per topology** — the **minimum frames and samples advanced** (resampler / inference / oversample / cabsim / bridge / recording), never an aggregated global number. The receipt is validated before merging: every mandatory topology must reach ≥ 1000 blocks, every matrix dimension value must be exercised, every DSP group must have advanced real frames per topology, and `no_stage_skipped` must be true — otherwise the build aborts.
-3. **Phase 3 (PGO Compilation):** Recompiles `nam-audio-pipe` using `-Cprofile-use=merged.profdata` and relocation symbols (`-Clink-arg=-Wl,-q`).
-4. **Phase 4 (LLVM BOLT Layout Optimization):** Uses Linux `perf` to capture CPU branch and instruction samples, then executes `llvm-bolt` to optimize instruction cache layout and minimize TLB misses. Readiness is proven (PipeWire capture node registered + process CPU sample consumption, replacing the blind `sleep 1.0`); `perf.data` must have ≥ 8 KiB and ≥ 500 samples; `perf.fdata` must have ≥ 20 sampled entries and DSP hot-path symbol coverage; the ELF Build-ID must match the traces (`--ignore-build-id` removed). Any BOLT failure or unavailability is recorded in `target/logs/release-receipt.json` as `OPTIMIZATION: PGO-ONLY (BOLT_FAILED/BOLT_UNAVAILABLE)` with the detailed cause, and becomes fatal under `--strict-release`.
-5. **Phase 4.5 (Filtered DSP Hotspot Report + Static Gates):** Disassembles the optimized binary, filters to the critical DSP loops only (`target/dsp_hotpath.asm`: `process_block_internal`, `tanh_and_*`, `gated_*`, `ResamplerCore::process*`, `capture_dsp_pipeline*`, `process_dsp_buffer`, `playback_dsp_cycle`, `CabSimAdapter::process_block`, `ConvEngine::process`, `LatencyHistogram::record` — sections `.text`/`.text.cold` only, excluding pre-BOLT `.bolt.org.text` duplicates), keeps the full dump as the secondary artifact (`target/dsp_hotpath.full.asm`), and emits a per-symbol summary (`target/dsp_hotpath_summary.txt`: instructions, `vfmadd*`, `call`, `(%rsp)` spills per symbol). Fail-closed static gates via `utils/dsp-hotpath-filter.py` driven by the per-repo symbol profile `utils/codegen-profile.json`: zero `zmm` (avx512 opt-in policy), zero `libm` calls on the RT path (currently 1 `tanhf` tail — the gate bites by design until Sprint 4), zero `alloc`/`__rust_alloc` calls. For microarchitectural analysis.
-6. **Phase 5 (Deployment):** Strips and installs the hyper-optimized binary to `~/.local/bin/nam-audio-pipe`.
-7. **Phase 6 (Release Packaging):** Packages the release tarball `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.tar.zst` with installer script and documentation.
-8. **Phase 7 (Flatpak Application Packaging):** Builds the standalone Flatpak bundle `~/nam-audio-pipe-vx.y.z-linux-x86_64-v3.flatpak` with low-latency PipeWire, PulseAudio, IPC permissions, and desktop metadata. Support `--install` flag for automated user installation.
-
-**A/B gain proof (operator ceremony — [`utils/ab-opt-ceremony.sh`](../utils/ab-opt-ceremony.sh)):** the DSP hot-path envelope is measured by `src/bin/ab_opt_bench.rs` compiled three ways (plain → PGO → PGO+BOLT), each run with `--runs ≥ 3`. The harness retains per-block serialized cycle counts (min/mean/p50/p99/p999/max + tail latency in ns) and, when `perf_event_open` is permitted, the PMU counters **cycles / instructions / iTLB misses / I-cache misses** with typed availability. The ceremony compares median p99/max/mean and emits the verdict plus the `// Measured: BOLT gain p99=..%, iTLB=..., I-cache=...` comment. **Invariant:** an optimization is announced only when it improves or preserves the measured envelope without regression; if BOLT regresses p99 vs PGO, the explicit **PGO-ONLY** rollback is applied. Fidelity (NAMCore parity, f64 oracle, spectral) is verified separately by this repo's own gates — `utils/lints.sh` + `utils/tests-quick.sh`, with soak/RT budget phases reserved for the human operator's `utils/tests-long.sh` (never run by AI). Quality-contract governance is intentionally delegated to the engine and this repository ships **no** `quality-dashboard.sh` of its own (the engine dashboard remains the single authority; see the sprint decision removing the downstream wrapper). [`utils/tests-performance-regression.sh`](../utils/tests-performance-regression.sh) lives in this repo and wraps the engine `nam_perf_gate` (see [Section 3.4](#34-rt-regression-gate--baseline-discipline)).
-
-**Receipts produced by the pipeline:**
-
-- `target/logs/pgo-workload-receipt.json` — PGO workload coverage matrix (schema v2: per-cell records, per-dimension coverage, per-DSP-group/per-topology minimum frames+samples progress, no-stage-skipped confirmation).
-- `target/logs/release-receipt.json` — release optimization status (`PGO+BOLT`, `PGO-ONLY`, `BOLT-ONLY`, `PLAIN`) with BOLT failure cause, cross-referencing the PGO receipt (including its per-group/per-topology progress). Carries no harness-measured performance metric (nothing is attributed to the final ELF).
-- `target/logs/ab-opt-<variant>.json` — per-variant A/B harness receipt (block-cycle stats, tail latency, PMU counters with typed availability).
-- `target/logs/ab-opt-ceremony-receipt.json` — A/B ceremony verdict (`PGO+BOLT` / `PGO-ONLY`) with per-variant medians and gains.
-- `target/logs/release-provenance.json` — cryptographic chain of custody (schema v2): artifact identity (SHA-256, size, Build-ID of the installed stripped ELF, tarball, Flatpak bundle, metainfo), build identity (profile `dist`, active features, RUSTFLAGS, optimization status with `measured_performance_claims: false`), build environment (`uname -r`, `pw-cli --version`), commit/tree/lock hashes and the ceremony chain. Under `--release-ceremony` the long-suite receipt is verified through the **semantic** `long_receipt_check` gate (`SUITE: tests-long`, `STRICT: 1`, `NAM_RT_STRICT: 1`, `MODE: full`, `OVERALL: PASSED`) — never a substring search.
+1. **No-Argument Launch**: Launch *NAM Audio Pipe* from the application menu. Expected: Displays usage instructions and exits immediately with code 0.
+2. **Bypass Action**: Trigger the *Run in bypass (no model)* action. Expected: Audio streams dry with real-time pass-through.
+3. **Diagnostics Action**: Trigger the *Diagnostics* action. Expected: Diagnostic bundle is printed and the terminal remains open until Enter is pressed (`--diagnose --pause`).
+4. **Non-Blocking Redirection**: Execute `nam-audio-pipe </dev/null | cat` in a terminal. Expected: Prints help text and exits immediately without blocking.
+5. **Flatpak Recording**: Launch with `--record`. Expected: Audio captures save to `$XDG_MUSIC_DIR/NAM-Audio-Pipe` without filesystem permission errors.
 
 ---
 
-## 5. Execution Commands & Developer Workflow
+### 3.6 Empirical Calibration & Evidence Registry (E-01…E-04)
 
-All test commands must be executed within `./NAM-Audio-Pipe/`:
+The following empirical measurements require physical hardware calibration by a human operator:
 
-### 5.1 Utility Scripts Inventory (`utils/`)
+| ID   | Measured Item                                               | Calibration Procedure                                                                 | Status |
+|:---- |:----------------------------------------------------------- |:------------------------------------------------------------------------------------- |:------ |
+| E-01 | Full-suite test receipts                                    | Operator executes `./utils/tests-long.sh` and submits `target/logs/long-receipt.txt`. | Open   |
+| E-02 | WAV finalization latency for 1 GiB capture on SSD / HDD     | Measured via `recording_ab_bench`; documented as `// Measured: finalize=... ms`.      | Open   |
+| E-03 | PipeWire daemon resurrection latency (p95 over 20 restarts) | Measured by restarting PipeWire; adjusts reconnect budget if $p95 > 10\text{ s}$.     | Open   |
+| E-04 | Desktop launcher integration across desktop environments    | Executed via manual checklist in §3.5.                                                | Open   |
 
-| Script                                      | Responsibility & Operation                                                                                          | Operational Scope                                                                               |
-|:------------------------------------------- |:------------------------------------------------------------------------------------------------------------------- |:----------------------------------------------------------------------------------------------- |
-| **`utils/lints.sh`**                        | Static analysis gate: `cargo fmt`, multi-target `cargo check`, clippy, SPDX, AppStream XML                          | Continuous / first-line pre-commit gate                                                         |
-| **`utils/tests-quick.sh`**                  | 4-phase agile suite (structural, release integration, live PipeWire, io_uring)                                      | Agile test loop (local dev & pre-commit)                                                        |
-| **`utils/tests-long.sh`**                   | 6-phase exhaustive audit (accelerated soak, heap-audit, RT deadline/jitter, endurance)                              | Nightly & release certification (operator only)                                                 |
-| **`utils/tests-performance-regression.sh`** | Criterion `rt_gate` regression gate over the engine `nam_perf_gate` (coverage + machine verdict)                    | Operator baseline renewal; on-demand regression check (`--legacy` rollback)                     |
-| **`utils/build-release.sh`**                | Multi-stage release builder with PGO, BOLT, filtered DSP hotspot gates, and Flatpak                                 | Production release pipeline                                                                     |
-| **`utils/dsp-hotpath-filter.py`**           | Unified disassembly filter & static gate (0 `zmm`, 0 `libm` in RT, 0 alloc), driven by `utils/codegen-profile.json` | Invoked by `build-release.sh` Phase 4.5 (shared, byte-identical with the engine and `NAM-Plug`) |
-| **`utils/test-lib-drift.sh`**               | Shell-core drift guard (recomputes the `utils/_lib_core.sh` `sha256`)                                               | On-demand infrastructure test (T5.1)                                                            |
-| **`utils/ab-opt-ceremony.sh`**              | A/B optimization ceremony measuring cycle count/PMU deltas (Plain → PGO → BOLT)                                     | Strictly on-demand ceremony (human operator only)                                               |
-| **`utils/miri-audit.sh`**                   | Formal pointer provenance and aliasing audit for lock-free `RecordingPool`                                          | Strictly out-of-band audit (requires nightly toolchain)                                         |
-| **`utils/test-pick-bench-core.sh`**         | Simulated-sysfs unit tests validating CPU affinity pinning helper `pick_bench_core`                                 | Strictly on-demand infrastructure test                                                          |
+---
 
-### 5.2 Direct Execution Commands
+### 3.7 Host Memory Protections & OOM Defense
+
+On development systems (e.g., 16 GiB RAM without swap), parallel compilation of release binaries or PGO profiles can exhaust memory, triggering the Linux OOM killer. To protect the host, development tools, and IDEs, `NAM-Audio-Pipe` implements a mandatory **two-layer defense**:
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     Host Memory Defense Architecture                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Layer 1: Worker Parallelism Control                                        │
+│    - export CARGO_BUILD_JOBS=4                                              │
+│    - Prevents spawning 16+ simultaneous rustc workers that exhaust RAM.     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Layer 2: Transient Systemd Cgroup Containment                              │
+│    - utils/mem-guard.sh <command>                                           │
+│    - Enforces MemoryHigh=5G, MemoryMax=6G, and oom_score_adj=500.           │
+│    - Contains runaway builds within cgroups without killing the IDE.        │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **IDE Protection**: Lower the IDE process `oom_score_adj` (default `-500`, requires sudo) to ensure compilers are targeted by the kernel before IDE processes.
+- **Opt-Out**: Set `NAM_NO_MEM_GUARD=1` to disable cgroup limits during formal real-time benchmarking where cgroup memory reclamation might introduce timing jitter.
+
+---
+
+## 4. Compiler Optimization & Packaging Pipeline ([`utils/build-release.sh`](../utils/build-release.sh))
+
+`NAM-Audio-Pipe` employs a multi-stage Profile-Guided Optimization (PGO) and LLVM BOLT pipeline to maximize cache locality and execution speed:
+
+```mermaid
+flowchart TD
+    A["Source Code (x86-64-v3)"] --> B["Phase 1: Environment Verification"]
+    B --> C["Phase 2: Instrument & Profile Workload"]
+    C --> D["Phase 3: PGO Recompilation (-Cprofile-use)"]
+    D --> E["Phase 4: LLVM BOLT Binary Layout Optimization"]
+    E --> F["Phase 4.5: Filtered DSP Hotspot Static Gates"]
+    F --> G["Phase 5: Strip & Install ~/.local/bin/"]
+    G --> H["Phase 6: Standalone Tarball (tar.zst)"]
+    G --> I["Phase 7: Flatpak Application Bundle"]
+```
+
+### 4.1 PGO Workload Coverage Matrix
+
+During Phase 2, `src/bin/pgo_workload.rs` executes a comprehensive training matrix across all DSP kernels:
+
+| Matrix Dimension     | Evaluated Values                   | Weight Distribution                  |
+|:-------------------- |:---------------------------------- |:------------------------------------ |
+| **Sample Rates**     | 44.1 kHz, 48.0 kHz, 96.0 kHz       | 25% / 50% / 25%                      |
+| **Quantum Sizes**    | 32, 64, 128, 256, 512, 1024 frames | 10% / **40%** / 15% / 20% / 10% / 5% |
+| **Model Topologies** | WaveNet A1, WaveNet A2, LSTM       | Equal (33.3% each)                   |
+| **Oversampling**     | Off, 2×, 4×                        | 60% / 20% / 20%                      |
+| **Cabinet IR**       | Enabled (Convolution), Bypass      | 70% / 30%                            |
+| **Noise Gate**       | Enabled, Disabled                  | 50% / 50%                            |
+| **Recording Pool**   | Enabled, Disabled                  | 50% / 50%                            |
+
+The workload generates `target/logs/pgo-workload-receipt.json`, verifying that every model topology processes at least 1,000 blocks and no DSP stage is skipped.
+
+### 4.2 Static Assembly & Microarchitectural Gates (Phase 4.5)
+
+After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disassembled hot-path (`target/dsp_hotpath.asm`), enforcing strict static architectural rules:
+
+- **Zero AVX-512 `zmm` registers**: Enforces baseline `x86-64-v3` compatibility.
+- **Zero `libm` calls in RT paths**: Prohibits scalar standard library math calls in audio loops.
+- **Zero `alloc` / `__rust_alloc` symbols**: Prohibits heap allocation in DSP kernels.
+
+### 4.3 A/B Optimization Ceremony ([`utils/ab-opt-ceremony.sh`](../utils/ab-opt-ceremony.sh))
+
+A human operator script that measures performance deltas across three compilation stages: `Plain` → `PGO` → `PGO+BOLT`. It records CPU cycles, instructions, instruction TLB misses, and I-cache misses using Linux PMU hardware counters. If BOLT degrades tail latency ($p99$) compared to PGO, the pipeline automatically falls back to **PGO-ONLY**.
+
+---
+
+## 5. Developer Workflow & Execution Guide
+
+All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repository:
+
+### 5.1 Utility Scripts Reference
+
+| Script                                      | Primary Responsibility                                                    | Target Audience / Frequency        |
+|:------------------------------------------- |:------------------------------------------------------------------------- |:---------------------------------- |
+| **`utils/lints.sh`**                        | Static quality checks (`cargo fmt`, `check`, `clippy`, SPDX, XML).        | Continuous / Every commit          |
+| **`utils/tests-quick.sh`**                  | 4-phase agile verification suite (unit, release, live PipeWire, io_uring) | Daily development / Pre-push       |
+| **`utils/tests-long.sh`**                   | Exhaustive 7-phase audit (soak, zero-alloc, RT deadline, endurance).      | Nightly / Release verification     |
+| **`utils/tests-performance-regression.sh`** | Criterion regression gate backed by the engine's `nam_perf_gate`.         | Performance audit / Baseline setup |
+| **`utils/build-release.sh`**                | Full release builder with PGO, BOLT, hotspot filtering, and Flatpak.      | Production releases                |
+| **`utils/ab-opt-ceremony.sh`**              | Hardware PMU counter benchmark measuring optimization deltas.             | Release optimization validation    |
+| **`utils/miri-audit.sh`**                   | Out-of-band formal aliasing and data-race audit for lock-free rings.      | Maintenance / Unsafe code audit    |
+
+### 5.2 Direct Command Cheat Sheet
 
 ```bash
-# 1. Run static analysis quality gate
-./utils/lints.sh
+# -----------------------------------------------------------------------------
+# 1. Static Analysis Quality Gate
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
+./utils/mem-guard.sh ./utils/lints.sh
 
-# 2. Run consolidated quick test suite
+# -----------------------------------------------------------------------------
+# 2. Agile Test Suite (4-Phase Quick Verification)
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 ./utils/tests-quick.sh
 
-# 3. Run unit tests only
+# -----------------------------------------------------------------------------
+# 3. Unit Tests Only
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 cargo test --features testing --lib
 
-# 4. Run CLI smoke tests
+# -----------------------------------------------------------------------------
+# 4. CLI End-to-End Black-Box Tests
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 cargo test --features testing --test e2e_cli
 
-# 5. Run live PipeWire integration test (requires running PipeWire daemon)
+# -----------------------------------------------------------------------------
+# 5. Live PipeWire Integration (Requires Running PipeWire Daemon)
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 cargo test --features testing --release --test pw_integration -- --ignored --nocapture
 
-# 6. Run full recording io_uring integration test
+# -----------------------------------------------------------------------------
+# 6. Asynchronous Recording Integration (io_uring)
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 cargo test --features testing --release --test recording -- --ignored --nocapture
 
-# 6b. Run the recording fault-injection, byte-by-byte and leak-sweep harness
-cargo test --features testing --release --test recording_fault_injection -- --ignored --test-threads=1 --nocapture
-
-# 6c. Run the service-resilience harness (daemon-free acceptances)
-cargo test --features testing --test service_resilience
-
-# 6d. Run the live service-resilience subprocess acceptances (real SIGTERM /
-#     double-signal against the compiled binary; requires live PipeWire)
-cargo test --features testing --release --test service_resilience -- --ignored --test-threads=1 --nocapture
-
-# 6e. Run the distribution-QA & release-audit harness (strict AppStream
-#     XML, typed receipt validator, provenance integrity, dist binary smoke)
+# -----------------------------------------------------------------------------
+# 7. Distribution QA & Packaging Audit
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 cargo test --features testing --test distribution_qa
 
-# 6f. Long-audit suite — HUMAN OPERATOR ONLY (~30-50 min, calibrated RT env).
-#     AI agents must never execute it directly; use the non-executing surfaces:
-./utils/tests-long.sh --help       # usage & phase inventory
-./utils/tests-long.sh --simulate   # registers the 6 planned phases + receipt
-#     Full audit (human operator, calibrated machine):
-./utils/tests-long.sh              # or: ./utils/tests-long.sh --strict-pre-release
-
-# 7. Run full PGO + LLVM BOLT release build
+# -----------------------------------------------------------------------------
+# 8. Full Release Build (PGO + LLVM BOLT + Flatpak)
+# -----------------------------------------------------------------------------
+export CARGO_BUILD_JOBS=4
 ./utils/build-release.sh
-
-# 8. A/B optimization ceremony — HUMAN OPERATOR ONLY (never by AI agents).
-#    Builds plain → PGO → PGO+BOLT, runs each >= 3 times and emits the verdict
-#    (PGO+BOLT or the explicit PGO-ONLY rollback) + the // Measured: comment.
-./utils/ab-opt-ceremony.sh --runs 3
 ```
 
 ---
 
-## 6. Quality Gates & Architectural Constraints
+## 6. Architectural Contracts & Quality Gates
 
-| Metric / Test Gate              | Constraint / Threshold                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Enforced In                                                                                              |
-|:------------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |:-------------------------------------------------------------------------------------------------------- |
-| **Real-Time Memory Safety**     | Exactly 0 heap allocations / deallocations in RT callback                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | Architectural invariants & review                                                                        |
-| **Lock-Free Concurrency**       | Exactly 0 mutex locks or blocking syscalls on audio thread                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | `src/standalone/pw_host/`                                                                                |
-| **WAV Header Integrity (R-13)** | Finalized WAV header `data` size == exact PCM bytes written                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | `tests/recording.rs`                                                                                     |
-| **Recording Capacity Domain**   | Every quantum accepted with `--record` (up to `MAX_BRIDGE_BUF` = 8192 frames) is persisted integrally: boundaries 2048/2049/8192 verified byte-exact; reconciliation `captured_frames == enqueued_frames + lost_frames` via `OVERRUN_COUNT` + `OVERRUN_FRAMES_COUNT`; `get_dealloc_count() == 0` on the enqueue path                                                                                                                                                                                                                                                                              | `process_test.rs` / `tests/recording_fault_injection.rs` / `utils/tests-long.sh` (Phase 2)               |
-| **PipeWire Execution (R-17)**   | `LIVE_PW=RAN` emitted only after ≥1 real DSP quantum executed                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `tests/pw_integration.rs` / `tests-quick.sh`                                                             |
-| **Target CPU Baseline**         | Mandatory `x86-64-v3` (AVX2, FMA, BMI2) minimum target                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | `.cargo/config.toml`                                                                                     |
-| **AppStream Structural**        | Metainfo parses under strict XML; exactly one `<release>` with `version == CARGO_PKG_VERSION` and non-empty `date`; malformed/truncated documents rejected                                                                                                                                                                                                                                                                                                                                                                                                                                        | `tests/distribution_qa.rs` / `utils/lints.sh`                                                            |
-| **Typed Receipt**               | Every mandatory target must have executed ≥1 test; free-text `SKIP:` without `TEST_RESULT[...]=SKIP:reason` marker fails validation                                                                                                                                                                                                                                                                                                                                                                                                                                                               | `tests/distribution_qa.rs` / `utils/_lib.sh`                                                             |
-| **Provenance Integrity**        | `target/logs/release-provenance.json` references only existing files with byte-identical SHA-256 and size; missing receipt is a typed skip, corrupt receipt is a hard failure                                                                                                                                                                                                                                                                                                                                                                                                                     | `tests/distribution_qa.rs` / `utils/build-release.sh`                                                    |
-| **Dist Binary Smoke**           | `--profile dist` (stripped, LTO fat; `panic = "unwind"` so catch_unwind containment works in the shipped artifact) binary exits 0 on `--diagnose`/`--help`, emits diagnostic bundle, no crash artifacts                                                                                                                                                                                                                                                                                                                                                                                           | `tests/distribution_qa.rs` / `utils/build-release.sh`                                                    |
-| **Buffer Size Domain**          | `--buffer-size` domain strictly `{0} ∪ {2^k \| 16 <= 2^k <= 8192}`; out-of-domain values (`1, 2, 8, 15, 63, 100, 500, 8193, 16384, 65536, u32::MAX`) rejected with the typed `BufferSizeError` before any PipeWire connection or allocation                                                                                                                                                                                                                                                                                                                                                       | `src/standalone/cli.rs` / `cli_test.rs` / `tests/e2e_cli.rs`                                             |
-| **Gate Threshold Domain**       | `--gate MODE` polymorphic: literals `on`/`true`/`default` → `GateConfig::default_on()` (`-70.0 dB` open, `-80.0 dB` close), `off`/`false`/`0` → `GateConfig::Off` (zeroed linear thresholds, FSM permanently open); numeric dBFS thresholds in `[-96.0, -20.0]` (`GAIN_MIN_DB` LUT floor to safety ceiling) with optional `db`/`dbfs` suffix and auto-sign normalization (`60` → `-60.0 dBFS`, logged); close threshold derived via 10 dB Schmitt hysteresis `max(open − 10, −96)`. Out-of-domain/malformed values rejected fail-fast with a didactic `Invalid gate mode` message before PipeWire | `src/standalone/cli.rs` / `cli_test.rs` / `tests/e2e_cli.rs`                                             |
-| **RT Quantum Bounds**           | Quantum rejection fail-closed: any SPA descriptor reporting `n_samples > MAX_BRIDGE_BUF` (8192) is rejected; exactly `MAX_BRIDGE_BUF` frames (32.768 bytes) is the largest accepted quantum                                                                                                                                                                                                                                                                                                                                                                                                       | `src/standalone/pw_host/rt_callback/process.rs` / `process_test.rs` / `output_pw.rs`                     |
-| **RT Deadline**                 | Worst-case DSP processing per quantum < 85% of the block budget `(N/SR)` over 10k quantums (p99/max measured with `CLOCK_MONOTONIC_RAW`); environment gaps typed `GAP:uncalibrated_environment`, fatal under `NAM_RT_STRICT=1` or `--strict-pre-release`                                                                                                                                                                                                                                                                                                                                          | `tests/rt_metrics.rs` / `utils/tests-long.sh` (Phase 3)                                                  |
-| **Zero-Alloc RT**               | Rigorously 0 heap allocations on the RT thread in every operational/error state, proven by the `heap-audit` counting allocator (`assert_eq!(get_alloc_count(), 0)`) across all callback paths — normal, noise-gate transition, noise-gate disabled (permanently open), playback-bridge starvation, malformed FFI and oversized quantum                                                                                                                                                                                                                                                            | `tests/swap_stress.rs` / `src/.../cabsim_swap.rs` (`heap_audit_tests`) / `utils/tests-long.sh` (Phase 2) |
-| **Long-Audit Structural**       | `utils/tests-long.sh` is `+x`, `GPL-3.0-or-later` SPDX-licensed, declares the AI-safety warning and all 6 canonical phases, parses `--strict-pre-release`/`--simulate`; `target/logs/long-receipt.txt` parses fail-closed and its `OVERALL:` verdict matches the phase/gap evidence                                                                                                                                                                                                                                                                                                               | `tests/distribution_qa.rs` / `utils/tests-long.sh`                                                       |
-| **Miri Concurrency Audit**      | Out-of-band UB/aliasing audit under Stacked Borrows / Tree Borrows; proves absence of data races in lock-free protocols (active: `RecordingPool` 11/11 pass; `DspBridge` concurrent writer/reader handshake, waiver `F-MIRI-BRIDGE-01` RESOLVED by NeuralAmpModeler-rs 1.0.0 interior mutability) without FFI; isolated from stable-only release gates                                                                                                                                                                                                                                            | `utils/miri-audit.sh` / `src/recording/pool_test.rs` / `src/standalone/pw_host/pw_host_test.rs`          |
+The following contractual rules are enforced across test suites and CI checks:
+
+| Quality Gate                | Target Contract / Boundary Threshold                                                                                                       | Enforcement Location                                       |
+|:--------------------------- |:------------------------------------------------------------------------------------------------------------------------------------------ |:---------------------------------------------------------- |
+| **Real-Time Memory Safety** | Exactly 0 heap allocations / deallocations in the RT callback.                                                                             | Verified under `feature = "heap-audit"`                    |
+| **Lock-Free Concurrency**   | Zero mutex locks or blocking system calls on the audio thread.                                                                             | Architecture review & static analysis                      |
+| **WAV Header Integrity**    | Finalized WAV `data` chunk header size must match the exact PCM payload bytes written to disk.                                             | `tests/recording.rs`, `tests/recording_fault_injection.rs` |
+| **Buffer Size Domain**      | Strictly `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`. Out-of-domain inputs reject fail-fast with typed `BufferSizeError`.                             | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                |
+| **Silence Gate Domain**     | Polymorphic mode: `on`/`off` or `[-96.0, -20.0]` dBFS threshold with 10 dB Schmitt hysteresis. Rejected fail-fast on malformed inputs.     | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                |
+| **RT Quantum Bounds**       | Maximum supported quantum is `MAX_BRIDGE_BUF` (8192 frames / 32,768 bytes). Larger descriptors reject fail-closed.                         | `src/standalone/pw_host/rt_callback/process.rs`            |
+| **RT Deadline Processing**  | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                           | `tests/rt_metrics.rs`, `utils/tests-long.sh` (Phase 3)     |
+| **Target CPU Baseline**     | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                       | `.cargo/config.toml`                                       |
+| **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`.                            | `tests/distribution_qa.rs`, `utils/lints.sh`               |
+| **Release Provenance**      | `release-provenance.json` must record cryptographic SHA-256 hashes and Build-IDs for all distribution artifacts.                           | `tests/distribution_qa.rs`, `utils/build-release.sh`       |
+| **Long-Audit Structure**    | `utils/tests-long.sh` must be executable, SPDX-licensed, declare the AI safety warning and all 7 canonical phases, and parse `--simulate`. | `tests/distribution_qa.rs`, `utils/tests-long.sh`          |
+
+---
 
 ### 6.1 Out-of-Band Miri Concurrency & Aliasing Audit
 
-In compliance with project policy, standard release and CI gates remain strictly **stable-only**. To verify formal pointer provenance, absence of data races, and compliance with the Stacked Borrows and Tree Borrows aliasing models under the MIR interpreter, an out-of-band audit tool is provided:
+Standard builds and CI pipelines use the stable Rust toolchain. To formally verify pointer provenance and absence of data races under the Stacked Borrows and Tree Borrows models, an out-of-band Miri script is provided:
 
 ```bash
-# Optional manual audit (requires nightly toolchain + miri component):
+# Optional manual verification (requires nightly toolchain + miri):
 ./utils/miri-audit.sh
 ```
 
-**Target Feasibility Matrix & Upstream Tracking:**
+**Miri Audit Scope**:
 
-1. **`src/recording/pool_test.rs` (`RecordingPool`) — Fully Sound & Verified (11/11 tests pass under Miri):**
-   Pure Rust SPSC ring and descriptor ownership state machine. Verifies absence of data races, control barrier ordering, FIFO integrity, and drop leak detection without FFI dependencies. Enforced fail-closed in `miri-audit.sh` (must pass all 11 tests).
-2. **`src/standalone/pw_host/pw_host_test.rs` (`test_dsp_bridge_concurrent_access`) — Active & Verified (Waiver `F-MIRI-BRIDGE-01` RESOLVED):**
-   Exercises the lock-free ping-pong bridge under concurrent writer/reader threads. `NeuralAmpModeler-rs 1.0.0` wraps `DspBridge::buffers` in `core::cell::UnsafeCell` and both `DspBridgeWriter` (`write_block`/`write_silence`) and `DspBridgeReader` (`read_block`) reach the payloads through raw pointers (`UnsafeCell::get`) without ever materializing a whole-struct `&DspBridge`/`&mut DspBridge`, eliminating the Miri retag conflict. The test runs unflagged (no `#[cfg_attr(miri, ignore)]`) and is enforced fail-closed as an active target in `utils/miri-audit.sh`.
-   - **Engine-side verification (`NeuralAmpModeler-rs`):** the engine's own `utils/miri-audit.sh` audits `dsp::pipeline::bridge` (4/4 tests) as part of its out-of-band matrix.
-   - **Historic tracking:** the former waiver required wrapping `buffers` in `UnsafeCell` or narrowing borrows in `read_block`/`write_block` to avoid whole-struct `&DspBridge` references during concurrent execution — both landed in the 1.0.0 bridge rewrite.
-3. **`src/standalone/pw_host/rt_callback/harness.rs` (`RtSwapHarness`) — Excluded from Full Pipeline Miri:**
-   Exercises the full DSP pipeline with AVX2/FMA vector intrinsics and large buffer allocations (`MAX_RESAMP_BUF = 8192`), resulting in severe interpreter slowdown (~10,000×) and potential unhandled SIMD intrinsic aborts. The concurrent swap state-machine drains can be audited under Loom/unit tests instead.
+1. **`src/recording/pool_test.rs` (`RecordingPool`)**: 11/11 tests pass under Miri, verifying lock-free SPSC ring ordering and atomic descriptor ownership without data races.
+2. **`src/standalone/pw_host/pw_host_test.rs` (`test_dsp_bridge_concurrent_access`)**: Exercises the shared ping-pong memory bridge under concurrent writer and reader threads. `DspBridge::buffers` wraps storage in `UnsafeCell`, accessing payloads through raw pointers to avoid invalid whole-struct retags.
+3. **Exclusions**: Full neural network SIMD evaluation kernels are excluded from Miri due to vector intrinsic emulation overhead (~10,000× slowdown).
 
 ---
 
 ## 7. References
 
-- [NAM-Audio-Pipe Architecture](architecture.md) — Core host architecture and threading model.
-- [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) — Core neural DSP engine.
-- [PipeWire Official Documentation](https://docs.pipewire.org/) — Linux audio graph daemon.
+- [NAM-Audio-Pipe Architecture](architecture.md) — Comprehensive threading model, host lifecycle, and memory layout.
+- [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) — Agnostic neural DSP engine.
+- [PipeWire Official Documentation](https://docs.pipewire.org/) — Linux audio graph daemon and SPA API reference.

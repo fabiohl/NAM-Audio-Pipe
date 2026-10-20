@@ -430,7 +430,7 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     assert_eq!(stream_status.e2e_hist.total_count(), 0);
 }
 
-/// EC-15 / T3.4: the end-to-end capture↦playback observation uses the log-linear
+/// The end-to-end capture↦playback observation uses the log-linear
 /// `LatencyHistogram` (≤ 12.5 % per-bin error), so a right-skewed distribution
 /// resolves **distinct** p50 and p99. The pre-migration power-of-two
 /// `AtomicHistogram` collapsed both onto the same bin edge, hiding tail
@@ -451,7 +451,7 @@ fn test_e2e_histogram_resolves_distinct_percentiles() {
     assert!(p50 <= p99, "p50 ({p50}) must not exceed p99 ({p99})");
     assert_ne!(
         p50, p99,
-        "the E2E LatencyHistogram must resolve a distinct tail percentile (EC-15)"
+        "the E2E LatencyHistogram must resolve a distinct tail percentile"
     );
 }
 
@@ -784,7 +784,7 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
     rt_log_ring::reset_pw_log_dropped_for_test();
 }
 
-/// S6-T4 / F-PR-11: the off-RT `prime_silence` pre-roll delivers the first
+/// F-PR-11: the off-RT `prime_silence` pre-roll delivers the first
 /// playback quantum through the normal wet path (no starvation), and the
 /// telemetry loop suppresses bridge clock-drift drops observed inside the
 /// bring-up window, accounting them only once the window closes.

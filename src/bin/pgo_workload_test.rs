@@ -160,7 +160,7 @@ fn matrix_weights_sum_to_one_per_dimension() {
     );
     // Documented typical-use dominance: 48 kHz and the 64-frame quantum are
     // the most-weighted cells (low-latency default first; 64 stays dominant
-    // over 128/256/512 and over the 32/1024 tails — Sprint 3b).
+    // over 128/256/512 and over the 32/1024 tails).
     const {
         assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[0]);
         assert!(RATE_WEIGHTS[1] > RATE_WEIGHTS[2]);

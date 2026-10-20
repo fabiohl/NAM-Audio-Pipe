@@ -4,7 +4,7 @@
 //! Resampler Draining (Zero-Alloc Swap) — engine `RtSwapDrain` integration.
 //! Replaces resamplers without using memory allocation in the critical path.
 //!
-//! T9.5 (F-PERF-20): the hand-rolled 3-phase protocol was migrated to the
+//! The 3-phase swap protocol uses the
 //! engine's canonical scheduler
 //! ([`RtSwapDrain`] + [`RtSwapHandler`], `NeuralAmpModeler-rs/common/spsc/swap.rs`)
 //! for this dedicated `Consumer<Box<ResamplerSwapPayload>>` channel — the ring
