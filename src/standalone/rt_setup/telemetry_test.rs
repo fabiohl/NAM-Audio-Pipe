@@ -864,6 +864,132 @@ fn test_playback_bringup_preroll_suppresses_drift() {
 }
 
 #[test]
+fn test_playback_bringup_delayed_poll_suppresses_startup_drops() {
+    let _guard = init_test_logger();
+    let bridge = create_test_bridge();
+    let stream_status = StreamStatusFlags::new();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let mut state = PollState::default();
+
+    // Real-world scenario: The audio thread progresses past the 4 bring-up quantums
+    // in ~5.3 ms, so the very first telemetry poll (after 100 ms) observes
+    // `playback_quantums == PLAYBACK_BRINGUP_QUANTUMS`.
+    // The startup drops accumulated in the bridge during that ramp must still be suppressed.
+    bridge.dropped_frames.store(1, Ordering::Relaxed);
+    stream_status.playback_quantums.store(
+        crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS,
+        Ordering::Relaxed,
+    );
+
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        0,
+        "first poll startup drops must be suppressed even if quanta reached bring-up limit"
+    );
+    assert!(
+        state.bringup_completed,
+        "bring-up must be marked completed after the initial startup drain"
+    );
+
+    // Second poll in steady state: any subsequent drops are genuine clock drift.
+    bridge.dropped_frames.store(2, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        2,
+        "subsequent drops after bring-up must be accounted as drift"
+    );
+}
+
+#[test]
+fn test_playback_bringup_early_zero_drop_poll_does_not_break_subsequent_startup_drain() {
+    let _guard = init_test_logger();
+    let bridge = create_test_bridge();
+    let stream_status = StreamStatusFlags::new();
+    let rt_status = RtStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let mut state = PollState::default();
+
+    // Poll 1: Quanta == 0 (early poll before audio thread finishes startup processing).
+    // Zero drops in bridge at this point.
+    stream_status.playback_quantums.store(0, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        0
+    );
+    assert!(!state.bringup_completed);
+
+    // Audio thread progresses to 4 quantums, dropping 1 frame due to pre-roll skew at quantum 2.
+    bridge.dropped_frames.store(1, Ordering::Relaxed);
+    stream_status.playback_quantums.store(
+        crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS,
+        Ordering::Relaxed,
+    );
+
+    // Poll 2: Quanta reached 4. Startup drop must be drained and suppressed without false drift warning.
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        0,
+        "startup drop in transition poll must be suppressed even if early poll occurred at quanta=0"
+    );
+    assert!(state.bringup_completed);
+
+    // Poll 3: Steady state. Subsequent drop is real drift.
+    bridge.dropped_frames.store(2, Ordering::Relaxed);
+    stream_status.playback_quantums.store(8, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        &bridge,
+        &mut state,
+    );
+    assert_eq!(
+        stream_status.bridge_dropped_frames.load(Ordering::Relaxed),
+        2,
+        "subsequent drops after bring-up must be accounted as drift"
+    );
+}
+
+#[test]
 fn gate_transition_throttle_emits_at_most_one_line_per_second() {
     use std::time::{Duration, Instant};
 

@@ -8,7 +8,8 @@ sdk: org.freedesktop.Sdk//25.08
 command: nam-audio-pipe
 
 finish-args:
-  - --socket=pipewire
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/pipewire-0
   - --share=ipc
   - --device=all
   - --filesystem=home:ro

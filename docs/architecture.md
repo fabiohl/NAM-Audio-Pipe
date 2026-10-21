@@ -462,7 +462,7 @@ NAM-Audio-Pipe is distributed as a standalone desktop Flatpak application target
 
 ### 9.1 Sandbox Permissions Rationale
 
-- **`--socket=pipewire` & `--filesystem=xdg-run/pipewire-0`**: Provides direct Unix domain socket access to the host PipeWire daemon for native quantum scheduling down to 64 samples (1.33 ms).
+- **`--filesystem=xdg-run/pipewire-0` & `--socket=pulseaudio`**: Provides direct Unix domain socket access to the host PipeWire daemon (`$XDG_RUNTIME_DIR/pipewire-0`) for native quantum scheduling down to 64 samples (1.33 ms), and compatibility with PulseAudio audio systems.
 - **`--share=ipc`**: Grants access to `memfd_create` for zero-copy SPA buffer sharing between the sandbox and the host daemon.
 - **`--device=all`**: Grants access to `/dev/snd/*` devices and `/dev/cpu_dma_latency` for real-time PM QoS configuration.
 - **`--filesystem=home:ro`**: Allows loading neural models (`.nam`/`.namb`) and cabinet IRs (`.wav`) from the user's home directory with read-only protection.

@@ -1142,12 +1142,16 @@ if [ "$USE_BOLT" = true ] && [ "$HAS_PERF" = true ] && [ -x "$PGO_WORKLOAD_BIN" 
         "$PGO_WORKLOAD_BIN" --seconds "$BOLT_LBR_DURATION_S" \
         > "$BOLT_DIR/lbr_record.log" 2>&1; then
         BOLT_LBR_SAMPLES=$(perf script -i "$BOLT_DIR/lbr.data" 2>/dev/null | wc -l || echo 0)
-        if "$PERF2BOLT" "${PERF2BOLT_LBR_FLAGS[@]}" -p "$BOLT_DIR/lbr.data" "$PGO_BIN" -o "$BOLT_DIR/lbr.fdata" \
+        if "$PERF2BOLT" "${PERF2BOLT_LBR_FLAGS[@]}" -p "$BOLT_DIR/lbr.data" "$PGO_WORKLOAD_BIN" -o "$BOLT_DIR/lbr.fdata" \
             > "$BOLT_DIR/lbr_perf2bolt.log" 2>&1; then
             BOLT_LBR_FDATA="$BOLT_DIR/lbr.fdata"
             BOLT_LBR_FDATA_SHA256=$(sha256sum "$BOLT_DIR/lbr.fdata" 2>/dev/null | awk '{print $1}')
         fi
-        echo -e "  ${GREEN}✓${NC} Profile evidence: ${BOLT_LBR_SAMPLES} samples, fdata sha256=${BOLT_LBR_FDATA_SHA256:0:16}..."
+        if [ -n "$BOLT_LBR_FDATA_SHA256" ]; then
+            echo -e "  ${GREEN}✓${NC} Profile evidence: ${BOLT_LBR_SAMPLES} samples, fdata sha256=${BOLT_LBR_FDATA_SHA256:0:16}..."
+        else
+            warn "perf2bolt failed to convert profile evidence (see $BOLT_DIR/lbr_perf2bolt.log)."
+        fi
     else
         warn "BOLT-profile capture failed (perf record); BOLT proof left MISSING."
     fi
@@ -2118,7 +2122,6 @@ PY
     echo -e "  Finalizing Flatpak application sandbox parameters..."
     flatpak build-finish "$FLATPAK_BUILD_DIR" \
         --command=nam-audio-pipe \
-        --socket=pipewire \
         --socket=pulseaudio \
         --filesystem=xdg-run/pipewire-0 \
         --share=ipc \

@@ -128,6 +128,8 @@ except Exception:
     pass
 ' 2>/dev/null || echo "")
 [ -n "$CONFIG_RUSTFLAGS" ] || die "Could not extract rustflags from .cargo/config.toml."
+# Retain symbol tables and relocation sections for LLVM BOLT (--relocs).
+CONFIG_RUSTFLAGS="$CONFIG_RUSTFLAGS -C strip=none -Clink-arg=-Wl,-q"
 
 LLVM_PROFDATA=""
 if [ "$USE_PGO" = true ]; then
@@ -158,6 +160,11 @@ if [ "$USE_BOLT" = true ]; then
     fi
     if command -v perf >/dev/null 2>&1; then
         PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "2")
+        if [ "$PARANOID" -gt 1 ]; then
+            if sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
+                PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "2")
+            fi
+        fi
         if [ "$PARANOID" -le 1 ]; then
             HAS_PERF=true
         else
@@ -224,7 +231,16 @@ if [ "$USE_BOLT" = true ] && [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = true ] && [ 
     echo -e "\n${BLUE}${BOLD}Building & running variant 'pgo+bolt'...${NC}"
     # The bench is offline DSP (no PipeWire needed): perf the hot path directly.
     rm -f "$PGO_DIR/perf.data"
-    if perf record -F 999 -e cycles:u -o "$PGO_DIR/perf.data" -- \
+    USE_LBR=false
+    if perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
+        USE_LBR=true
+    fi
+    if [ "$USE_LBR" = "true" ]; then
+        PERF_ARGS=(-F 99 -e cycles:u -j any,u)
+    else
+        PERF_ARGS=(-F 4000 -e cycles:u)
+    fi
+    if perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
         "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
         --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
         :
@@ -237,7 +253,16 @@ if [ "$USE_BOLT" = true ] && [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = true ] && [ 
     fi
 
     if [ -z "$BOLT_CAUSE" ]; then
-        if "$PERF2BOLT" -p "$PGO_DIR/perf.data" "$AB_BUILD_DIR/release/ab_opt_bench" \
+        chmod 644 "$PGO_DIR/perf.data" 2>/dev/null || true
+        PERF2BOLT_FLAGS=()
+        if [ "$USE_LBR" = "false" ]; then
+            if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
+                PERF2BOLT_FLAGS+=("--basic-events")
+            else
+                warn "perf2bolt --basic-events not supported by this toolchain; omitting flag."
+            fi
+        fi
+        if "$PERF2BOLT" "${PERF2BOLT_FLAGS[@]}" -p "$PGO_DIR/perf.data" "$AB_BUILD_DIR/release/ab_opt_bench" \
             -o "$PGO_DIR/perf.fdata" > "$PGO_DIR/perf2bolt.log" 2>&1; then
             :
         else
@@ -275,7 +300,7 @@ import os
 import sys
 
 ab_dir, receipt_path, runs, bolt_applied, bolt_cause = sys.argv[1:6]
-bolt_applied = bolt_applied == "True"
+bolt_applied = bolt_applied.lower() in ("true", "1")
 
 def read_variant(name):
     path = os.path.join(ab_dir, f"ab-opt-{name}.json")

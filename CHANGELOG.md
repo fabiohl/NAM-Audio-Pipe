@@ -63,5 +63,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Automated generation of filtered DSP hotspot reports (`target/dsp_hotpath.asm`).
 - **Flatpak Distribution (`io.github.fabiohl.NAMAudioPipe`):**
   - Standalone desktop application targeting `org.freedesktop.Platform` 25.08.
-  - Scoped low-latency audio permissions (`--socket=pipewire`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--filesystem=xdg-music`).
+  - Scoped low-latency audio permissions (`--filesystem=xdg-run/pipewire-0`, `--socket=pulseaudio`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--filesystem=xdg-music`).
   - XDG desktop integration and complete hicolor icon theme hierarchy (SVG + 64x64 to 512x512 PNGs).

@@ -561,9 +561,15 @@ pub fn observe_stream_state(
         pw::stream::StreamState::Streaming => {
             backend.set_stream_active(stream, true);
             if old == pw::stream::StreamState::Paused {
+                let action = match stream {
+                    "playback" => "Playback active",
+                    "capture" => "Audio captured",
+                    _ => "Audio stream active",
+                };
                 log::info!(
-                    "{} Audio captured ({stream} connection established).",
+                    "{} {} ({stream} connection established).",
                     "▶️".green(),
+                    action,
                 );
             }
         }

@@ -9,48 +9,52 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 **NAM-Audio-Pipe** is an ultra-low latency, real-time standalone PipeWire host application for [Neural Amp Modeler (NAM)](https://www.neuralampmodeler.com/) simulation on Linux.
 
-Turn your Linux machine into a world-class, instantaneous guitar amplifier rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine, NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
+Turn your Linux machine into a world-class, instantaneous guitar amplifier or studio rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine, NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
 
 Whether practicing at home, tracking live in the studio, or performing on stage, NAM-Audio-Pipe delivers studio-grade tone with **analog-like responsiveness**, **sub-millisecond buffer sizes**, **zero dropouts**, and **one-touch lock-free WAV recording**.
 
 ---
 
-## ⚡ Why NAM-Audio-Pipe? (The Value Proposition)
+## ⚡ Why NAM-Audio-Pipe?
 
 NAM-Audio-Pipe inherits the relentless engineering, mathematical precision, and raw performance of the [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) core engine, wrapping it in a standalone Linux application designed specifically for musicians and audio professionals:
 
 ### 🎯 1. 100% Bit-Exact Numerical Parity with C++ NAMCore
 
-You get the exact, authentic tone of your favorite amp models. The underlying engine is verified under a continuous dual-oracle regression suite against both the reference C++ NAMCore and a double-precision $f64$ mathematical oracle:
+You get the exact, authentic tone of your favorite amp models. The underlying engine is verified under a continuous dual-oracle regression suite against both the reference C++ NAMCore ($f32$) and a double-precision $f64$ mathematical oracle tracking 52 model baselines in `NeuralAmpModeler-rs`:
 
-- **WaveNet A1/A2 Models**: Maintains Error-to-Signal Ratio (ESR) $< 2.31 \times 10^{-14}$ ($> 136\text{ dB}$ SNR).
-- **ConvNet Models**: Achieves ESR $< 9.33 \times 10^{-16}$ ($> 150\text{ dB}$ SNR).
-- **Full Model Coverage**: Loads standard `.nam` (JSON) and lightning-fast pre-transposed `.namb` v2 (binary, $< 1\text{ ms}$ load time) models across all major architectures: WaveNet A1/A2, LSTM (1 & 2 layers), ConvNet, and Linear FIR/FFT.
+- **WaveNet A1/A2 Models**: Maintains Error-to-Signal Ratio (ESR) $< 2.31 \times 10^{-14}$ against NAMCore and $9.05 \times 10^{-15}$ against the $f64$ oracle ($136.4\text{ dB}$ SNR).
+- **ConvNet Models**: Achieves ESR $< 9.33 \times 10^{-16}$ ($150.3\text{ dB}$ SNR).
+- **Perceptual Metric Validation**: All models verify multi-resolution STFT distance (MR-STFT $< 6.5 \times 10^{-6}$), spectral convergence, and LUFS loudness constancy.
+- **Full Model Coverage**: Loads standard `.nam` (JSON) and lightning-fast pre-transposed `.namb` v2 (binary, Gate-Major LSTM / Interleaved-4 WaveNet with CRC32, $< 1\text{ ms}$ load time) models across all major architectures: WaveNet A1/A2, LSTM (1 & 2 layers, multi-I/O), ConvNet, Linear FIR/FFT, and Sequential compositions.
 
 ### 🚀 2. Unmatched CPU Efficiency & Headroom
 
-Hand-written vector SIMD compute kernels (`x86-64-v3` AVX2/FMA) monomorphized at compile-time with zero virtual dispatch:
+Hand-written vector SIMD compute kernels (`x86-64-v3` AVX2/FMA baseline) monomorphized at compile-time with zero virtual dispatch:
 
-- **Massive Real-Time Headroom**: On modern hardware (e.g., AMD Ryzen 7 5700U), a WaveNet Standard model processes a 64-sample buffer in just **$41.8\text{ µs}$**—consuming less than **$3.2\%$** of the available $1.33\text{ ms}$ real-time budget. Lighter LSTM profiles execute in as little as **$6.8\text{ µs}$** ($< 0.6\%$ CPU).
-- **Zero-Vtable Dispatch**: No function pointer jumps or dynamic memory lookups on the audio path.
+- **Massive Real-Time Headroom**: On modern hardware (e.g., AMD Ryzen 7 5700U), a WaveNet Standard model processes a 64-sample buffer in just **$41.8\text{ µs}$**—consuming only **$3.1\%$** of the available $1.33\text{ ms}$ real-time budget. Modern WaveNet A2 models execute in **$14.0\text{–}19.8\text{ µs}$** ($1.1\text{–}1.5\%$), and lighter LSTM profiles execute in as little as **$6.8\text{ µs}$** ($0.5\%$ CPU).
+- **Const-Generic Optimization & Dynamic Topologies**: Features 24 distinct model variants (16 static const-generic profiles + zero-allocation dynamic fallbacks). Canonical channel counts ($CH=16, 12, 8, 4, 3$), kernel sizes, and receptive fields are monomorphized at compile time, enabling aggressive LLVM loop unrolling and register allocation.
+- **Zero-Vtable Dispatch**: The static `dispatch_simd!` engine eliminates all indirect function pointers and vtable lookups on the audio path. Compute kernels utilize tap-major memory layouts and instruction-level parallelism (`sum0..sum3`) unrolling.
+- **Adaptive Compute FSM**: Dynamic CPU load-monitoring state machine with hysteresis (`--slim auto`) that automatically throttles model complexity under system spikes (Full → Reduced → Minimal) using 32 ms click-free linear crossfades to prevent buffer dropouts.
 - **Microarchitecture Layout Optimization**: Compiled with Profile-Guided Optimization (PGO) and LLVM BOLT instruction reordering to maximize CPU Instruction Cache (I-Cache) and TLB hit rates.
 
 ### 🛡️ 3. Strict Hard Real-Time Determinism (The Three Laws of Audio DSP)
 
 Engineered from the ground up for zero-dropout live playing:
 
-- **Zero Heap Allocations**: Scratch memory, model weights, and resamplers are pre-allocated. No `malloc` or `free` ever occurs on the audio thread.
-- **Zero Mutex Locks**: State changes, model swaps, and telemetries communicate across bounded lock-free Single-Producer Single-Consumer (SPSC) rings with a 3-tier garbage collection cascade.
-- **Zero Blocking I/O**: Filesystem access and logging macros are strictly excluded from the audio callback.
-- **Denormal & Subnormal Armor**: Injects symmetric $-220\text{ dBFS}$ dither and enforces hardware FTZ/DAZ to eliminate CPU microcode stalls during digital silence.
+- **Zero Heap Allocations**: Scratch memory, model weights, and resamplers are pre-allocated. No `malloc` or `free` ever occurs on the audio thread (audited via `CountingAllocator`).
+- **Zero Mutex Locks & 3-Tier GC Cascade**: State changes, model swaps, and telemetries communicate across bounded lock-free Single-Producer Single-Consumer (SPSC) rings backed by a 3-tier garbage collection cascade (*SPSC queue → 16-slot parking lot → overwrite ring*), ensuring safe off-RT resource deallocation without audio thread stalls.
+- **Zero Blocking I/O**: Filesystem access, socket IPC, and logging macros are strictly excluded from the audio callback.
+- **Denormal & Subnormal Armor**: Injects symmetric $-220\text{ dBFS}$ deterministic dither ($1.0 \times 10^{-11}$) combined with hardware MXCSR FTZ/DAZ reassertion on every processing block, preventing 10–100× CPU microcode penalties during digital silence with zero net DC drift.
 
 ### 🔊 4. Studio-Grade Native DSP Suite
 
 No external audio libraries or third-party wrappers needed:
 
-- **Zero-Latency Cabinet Simulation**: Uniformly Partitioned Overlap-Save (UPOLS) FFT convolution engine runs cabinet impulse responses (`.wav`) in **$1.3\text{ µs}$** with bounded, deterministic latency.
-- **Polyphase Sinc Resampling**: Native minimum-phase sinc resampler (256 phases × 64 taps, $>105\text{ dB}$ stopband attenuation, zero pre-ringing) seamlessly adapts models trained at 48 kHz to any host sample rate (44.1 kHz, 96 kHz, 192 kHz).
-- **Half-Band Anti-Aliasing Oversampling**: Multi-stage half-band polyphase FIR filters (`2x`, `4x`, $>100\text{ dB}$ stopband) attenuate non-linear high-frequency foldover distortion on screaming high-gain leads.
+- **Zero-Latency Cabinet Simulation**: Uniformly Partitioned Overlap-Save (UPOLS) FFT convolution engine runs cabinet impulse responses (`.wav`) in **$1.3\text{ µs}$** (for 512-sample IRs) with bounded, deterministic latency.
+- **Minimum-Phase Polyphase Sinc Resampling**: Native 256 phases × 64 taps Kaiser sinc resampler (Kaiser $\beta=12$, $>105\text{ dB}$ stopband attenuation, $< 0.05\text{ dB}$ passband ripple, zero pre-ringing, $0.7\text{–}1.3\text{ µs}$ execution) seamlessly adapts 48 kHz models to any host sample rate (44.1 kHz, 96 kHz, 192 kHz).
+- **Half-Band Anti-Aliasing Oversampling**: Multi-stage half-band polyphase FIR filters (`Off`, `2x`, `4x`, $>100\text{ dB}$ stopband attenuation) attenuate non-linear high-frequency foldover distortion on screaming high-gain leads.
+- **Selectable Activation Precision**: Choose between `standard` (exact Taylor minimax, +89.5 dB SNR) and `fast` (Padé polynomial minimax approximation) to tailor math precision against CPU cycles.
 - **Smart Schmitt Silence Gate**: Dual-threshold noise gate with 10 dB Schmitt hysteresis and auto-gain normalization to silence pickup hum without cutting off delicate note decays.
 
 ### 💾 5. High-Performance Asynchronous WAV Recording (`--record`)
@@ -96,7 +100,7 @@ Getting started with guitar on Linux has never been easier. You do not need to c
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Step 1: Install System Dependencies
+### Step 1: Compiling System Dependencies
 
 On Ubuntu, Debian, Pop!_OS, or Linux Mint:
 
@@ -108,7 +112,6 @@ sudo apt update && sudo apt install -y build-essential pkg-config libpipewire-0.
 
 Download free community-created amp models and impulse responses from:
 
-- [ToneHunt.org](https://tonehunt.org/) (Thousands of free captures of vintage & modern amps)
 - [Tone3000](https://tone3000.com/)
 
 ### Step 3: Run and Play
@@ -125,26 +128,92 @@ nam-audio-pipe --model ~/models/Plexi50W.nam --cab ~/irs/Greenback4x12.wav
 
 You will hear your guitar processed with full neural simulation in real time!
 
+> ### 💡 Pro-Tip: Visual Patching & Innovative Routing with [`qpwgraph`](https://gitlab.freedesktop.org/rncbc/qpwgraph)
+>
+> While `nam-audio-pipe` automatically wires your guitar input to your speakers on startup, PipeWire's dynamic multimedia graph lets you route **any audio source** through the neural amp rig with zero latency penalties.
+>
+> Using a visual patchbay tool such as **`qpwgraph`** (or `Helvum`), you can explore innovative signal routing schemes:
+>
+> - **Jam Along with YouTube / Spotify / Media Players:** Route your web browser or desktop music player directly alongside your guitar into your monitors or headphones for effortless practice sessions.
+> - **Creative Re-Amping & Tone Coloration:** Disconnect your physical guitar capture and patch any desktop application (Firefox, Chromium, VLC, MPV, software synthesizers, or drum samplers) straight into **`NAM-Audio-Pipe-input`**. Warm up digital synths, give virtual drums punchy tube saturation, or experiment with lo-fi vocal and podcast processing through vintage tube heads and speaker cabinets.
+> - **Live Dynamic Re-Routing:** Connections can be made, broken, or rerouted on the fly while playing—no audio dropouts, no driver reloading, and no engine restarts needed.
+>
+> Install `qpwgraph` easily via your package manager:
+>
+> ```bash
+> sudo apt install qpwgraph   # Debian / Ubuntu / Pop!_OS
+> # or via Flatpak: flatpak install flathub org.rncbc.qpwgraph
+> ```
+
 ---
 
 ## 🥊 Feature Showcase & Technical Matrix
 
-| Capability                       | Technical Implementation                                                       | Practical Musician / Engineering Impact                                                 |
-|:-------------------------------- |:------------------------------------------------------------------------------ |:--------------------------------------------------------------------------------------- |
-| **Neural Amp Simulation**        | Full `NeuralAmpModeler-rs` engine (WaveNet A1/A2, LSTM, ConvNet, Linear)       | Authentic tube amp tone with exact dynamic feel and pick-attack nuance                  |
-| **Native PipeWire Routing**      | Direct Client API (`libpipewire-0.3-dev`) via `pipewire` crate                 | Seamless integration with `qpwgraph`, `Helvum`, and system audio patchbays              |
-| **Latency Benchmark**            | Native quantums down to 64 samples ($1.33\text{ ms}$ at 48 kHz)                | Imperceptible latency matching real analog hardware amplifiers                          |
-| **Real-Time Safety**             | Strict zero-allocation audio callbacks, zero mutex locks, zero blocking I/O    | Absolute reliability on stage and in the studio—no audio glitches or xruns              |
-| **Numerical Accuracy**           | Dual-oracle verified against C++ NAMCore $f32$ & $f64$ mathematical models     | Laboratory-grade fidelity ($>136\text{ dB}$ SNR on standard WaveNet)                    |
-| **Low-Latency Cabinet IR**       | Uniform-Partitioned Overlap-Save (UPOLS) FFT convolution engine                | Natural speaker cabinet resonance ($1.3\text{ µs}$ compute overhead for 512-sample IRs) |
-| **Multi-Rate Resampling**        | 256-phase Kaiser-windowed polyphase sinc resampler ($>105\text{ dB}$ stopband) | Play 48 kHz models at 44.1 kHz, 96 kHz, or 192 kHz with zero pre-ringing or aliasing    |
-| **Anti-Aliasing Oversampling**   | Half-band polyphase FIR filtering (`2x`, `4x`, $>100\text{ dB}$ stopband)      | Eliminates high-frequency digital harshness on extreme high-gain metal captures         |
-| **Smart Silence Gate**           | Polymorphic gate (`on`/`off`/custom dBFS) with 10 dB Schmitt hysteresis        | Silences pickup hum and hiss during pauses without cutting off sustain                  |
-| **Asynchronous WAV Recording**   | Non-blocking slot pool transport + Linux `tokio-uring` engine                  | Lossless 32-bit float stereo recording straight to disk with zero audio thread burden   |
-| **Crash Protection**             | Periodic 3-second header checkpointing & 5-second graceful signal shutdown     | Saves your take even if the host machine experiences a sudden power loss                |
-| **Kernel Latency Tuning**        | Real-time PM QoS ($0\text{ µs}$), `mlockall`, THP disable, CPU IRQ isolation   | Prevents CPU sleep states and operating system scheduler interruptions                  |
-| **Adaptive Compute**             | Dynamic CPU pressure monitoring (`--slim auto`)                                | Automatically throttles model complexity under system overload to prevent dropouts      |
-| **Desktop & Flatpak Deployment** | Standalone Flatpak bundle with AppStream metadata & `.desktop` launcher        | 1-click install and sandboxed execution across all modern Linux distributions           |
+| Capability                       | Technical Implementation                                                                     | Practical Musician / Engineering Impact                                                      |
+|:-------------------------------- |:-------------------------------------------------------------------------------------------- |:-------------------------------------------------------------------------------------------- |
+| **Neural Amp Simulation**        | Full `NeuralAmpModeler-rs` engine (WaveNet A1/A2, LSTM, ConvNet, Linear, Sequential)         | Authentic tube amp tone with exact dynamic feel and pick-attack nuance                       |
+| **Native PipeWire Routing**      | Direct Client API (`libpipewire-0.3-dev`) via `pipewire` crate                               | Seamless integration with `qpwgraph`, `Helvum`, and system audio patchbays                   |
+| **Latency Benchmark**            | Native quantums down to 64 samples ($1.33\text{ ms}$ at 48 kHz)                              | Imperceptible latency matching real analog hardware amplifiers                               |
+| **Real-Time Safety**             | Strict zero heap allocations, zero mutex locks, zero blocking I/O                            | Absolute reliability on stage and in the studio—no audio glitches or xruns                   |
+| **Numerical Accuracy**           | Dual-oracle verified against C++ NAMCore $f32$ & $f64$ oracles (52 model baselines)          | Laboratory-grade fidelity ($>136.4\text{ dB}$ SNR on WaveNet, $>150.3\text{ dB}$ on ConvNet) |
+| **Const-Generic Profiles**       | 24 model variants (16 static compile-time profiles $CH=16, 12, 8, 4, 3$ + dynamic fallbacks) | Compile-time loop unrolling and optimal register allocation for canonical architectures      |
+| **Low-Latency Cabinet IR**       | Uniform-Partitioned Overlap-Save (UPOLS) FFT convolution engine                              | Natural speaker cabinet resonance ($1.3\text{ µs}$ compute overhead for 512-sample IRs)      |
+| **Multi-Rate Resampling**        | 256-phase × 64-tap Kaiser sinc resampler (>105 dB stopband, <0.05 dB ripple)                 | Pristine 44.1/48/96/192 kHz rate conversion in 0.7–1.3 µs with zero pre-ringing              |
+| **Anti-Aliasing Oversampling**   | Multi-stage half-band polyphase FIR filtering (`2x`, `4x`, $>100\text{ dB}$ stopband)        | Eliminates high-frequency digital harshness on extreme high-gain metal captures              |
+| **Activation Math Modes**        | `standard` (exact Taylor minimax) vs `fast` (Padé polynomial approximation)                  | Balance maximum floating-point precision (+89.5 dB SNR) against minimal CPU cycles           |
+| **Smart Silence Gate**           | Polymorphic gate (`on`/`off`/custom dBFS) with 10 dB Schmitt hysteresis                      | Silences pickup hum and hiss during pauses without cutting off sustain                       |
+| **Binary `.namb` v2 Format**     | Pre-transposed memory layout (Gate-Major LSTM, Interleaved-4 WaveNet) with CRC32             | Lightning-fast model loading and live hot-swapping in $< 1\text{ ms}$ (vs ~50 ms JSON)       |
+| **Denormal Armor**               | Symmetric −220 dBFS dither injection + hardware MXCSR FTZ/DAZ                                | Prevents 10–100× CPU microcode stalls on digital silence with zero net DC drift              |
+| **Asynchronous WAV Recording**   | Non-blocking slot pool transport + Linux `tokio-uring` engine                                | Lossless 32-bit float stereo recording straight to disk with zero audio thread burden        |
+| **Crash Protection**             | Periodic 3-second header checkpointing & 5-second graceful signal shutdown                   | Saves your take even if the host machine experiences a sudden power loss                     |
+| **Kernel Latency Tuning**        | Real-time PM QoS ($0\text{ µs}$), `mlockall`, THP disable, CPU IRQ isolation                 | Prevents CPU sleep states and operating system scheduler interruptions                       |
+| **Adaptive Compute**             | Dynamic CPU pressure monitoring (`--slim auto`) with 32 ms crossfading                       | Automatically throttles model complexity under system overload to prevent dropouts           |
+| **Desktop & Flatpak Deployment** | Standalone Flatpak bundle with AppStream metadata & `.desktop` launcher                      | 1-click install and sandboxed execution across all modern Linux distributions                |
+
+---
+
+## 🏆 Measured Audio Fidelity & CPU Headroom
+
+NAM-Audio-Pipe delivers world-class audio fidelity backed by the strict quality contract and empirical baselines established in [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs).
+
+### Dual-Oracle Parity & Perceptual Validation
+
+Accuracy is validated against two co-equal reference oracles across 52 model baselines:
+
+1. **Canonical C++ NAMCore Reference ($f32$):** Verifies bit-exact behavioral parity across WaveNet A1/A2, LSTM, ConvNet, and Linear architectures.
+2. **Double-Precision Reference ($f64$):** Quantifies numerical ideality and eliminates floating-point rounding divergence.
+
+| Architecture / Model | Error-to-Signal Ratio (ESR) | Signal-to-Noise Ratio (SNR) | Multi-Resolution STFT  |
+|:-------------------- |:--------------------------- |:--------------------------- |:---------------------- |
+| **WaveNet Standard** | $< 2.31 \times 10^{-14}$    | $> 136.4\text{ dB}$         | $< 6.5 \times 10^{-6}$ |
+| **WaveNet A2**       | $< 2.10 \times 10^{-14}$    | $> 136.8\text{ dB}$         | $< 5.8 \times 10^{-6}$ |
+| **ConvNet ReLU**     | $< 9.33 \times 10^{-16}$    | $> 150.3\text{ dB}$         | $< 1.2 \times 10^{-6}$ |
+| **LSTM 1-Layer**     | $< 1.45 \times 10^{-14}$    | $> 138.2\text{ dB}$         | $< 4.1 \times 10^{-6}$ |
+
+All models satisfy spectral convergence and LUFS loudness constancy invariants.
+
+### Measured CPU Headroom (Quality Contract SLA Baselines)
+
+Execution times measured per **64-sample block at 48 kHz** ($1.33\text{ ms}$ real-time deadline budget) on an AMD Ryzen 7 5700U (`x86-64-v3` AVX2 baseline, `rustc 1.99.0`):
+
+| Component / Profile                            | Execution Time | RT Deadline Budget Used | Max Theoretical Instances |
+|:---------------------------------------------- |:-------------- |:----------------------- |:------------------------- |
+| **WaveNet Standard (CH=16)**                   | **41.8 µs**    | 3.1%                    | ~31 instances             |
+| **WaveNet Lite (CH=12)**                       | **57.2 µs**    | 4.3%                    | ~23 instances             |
+| **WaveNet Feather (CH=8)**                     | **20.1 µs**    | 1.5%                    | ~66 instances             |
+| **WaveNet Nano (CH=4)**                        | **18.3 µs**    | 1.4%                    | ~72 instances             |
+| **WaveNet A2 Full (CH=8)**                     | **19.8 µs**    | 1.5%                    | ~67 instances             |
+| **WaveNet A2 Lite (CH=3)**                     | **14.0 µs**    | 1.1%                    | ~95 instances             |
+| **LSTM 1-Layer (Hidden=16)**                   | **6.8 µs**     | 0.5%                    | ~195 instances            |
+| **LSTM 2-Layer (Hidden=8)**                    | **7.6 µs**     | 0.6%                    | ~175 instances            |
+| **ConvNet**                                    | **9.5 µs**     | 0.7%                    | ~140 instances            |
+| **Linear FIR (RF=4 Direct)**                   | **0.13 µs**    | 0.01%                   | >1,000 instances          |
+| **DSP Resampler (44.1 kHz → 48 kHz)**          | **1.3 µs**     | 0.10%                   | >1,000 instances          |
+| **Cabinet IR Simulation (UPOLS 512)**          | **1.3 µs**     | 0.10%                   | >1,000 instances          |
+| **Full Pipeline Base (Model + CabSim, No OS)** | **42.8 µs**    | 3.2%                    | ~31 instances             |
+| **Full Pipeline HQ (Model + CabSim + 4× OS)**  | **174.4 µs**   | 13.1%                   | ~7 instances              |
+
+> **Why This Matters for Live Guitarists:** A standard guitar rig (WaveNet + CabSim) requires only **42.8 µs** of CPU time per 64-sample buffer. Out of a 1,333 µs budget, over **96.8%** of the CPU remains idle, guaranteeing rock-solid real-time audio stability, zero xruns, and effortless coexistence with background desktop tasks.
 
 ---
 
@@ -252,7 +321,6 @@ For maximum performance in mission-critical live setups, compile using the autom
 
 ```bash
 # Build hyper-optimized PGO + LLVM BOLT binary:
-export CARGO_BUILD_JOBS=4
 ./utils/build-release.sh --install
 ```
 
@@ -271,7 +339,6 @@ For developers working directly on source code:
 
 ```bash
 # Direct development execution:
-export CARGO_BUILD_JOBS=4
 cargo run --release -- --model /path/to/amp_model.nam
 
 # Build standard release binary:
@@ -340,7 +407,7 @@ On startup, NAM-Audio-Pipe automatically registers dedicated capture and playbac
 
 - **Zero-Context Switching**: Both nodes are bound to identical scheduling groups (`node.group = "nam-audio-pipe-dsp"`), ensuring execution on the same real-time driver thread (`nam-audio-pipe-loop`).
 - **Feedback Protection**: Queries `pw-metadata` with an automatic 500 ms watchdog to discover the default output sink, automatically ignoring self-capture nodes to prevent acoustic feedback loops.
-- **Visual Patchbay Support**: Nodes are clearly labelled and easily connected using visual patchbays such as **`qpwgraph`**, **`Helvum`**, or **`Carla`**.
+- **Visual Patchbay Support**: Nodes are clearly labelled and easily connected using visual patchbays such as **`qpwgraph`**, **`Helvum`**, or **`Carla`**. Seamlessly patch physical guitar inputs, desktop browsers, media players, software synthesizers, or DAW tracks into `NAM-Audio-Pipe-input` for instant live processing and re-amping.
 
 ---
 
@@ -350,17 +417,14 @@ NAM-Audio-Pipe maintains enterprise-grade reliability through an automated testi
 
 ```bash
 # 1. Run static analysis quality gate (fmt, check, clippy, SPDX headers, AppStream XML):
-export CARGO_BUILD_JOBS=4
 ./utils/mem-guard.sh ./utils/lints.sh
 
 # 2. Run consolidated 4-phase agile verification suite:
-export CARGO_BUILD_JOBS=4
 ./utils/tests-quick.sh
 
 # 3. Comprehensive 7-phase long-duration audit suite (Human Operator Only):
 # Runs accelerated soak (320k blocks), zero-alloc heap audit, nanosecond RT deadline/jitter
 # dispersion, real wall-clock endurance, and PipeWire resilience under private daemons.
-export CARGO_BUILD_JOBS=4
 ./utils/tests-long.sh --strict-pre-release
 ```
 

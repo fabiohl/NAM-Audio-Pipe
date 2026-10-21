@@ -155,6 +155,13 @@ pub struct PollState {
     /// current bring-up window. Caps the window so a stalled playback stream
     /// cannot suppress (and discard) drift drops indefinitely.
     pub bringup_suppressed_polls: u32,
+    /// Whether the monitor loop has observed and polled during `quanta < PLAYBACK_BRINGUP_QUANTUMS`.
+    pub has_polled_in_bringup: bool,
+    /// Whether the initial startup drops (ramp / pre-roll silence skew) have been drained.
+    pub startup_drops_drained: bool,
+    /// Whether the bring-up transient has been drained and closed for the current
+    /// streaming session.
+    pub bringup_completed: bool,
     /// Gate-transition log rate limiter (F-UX-13).
     pub gate_throttle: GateTransitionThrottle,
 }
@@ -176,6 +183,9 @@ impl PollState {
             pw_log_dropped_last: 0,
             last_bringup_quanta: 0,
             bringup_suppressed_polls: 0,
+            has_polled_in_bringup: false,
+            startup_drops_drained: false,
+            bringup_completed: false,
             gate_throttle: GateTransitionThrottle::default(),
         }
     }
@@ -622,22 +632,55 @@ pub fn poll_rt_status(
     // neither accounted in `bridge_dropped_frames` nor warned — until the
     // bring-up window closes; afterwards a real drift episode warns normally.
     // The window is bounded two ways so it can never mask drift indefinitely:
-    // by the quantum count and by a poll budget that reset whenever playback
+    // by the quantum count and by a poll budget that resets whenever playback
     // advances (a stalled playback lets suppression expire).
+    //
+    // Latency note: In a live PipeWire graph, the 4 bring-up quantums take ~5.3 ms
+    // (@48kHz/64), whereas the monitor loop polls at 100 ms. Thus the very first
+    // poll often arrives with `quanta >= PLAYBACK_BRINGUP_QUANTUMS`. If no poll
+    // has yet drained the bring-up ramp (`!state.bringup_completed` with zero prior
+    // suppressed polls), that initial drain is recognized as the startup ramp.
     let quanta = stream_status
         .map(|s| s.playback_quantums.load(Ordering::Relaxed))
         .unwrap_or(u32::MAX);
-    if quanta != state.last_bringup_quanta {
+    if quanta < state.last_bringup_quanta {
+        // Stream restarted / reconnected: re-arm bring-up suppression.
+        state.last_bringup_quanta = quanta;
+        state.bringup_suppressed_polls = 0;
+        state.has_polled_in_bringup = false;
+        state.startup_drops_drained = false;
+        state.bringup_completed = false;
+    } else if quanta != state.last_bringup_quanta {
         state.last_bringup_quanta = quanta;
         state.bringup_suppressed_polls = 0;
     }
-    let bringing_up = quanta < crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS
-        && state.bringup_suppressed_polls
-            < crate::standalone::pw_host::MAX_BRINGUP_SUPPRESSED_POLLS;
+
+    let mut bringing_up = false;
+    if !state.bringup_completed {
+        if quanta < crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS {
+            bringing_up = state.bringup_suppressed_polls
+                < crate::standalone::pw_host::MAX_BRINGUP_SUPPRESSED_POLLS;
+            state.has_polled_in_bringup = true;
+        } else if !state.startup_drops_drained {
+            // First poll arrived after the bring-up quantums elapsed (~5.3ms @48k/64 vs 100ms poll),
+            // or an early poll occurred before the audio thread incurred the startup ramp drop.
+            // Drain and suppress the startup ramp drop without reporting false clock drift.
+            bringing_up = true;
+            state.startup_drops_drained = true;
+            state.bringup_completed = true;
+        } else {
+            // Bring-up had already been drained in a prior poll; steady streaming reached.
+            state.bringup_completed = true;
+        }
+    }
+
     if bringing_up {
         state.bringup_suppressed_polls = state.bringup_suppressed_polls.saturating_add(1);
     }
     let drops = bridge.drain_dropped_frames();
+    if bringing_up && drops > 0 {
+        state.startup_drops_drained = true;
+    }
     if !bringing_up {
         if let Some(s) = stream_status.filter(|_| drops > 0) {
             s.bridge_dropped_frames.fetch_add(drops, Ordering::Relaxed);
