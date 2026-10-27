@@ -3,7 +3,7 @@
 
 //! Native `io_uring` capability probe — shell-orchestration entrypoint.
 //!
-//! Used by `utils/tests-quick.sh` Phase 4 to decide whether the recording
+//! Used by `utils/tests-long.sh` PHASE9 to decide whether the recording
 //! disk-writer tests can run, without depending on `python3`.
 //!
 //! Exit codes:

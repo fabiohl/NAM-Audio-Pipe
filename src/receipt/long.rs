@@ -4,14 +4,11 @@
 //! Fail-closed semantic parser for the long-suite receipt
 //! (`target/logs/long-receipt.txt`, emitted by `utils/tests-long.sh`).
 //!
-//! This is the single source of truth for the long-receipt format, shared by:
-//!
-//! - `tests/distribution_qa.rs` — the certification audit of the runner
-//!   and its receipt (`parse_long_receipt` + [`LongReceipt::audit`]);
-//! - `src/bin/long_receipt_check.rs` — the strict-release semantic gate
-//!   invoked by `utils/build-release.sh --release-ceremony`,
-//!   which verifies the receipt via [`verify_release_certification_file`]
-//!   instead of a substring search.
+//! This is the single source of truth for the long-receipt format, consumed
+//! by `src/bin/long_receipt_check.rs` — the standalone strict-release gate —
+//! and by `src/receipt/release.rs` during certification. Both verify the
+//! receipt via
+//! [`verify_release_certification_file`] instead of a substring search.
 //!
 //! The format:
 //!

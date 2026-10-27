@@ -64,7 +64,7 @@ pub fn deterministic_cpu_receipt() -> CpuSelectionReceipt {
 /// Probes for a reachable PipeWire daemon via `pw-cli info 0`.
 ///
 /// `true` only when the command succeeds — the same check
-/// `utils/tests-quick.sh` uses to gate Phase 3.
+/// the long suite uses to gate the live PipeWire phase.
 pub fn probe_pipewire_daemon() -> bool {
     std::process::Command::new("pw-cli")
         .args(["info", "0"])

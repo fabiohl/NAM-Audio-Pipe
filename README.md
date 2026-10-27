@@ -429,16 +429,20 @@ On startup, NAM-Audio-Pipe automatically registers dedicated capture and playbac
 NAM-Audio-Pipe maintains enterprise-grade reliability through an automated testing and verification suite located in [`utils/`](utils/):
 
 ```bash
-# 1. Run static analysis quality gate (fmt, check, clippy, SPDX headers, AppStream XML):
-./utils/mem-guard.sh ./utils/lints.sh
+# 1. Static quality gate (formatting applied, check, clippy -D warnings, SPDX, AppStream):
+./utils/lints.sh
 
-# 2. Run consolidated 4-phase agile verification suite:
+# 2. Quick discipline (all non-ignored targets, development profile):
 ./utils/tests-quick.sh
 
-# 3. Comprehensive 7-phase long-duration audit suite (Human Operator Only):
-# Runs accelerated soak (320k blocks), zero-alloc heap audit, nanosecond RT deadline/jitter
-# dispersion, real wall-clock endurance, and PipeWire resilience under private daemons.
-./utils/tests-long.sh --strict-pre-release
+# 3. Release chain (human operator only): build -> long audit -> certify.
+# On BOLT-capable hosts, run ./utils/ab-opt-ceremony.sh first to produce the
+# PGO+BOLT proof required by `build-release.sh --strict`.
+# The long suite covers accelerated soak, zero-alloc heap audit, RT deadline/jitter,
+# endurance, live PipeWire, io_uring and offline f64 parity.
+./utils/build-release.sh --strict --install
+./utils/tests-long.sh --strict --artifact
+./utils/build-release.sh --certify
 ```
 
 For complete architectural details on testing, verification phases, and real-time compliance criteria, consult [`docs/testing.md`](docs/testing.md).
@@ -448,7 +452,7 @@ For complete architectural details on testing, verification phases, and real-tim
 ## 📚 Technical Documentation Directory
 
 - [`docs/architecture.md`](docs/architecture.md) — Comprehensive architecture bible: dual-stream PipeWire topology, `DspBridge` shared memory layout, SPSC GC cascade, Linux RT hardening, and asynchronous `io_uring` WAV recording.
-- [`docs/testing.md`](docs/testing.md) — Testing architecture, unit/integration inventory, 7-phase long audit suite, and compiler optimization pipeline.
+- [`docs/testing.md`](docs/testing.md) — Testing architecture, unit/integration inventory, 10-phase long audit suite, script contract, and compiler optimization pipeline.
 - [`CHANGELOG.md`](CHANGELOG.md) — Project release history, version milestones, and feature additions.
 
 ---

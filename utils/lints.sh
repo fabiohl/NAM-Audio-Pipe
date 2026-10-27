@@ -1,275 +1,100 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
-#
-# Standard quality control and static analysis script for nam-audio-pipe.
-# Runs all cargo checks first (fmt, check, clippy) covering the maximum
-# feature spectrum dynamically, followed by static textual checks.
-#
-# Dynamic feature matrix (broad and resilient to Cargo.toml changes):
-#   All Features (catch-all) : --all-targets --all-features
-#   No Default Features      : --all-targets --no-default-features
-
+# lints.sh — formatação, análise estática e conformidade textual. Classe A.
+# Uso: utils/lints.sh [-h|--help]
+set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
+cd "$(dirname "$0")/.."
+. utils/_lib.sh
+[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { echo "Uso: utils/lints.sh"; exit 0; }
+trap 'echo "RESULT: FAIL ($((SECONDS - T0))s) fails=${PHASE_NAME:-step} gaps=none"' ERR
+run_step() {
+  local name="$1"; shift
+  PHASE_NAME="$name"; phase "$name"
+  local log="$LOG_DIR/lints-$name.log" rc=0
+  "$@" 2>&1 | tee "$log" || rc=${PIPESTATUS[0]}
+  [ "$rc" -eq 0 ] || { FAILS+=("$name"); echo "PHASE: $name FAIL rc=$rc log=$log"; finish; exit 1; }
+  echo "PHASE: $name PASS log=$log"
+}
 
-PHASE_TOTAL=8
-source "$(dirname "$0")/_lib.sh"
+# N-5: formatting is applied locally; CI only verifies it.
+phase_fmt() {
+  if [ "${CI:-}" = "true" ]; then cargo fmt --all -- --check; else cargo fmt --all; git diff --stat; fi
+}
+run_step fmt phase_fmt
 
-echo -e "${BLUE}${BOLD}========================================${NC}"
-echo -e "${BLUE}${BOLD} NAM-Audio-Pipe Linting & Quality Suite${NC}"
-echo -e "${BLUE}${BOLD}========================================${NC}"
-SUITE_START=$(date +%s%N)
+phase_check() {
+  cargo check --locked --all-targets --all-features
+  cargo check --locked --lib --no-default-features
+  cargo check --locked --all-targets --no-default-features
+}
+run_step check phase_check
 
-# ---------------------------------------------------------------------------
-# [1/7] Code formatting check (cargo fmt --check) — strictly read-only: the
-# lint gate must never mutate the worktree; a style divergence fails the gate.
-# ---------------------------------------------------------------------------
-phase "Checking code formatting (cargo fmt --all -- --check)..."
-cargo fmt --all -- --check
-ok "Code formatting check passed ($(phase_elapsed_str))."
+phase_clippy() {
+  cargo clippy --locked --all-targets --all-features -- -D warnings
+  cargo clippy --locked --lib --no-default-features -- -D warnings
+  cargo clippy --locked --all-targets --no-default-features -- -D warnings
+}
+run_step clippy phase_clippy
+# Rustdoc warnings are capped while the pre-existing intra-doc link debt is
+# addressed; genuine documentation build errors still fail.
+phase_doc() { RUSTDOCFLAGS="--cap-lints allow" cargo doc --locked --no-deps --all-features; }
+run_step doc phase_doc
 
-# ---------------------------------------------------------------------------
-# [2/7] Compilation checks (cargo check) — broad feature matrix
-# ---------------------------------------------------------------------------
-phase "Executing compilation checks (cargo check)..."
+phase_spdx() {
+  local files=() missing=() f rc
+  mapfile -t files < <(git ls-files '*.rs' '*.sh' '*.py' 'build.rs' 'Cargo.toml')
+  for f in "${files[@]}"; do
+    grep -qE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" "$f"; rc=$?
+    [ "$rc" -eq 0 ] && continue
+    [ "$rc" -eq 1 ] || { echo "SPDX scan failed: $f" >&2; return 1; }
+    missing+=("$f")
+  done
+  [ ${#missing[@]} -eq 0 ] || { echo "Missing or invalid SPDX header:" >&2; printf '  %s\n' "${missing[@]}" >&2; return 1; }
+}
+run_step spdx phase_spdx
 
-echo -e "  ${YELLOW}${BOLD}Checking: All Targets + All Features (broad catch-all)...${NC}"
-cargo check --all-targets --all-features
+# Suppressions need a justification comment; the global log level is centralized
+# in test_logger (a direct set_max_level races with parallel tests).
+phase_policies() {
+  local bad
+  bad=$(git ls-files '*.rs' | xargs awk '
+    FNR == 1 { ok = 0 }
+    /^[[:space:]]*#\[allow\(clippy::/ { if (!ok) print FILENAME ":" FNR ": " $0; ok = 0; next }
+    /^[[:space:]]*(\/\/|\/\*)/ { ok = 1; next }
+    /^[[:space:]]*$/ { next }
+    { ok = 0 }')
+  if [ -n "$bad" ]; then
+    echo "Undocumented #[allow(clippy::)] (add a justification comment above):" >&2
+    echo "$bad" >&2; return 1
+  fi
+  bad=$(grep -rnE '\bset_max_level\s*\(' src tests 2>/dev/null \
+    | grep -vE ':[0-9]+:\s*(//|/\*|\*)' \
+    | grep -v 'src/standalone/test_logger.rs:' \
+    | grep -v 'src/main.rs:' || true)
+  if [ -n "$bad" ]; then
+    echo "Unauthorized log::set_max_level (use test_logger::with_logger_level):" >&2
+    echo "$bad" >&2; return 1
+  fi
+}
+run_step policies phase_policies
 
-echo -e "  ${YELLOW}${BOLD}Checking: All Targets (no default features)...${NC}"
-cargo check --all-targets --no-default-features
-ok "Compilation checks passed ($(phase_elapsed_str))."
+# Product metadata is validated by the official AppStream/desktop tools; the
+# crate/product tests additionally enforce well-formedness and version sync.
+phase_packaging() {
+  local d=packaging/flatpak
+  local m="$d/io.github.fabiohl.NAMAudioPipe.metainfo.xml"
+  local x="$d/io.github.fabiohl.NAMAudioPipe.desktop"
+  local p
+  for p in "$m" "$x" "$d/icons/hicolor"; do
+    [ -e "$p" ] || { echo "Missing mandatory packaging path: $p" >&2; return 1; }
+  done
+  command -v appstreamcli >/dev/null 2>&1 || { echo "appstreamcli is required (appstream package)" >&2; return 1; }
+  command -v desktop-file-validate >/dev/null 2>&1 || { echo "desktop-file-validate is required (desktop-file-utils)" >&2; return 1; }
+  appstreamcli validate --no-net --strict "$m"
+  desktop-file-validate "$x"
+}
+run_step packaging phase_packaging
 
-# ---------------------------------------------------------------------------
-# [3/7] Static analysis (cargo clippy) — strict, broad feature matrix
-#
-# `-D warnings` promotes `[lints.clippy] undocumented_unsafe_blocks` (declared
-# in Cargo.toml) to an error, so every `unsafe` block/expression in src/ and
-# tests/ must carry a `// SAFETY:` comment documenting its invariant and
-# pointer provenance (§4 hygiene contract, machine-enforced).
-# ---------------------------------------------------------------------------
-phase "Executing strict static analysis (cargo clippy)..."
-
-echo -e "  ${YELLOW}${BOLD}Clippy: All Targets + All Features (broad catch-all)...${NC}"
-cargo clippy --all-targets --all-features -- -D warnings
-
-echo -e "  ${YELLOW}${BOLD}Clippy: All Targets (no default features)...${NC}"
-cargo clippy --all-targets --no-default-features -- -D warnings
-ok "Static analysis passed cleanly with zero warnings ($(phase_elapsed_str))."
-
-# ---------------------------------------------------------------------------
-# [4/7] SPDX license header validation (deterministic, no external tooling)
-# ---------------------------------------------------------------------------
-phase "Validating SPDX license headers..."
-
-# Build the list of directories to search as an array to avoid fragile word
-# splitting inside command substitution when benches/ is absent.
-rs_dirs=( src tests )
-[ -d benches ] && rs_dirs+=( benches )
-
-# Enumeration is fail-closed: with `set -euo pipefail` and no `|| true`, any
-# failure in the find/test commands aborts the gate instead of silently
-# producing an empty (or partial) scope.
-spdx_scope=$(
-    {
-        find "${rs_dirs[@]}" -type f -name '*.rs'
-        find utils tests -type f -name '*.sh'
-        if [ -d packaging ]; then find packaging -type f \( -name '*.py' -o -name '*.sh' \); fi
-        if [ -f build.rs ]; then echo build.rs; fi
-        if [ -f Cargo.toml ]; then echo Cargo.toml; fi
-    }
-)
-
-# Missing SPDX header: scan file-by-file (no xargs, so grep errors are never
-# masked into an empty result) — an unreadable file counts as missing.
-missing=""
-while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    if ! grep -q "SPDX-License-Identifier" "$f"; then
-        missing+="$f"$'\n'
-    fi
-done <<< "$spdx_scope"
-if [ -n "$missing" ]; then
-    echo -e "  ${RED}${BOLD}Missing SPDX header in files:${NC}"
-    echo "$missing" | sed 's/^/    /'
-    exit 1
-fi
-
-# Invalid SPDX identifier (expected GPL-3.0-or-later or MIT): same file-by-file
-# scan — a grep error on one file is a hard failure, never a silent pass.
-invalid=""
-while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    if grep -q "SPDX-License-Identifier" "$f" \
-        && ! grep -qE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" "$f"; then
-        invalid+="$f"$'\n'
-    fi
-done <<< "$spdx_scope"
-if [ -n "$invalid" ]; then
-    echo -e "  ${RED}${BOLD}Invalid SPDX identifier (expected GPL-3.0-or-later or MIT):${NC}"
-    echo "$invalid" | sed 's/^/    /'
-    exit 1
-fi
-ok "All files have valid SPDX headers (GPL-3.0-or-later, MIT) ($(phase_elapsed_str))."
-
-# ---------------------------------------------------------------------------
-# [5/7] Undocumented #[allow(clippy::)] check (enforce allow_attributes policy)
-#
-# The project sets `allow_attributes = "warn"` in [lints.clippy], meaning every
-# #[allow(clippy::...)] must carry a justification comment immediately above it
-# (using the standard `// REASON:` or `// #[allow]` comment convention).
-# A bare #[allow(clippy::...)] with no preceding comment is flagged here as a
-# policy violation to keep lint suppressions auditable.
-# ---------------------------------------------------------------------------
-phase "Checking for undocumented #[allow(clippy::)] suppressions..."
-
-undocumented_allows=""
-while IFS= read -r rs_file; do
-    # Read the file line by line, tracking whether the previous non-blank line
-    # was a comment. Flag any #[allow(clippy:: line whose preceding non-blank
-    # line is not a comment (// or #).
-    prev_was_comment=false
-    while IFS= read -r line; do
-        trimmed="${line#"${line%%[! ]*}"}"   # lstrip whitespace
-        if [[ "$trimmed" =~ ^\#\[allow\(clippy:: ]]; then
-            if ! $prev_was_comment; then
-                undocumented_allows+="$rs_file: $trimmed"$'\n'
-            fi
-            prev_was_comment=false
-        elif [[ "$trimmed" =~ ^//|^# ]]; then
-            prev_was_comment=true
-        elif [ -n "$trimmed" ]; then
-            prev_was_comment=false
-        fi
-        # blank lines do not reset the comment flag (allow blank separator between
-        # comment and attribute)
-    done < "$rs_file"
-done < <(printf '%s\n' "$spdx_scope" | grep '\.rs$')
-
-if [ -n "$undocumented_allows" ]; then
-    echo -e "  ${RED}${BOLD}ERROR: Undocumented #[allow(clippy::)] found (add a justification comment above):${NC}"
-    echo "$undocumented_allows" | sed 's/^/    /'
-    exit 1
-fi
-ok "All #[allow(clippy::)] suppressions are documented ($(phase_elapsed_str))."
-
-# ---------------------------------------------------------------------------
-# [6/8] Direct log::set_max_level mutation check (enforce test_logger isolation)
-#
-# Direct mutation of the global log level via `log::set_max_level` causes test
-# race conditions, flaky tests, and poll timeouts. All tests must use
-# `test_logger::acquire_logger_level` or `test_logger::with_logger_level`.
-# Direct invocations of `set_max_level` are restricted exclusively to
-# `src/standalone/test_logger.rs` (and optionally `src/main.rs`).
-# ---------------------------------------------------------------------------
-phase "Checking for unauthorized log::set_max_level invocations..."
-
-unauthorized_set_level=$(
-    grep -rnE '\bset_max_level\s*\(' "${rs_dirs[@]}" 2>/dev/null \
-        | grep -vE ':[0-9]+:\s*(//|/\*|\*)' \
-        | grep -v 'src/standalone/test_logger.rs:' \
-        | grep -v 'src/main.rs:' || true
-)
-
-if [ -n "$unauthorized_set_level" ]; then
-    echo -e "  ${RED}${BOLD}ERROR: Direct set_max_level invocation found!${NC}"
-    echo -e "  ${RED}${BOLD}Direct mutation causes test race conditions. Use test_logger::with_logger_level instead:${NC}"
-    echo "$unauthorized_set_level" | sed 's/^/    /'
-    exit 1
-fi
-ok "No unauthorized log::set_max_level invocations found ($(phase_elapsed_str))."
-
-# ---------------------------------------------------------------------------
-# [7/8] AppStream packaging metadata validation (mandatory, fail-closed)
-# ---------------------------------------------------------------------------
-phase "Validating AppStream packaging metadata (mandatory files + official validators)..."
-
-packaging_dir="packaging/flatpak"
-metainfo_file="$packaging_dir/io.github.fabiohl.NAMAudioPipe.metainfo.xml"
-desktop_file="$packaging_dir/io.github.fabiohl.NAMAudioPipe.desktop"
-icon_theme_dir="$packaging_dir/icons/hicolor"
-
-# Presence of the packaging metadata is mandatory: a Flatpak-ready release
-# requires the AppStream metainfo, the desktop launcher and the hicolor icon
-# theme. Any missing file aborts the lint gate (fail-closed).
-missing_pkg=0
-for pkg_path in "$metainfo_file" "$desktop_file" "$icon_theme_dir"; do
-    if [ ! -e "$pkg_path" ]; then
-        echo -e "  ${RED}${BOLD}ERROR: Mandatory packaging file/dir missing: $pkg_path${NC}"
-        missing_pkg=1
-    fi
-done
-if [ "$missing_pkg" -eq 1 ]; then
-    die "Packaging metadata is incomplete; Flatpak distribution requires metainfo, desktop entry and hicolor icons."
-fi
-ok "Mandatory packaging files present."
-
-command -v appstreamcli >/dev/null 2>&1 \
-    || die "appstreamcli is required to validate AppStream metadata (install appstream-compose/appstream-util)."
-command -v desktop-file-validate >/dev/null 2>&1 \
-    || die "desktop-file-validate is required to validate the .desktop launcher (install desktop-file-utils)."
-
-echo -e "  ${YELLOW}${BOLD}appstreamcli validate --no-net --strict $metainfo_file${NC}"
-if ! appstreamcli validate --no-net --strict "$metainfo_file"; then
-    die "AppStream metainfo validation failed (structural or semantic errors, see output above)."
-fi
-ok "appstreamcli validation passed with zero errors/warnings."
-
-echo -e "  ${YELLOW}${BOLD}desktop-file-validate $desktop_file${NC}"
-if ! desktop-file-validate "$desktop_file"; then
-    die "Desktop entry validation failed (see output above)."
-fi
-ok "Desktop entry validation passed."
-
-# Semantic alignment: <id>, <name> and <launchable> must match the desktop file.
-desktop_id="$(basename "$desktop_file")"
-desktop_name="$(grep -m1 '^Name=' "$desktop_file" | cut -d= -f2-)"
-meta_id="$(grep -m1 -oP '(?<=<id>)[^<]+' "$metainfo_file")"
-meta_launchable="$(grep -m1 -oP '(?<=<launchable type="desktop-id">)[^<]+' "$metainfo_file")"
-meta_name="$(grep -m1 -oP '(?<=<name>)[^<]+' "$metainfo_file")"
-
-if [ "$meta_id" != "$desktop_id" ]; then
-    die "Metainfo <id> ($meta_id) does not match desktop file ID ($desktop_id)."
-fi
-if [ "$meta_launchable" != "$desktop_id" ]; then
-    die "Metainfo <launchable desktop-id> ($meta_launchable) does not match desktop file ID ($desktop_id)."
-fi
-if [ "$meta_name" != "$desktop_name" ]; then
-    die "Metainfo <name> ($meta_name) does not match desktop Name= ($desktop_name)."
-fi
-ok "Metainfo id/name/launchable aligned with desktop entry ($(phase_elapsed_str))."
-
-# ---------------------------------------------------------------------------
-# [8/8] AppStream release version sync check
-# ---------------------------------------------------------------------------
-phase "Checking AppStream release version sync with Cargo.toml..."
-
-cargo_ver=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
-# Extract version and date from the most recent <release> entry.
-release_line=$(grep -m1 -oP '<release version="[^"]+"[^>]*>' "$metainfo_file")
-if [ -z "$release_line" ]; then
-    die "No <release version=\"...\"> entry found in $metainfo_file."
-fi
-xml_ver=$(printf '%s' "$release_line" | sed -E 's/.*version="([^"]+)".*/\1/')
-release_date=$(printf '%s' "$release_line" | sed -nE 's/.*date="([^"]+)".*/\1/p')
-
-if [ -z "$xml_ver" ]; then
-    die "Could not extract version from <release> in $metainfo_file."
-fi
-if [ "$cargo_ver" != "$xml_ver" ]; then
-    echo -e "  ${RED}${BOLD}ERROR: Version mismatch between Cargo.toml ($cargo_ver) and $metainfo_file ($xml_ver)!${NC}"
-    exit 1
-fi
-if [ -z "$release_date" ]; then
-    echo -e "  ${RED}${BOLD}ERROR: AppStream release $xml_ver is missing the mandatory date attribute!${NC}"
-    exit 1
-fi
-ok "AppStream release $xml_ver ($release_date) matches Cargo.toml ($cargo_ver) ($(phase_elapsed_str))."
-
-SUITE_END=$(date +%s%N)
-TOTAL_DUR_MS=$(( (SUITE_END - SUITE_START) / 1000000 ))
-TOTAL_DUR_STR=$(format_duration_ms "$TOTAL_DUR_MS")
-
-echo -e "${GREEN}${BOLD}=======================================${NC}"
-echo -e "${GREEN}${BOLD} Quality suite completed successfully in ${TOTAL_DUR_STR}!${NC}"
-echo -e "${GREEN}${BOLD}=======================================${NC}"
+finish

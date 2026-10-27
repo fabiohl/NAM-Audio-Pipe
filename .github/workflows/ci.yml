@@ -1,0 +1,154 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+name: CI
+
+# Fast disciplines only: utils/lints.sh (fmt check, check/clippy matrix, rustdoc, SPDX, policies,
+# AppStream/desktop packaging) and utils/tests-quick.sh (cargo test --features testing, dev profile,
+# private PipeWire daemon). Heavy/RT/certification work lives in long.yml (manual dispatch).
+# Linux only: the product is a PipeWire host (x86_64 reference + aarch64).
+on:
+  push:
+    branches: [main, dev, 'dev-*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR cancels the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # x86_64 is the reference platform: canonical lints + quick QA suite disciplines.
+  x86_64-linux:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      # libpipewire/libspa headers + clang feed pipewire-sys bindgen; `pipewire` + `pipewire-bin`
+      # provide the private daemon, pw-cli and pw-play used by the integration tests;
+      # appstream/desktop-file-utils feed the packaging lint phase.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
+            appstream desktop-file-utils
+      # Runner images can ship an older preinstalled stable; the crate needs rust-version 1.99.
+      - name: Update Rust toolchain
+        run: rustup update --no-self-update stable && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      # GitHub sets CI=true, so lints.sh verifies formatting (--check) instead of applying it.
+      - name: Lints (fmt, check, clippy, doc, policies, packaging)
+        run: ./utils/lints.sh
+      - name: Quick QA suite
+        run: ./utils/tests-quick.sh
+      - name: Publish step summary
+        if: always()
+        run: |
+          echo "### Run Summary: x86_64-linux" >> $GITHUB_STEP_SUMMARY
+          if [ -d target/logs ]; then
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            grep -hE '^(RESULT:|PHASE:|Tests summary:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            for f in target/logs/*.log; do
+              if grep -qE '(FAILED|panicked at|FAIL rc=)' "$f" 2>/dev/null; then
+                echo "<details><summary>Failure Details: $(basename "$f")</summary>" >> $GITHUB_STEP_SUMMARY
+                echo '' >> $GITHUB_STEP_SUMMARY
+                echo '```text' >> $GITHUB_STEP_SUMMARY
+                grep -E 'FAILED|panicked at|FAIL rc=' "$f" | head -n 40 >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                echo '</details>' >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-x86_64-linux
+          path: target/logs/**
+          retention-days: 14
+
+  # linux-arm64 (NEON engine backend): clippy + quick QA suite.
+  # Non-blocking until the engine release consumed through crates.io supports aarch64: the
+  # published NeuralAmpModeler-rs 1.0.1 build script rejects every target without x86-64-v3,
+  # and src/standalone/rt_setup + rt_callback/harness are still gated on x86_64. Flip
+  # `continue-on-error` to false once Cargo.lock resolves an aarch64-capable engine.
+  linux-arm64:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin
+      - name: Update Rust toolchain
+        run: rustup update --no-self-update stable && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features testing -- -D warnings
+      - name: Quick QA suite
+        run: ./utils/tests-quick.sh
+      - name: Publish step summary
+        if: always()
+        run: |
+          echo "### Run Summary: linux-arm64" >> $GITHUB_STEP_SUMMARY
+          if [ -d target/logs ]; then
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            grep -hE '^(RESULT:|PHASE:|Tests summary:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-arm64
+          path: target/logs/**
+          retention-days: 14
+
+  # MSRV job: validates compilation with rust-version from Cargo.toml (1.99.0).
+  # rust-toolchain.toml pins `stable`, so RUSTUP_TOOLCHAIN is required to override it;
+  # `rustup default` alone would be silently ignored by the toolchain file.
+  msrv:
+    name: msrv (1.99.0)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 25
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.0
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev
+      - name: Install MSRV toolchain
+        run: rustup toolchain install 1.99.0 --no-self-update --profile minimal && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Cargo check (MSRV)
+        run: cargo check --locked --all-targets --features testing
+      - name: Publish step summary
+        if: always()
+        run: |
+          echo "### Run Summary: msrv (1.99.0)" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "MSRV cargo check passed." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "MSRV cargo check failed." >> $GITHUB_STEP_SUMMARY
+          fi

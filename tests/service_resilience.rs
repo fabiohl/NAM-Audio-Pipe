@@ -31,7 +31,7 @@
 //!
 //! The subprocess tests (1 and 2) require a running PipeWire daemon (and, for
 //! the recording acceptance, `pw-play` + `io_uring`); they are `#[ignore]`d and
-//! executed in Phase 3 of `utils/tests-quick.sh`. Tests 3–5 are daemon-free
+//! executed in PHASE8 of `utils/tests-long.sh`. Tests 3–5 are daemon-free
 //! pure-kernel/state-machine acceptances that run in every quick pass.
 
 use nam_audio_pipe::recording::{IoUringSupport, probe_io_uring};
@@ -397,9 +397,9 @@ fn assert_valid_finalized_wav(path: &std::path::Path, expect_silence: bool) {
 ///   [`assert_valid_finalized_wav`]).
 ///
 /// Requires a running PipeWire daemon, `pw-play` and `io_uring`. Runs in
-/// Phase 3 of `utils/tests-quick.sh`.
+/// PHASE8 of `utils/tests-long.sh`.
 #[test]
-#[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-quick Phase 3"]
+#[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-long PHASE8"]
 fn sigterm_subprocess_finalizes_wav_gracefully() {
     if !common::probe_pipewire_daemon() {
         eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
@@ -470,7 +470,7 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
 /// capture sink, sends `SIGTERM` via `libc::kill`, and proves graceful exit 0
 /// and full WAV finalization with silence preserved.
 #[test]
-#[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-quick Phase 3"]
+#[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-long PHASE8"]
 fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
     if !common::probe_pipewire_daemon() {
         eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
@@ -548,10 +548,10 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
 /// level by the staged-handler subprocess test (`signals.rs`); a healthy
 /// service teardown completes in ~100 ms and can never reach that stage.
 ///
-/// Requires a running PipeWire daemon (to bring the host up). Runs in Phase 3
-/// of `utils/tests-quick.sh`.
+/// Requires a running PipeWire daemon (to bring the host up). Runs in PHASE8
+/// of `utils/tests-long.sh`.
 #[test]
-#[ignore = "requires a running PipeWire daemon; runs in tests-quick Phase 3"]
+#[ignore = "requires a running PipeWire daemon; runs in tests-long PHASE8"]
 fn double_signal_burst_within_grace_window_stays_graceful() {
     if !common::probe_pipewire_daemon() {
         eprintln!("TEST_RESULT[double_signal]=SKIP:daemon_unavailable");

@@ -1,84 +1,46 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
-#
-# Out-of-band Miri Concurrency & Aliasing Audit Script for NAM-Audio-Pipe.
-#
-# GOVERNANCE & POLICY NOTICE:
-#   In accordance with the project compliance policy (rules/testing.md §2),
-#   all CI and standard release verification gates (lints.sh, tests-quick.sh,
-#   tests-long.sh) use strictly the stable Rust toolchain.
-#
-#   This script is an OPTIONAL, out-of-tree periodic audit tool for developers
-#   investigating unsafe invariants, data races, and Stacked/Tree Borrows aliasing
-#   soundness under the Miri MIR interpreter.
-#
-# SCOPE & TARGET MATRIX:
-#   - TARGET: `recording::pool::pool_test` (RecordingPool SPSC ring & descriptors)
-#     Soundness proof for lock-free slot reuse, atomic barriers, and drop leaks (11/11 pass under Miri).
-#   - TARGET: `standalone::pw_host::pw_host_test` (DspBridge concurrent access)
-#     Interior-mutability narrowing landed upstream: NeuralAmpModeler-rs 1.0.0 wraps
-#     `DspBridge::buffers` in `UnsafeCell` and the writer/reader never form a whole-struct
-#     `&DspBridge` reference, so the concurrent writer/reader handshake is now auditable.
-#     Waiver `F-MIRI-BRIDGE-01` is RESOLVED.
-#   - EXCLUDED: `rt_callback/harness.rs` (Full offline DSP pipeline)
-#     Excluded from full-pipeline Miri interpretation due to x86-64-v3 AVX2/FMA
-#     vector intrinsics and severe simulation overhead (~10,000x slowdown).
-
+# miri-audit.sh — optional Miri concurrency/aliasing audit (RecordingPool + DspBridge). Classe D.
+# Uso: utils/miri-audit.sh [-h|--help]
+set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
+cd "$(dirname "$0")/.."
+. utils/_lib.sh
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
-source "$SCRIPT_DIR/_lib.sh"
-
-# ── Memory guard (OOM containment) ──────────────────────────────────────────
-# Miri interpretation is memory-hungry and runs alongside rust-analyzer/IDE on
-# the same 16 GiB host. Re-exec inside a transient, memory-capped systemd scope
-# (fail-open when unavailable). Opt out with NAM_NO_MEM_GUARD=1.
-if [ "${NAM_MEM_GUARD:-0}" != "1" ] && [ "${NAM_NO_MEM_GUARD:-0}" != "1" ]; then
-    export NAM_MEM_GUARD=1
-    exec "$SCRIPT_DIR/mem-guard.sh" "$SCRIPT_PATH" "$@"
-fi
-
-echo -e "${BLUE}${BOLD}====================================================${NC}"
-echo -e "${BLUE}${BOLD}   NAM-Audio-Pipe Miri Concurrency & UB Audit Gate  ${NC}"
-echo -e "${BLUE}${BOLD}====================================================${NC}"
-
-# Check for nightly toolchain and miri
-if ! command -v rustup >/dev/null 2>&1; then
-    warn "rustup not found. Miri requires a nightly Rust toolchain with the miri component."
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    echo "Uso: utils/miri-audit.sh"
     exit 0
 fi
 
-if ! rustup toolchain list | grep -q "nightly"; then
-    warn "Nightly toolchain not installed."
-    echo -e "  To run Miri audits on demand, install via:"
-    echo -e "    ${BOLD}rustup toolchain install nightly --profile minimal${NC}"
-    echo -e "    ${BOLD}rustup component add miri --toolchain nightly${NC}"
-    exit 0
-fi
+echo "Miri concurrency & UB audit gate"
+echo "  TARGET: recording::pool::pool_test (RecordingPool SPSC ring, 11/11)"
+echo "  TARGET: standalone::pw_host::pw_host_test (DspBridge handshake)"
+echo "  EXCLUDED: rt_callback/harness.rs (AVX2/FMA intrinsics, ~10,000x slowdown)"
 
-if ! cargo +nightly miri --version >/dev/null 2>&1; then
-    warn "Miri component not found on nightly toolchain."
-    echo -e "  To install miri, run:"
-    echo -e "    ${BOLD}rustup component add miri --toolchain nightly${NC}"
-    exit 0
-fi
+# Fail-closed prerequisites: an unavailable toolchain is a typed usage
+# precondition (exit 2), never a silent success.
+command -v rustup >/dev/null 2>&1 || {
+    echo "MIRI: rustup not found — install a nightly toolchain with the miri component." >&2
+    exit 2
+}
+rustup toolchain list 2>/dev/null | grep -q "nightly" || {
+    echo "MIRI: no nightly toolchain — rustup toolchain install nightly --profile minimal" >&2
+    exit 2
+}
+cargo +nightly miri --version >/dev/null 2>&1 || {
+    echo "MIRI: component missing — rustup component add miri --toolchain nightly" >&2
+    exit 2
+}
 
-echo -e "${GREEN}Miri environment detected:${NC}"
 cargo +nightly miri --version
-echo ""
+# A failed sysroot build invalidates the whole audit: never ignore it.
+CARGO_BUILD_WARNINGS=allow cargo +nightly miri setup
 
-# Ensure Miri sysroot is pre-compiled and cached. We override [build] warnings = "deny"
-# from .cargo/config.toml to allow compilation warnings in the standard sysroot generator.
-CARGO_BUILD_WARNINGS=allow cargo +nightly miri setup >/dev/null 2>&1 || true
-
-# Configuration flags:
-# -Zmiri-tree-borrows : modern aliasing model (or Stacked Borrows by default)
-# -Zmiri-disable-isolation : allow host clock / pseudo-sleeps
+# -Zmiri-disable-isolation: allow host clock / pseudo-sleeps.
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}"
 
-echo -e "${YELLOW}${BOLD}Target: RecordingPool SPSC lock-free ring (pool_test)...${NC}"
+echo "Target: RecordingPool SPSC lock-free ring (pool_test)..."
 MIRI_LOG=$(mktemp)
 BRIDGE_MIRI_LOG=$(mktemp)
 trap 'rm -f "$MIRI_LOG" "$BRIDGE_MIRI_LOG"' EXIT
@@ -86,9 +48,8 @@ cargo +nightly miri test --lib recording::pool::pool_test 2>&1 | tee "$MIRI_LOG"
 assert_ran_tests "$MIRI_LOG" 11
 
 echo ""
-echo -e "${YELLOW}${BOLD}Target: DspBridge concurrent handshake (pw_host_test)...${NC}"
+echo "Target: DspBridge concurrent handshake (pw_host_test)..."
 cargo +nightly miri test --lib standalone::pw_host::pw_host_test 2>&1 | tee "$BRIDGE_MIRI_LOG"
 assert_ran_tests "$BRIDGE_MIRI_LOG" 1
 
-echo ""
 ok "Miri concurrency and aliasing audit completed successfully (pool 11/11 + bridge handshake)!"

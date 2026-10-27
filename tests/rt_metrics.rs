@@ -66,7 +66,7 @@
 //! adjustments. Environment calibration is probed from `/proc/self/status`
 //! (`Cpus_allowed_list`), `/sys/devices/system/cpu/isolated` and
 //! `sched_getscheduler`. `NAM_RT_STRICT=1` (propagated by
-//! `utils/tests-long.sh --strict-pre-release`) promotes every GAP
+//! `utils/tests-long.sh --strict`) promotes every GAP
 //! condition to a hard assertion failure AND refuses to certify a PASS
 //! measured on an uncalibrated environment — a numeric pass below the limits
 //! on a non-calibrated host must fail, never emit a silent pass.

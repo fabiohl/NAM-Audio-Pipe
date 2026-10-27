@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Emitter/verifier for the unified-schema long-audit receipt
-//! (`target/logs/long-audit-receipt.jsonl`).
+//! Receipt tooling for the NAM-Audio-Pipe QA and release chain.
 //!
 //! `utils/tests-long.sh` appends one machine-readable line per completed phase
-//! using the same engine receipt schema the engine and NAM-Plug emit; the
-//! human-readable `target/logs/long-receipt.txt` remains the derived view. The
-//! suite-level `overall` line is derived in Rust by `summary`.
+//! to `target/logs/long-audit-receipt.jsonl` using the engine receipt schema;
+//! the human-readable `target/logs/long-receipt.txt` remains the derived view.
+//! The suite-level `overall` line is derived in Rust by `summary`.
 //!
-//! Subcommands: `append`, `summary`, `validate [--strict]`.
+//! `build-receipt` emits `target/dist/build-receipt.json` (artifact SHA, engine
+//! provenance from `Cargo.lock`, PGO/BOLT evidence); `certify` reconciles that
+//! receipt with the strict long audit and writes `release-receipt.json`.
+//!
+//! Subcommands: `append`, `summary`, `validate [--strict]`, `pgo-check`,
+//! `bolt-proof`, `build-receipt`, `certify`.
 //! Exit codes: 0 success; 1 I/O or verification error; 2 usage error.
 
 use std::env;
@@ -20,8 +24,14 @@ use std::process::exit;
 use std::str::FromStr;
 
 use nam_audio_pipe::receipt::LONG_ROSTER;
+use nam_audio_pipe::receipt::build::{
+    BuildArtifacts, BuildOptimizations, BuildProvenance, BuildReceipt, PackageInfo,
+    extract_engine_provenance, hash_file, parse_ab_opt_ceremony_receipt,
+    parse_pgo_workload_receipt, validate_pgo_matrix,
+};
 use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
 use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict};
+use nam_audio_pipe::receipt::release::{evaluate_certification, verify_receipt_artifact};
 use neural_amp_modeler_rs::testing::receipt::{
     LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, count_tests_executed_from_log,
     detect_gap_markers, now_iso8601,
@@ -39,6 +49,11 @@ fn main() {
         "append" => cmd_append(&args[1..]),
         "summary" => cmd_summary(&args[1..]),
         "validate" => cmd_validate(&args[1..]),
+        "pgo-check" => cmd_pgo_check(&args[1..]),
+        "bolt-proof" => cmd_bolt_proof(&args[1..]),
+        "build-receipt" => cmd_build_receipt(&args[1..]),
+        "certify" => cmd_certify(&args[1..]),
+        "verify-artifact" => cmd_verify_artifact(&args[1..]),
         "-h" | "--help" => {
             print_help();
             exit(0);
@@ -61,6 +76,15 @@ fn print_help() {
     println!("                      [--artifact-sha256 <hex>]");
     println!("  pipe_long_receipt summary [--out <file>]");
     println!("  pipe_long_receipt validate [--out <file>] [--strict]");
+    println!("  pipe_long_receipt pgo-check --receipt <file>");
+    println!("  pipe_long_receipt bolt-proof --receipt <file>");
+    println!(
+        "  pipe_long_receipt build-receipt --artifact <path> [--out <file>] [--strict] [options...]"
+    );
+    println!(
+        "  pipe_long_receipt certify [--artifact <path>] [--build-receipt <path>] [--long-receipt <path>] [--text-receipt <path>] [--out <file>] [--strict]"
+    );
+    println!("  pipe_long_receipt verify-artifact --out <file> --artifact <path>");
     println!();
     println!(
         "Status values: PASSED, FAILED, SKIPPED, INCONCLUSIVE, SKIP_CAPABILITY, NOT_RUN, SIMULATED"
@@ -70,6 +94,10 @@ fn print_help() {
 }
 
 const VALUE_LESS_FLAGS: &[&str] = &["strict"];
+const DEFAULT_ARTIFACT: &str = "target/dist/nam-audio-pipe";
+const DEFAULT_BUILD_RECEIPT: &str = "target/dist/build-receipt.json";
+const DEFAULT_RELEASE_RECEIPT: &str = "target/dist/release-receipt.json";
+const DEFAULT_TEXT_RECEIPT: &str = "target/logs/long-receipt.txt";
 
 fn parse_flags(args: &[String]) -> Result<std::collections::HashMap<String, String>, String> {
     let mut flags = std::collections::HashMap::new();
@@ -230,6 +258,29 @@ fn cmd_summary(args: &[String]) {
         exit(1);
     }
     audit.push_summary();
+    // Propagate the artifact declared by every phase into the derived overall
+    // line so release certification can bind the whole campaign to one SHA.
+    let mut declared: Option<String> = None;
+    let mut complete = true;
+    for phase in &audit.phases {
+        if phase.phase_id == "overall" {
+            continue;
+        }
+        match (&declared, &phase.artifact_sha256) {
+            (None, Some(sha)) => declared = Some(sha.clone()),
+            (Some(expected), Some(sha)) if expected != sha => exit(1),
+            (Some(_), None) => {
+                complete = false;
+            }
+            _ => {}
+        }
+    }
+    if complete
+        && let Some(sha) = declared
+        && let Some(overall) = audit.phases.last_mut()
+    {
+        overall.artifact_sha256 = Some(sha);
+    }
     let overall = audit
         .phases
         .last()
@@ -296,6 +347,344 @@ fn cmd_validate(args: &[String]) {
             exit(1);
         }
     }
+}
+
+fn cmd_pgo_check(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("pgo-check", &e),
+    };
+    let receipt = match required(&flags, "receipt") {
+        Ok(v) => v.clone(),
+        Err(e) => die_usage("pgo-check", &e),
+    };
+    match validate_pgo_matrix(&receipt) {
+        Ok(summary) => {
+            println!("PGO_RECEIPT: PASS {summary}");
+            exit(0);
+        }
+        Err(e) => {
+            eprintln!("PGO_RECEIPT: FAIL {e}");
+            exit(1);
+        }
+    }
+}
+
+fn cmd_bolt_proof(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("bolt-proof", &e),
+    };
+    let receipt = match required(&flags, "receipt") {
+        Ok(v) => v.clone(),
+        Err(e) => die_usage("bolt-proof", &e),
+    };
+    match parse_ab_opt_ceremony_receipt(&receipt) {
+        Some((proof_id, _, _)) => {
+            println!("BOLT_PROOF: {proof_id}");
+            exit(0);
+        }
+        None => {
+            println!("BOLT_PROOF: MISSING");
+            exit(1);
+        }
+    }
+}
+
+fn cmd_build_receipt(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("build-receipt", &e),
+    };
+    let out = flags
+        .get("out")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_BUILD_RECEIPT.to_string());
+    let artifact_path = flags
+        .get("artifact")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_ARTIFACT.to_string());
+    let package_name = flags
+        .get("package-name")
+        .cloned()
+        .unwrap_or_else(|| "nam-audio-pipe".to_string());
+    let package_version = flags
+        .get("package-version")
+        .cloned()
+        .unwrap_or_else(|| "1.0.0".to_string());
+    let git_commit = flags
+        .get("git-commit")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let git_branch = flags
+        .get("git-branch")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let git_dirty = flags
+        .get("git-dirty")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+    let cargo_lock = flags
+        .get("cargo-lock")
+        .cloned()
+        .unwrap_or_else(|| "Cargo.lock".to_string());
+    let rustc_version = flags
+        .get("rustc-version")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let rustflags = flags.get("rustflags").cloned().unwrap_or_default();
+    let pgo_status = flags
+        .get("pgo-status")
+        .cloned()
+        .unwrap_or_else(|| "skipped".to_string());
+    let bolt_status = flags
+        .get("bolt-status")
+        .cloned()
+        .unwrap_or_else(|| "skipped".to_string());
+    let bolt_version = flags.get("bolt-version").cloned();
+    let bolt_profile = flags.get("bolt-profile").cloned();
+    let ceremony_receipt = flags.get("ceremony-receipt").cloned();
+    let pgo_workload_receipt = flags.get("pgo-workload-receipt").cloned();
+    let codegen_status = flags
+        .get("codegen-status")
+        .cloned()
+        .unwrap_or_else(|| "unavailable".to_string());
+    let tarball_path = flags.get("tarball-path").cloned();
+    let flatpak_path = flags.get("flatpak-path").cloned();
+    let installed_path = flags.get("installed-path").cloned();
+    let strict = flags.contains_key("strict");
+    let run_id = flags
+        .get("run-id")
+        .cloned()
+        .or_else(|| env::var("NAM_RUN_ID").ok());
+
+    let mut gaps: Vec<String> = Vec::new();
+    if let Some(list) = flags.get("gaps") {
+        for item in list.split(',') {
+            let item = item.trim();
+            if !item.is_empty() {
+                gaps.push(item.to_string());
+            }
+        }
+    }
+
+    let artifact = Path::new(&artifact_path);
+    if !artifact.exists() {
+        eprintln!("build-receipt: artifact not found: {artifact_path}");
+        exit(1);
+    }
+    let artifact_sha256 = match hash_file(artifact) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("build-receipt: failed to hash artifact {artifact_path}: {e}");
+            exit(1);
+        }
+    };
+
+    let cargo_lock_path = Path::new(&cargo_lock);
+    let cargo_lock_sha256 = hash_file(cargo_lock_path).unwrap_or_else(|_| "absent".to_string());
+    let engine_provenance = extract_engine_provenance(cargo_lock_path);
+
+    let tarball_sha256 = tarball_path
+        .as_ref()
+        .and_then(|p| hash_file(Path::new(p)).ok());
+    let flatpak_sha256 = flatpak_path
+        .as_ref()
+        .and_then(|p| hash_file(Path::new(p)).ok());
+    let installed_sha256 = installed_path
+        .as_ref()
+        .and_then(|p| hash_file(Path::new(p)).ok());
+
+    let bolt_proof = if let Some(path) = ceremony_receipt.as_deref() {
+        match parse_ab_opt_ceremony_receipt(path) {
+            Some((proof_id, _, _)) => proof_id,
+            None => {
+                if bolt_status == "applied" {
+                    gaps.push("bolt_proof_unverified".to_string());
+                }
+                "unverified".to_string()
+            }
+        }
+    } else {
+        if bolt_status == "applied" {
+            gaps.push("bolt_proof_unverified".to_string());
+        }
+        "skipped".to_string()
+    };
+
+    let bolt_profile_sha256 = bolt_profile
+        .as_ref()
+        .and_then(|p| hash_file(Path::new(p)).ok());
+    let pgo_workload = pgo_workload_receipt
+        .as_deref()
+        .and_then(parse_pgo_workload_receipt);
+
+    let pgo_applied = pgo_status == "applied";
+    let bolt_applied = bolt_status == "applied";
+    if !pgo_applied {
+        gaps.push("pgo_not_applied".to_string());
+    }
+    if !bolt_applied {
+        gaps.push("bolt_not_applied".to_string());
+    }
+    if codegen_status != "pass" {
+        gaps.push(format!("codegen_gate_{codegen_status}"));
+    }
+    gaps.sort();
+    gaps.dedup();
+
+    let status = if !gaps.is_empty() && strict {
+        "FAILED"
+    } else if !gaps.is_empty() {
+        "PASS_WITH_GAPS"
+    } else {
+        "PASSED"
+    }
+    .to_string();
+
+    let receipt = BuildReceipt {
+        schema_version: "1.0.0".to_string(),
+        timestamp_utc: now_iso8601(),
+        status: status.clone(),
+        strict_mode: strict,
+        gaps,
+        package: PackageInfo {
+            name: package_name,
+            version: package_version,
+        },
+        provenance: BuildProvenance {
+            git_commit,
+            git_branch,
+            git_dirty,
+            cargo_lock_sha256,
+            rustc_version,
+            rustflags,
+            run_id,
+        },
+        engine_provenance,
+        optimizations: BuildOptimizations {
+            pgo_applied,
+            bolt_applied,
+            bolt_proof,
+            bolt_profile_sha256,
+            bolt_version,
+            codegen_status,
+        },
+        pgo_workload,
+        artifacts: BuildArtifacts {
+            artifact_path,
+            artifact_sha256: artifact_sha256.clone(),
+            tarball_path,
+            tarball_sha256,
+            flatpak_path,
+            flatpak_sha256,
+            installed_path,
+            installed_sha256,
+        },
+    };
+
+    let json = match serde_json::to_string_pretty(&receipt) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("build-receipt: failed to serialize json: {e}");
+            exit(1);
+        }
+    };
+    if let Err(e) = write_file(&out, &json) {
+        eprintln!("build-receipt: failed to write {out}: {e}");
+        exit(1);
+    }
+    if status == "FAILED" {
+        eprintln!("BUILD_RECEIPT: FAIL log={out}");
+        exit(1);
+    }
+    println!("BUILD_RECEIPT: {status} log={out} sha256={artifact_sha256}");
+    exit(0);
+}
+
+fn cmd_verify_artifact(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("verify-artifact", &e),
+    };
+    let out = match required(&flags, "out") {
+        Ok(v) => v.clone(),
+        Err(e) => die_usage("verify-artifact", &e),
+    };
+    let artifact = match required(&flags, "artifact") {
+        Ok(v) => PathBuf::from(v),
+        Err(e) => die_usage("verify-artifact", &e),
+    };
+
+    let verdict = verify_receipt_artifact(Path::new(&out), &artifact);
+    println!("ARTIFACT_CONSISTENCY: {}", verdict.as_str());
+    println!(
+        "ARTIFACT_SHA256: {}",
+        verdict.declared_sha256().unwrap_or("-")
+    );
+    if let Some(reason) = verdict.problem() {
+        eprintln!("verify-artifact: {reason}");
+    }
+    exit(verdict.exit_code() as i32);
+}
+
+fn cmd_certify(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("certify", &e),
+    };
+    let artifact = flags
+        .get("artifact")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_ARTIFACT.to_string());
+    let build_receipt = flags
+        .get("build-receipt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_BUILD_RECEIPT.to_string());
+    let long_receipt = flags
+        .get("long-receipt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_OUT.to_string());
+    let text_receipt = flags
+        .get("text-receipt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_TEXT_RECEIPT.to_string());
+    let out = flags
+        .get("out")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_RELEASE_RECEIPT.to_string());
+    let strict = flags.contains_key("strict");
+
+    let release_receipt = evaluate_certification(
+        Path::new(&artifact),
+        Path::new(&build_receipt),
+        Path::new(&long_receipt),
+        Path::new(&text_receipt),
+        strict,
+    );
+    let json = match serde_json::to_string_pretty(&release_receipt) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("certify: failed to serialize release receipt: {e}");
+            exit(1);
+        }
+    };
+    if let Err(e) = write_file(&out, &json) {
+        eprintln!("certify: failed to write {out}: {e}");
+        exit(1);
+    }
+    if release_receipt.status == "CERTIFIED" {
+        println!(
+            "CERTIFIED: PASS log={out} sha256={}",
+            release_receipt.artifacts.artifact_sha256
+        );
+        exit(0);
+    }
+    eprintln!(
+        "REJECTED: FAIL log={out} reasons={}",
+        release_receipt.reasons.join("; ")
+    );
+    exit(1);
 }
 
 fn append_line(out: &str, line: &str) -> std::io::Result<()> {

@@ -1,458 +1,249 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
-#
-# utils/ab-opt-ceremony.sh — A/B optimization ceremony (HUMAN OPERATOR ONLY).
-#
-# Builds the A/B harness (src/bin/ab_opt_bench.rs) three ways and compares their
-# measured DSP hot-path envelope:
-#
-#   plain → PGO → PGO+BOLT
-#
-# Each variant is built and then run with `--runs N` (default 3; statistical
-# validation requires >= 3 runs). The per-variant receipts
-# (`target/logs/ab-opt-<variant>.json`) retain per-block cycle counts
-# (min/mean/p50/p99/p999/max + tail latency in ns) and, when the kernel permits
-# (perf_event_open), the PMU counters cycles/instructions/iTLB misses/I-cache
-# misses with typed availability.
-#
-# Verdict (Invariant: announce an optimization only when it improves or
-# preserves the measured envelope without fidelity regression):
-#
-#   PGO+BOLT  — BOLT improves or preserves the p99 tail-latency envelope vs PGO
-#               across all runs (no regression), and PMU counters (when
-#               available on this host) do not regress.
-#   PGO-ONLY  — Explicit rollback: BOLT did not prove gain (regression) or
-#               the BOLT toolchain/perf was unavailable. The release continues
-#               PGO-only; PGO+BOLT is never announced without proof.
-#
-# Fidelity (NAMCore parity, f64 oracle, spectral fidelity) is NOT re-checked
-# here — the operator must also run quality checks before certifying any
-# optimization (the A/B only proves the execution envelope).
-#
-# AI agents MUST NOT execute this script; it is part of the operator-only
-# release ceremony.
-
+# ab-opt-ceremony.sh — A/B optimization ceremony (operator-only: plain → PGO → PGO+BOLT). Classe D.
+# Uso: utils/ab-opt-ceremony.sh [--runs N] [--blocks N] [--no-pgo] [--no-bolt] [--bench-extra 'ARGS'] [-h|--help]
+# AI agents must not execute this script; it belongs to the operator release ceremony.
+set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-cd "$PROJECT_DIR"
-NAM_LIB_NO_CD=1 source "$SCRIPT_DIR/_lib.sh"
+cd "$(dirname "$0")/.."
+. utils/_lib.sh
+SCRIPT_NAME=ab-opt-ceremony
 
 RUNS=3
 BLOCKS=20000
-USE_PGO=true
-USE_BOLT=true
-AB_DIR="$PROJECT_DIR/target/logs"
-AB_BUILD_DIR="$PROJECT_DIR/target/ab-opt-build"
+USE_PGO=1
+USE_BOLT=1
+VARIANT_TIMEOUT_S=1800
+COOLDOWN_S="${NAM_THERMAL_COOLDOWN_S:-0}"
+AB_DIR="$PWD/target/logs"
+AB_BUILD_DIR="$PWD/target/ab-opt-build"
 RECEIPT="$AB_DIR/ab-opt-ceremony-receipt.json"
-AB_BENCH_FLAGS=(--blocks "$BLOCKS")
+AB_BENCH_FLAGS=()
 
-show_help() {
-    cat <<EOF
-Usage: $(basename "$0") [OPTIONS]
-
-A/B optimization ceremony: plain → PGO → PGO+BOLT on the DSP hot-path
-harness. OPERATOR ONLY (never run by AI agents).
-
-Options:
-  --runs N         Number of measured runs per variant (default 3, min 3).
-  --blocks N       DSP blocks per measured run (default 20000).
-  --no-pgo         Skip PGO and BOLT; compare PLAIN only (diagnostic).
-  --no-bolt        Build PGO but skip BOLT (compare plain → PGO only).
-  --bench-extra 'ARGS'  Extra flags forwarded to ab_opt_bench (e.g.
-                   '--quantum 256 --oversample 4x').
-  -h, --help       Show this help.
+usage() {
+    cat <<'EOF'
+Uso: utils/ab-opt-ceremony.sh [OPÇÕES]
+  --runs N            Execuções medidas por variante (padrão 3, mínimo 3)
+  --blocks N          Blocos DSP por execução medida (padrão 20000)
+  --no-pgo            Compara apenas PLAIN (diagnóstico, sem veredito)
+  --no-bolt           Compila PGO mas não BOLT (compara plain → PGO)
+  --bench-extra 'ARGS'  Flags extras para ab_opt_bench (ex.: '--quantum 256 --oversample 4x')
+  -h, --help          Exibe esta ajuda
 EOF
 }
 
-while [[ $# -gt 0 ]]; do
+while [ $# -gt 0 ]; do
     case "$1" in
         --runs) RUNS="$2"; shift 2 ;;
         --blocks) BLOCKS="$2"; shift 2 ;;
-        --no-pgo) USE_PGO=false; USE_BOLT=false; shift ;;
-        --no-bolt) USE_BOLT=false; shift ;;
+        --no-pgo) USE_PGO=0; USE_BOLT=0; shift ;;
+        --no-bolt) USE_BOLT=0; shift ;;
         --bench-extra)
             IFS=' ' read -r -a EXTRA <<< "$2"
-            AB_BENCH_FLAGS+=("${EXTRA[@]}")
+            AB_BENCH_FLAGS+=(${EXTRA[@]+"${EXTRA[@]}"})
             shift 2
             ;;
-        -h|--help) show_help; exit 0 ;;
-        *) die "Unknown option: $1 (see --help)" ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERRO: opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-if [ "$RUNS" -lt 3 ]; then
-    die "A/B ceremony requires >= 3 runs per variant for statistical confidence (got --runs $RUNS)."
+[ "$RUNS" -ge 3 ] 2>/dev/null || { echo "ERRO: --runs exige inteiro >= 3 (recebido: $RUNS)" >&2; exit 2; }
+[ "$BLOCKS" -ge 1 ] 2>/dev/null || { echo "ERRO: --blocks exige inteiro >= 1 (recebido: $BLOCKS)" >&2; exit 2; }
+AB_BENCH_FLAGS=(--blocks "$BLOCKS" ${AB_BENCH_FLAGS[@]+"${AB_BENCH_FLAGS[@]}"})
+[[ "$COOLDOWN_S" =~ ^[0-9]+$ ]] || { echo "ERRO: NAM_THERMAL_COOLDOWN_S inválido: $COOLDOWN_S" >&2; exit 2; }
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "ERRO: '$1' não encontrado no PATH." >&2; exit 2; }; }
+need rustc; need cargo; need timeout
+mkdir -p "$AB_DIR"
+rm -f "$AB_DIR"/ab-opt-plain.json "$AB_DIR"/ab-opt-pgo.json "$AB_DIR"/ab-opt-pgo+bolt.json
+rm -f "$AB_DIR"/ab-opt-pgo-gen.json "$AB_DIR"/ab-opt-bolt-probe.json "$AB_DIR"/ab-opt-ceremony-receipt.json
+rm -rf "$AB_BUILD_DIR"
+mkdir -p "$AB_BUILD_DIR"
+export CARGO_TARGET_DIR="$AB_BUILD_DIR"
+cargo build --quiet --locked --release --bin pipe_perf_gate --bin pipe_ab_opt
+PERF_GATE_BIN="$AB_BUILD_DIR/release/pipe_perf_gate"
+COMPARE_BIN="$AB_BUILD_DIR/release/pipe_ab_opt"
+
+# §4.2: explicit NAM_BENCH_CORE → first online isolated CPU → first permitted
+# CPU → unpinned GAP. The typed helper owns the topology policy.
+PIN=()
+BENCH_CORE=""
+if BENCH_CORE=$("$PERF_GATE_BIN" pick-core 2>/dev/null); then
+    PIN=("$PERF_GATE_BIN" pin --bench-core "$BENCH_CORE" --)
+    echo "bench core: $BENCH_CORE"
+else
+    gap bench_core_unavailable; echo "  reason: no explicit/isolated/permitted core (running unpinned)"
 fi
 
-echo -e "${BLUE}${BOLD}========================================================================${NC}"
-echo -e "${BLUE}${BOLD}   A/B Optimization Ceremony (plain → PGO → PGO+BOLT)                   ${NC}"
-echo -e "${BLUE}${BOLD}========================================================================${NC}"
-echo -e "  runs=${RUNS} blocks=${BLOCKS} bench-flags=${AB_BENCH_FLAGS[*]:-}"
+cooldown() {
+    [ "$COOLDOWN_S" -eq 0 ] && return 0
+    echo "cooldown: ${COOLDOWN_S}s"
+    sleep "$COOLDOWN_S"
+}
+run_timed() { local t="$1"; shift; timeout --kill-after=30 "$t" "$@"; }
 
-# ── Toolchain discovery (mirrors build-release.sh) ───────────────────────────
-REQUIRED_CMDS=(rustc cargo python3)
-for cmd in "${REQUIRED_CMDS[@]}"; do
-    command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' not found in PATH."
-done
-
-CONFIG_RUSTFLAGS=$(python3 -c '
-import sys
-try:
-    import tomllib
-    with open(".cargo/config.toml", "rb") as f:
-        flags = tomllib.load(f).get("build", {}).get("rustflags", [])
-    if flags:
-        print(" ".join(flags))
-        sys.exit(0)
-except Exception:
-    pass
-import re
-try:
-    with open(".cargo/config.toml", "r") as f:
-        content = f.read()
-    m = re.search(r"rustflags\s*=\s*\[(.*?)\n\]", content, re.DOTALL)
-    if m:
-        flags = []
-        for line in m.group(1).splitlines():
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            fm = re.search(r"\"([^\"]+)\"", s)
-            if fm:
-                flags.append(fm.group(1))
-        print(" ".join(flags))
-except Exception:
-    pass
-' 2>/dev/null || echo "")
-[ -n "$CONFIG_RUSTFLAGS" ] || die "Could not extract rustflags from .cargo/config.toml."
-# Retain symbol tables and relocation sections for LLVM BOLT (--relocs).
+# Preserve [build] rustflags from .cargo/config.toml: an explicit RUSTFLAGS
+# replaces the config value, so the ceremony re-injects it around the PGO flags.
+CONFIG_RUSTFLAGS=$(awk '
+    /^[[:space:]]*rustflags[[:space:]]*=/ { active = 1 }
+    active {
+        line = $0; sub(/#.*/, "", line)
+        while (match(line, /"[^"]*"/)) {
+            printf "%s ", substr(line, RSTART + 1, RLENGTH - 2)
+            line = substr(line, RSTART + RLENGTH)
+        }
+        if (index(line, "]")) active = 0
+    }
+' .cargo/config.toml)
+CONFIG_RUSTFLAGS="${CONFIG_RUSTFLAGS% }"
+[ -n "$CONFIG_RUSTFLAGS" ] || die "Não foi possível extrair rustflags de .cargo/config.toml."
+# LLVM BOLT needs retained symbols and relocation sections (--relocs).
 CONFIG_RUSTFLAGS="$CONFIG_RUSTFLAGS -C strip=none -Clink-arg=-Wl,-q"
 
 LLVM_PROFDATA=""
-if [ "$USE_PGO" = true ]; then
-    RUST_SYSROOT="$(rustc --print sysroot)"
-    RUST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-    LLVM_PROFDATA="$RUST_SYSROOT/lib/rustlib/$RUST_TARGET/bin/llvm-profdata"
-    [ -x "$LLVM_PROFDATA" ] || die "llvm-profdata not found at $LLVM_PROFDATA (rustup component add llvm-tools-preview)."
+if [ "$USE_PGO" = 1 ]; then
+    SYSROOT="$(rustc --print sysroot)"
+    HOST="$(rustc -vV | sed -n 's/^host: //p')"
+    LLVM_PROFDATA="$SYSROOT/lib/rustlib/$HOST/bin/llvm-profdata"
+    [ -x "$LLVM_PROFDATA" ] || die "llvm-profdata ausente em $LLVM_PROFDATA (rustup component add llvm-tools-preview)."
 fi
 
 LLVM_BOLT=""
-HAS_PERF=false
-if [ "$USE_BOLT" = true ]; then
-    for candidate in \
-        /usr/lib/llvm-22/bin/llvm-bolt /usr/lib/llvm-21/bin/llvm-bolt \
-        /usr/lib/llvm-20/bin/llvm-bolt /usr/lib/llvm-19/bin/llvm-bolt \
-        /usr/lib/llvm-18/bin/llvm-bolt /usr/bin/llvm-bolt-22 /usr/bin/llvm-bolt-21 \
-        /usr/bin/llvm-bolt; do
-        if [ -x "$candidate" ]; then
-            LLVM_BOLT="$candidate"
-            break
-        fi
+HAS_PERF=0
+if [ "$USE_BOLT" = 1 ]; then
+    for candidate in /usr/lib/llvm-{22,21,20,19,18}/bin/llvm-bolt \
+        /usr/bin/llvm-bolt-{22,21} /usr/bin/llvm-bolt; do
+        [ -x "$candidate" ] && { LLVM_BOLT="$candidate"; break; }
     done
     if [ -n "$LLVM_BOLT" ]; then
         PERF2BOLT="$(dirname "$LLVM_BOLT")/perf2bolt"
         [ -x "$PERF2BOLT" ] || PERF2BOLT="perf2bolt"
     else
-        warn "llvm-bolt not found; the ceremony will compare PLAIN → PGO only (BOLT_UNAVAILABLE)."
+        gap llvm_bolt_unavailable; echo "  reason: llvm-bolt not found (comparing plain → PGO only)"
     fi
     if command -v perf >/dev/null 2>&1; then
-        PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "2")
-        if [ "$PARANOID" -gt 1 ]; then
-            if sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
-                PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo "2")
-            fi
+        PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+        if [ "$PARANOID" -gt 1 ] && sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
+            PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
         fi
         if [ "$PARANOID" -le 1 ]; then
-            HAS_PERF=true
+            HAS_PERF=1
         else
-            warn "kernel.perf_event_paranoid=$PARANOID (>1): perf record for BOLT unavailable. Set it to 1 with: sudo sysctl -w kernel.perf_event_paranoid=1"
+            gap perf_event_paranoid; echo "  reason: kernel.perf_event_paranoid=$PARANOID (sudo sysctl -w kernel.perf_event_paranoid=1)"
         fi
     else
-        warn "perf not found; BOLT profiling unavailable."
+        gap perf_unavailable; echo "  reason: perf not found"
     fi
 fi
 
-mkdir -p "$AB_DIR"
-rm -rf "$AB_BUILD_DIR"
-mkdir -p "$AB_BUILD_DIR"
-export CARGO_TARGET_DIR="$AB_BUILD_DIR"
-
-# ── Build + run one variant ──────────────────────────────────────────────────
-# build_and_run <name> <rustflags> [<bin>]
-#   Compiles ab_opt_bench with the given RUSTFLAGS (or reuses the passed binary
-#   for the post-BOLT artifact) and runs `RUNS` measured passes, writing
-#   target/logs/ab-opt-<name>.json.
-build_and_run() {
-    local name="$1" flags="$2" bin="${3:-}"
-    if [ -z "$bin" ]; then
-        eprintln_banner "building variant '$name'"
-        RUSTFLAGS="$flags" cargo build --locked --release --features testing --bin ab_opt_bench
-        bin="$AB_BUILD_DIR/release/ab_opt_bench"
-    fi
-    [ -x "$bin" ] || die "variant '$name' binary not found: $bin"
-    eprintln_banner "running variant '$name' (runs=$RUNS)"
-    "$bin" --variant "$name" --runs "$RUNS" "${AB_BENCH_FLAGS[@]}" \
+build_variant() {
+    local name="$1" flags="$2"
+    echo "building variant '$name'"
+    run_timed "$VARIANT_TIMEOUT_S" env RUSTFLAGS="$flags" \
+        cargo build --locked --release --features testing --bin ab_opt_bench
+}
+run_variant() {
+    local name="$1" bin="$2"
+    [ -x "$bin" ] || die "binário da variante '$name' ausente: $bin"
+    echo "running variant '$name' (runs=$RUNS, blocks=$BLOCKS)"
+    run_timed "$VARIANT_TIMEOUT_S" ${PIN[@]+"${PIN[@]}"} "$bin" \
+        --variant "$name" --runs "$RUNS" "${AB_BENCH_FLAGS[@]}" \
         --receipt "$AB_DIR/ab-opt-$name.json"
 }
 
-eprintln_banner() { echo -e "  ${CYAN}$*${NC}"; }
+echo "A/B optimization ceremony: runs=$RUNS blocks=$BLOCKS flags=${AB_BENCH_FLAGS[*]}"
+build_variant plain "$CONFIG_RUSTFLAGS"
+run_variant plain "$AB_BUILD_DIR/release/ab_opt_bench"
+cooldown
 
-# ── PLAIN ────────────────────────────────────────────────────────────────────
-build_and_run plain "$CONFIG_RUSTFLAGS"
-
-# ── PGO ──────────────────────────────────────────────────────────────────────
 PGO_DIR="$AB_BUILD_DIR/pgo"
-mkdir -p "$PGO_DIR/profraw"
-if [ "$USE_PGO" = true ]; then
-    # Build the profile-generate binary (no run), then run it once with
-    # LLVM_PROFILE_FILE pointed at the profraw dir so no stray .profraw lands
-    # in the repo root.
-    echo -e "  ${CYAN}building variant 'pgo-gen'${NC}"
-    RUSTFLAGS="$CONFIG_RUSTFLAGS -Cprofile-generate=$PGO_DIR/profraw" \
+BOLT_APPLIED=0
+BOLT_CAUSE=""
+if [ "$USE_PGO" = 1 ]; then
+    mkdir -p "$PGO_DIR/profraw"
+    echo "building variant 'pgo-gen'"
+    run_timed "$VARIANT_TIMEOUT_S" env \
+        RUSTFLAGS="$CONFIG_RUSTFLAGS -Cprofile-generate=$PGO_DIR/profraw" \
         cargo build --locked --release --features testing --bin ab_opt_bench
-    LLVM_PROFILE_FILE="$PGO_DIR/profraw/default_%m_%p.profraw" \
+    echo "running variant 'pgo-gen' (profile capture)"
+    run_timed "$VARIANT_TIMEOUT_S" env \
+        LLVM_PROFILE_FILE="$PGO_DIR/profraw/default_%m_%p.profraw" \
+        timeout --kill-after=30 "$VARIANT_TIMEOUT_S" ${PIN[@]+"${PIN[@]}"} \
         "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
         --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-pgo-gen.json"
-    PROFRAW_COUNT=$(find "$PGO_DIR/profraw" -name "*.profraw" 2>/dev/null | wc -l)
-    [ "$PROFRAW_COUNT" -gt 0 ] || die "PGO: no .profraw generated."
-    "$LLVM_PROFDATA" merge -sparse -o "$PGO_DIR/merged.profdata" "$PGO_DIR/profraw"/*.profraw
-    build_and_run pgo "$CONFIG_RUSTFLAGS -Cprofile-use=$PGO_DIR/merged.profdata"
-else
-    warn "--no-pgo: comparing PLAIN only."
-fi
+    PROFRAW_COUNT=$(find "$PGO_DIR/profraw" -name '*.profraw' | wc -l)
+    [ "$PROFRAW_COUNT" -gt 0 ] || die "PGO: nenhum .profraw gerado."
+    run_timed "$VARIANT_TIMEOUT_S" "$LLVM_PROFDATA" merge -sparse \
+        -o "$PGO_DIR/merged.profdata" "$PGO_DIR"/profraw/*.profraw
+    build_variant pgo "$CONFIG_RUSTFLAGS -Cprofile-use=$PGO_DIR/merged.profdata"
+    run_variant pgo "$AB_BUILD_DIR/release/ab_opt_bench"
+    cooldown
 
-# ── PGO+BOLT ─────────────────────────────────────────────────────────────────
-BOLT_APPLIED=false
-BOLT_CAUSE=""
-if [ "$USE_BOLT" = true ] && [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = true ] && [ "$USE_PGO" = true ]; then
-    echo -e "\n${BLUE}${BOLD}Building & running variant 'pgo+bolt'...${NC}"
-    # The bench is offline DSP (no PipeWire needed): perf the hot path directly.
-    rm -f "$PGO_DIR/perf.data"
-    USE_LBR=false
-    if perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
-        USE_LBR=true
-    fi
-    if [ "$USE_LBR" = "true" ]; then
-        PERF_ARGS=(-F 99 -e cycles:u -j any,u)
-    else
+    if [ "$USE_BOLT" = 1 ] && [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = 1 ]; then
+        echo "building & running variant 'pgo+bolt'"
+        rm -f "$PGO_DIR/perf.data"
         PERF_ARGS=(-F 4000 -e cycles:u)
-    fi
-    if perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
-        "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
-        --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
-        :
-    else
-        BOLT_CAUSE="BOLT_FAILED: perf record session failed."
-    fi
-
-    if [ -z "$BOLT_CAUSE" ] && [ ! -s "$PGO_DIR/perf.data" ]; then
-        BOLT_CAUSE="BOLT_FAILED: perf.data empty or missing."
-    fi
-
-    if [ -z "$BOLT_CAUSE" ]; then
-        chmod 644 "$PGO_DIR/perf.data" 2>/dev/null || true
-        PERF2BOLT_FLAGS=()
-        if [ "$USE_LBR" = "false" ]; then
-            if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
-                PERF2BOLT_FLAGS+=("--basic-events")
-            else
-                warn "perf2bolt --basic-events not supported by this toolchain; omitting flag."
+        if run_timed 60 perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
+            PERF_ARGS=(-F 99 -e cycles:u -j any,u)
+            LBR=1
+        else
+            LBR=0
+        fi
+        if ! run_timed "$VARIANT_TIMEOUT_S" perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
+            ${PIN[@]+"${PIN[@]}"} "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
+            --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
+            BOLT_CAUSE="BOLT_FAILED: perf record session failed."
+        elif [ ! -s "$PGO_DIR/perf.data" ]; then
+            BOLT_CAUSE="BOLT_FAILED: perf.data empty or missing."
+        fi
+        if [ -z "$BOLT_CAUSE" ]; then
+            chmod 644 "$PGO_DIR/perf.data" 2>/dev/null || true
+            P2B_FLAGS=()
+            if [ "$LBR" = 0 ]; then
+                if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
+                    P2B_FLAGS=(--basic-events)
+                else
+                    gap perf2bolt_without_basic_events
+                fi
+            fi
+            if ! run_timed "$VARIANT_TIMEOUT_S" "$PERF2BOLT" ${P2B_FLAGS[@]+"${P2B_FLAGS[@]}"} \
+                -p "$PGO_DIR/perf.data" "$AB_BUILD_DIR/release/ab_opt_bench" \
+                -o "$PGO_DIR/perf.fdata" >"$PGO_DIR/perf2bolt.log" 2>&1; then
+                BOLT_CAUSE="BOLT_FAILED: perf2bolt conversion failed: $(tail -n1 "$PGO_DIR/perf2bolt.log" 2>/dev/null || true)"
             fi
         fi
-        if "$PERF2BOLT" "${PERF2BOLT_FLAGS[@]}" -p "$PGO_DIR/perf.data" "$AB_BUILD_DIR/release/ab_opt_bench" \
-            -o "$PGO_DIR/perf.fdata" > "$PGO_DIR/perf2bolt.log" 2>&1; then
-            :
-        else
-            BOLT_CAUSE="BOLT_FAILED: perf2bolt conversion failed: $(tail -n1 "$PGO_DIR/perf2bolt.log" 2>/dev/null || true)"
-        fi
-    fi
-
-    if [ -z "$BOLT_CAUSE" ]; then
-        if "$LLVM_BOLT" "$AB_BUILD_DIR/release/ab_opt_bench" \
-            -o "$AB_BUILD_DIR/release/ab_opt_bench.bolt" \
-            -data "$PGO_DIR/perf.fdata" \
-            --reorder-blocks=ext-tsp --reorder-functions=hfsort --split-functions \
-            --split-all-cold -hugify --relocs --lite > "$PGO_DIR/llvm-bolt.log" 2>&1; then
-            BOLT_APPLIED=true
-        else
+        if [ -z "$BOLT_CAUSE" ] && run_timed "$VARIANT_TIMEOUT_S" "$LLVM_BOLT" \
+            "$AB_BUILD_DIR/release/ab_opt_bench" -o "$AB_BUILD_DIR/release/ab_opt_bench.bolt" \
+            -data "$PGO_DIR/perf.fdata" --reorder-blocks=ext-tsp --reorder-functions=hfsort \
+            --split-functions --split-all-cold -hugify --relocs --lite >"$PGO_DIR/llvm-bolt.log" 2>&1; then
+            BOLT_APPLIED=1
+        elif [ -z "$BOLT_CAUSE" ]; then
             BOLT_CAUSE="BOLT_FAILED: llvm-bolt failed: $(tail -n1 "$PGO_DIR/llvm-bolt.log" 2>/dev/null || true)"
         fi
+        if [ "$BOLT_APPLIED" = 1 ]; then
+            run_variant pgo+bolt "$AB_BUILD_DIR/release/ab_opt_bench.bolt"
+            cooldown
+        else
+            gap bolt_not_applied; echo "  reason: $BOLT_CAUSE"
+        fi
+    elif [ "$USE_BOLT" = 1 ]; then
+        BOLT_CAUSE="BOLT_UNAVAILABLE: ${LLVM_BOLT:-llvm-bolt-not-found}/perf=$HAS_PERF"
+        gap bolt_skipped; echo "  reason: $BOLT_CAUSE"
     fi
-
-    if [ "$BOLT_APPLIED" = true ]; then
-        build_and_run pgo+bolt "$CONFIG_RUSTFLAGS" "$AB_BUILD_DIR/release/ab_opt_bench.bolt"
-    else
-        warn "BOLT not applied (${BOLT_CAUSE}); the ceremony will compare PLAIN → PGO only."
-    fi
-elif [ "$USE_BOLT" = true ]; then
-    BOLT_CAUSE="BOLT_UNAVAILABLE: $([ -z "$LLVM_BOLT" ] && echo llvm-bolt-not-found || ([ "$HAS_PERF" != true ] && echo perf-unavailable || echo pgo-disabled))"
-    warn "BOLT skipped: ${BOLT_CAUSE}"
 fi
 
-# ── Compare receipts & emit verdict ──────────────────────────────────────────
-if [ "$USE_PGO" = true ]; then
-    python3 - "$AB_DIR" "$RECEIPT" "$RUNS" "$BOLT_APPLIED" "$BOLT_CAUSE" <<'PY'
-import json
-import os
-import sys
-
-ab_dir, receipt_path, runs, bolt_applied, bolt_cause = sys.argv[1:6]
-bolt_applied = bolt_applied.lower() in ("true", "1")
-
-def read_variant(name):
-    path = os.path.join(ab_dir, f"ab-opt-{name}.json")
-    runs_data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            if obj.get("event") == "run":
-                runs_data.append(obj)
-    return runs_data
-
-variants = {"plain": read_variant("plain"), "pgo": read_variant("pgo")}
-if bolt_applied:
-    variants["pgo+bolt"] = read_variant("pgo+bolt")
-
-def median_of(runs_data, key):
-    if not runs_data:
-        return None
-    vals = sorted(r[key] for r in runs_data)
-    return vals[len(vals) // 2]
-
-def median_cycles(runs_data, field):
-    if not runs_data:
-        return None
-    vals = sorted(r["cycles"][field] for r in runs_data)
-    return vals[len(vals) // 2]
-
-def median_pmu(runs_data, key):
-    avail = [r for r in runs_data if r.get("pmu_availability", {}).get(key) == "ok"]
-    if not avail or len(avail) < len(runs_data):
-        return None  # not available on every run → cannot attribute
-    vals = sorted(r["pmu"][key] for r in runs_data)
-    return vals[len(vals) // 2]
-
-def pct(new, old):
-    if not old:
-        return None
-    return (new - old) / old * 100.0
-
-def fmt(v):
-    return f"{v:.2f}%" if v is not None else "n/a"
-
-def gain(from_name, to_name, field):
-    a = median_cycles(variants[from_name], field)
-    b = median_cycles(variants[to_name], field)
-    return pct(b, a)
-
-def pmu_gain(from_name, to_name, key):
-    a = median_pmu(variants[from_name], key)
-    b = median_pmu(variants[to_name], key)
-    return pct(b, a)
-
-if not variants["plain"] or not variants["pgo"]:
-    print("[FATAL] plain/pgo receipts are empty; cannot compare.", file=sys.stderr)
-    sys.exit(1)
-
-doc = {
-    "schema_version": 1,
-    "tool": "ab-opt-ceremony.sh",
-    "runs": int(runs),
-    "variants": {
-        name: {
-            "median_p99_cycles": median_cycles(data, "p99"),
-            "median_max_cycles": median_cycles(data, "max"),
-            "median_mean_cycles": median_cycles(data, "mean"),
-        }
-        for name, data in variants.items()
-    },
-    "pgo_gain_pct": {
-        "p99": gain("plain", "pgo", "p99"),
-        "max": gain("plain", "pgo", "max"),
-        "mean": gain("plain", "pgo", "mean"),
-    },
-    "pmu_pgo_gain_pct": {
-        k: pmu_gain("plain", "pgo", k)
-        for k in ("cycles", "instructions", "itlb_misses", "icache_misses")
-    },
-}
-
-# Verdict: invariant = an optimization is announced only when it improves or
-# preserves the envelope without regression.
-if bolt_applied:
-    doc["bolt_gain_pct"] = {
-        "p99": gain("pgo", "pgo+bolt", "p99"),
-        "max": gain("pgo", "pgo+bolt", "max"),
-        "mean": gain("pgo", "pgo+bolt", "mean"),
-    }
-    doc["pmu_bolt_gain_pct"] = {
-        k: pmu_gain("pgo", "pgo+bolt", k)
-        for k in ("cycles", "instructions", "itlb_misses", "icache_misses")
-    }
-
-    plain_p99 = median_cycles(variants["plain"], "p99")
-    pgo_p99 = median_cycles(variants["pgo"], "p99")
-    bolt_p99 = median_cycles(variants["pgo+bolt"], "p99")
-    pgo_regression = pgo_p99 is not None and plain_p99 is not None and pgo_p99 > plain_p99
-    bolt_regression = bolt_p99 is not None and pgo_p99 is not None and bolt_p99 > pgo_p99
-    if bolt_regression:
-        doc["verdict"] = "PGO-ONLY"
-        doc["rollback"] = "BOLT regressed the p99 tail-latency envelope vs PGO; PGO-only is the explicit fallback."
-    elif pgo_regression and bolt_p99 is not None and plain_p99 is not None and bolt_p99 > plain_p99:
-        doc["verdict"] = "PGO-ONLY"
-        doc["rollback"] = "Neither PGO nor BOLT improved the plain envelope (both regressed p99)."
-    else:
-        doc["verdict"] = "PGO+BOLT"
-        doc["rollback"] = ""
-else:
-    plain_p99 = median_cycles(variants["plain"], "p99")
-    pgo_p99 = median_cycles(variants["pgo"], "p99")
-    if pgo_p99 is not None and plain_p99 is not None and pgo_p99 > plain_p99:
-        doc["verdict"] = "UNOPTIMIZED"
-        doc["rollback"] = "PGO regressed the envelope vs PLAIN; do not announce any optimization."
-    else:
-        doc["verdict"] = "PGO-ONLY"
-        doc["rollback"] = "BOLT not proven/applied on this host (PGO-only fallback)."
-    doc["bolt_cause"] = bolt_cause or "BOLT not requested"
-
-with open(receipt_path, "w", encoding="utf-8") as f:
-    json.dump(doc, f, indent=2, sort_keys=True)
-    f.write("\n")
-
-verdict = doc["verdict"]
-print()
-print(f"VERDICT: {verdict}")
-if doc.get("rollback"):
-    print(f"  {doc['rollback']}")
-print()
-if bolt_applied:
-    print(
-        f"  // Measured: BOLT gain p99={fmt(doc['bolt_gain_pct']['p99'])} "
-        f"(PGO p99={median_cycles(variants['pgo'], 'p99')} → BOLT p99={median_cycles(variants['pgo+bolt'], 'p99')} cyc), "
-        f"max={fmt(doc['bolt_gain_pct']['max'])}, mean={fmt(doc['bolt_gain_pct']['mean'])}"
-    )
-    print(
-        "  // Measured: BOLT iTLB=" + fmt(doc["pmu_bolt_gain_pct"]["itlb_misses"])
-        + ", I-cache=" + fmt(doc["pmu_bolt_gain_pct"]["icache_misses"])
-    )
-    print(
-        "  // Measured: PGO gain p99=" + fmt(doc["pgo_gain_pct"]["p99"])
-        + ", max=" + fmt(doc["pgo_gain_pct"]["max"]) + ", mean=" + fmt(doc["pgo_gain_pct"]["mean"])
-    )
-else:
-    print(
-        "  // Measured: PGO gain p99=" + fmt(doc["pgo_gain_pct"]["p99"])
-        + ", max=" + fmt(doc["pgo_gain_pct"]["max"]) + ", mean=" + fmt(doc["pgo_gain_pct"]["mean"])
-    )
-print()
-print(f"  Receipt: {receipt_path}")
-sys.exit(0 if verdict in ("PGO+BOLT", "PGO-ONLY") else 1)
-PY
+if [ "$USE_PGO" = 1 ]; then
+    CAUSE=()
+    [ "$BOLT_APPLIED" = 1 ] || CAUSE=(--bolt-cause "${BOLT_CAUSE:-BOLT not requested}")
+    RC=0
+    run_timed 120 "$COMPARE_BIN" compare --dir "$AB_DIR" --out "$RECEIPT" --runs "$RUNS" \
+        --bolt-applied "$BOLT_APPLIED" ${CAUSE[@]+"${CAUSE[@]}"} || RC=$?
+    [ "$RC" -eq 0 ] || FAILS+=(verdict)
+    finish || exit 1
+    [ "$RC" -eq 0 ] || exit 1
 else
-    echo -e "\n${YELLOW}PLAIN-only diagnostic run; no PGO/BOLT verdict.${NC}"
+    echo "PLAIN-only diagnostic run; no PGO/BOLT verdict."
+    finish
 fi

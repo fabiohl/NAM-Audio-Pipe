@@ -6,28 +6,33 @@
 //! Single source of truth for the semantic receipt formats so the test
 //! harnesses, the release pipeline and the CLI verifiers never drift apart:
 //!
-//! - [`long`] — the nightly / pre-release long-audit receipt
-//!   (`target/logs/long-receipt.txt`, emitted by `utils/tests-long.sh`),
-//!   consumed by `tests/distribution_qa.rs` (audit suite) and by
-//!   `src/bin/long_receipt_check.rs` (the strict-release semantic gate invoked
-//!   by `utils/build-release.sh --release-ceremony`).
+//! - [`long`] — the legacy human-readable long-audit receipt
+//!   (`target/logs/long-receipt.txt`), retained as the derived view.
 //! - [`jsonl`] — the unified-schema machine-readable receipt
-//!   (`target/logs/long-audit-receipt.jsonl`), emitted alongside the `.txt`
-//!   derived view and validated with the engine's canonical
-//!   `testing::receipt` parser. Testing-only (it reuses engine test scaffolding).
+//!   (`target/logs/long-audit-receipt.jsonl`) and the source of truth for
+//!   certification. Testing-only (it reuses engine test scaffolding).
+//! - [`build`]/[`release`] — typed build provenance and fail-closed release
+//!   certification (`target/dist/{build,release}-receipt.json`).
 
 pub mod long;
 
 #[cfg(feature = "testing")]
+pub mod build;
+
+#[cfg(feature = "testing")]
 pub mod jsonl;
+
+#[cfg(feature = "testing")]
+pub mod release;
 
 /// Sibling-file carrier for typed long-audit FAIL causes. Testing-only:
 /// it is written by `src/bin/pipe_long_receipt.rs` and the long suite.
 #[cfg(feature = "testing")]
 pub mod fail_reasons;
 
-/// Canonical phase roster of the long-audit suite: `phase1`..`phase7` plus the
+/// Canonical phase roster of the long-audit suite: `phase1`..`phase10` plus the
 /// terminal `overall` line. Shared by the JSONL emitter/verifier and the tests.
-pub const LONG_ROSTER: [&str; 8] = [
-    "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "overall",
+pub const LONG_ROSTER: [&str; 11] = [
+    "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9",
+    "phase10", "overall",
 ];

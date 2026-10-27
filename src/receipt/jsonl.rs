@@ -13,7 +13,6 @@
 use std::path::Path;
 
 pub use neural_amp_modeler_rs::testing::receipt::LongAuditReceipt;
-use neural_amp_modeler_rs::testing::receipt::LongPhaseStatus;
 
 use crate::receipt::LONG_ROSTER;
 
@@ -55,10 +54,4 @@ pub fn verify_long_jsonl_strict(path: &Path) -> Result<LongAuditReceipt, String>
             )
         })?;
     Ok(audit)
-}
-
-/// Derived verdict of the unified JSONL receipt, for coherence checks against
-/// the `.txt` reader.
-pub fn derived_status(audit: &LongAuditReceipt) -> LongPhaseStatus {
-    audit.summary_receipt().status
 }

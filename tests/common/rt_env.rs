@@ -12,6 +12,10 @@
 //! Kept self-contained (rather than re-exporting the engine's
 //! `testing::host::rt_env`) because `pw_integration` builds without the
 //! `testing` feature, which is what gates the engine's host probes.
+//!
+//! Host topology policy: the process affinity decides the measured CPU
+//! (`NAM_BENCH_CORE` → first online isolated CPU → first permitted CPU);
+//! there is no host-specific core preference and no `cpuN` probe here.
 
 /// Reads the process's `Cpus_allowed_list` from `/proc/self/status`.
 pub fn cpus_allowed_list() -> Vec<u32> {
@@ -66,13 +70,6 @@ pub fn read_cpu_governor(cpu: Option<u32>) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Detects if CPU 9 is offline (the SMT sibling kept offline for the RT core).
-pub fn is_cpu9_offline() -> bool {
-    std::fs::read_to_string("/sys/devices/system/cpu/cpu9/online")
-        .map(|s| s.trim() == "0")
-        .unwrap_or(false)
-}
-
 /// Calibration facts of the measurement environment (probed once per gate).
 #[derive(Debug, Clone)]
 pub struct RtCalibration {
@@ -86,8 +83,6 @@ pub struct RtCalibration {
     pub sched_fifo: bool,
     /// Scaling governor of the pinned CPU or system.
     pub governor: String,
-    /// Whether CPU 9 is offline (SMT pair offline).
-    pub cpu9_offline: bool,
     /// `NAM_RT_STRICT=1`: promote every GAP condition to a hard failure.
     pub strict: bool,
 }
@@ -113,7 +108,6 @@ impl RtCalibration {
             cpu_isolated,
             sched_fifo,
             governor: read_cpu_governor(pinned_cpu),
-            cpu9_offline: is_cpu9_offline(),
             strict: std::env::var("NAM_RT_STRICT").as_deref() == Ok("1"),
         }
     }
@@ -133,13 +127,8 @@ impl RtCalibration {
             Some(id) => id.to_string(),
             None => "none".to_string(),
         };
-        let cpu9_str = if self.cpu9_offline {
-            "offline"
-        } else {
-            "online"
-        };
         format!(
-            "env=pinned:{pinned},isolated:{isolated},fifo:{fifo},governor:{},cpu:{cpu_str},cpu9:{cpu9_str}",
+            "env=pinned:{pinned},isolated:{isolated},fifo:{fifo},governor:{},cpu:{cpu_str}",
             self.governor
         )
     }

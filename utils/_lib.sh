@@ -1,42 +1,24 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+# _lib.sh — local QA helpers for NAM-Audio-Pipe. No pinned copy, no hash, no host policy.
+# Source with: PHASE_TOTAL=<N>; source utils/_lib.sh (NAM_LIB_NO_CD=1 keeps the caller's cwd).
+LOG_DIR=target/logs
+mkdir -p "$LOG_DIR"
+export NAM_RUN_ID="${NAM_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+T0=$SECONDS
+FAILS=()
+GAPS=()
+gap() { GAPS+=("$1"); echo "PHASE: $1 GAP"; }
+STRICT=0
 
-# _lib.sh — Common bash utilities for nam-audio-pipe scripts.
-#
-# Source with:
-#   PHASE_TOTAL=<N>; source "$(dirname "$0")/_lib.sh"
-# or for scripts that manage their own working directory (e.g. build-release.sh):
-#   NAM_LIB_NO_CD=1 PHASE_TOTAL=<N>; source "$(dirname "$0")/_lib.sh"
-#
-# The project-neutral helpers (ANSI colors, phase/ok/warn/die,
-# format_duration_ms/phase_elapsed_str, emit/emit_to, assert_ran_tests/
-# assert_subphase_ran, pick_bench_core) live in the canonical, byte-identical
-# `_lib_core.sh` block (see utils/test-lib-drift.sh). This file adds only the
-# repository-specific glue on top.
-#
-# Then call:
-#   phase "Description of the current step"
-#   die  "Fatal error message"    # prints to stderr and exits 1
-#   ok   "Success message"        # prints indented green OK line
-#   warn "Warning message"        # prints indented yellow notice
-
-# Canonical project-neutral core (drift-pinned; see utils/test-lib-drift.sh).
-source "$(dirname "${BASH_SOURCE[0]}")/_lib_core.sh"
-
-# ---------------------------------------------------------------------------
-# Resolve project root dynamically relative to this helper script.
-# ---------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+NC='\033[0m'
 LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$LIB_DIR")"
-
-if [ -z "$PROJECT_DIR" ]; then
-    echo -e "${RED}${BOLD}[FATAL]${NC} _lib.sh: could not resolve PROJECT_DIR." >&2
-    exit 1
-fi
-
-# Automatically enter the project root directory, unless the caller has set
-# NAM_LIB_NO_CD=1 (used by scripts that manage their own working directory,
-# such as build-release.sh which sets up its own cd before sourcing this lib).
 if [ "${NAM_LIB_NO_CD:-0}" != "1" ]; then
     cd "$PROJECT_DIR" || {
         echo -e "${RED}${BOLD}[FATAL]${NC} _lib.sh: failed to cd into project root: $PROJECT_DIR" >&2
@@ -44,56 +26,95 @@ if [ "${NAM_LIB_NO_CD:-0}" != "1" ]; then
     }
 fi
 
-# ---------------------------------------------------------------------------
-# Mandatory test-target execution gate
-# ---------------------------------------------------------------------------
+warn() { echo -e "  ${YELLOW}ⓘ${NC} $*"; }
+die() {
+    echo -e "${RED}${BOLD}[FATAL]${NC} $*" >&2
+    exit 1
+}
+ok() { echo -e "  ${GREEN}OK${NC} $*"; }
+
+# Canonical phase line and portable elapsed time ($SECONDS; no date +%s%N).
+PHASE_NUM=0
+PHASE_START=$SECONDS
+phase() {
+    PHASE_NUM=$((PHASE_NUM + 1))
+    PHASE_START=$SECONDS
+    echo "PHASE: $1"
+}
+format_duration_ms() {
+    local ms="${1:-0}"
+    if [ "$ms" -lt 1000 ]; then
+        echo "${ms}ms"
+    elif [ "$ms" -lt 10000 ]; then
+        printf "%d.%02ds\n" "$((ms / 1000))" "$(((ms % 1000) / 10))"
+    else
+        printf "%d.%ds\n" "$((ms / 1000))" "$(((ms % 1000) / 100))"
+    fi
+}
+phase_elapsed_str() { format_duration_ms "$(((SECONDS - PHASE_START) * 1000))"; }
+
+# ran_tests <log>: every cargo test binary ran and none reported failures.
+# ANSI escapes (CARGO_TERM_COLOR=always) are stripped; grep -c uses "|| true"
+# so zero matches never turn into the "0\n0" integer-comparison trap.
+ran_tests() {
+    local log="$1" clean n_run n_start n_res
+    clean=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" 2>/dev/null || true)
+    n_run=$(printf '%s\n' "$clean" | grep -c -E '^\s*(Running|Doc-tests)\b' || true)
+    n_start=$(printf '%s\n' "$clean" | grep -c -E '^\s*running [0-9]+ tests?' || true)
+    n_res=$(printf '%s\n' "$clean" | grep -c -E '^test result: (ok|FAILED)\.' || true)
+    [ "$n_run" -gt 0 ] && [ "$n_res" -ge "$n_run" ] && [ "$n_start" -eq "$n_res" ] \
+        && ! printf '%s\n' "$clean" | grep -q 'test result: FAILED' \
+        && printf '%s\n' "$clean" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'
+}
+
+# assert_ran_tests <log> [min_count]: fail-closed gate against empty selections,
+# filter typos and fully skipped targets.
+assert_ran_tests() {
+    local log="$1" min="${2:-1}" total
+    total=$(grep -oE '[0-9]+ (passed|measured)' "$log" 2>/dev/null \
+        | awk '{s += $1} END {print s + 0}' || true)
+    if [ "${total:-0}" -lt "$min" ] || ! ran_tests "$log"; then
+        echo -e "${RED}${BOLD}❌ Gate failed: $log executed ${total:-0} test(s) < $min.${NC}" >&2
+        return 1
+    fi
+    echo -e "  Gate: ${total} test(s) ≥ $min  ✓"
+}
 
 # assert_ran_target <log_file> <target_name> [min_count]
-#   Verifies that a specific mandatory test target was actually executed in the
-#   log and that its nominal executed-test count (passed + measured) reached
-#   min_count. <target_name> is the text after the "Running " banner produced
-#   by cargo test, e.g. "unittests src/lib.rs", "unittests src/main.rs" or
-#   "tests/service_resilience.rs".
-#   Fail-closed against removed/renamed targets (no "Running ..." section),
-#   empty filters and full skips (executed count below min_count).
+#   Verifies that a mandatory cargo test target executed at least min_count
+#   tests/benchmarks and failed closed when the target was removed, renamed,
+#   filtered out or fully skipped.
 assert_ran_target() {
-    local log_file="$1"
-    local target_name="$2"
-    local min_count="${3:-1}"
-
-    if [ ! -f "$log_file" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: log file not found: $log_file${NC}"
+    local log="$1" target="$2" min="${3:-1}" line lineno passed measured executed
+    if [ ! -f "$log" ] || [ -z "$target" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: missing log or target name ($log, '$target').${NC}" >&2
         return 1
     fi
-    if [ -z "$target_name" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: assert_ran_target called without a target name.${NC}"
+    line=$(grep -n -m1 -F "Running $target " "$log" 2>/dev/null || true)
+    if [ -z "$line" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '$target' was not executed ($log).${NC}" >&2
         return 1
     fi
-
-    local run_line run_lineno result_line passed measured executed
-    run_line=$(grep -n -m1 -F "Running ${target_name} " "$log_file" 2>/dev/null || true)
-    if [ -z "$run_line" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' was not executed (no 'Running ...' section in $log_file). Target removed, renamed or filtered out?${NC}"
+    lineno="${line%%:*}"
+    line=$(sed -n "$((lineno + 1)),\$p" "$log" | grep -m1 -E 'test result:' 2>/dev/null || true)
+    if [ -z "$line" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '$target' has no 'test result:' summary.${NC}" >&2
         return 1
     fi
-    run_lineno="${run_line%%:*}"
-
-    result_line=$(sed -n "$((run_lineno + 1)),\$p" "$log_file" | grep -m1 -E 'test result:' 2>/dev/null || true)
-    if [ -z "$result_line" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' has no 'test result:' summary in $log_file.${NC}"
+    passed=$(printf '%s\n' "$line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -n1 || true)
+    measured=$(printf '%s\n' "$line" | grep -oE '[0-9]+ measured' | grep -oE '^[0-9]+' | head -n1 || true)
+    executed=$(( ${passed:-0} + ${measured:-0} ))
+    if [ "$executed" -lt "$min" ]; then
+        echo -e "${RED}${BOLD}❌ Gate failed: target '$target' executed $executed < $min.${NC}" >&2
         return 1
     fi
+    echo -e "  Gate: target '$target' executed $executed test(s) ≥ $min  ✓"
+}
 
-    passed=$(printf '%s\n' "$result_line" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+' | head -n1 || true)
-    passed="${passed:-0}"
-    measured=$(printf '%s\n' "$result_line" | grep -oE '[0-9]+ measured' | grep -oE '^[0-9]+' | head -n1 || true)
-    measured="${measured:-0}"
-    executed=$((passed + measured))
-
-    if [ "$executed" -lt "$min_count" ]; then
-        echo -e "${RED}${BOLD}❌ Gate failed: target '${target_name}' executed $executed test(s)/benchmark(s) < $min_count (empty filter or full skip?).${NC}"
-        return 1
-    fi
-    echo -e "  Gate: target '${target_name}' executed $executed test(s)/benchmark(s) ≥ $min_count  ✓"
-    return 0
+finish() {
+    local s=PASS
+    [ ${#GAPS[@]} -gt 0 ] && s=PASS_WITH_GAPS
+    { [ ${#FAILS[@]} -gt 0 ] || { [ "$STRICT" = 1 ] && [ ${#GAPS[@]} -gt 0 ]; }; } && s=FAIL
+    echo "RESULT: $s ($((SECONDS - T0))s) fails=${FAILS[*]:-none} gaps=${GAPS[*]:-none}"
+    [ "$s" != FAIL ]
 }

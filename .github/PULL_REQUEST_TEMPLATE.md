@@ -43,8 +43,8 @@ Fixes #
 <!-- Run these verification scripts from the repository root before opening or marking PR ready for review: -->
 
 ```bash
-utils/mem-guard.sh utils/lints.sh        # Static analysis, fmt, clippy (-D warnings), SPDX validation
-utils/tests-quick.sh                     # Agile testing, PipeWire mock streams, CLI tests (auto-contained)
+utils/lints.sh                           # Formatting, static analysis, clippy (-D warnings), SPDX, AppStream
+utils/tests-quick.sh                     # Quick discipline: all non-ignored tests in the development profile
 ```
 
 - [ ] **`utils/lints.sh` Passed**: 100% clean across all feature permutations (`--all-features`, `--no-default-features`).

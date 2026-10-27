@@ -274,11 +274,11 @@ fn disk_writer_loop_discards_audio_before_metadata() {
 ///
 /// Requires a running PipeWire daemon AND io_uring. If the daemon is absent
 /// the test prints an honest `TEST_RESULT[record_e2e]=SKIP:daemon_unavailable`
-/// marker (Phase 4 of `utils/tests-quick.sh` matches that typed marker and
+/// marker (`utils/tests-long.sh` PHASE9 matches that typed marker and
 /// never emits `RECORDING_IO_URING=RAN` for a skip; on success it emits
 /// `TEST_RESULT[record_e2e]=PASS`).
 #[test]
-#[ignore = "E2E recording: requires running PipeWire daemon + io_uring; auto-detected by utils/tests-quick.sh Phase 4"]
+#[ignore = "E2E recording: requires running PipeWire daemon + io_uring; run by utils/tests-long.sh PHASE9"]
 fn record_e2e_pipewire_wav_header_matches_bytes() {
     let _lock = TEST_MUTEX.lock().unwrap();
     let _sd = ShutdownGuard::new();

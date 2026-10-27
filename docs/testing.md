@@ -46,7 +46,7 @@ NAM-Audio-Pipe Test Hierarchy
     ├── soak_extended.rs           -> Accelerated-timeline soak (320k blocks, RSS stability)
     ├── endurance.rs               -> Real wall-clock endurance (fail-closed validation windows)
     ├── rt_metrics.rs              -> Nanosecond deadline & inter-callback jitter profiling
-    └── distribution_qa.rs         -> AppStream XML, release provenance & receipt audits
+    └── distribution_qa.rs         -> AppStream XML & dist-binary packaging smoke
 ```
 
 ---
@@ -193,7 +193,7 @@ tests/
 ├── soak_extended.rs             -> Accelerated timeline soak (320k blocks, RSS leak checks)
 ├── endurance.rs                 -> Wall-clock real-time endurance testing
 ├── rt_metrics.rs                -> Nanosecond deadline & jitter benchmarking (SCHED_FIFO)
-└── distribution_qa.rs           -> AppStream validation, release provenance & receipt audits
+└── distribution_qa.rs           -> AppStream validation & dist-binary packaging smoke
 ```
 
 #### CLI End-to-End Black-Box Suite
@@ -227,7 +227,7 @@ tests/
 
 - **File**: [`tests/pw_integration.rs`](../tests/pw_integration.rs)
 - **Objective**: Tests full audio graph execution against an active PipeWire daemon.
-- **Verifications**: Context creation, dual-stream setup, parameter injection, real audio execution (`last_n_samples > 0`), and atomic shutdown. Uses an inaudible tone driver to keep the capture node actively scheduled. Includes opt-in daemon disruption tests (`NAM_DAEMON_BOUNCE_TEST=1`) proving automatic recovery after daemon restarts.
+- **Verifications**: Context creation, dual-stream setup, parameter injection, real audio execution (`last_n_samples > 0`), and atomic shutdown. Uses an inaudible tone driver to keep the capture node actively scheduled. Includes `#[ignore]` private-daemon disruption tests (`daemon_bounce_*`, run by the long audit) proving automatic recovery after daemon restarts.
 
 #### Service Resilience & Signal Harness
 
@@ -267,11 +267,11 @@ tests/
   - **RT Jitter Gate**: Measures callback dispersion under thread contention, verifying tail jitter $p99.99 \le 0.75 \cdot T$ on calibrated real-time kernels.
   - **Concurrency Stress**: Validates lock-free state transitions and SPSC throughput across 16 competing threads.
 
-#### Distribution QA & Release Audit Harness
+#### Distribution QA Harness
 
 - **File**: [`tests/distribution_qa.rs`](../tests/distribution_qa.rs)
-- **Objective**: Certifies packaging, metadata, and build artifact integrity before release.
-- **Verifications**: Strict AppStream XML validation (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`), typed test-receipt parsing, cryptographic provenance verification (`release-provenance.json`), and stripped production binary smoke tests.
+- **Objective**: Certifies shipping metadata and the distributed binary artifact.
+- **Verifications**: Strict AppStream XML validation (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`) and stripped production binary smoke tests (`--diagnose`/`--help`). Release receipts and long-audit certification are verified by the release chain, not by this harness.
 
 ---
 
@@ -279,78 +279,50 @@ tests/
 
 Executable verification scripts in [`utils/`](../utils/) automate testing across different developer and CI phases:
 
-### 3.1 Static Analysis Quality Gate ([`utils/lints.sh`](../utils/lints.sh))
+### 3.1 Static Quality Gate ([`utils/lints.sh`](../utils/lints.sh))
 
-Executes mandatory pre-commit static quality checks:
+Class A. It runs the following steps in order and aborts on the first failure:
 
-1. **Formatting**: Enforces standard Rust formatting via `cargo fmt --all`.
-2. **Compilation Matrix**: Runs `cargo check` across `--all-features`, `--no-default-features`, and release profiles.
-3. **Strict Clippy**: Enforces `cargo clippy -- -D warnings` across all feature configurations.
-4. **SPDX License Headers**: Verifies valid `GPL-3.0-or-later` or `MIT` SPDX headers on all `.rs` and `.sh` files.
-5. **AppStream & Desktop Validation**: Validates Flatpak metadata and desktop entries.
+1. **Formatting:** `cargo fmt --all` is applied during local development (N-5); with `CI=true` it only verifies with `--check`.
+2. **Compilation matrix:** `cargo check --locked` for all-targets/all-features, lib/no-default-features, and all-targets/no-default-features.
+3. **Strict Clippy:** the same matrix with `-- -D warnings`.
+4. **Documentation:** `cargo doc --locked --no-deps --all-features` must build. Rustdoc warnings are capped while the pre-existing intra-doc link debt is addressed.
+5. **SPDX headers:** every tracked `.rs`, `.sh`, `.py`, `build.rs`, and `Cargo.toml` must carry `GPL-3.0-or-later` or `MIT`.
+6. **Text policies:** documented `#[allow(clippy::...)]` suppressions and the centralized `log::set_max_level` rule.
+7. **Packaging:** mandatory Flatpak/AppStream/desktop paths, plus `appstreamcli validate --no-net --strict` and `desktop-file-validate`.
 
-### 3.2 Agile First Line of Defense ([`utils/tests-quick.sh`](../utils/tests-quick.sh))
+### 3.2 Quick Discipline ([`utils/tests-quick.sh`](../utils/tests-quick.sh))
 
-A lightweight 4-phase agile test runner operating under reduced CPU/IO priority (`nice -n 19`, `ionice -c 3`) to prevent audio dropouts during development:
+Class A with a single invocation: `cargo test --locked --features testing --no-fail-fast` over all targets in the development profile. `#[ignore]` tests are skipped by construction. The discipline never builds release, never provisions infrastructure, never emits receipts, and never applies manual `--skip` lists. It is the suite expected at the end of each sprint and must stay within 5 minutes with a warm cache (measured: ≈45 s on the reference host).
 
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       utils/tests-quick.sh Execution Flow                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Phase 1: Structural Unit & Integration (Debug)                             │
-│    - cargo test --features testing --lib --bins --tests                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Phase 2: Release Verification (Release)                                    │
-│    - cargo test --features testing --release --test recording               │
-│                 --test e2e_cli --test recording_fault_injection             │
-│                 --test service_resilience --test stereo_fidelity            │
-│                 --test swap_stress --test endurance --test distribution_qa  │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Phase 3: PipeWire Live Integration (Release, Daemon Probe)                 │
-│    - Probes pw-cli info 0 -> Runs tests/pw_integration.rs (asserts DSP run) │
-│    - Runs tests/service_resilience.rs live subprocess acceptances           │
-│    - Fail-closed: Daemon errors trigger immediate test failures             │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Phase 4: Recording io_uring Capability (Release, Native Probe)             │
-│    - Probes src/bin/io_uring_probe -> Runs ignored recording suites         │
-│    - Asserts WAV data header byte-size match (R-13) and certification tests │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+### 3.3 Long Audit Suite ([`utils/tests-long.sh`](../utils/tests-long.sh))
 
-Outputs detailed logs to `target/logs/quick-phaseN.log` and emits a structured receipt to `target/logs/quick-receipt.txt`. Under `NAM_QUICK_STRICT=1`, any environmental gap is promoted to a hard failure.
-
----
-
-### 3.3 Pre-Release Long Audit Suite ([`utils/tests-long.sh`](../utils/tests-long.sh))
-
-The comprehensive long-duration audit suite (~30–50 minutes) validates performance and resilience invariants that cannot be verified in quick passes.
+Class B, operator-only. It records every phase result instead of aborting on the first failure, runs all `#[ignore]` product suites in release, and, with `--artifact`, binds the machine-readable receipt to the exact SHA-256 of `target/dist/nam-audio-pipe`.
 
 > [!CAUTION]
-> **Human Operator Exclusive**: This suite must be executed exclusively by human operators on calibrated real-time test hardware. AI agents must never run this suite directly; agents perform structural validation using `--help`, `--simulate`, and `tests/distribution_qa.rs`.
+> **Human Operator Exclusive:** AI agents may inspect `--help` but must never execute this suite.
 
-The suite executes **7 isolated phases**, recording logs to `target/logs/phaseN-*.log` and generating `target/logs/long-receipt.txt`:
+`--strict` promotes any `GAP` to `FAIL` and exports `NAM_RT_STRICT=1`; `NAM_PHASE_TIMEOUT_S` overrides the timeout used by every phase command. The phases are:
 
-| Phase      | Canonical Name                        | Harness & Invariant Evaluated                                                                                             | Output Log File            |
-|:---------- |:------------------------------------- |:------------------------------------------------------------------------------------------------------------------------- |:-------------------------- |
-| **PHASE1** | Accelerated Soak & Swap Concurrency   | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts RSS memory delta < 256 KiB. | `phase1-soak.log`          |
-| **PHASE2** | RT-Safety Heap Audit (Zero-Alloc)     | `cargo test --features "testing heap-audit" --release`; asserts exactly 0 heap allocations on RT paths.                   | `phase2-heap-audit.log`    |
-| **PHASE3** | Real-Time Deadline Gate               | `tests/rt_metrics.rs` (10k quantums, DSP load < 85% budget `(N/SR) * 10^9 * 0.85` under `SCHED_FIFO`).                    | `phase3-rt-deadline.log`   |
-| **PHASE4** | Real-Time Jitter Gate                 | `tests/rt_metrics.rs` (10k callbacks under contention; $p99.99 \le 0.75 \cdot T$ dispersion).                             | `phase4-rt-jitter.log`     |
-| **PHASE5** | Concurrency Interleaving & Throughput | `tests/rt_metrics.rs` (16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks).            | `phase5-concurrency.log`   |
-| **PHASE6** | Real Wall-Clock Endurance             | `tests/endurance.rs` (real-time timeline at 48 kHz/64 frames; asserts fail-closed validation windows & zero leaks).       | `phase6-endurance.log`     |
-| **PHASE7** | PipeWire Resilience & Daemon Bounce   | `tests/pw_integration.rs` executed against an isolated PipeWire instance; asserts automatic stream recovery.              | `phase7-pw-resilience.log` |
+| Phase       | Canonical Name                        | Harness & Invariant Evaluated                                                                                              | Output Log File            |
+|:----------- |:------------------------------------- |:-------------------------------------------------------------------------------------------------------------------------- |:-------------------------- |
+| **PHASE1**  | Accelerated Soak & Swap Concurrency   | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                  | `phase1-soak.log`          |
+| **PHASE2**  | RT-Safety Heap Audit (Zero-Alloc)     | `cargo test --features "testing heap-audit" --release`; asserts zero heap allocations on RT paths.                          | `phase2-heap-audit.log`    |
+| **PHASE3**  | Real-Time Deadline Gate               | `tests/rt_metrics.rs` (10k quantums, DSP load < 85% of the quantum budget under `SCHED_FIFO`).                              | `phase3-rt-deadline.log`   |
+| **PHASE4**  | Real-Time Jitter Gate                 | `tests/rt_metrics.rs` (10k callbacks under contention; bounded inter-callback dispersion).                                  | `phase4-rt-jitter.log`     |
+| **PHASE5**  | Concurrency Interleaving & Throughput | `tests/rt_metrics.rs` (16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks).              | `phase5-concurrency.log`   |
+| **PHASE6**  | Real Wall-Clock Endurance             | `tests/endurance.rs` (real timeline at 48 kHz/64 frames; fail-closed validation windows and zero leaks).                    | `phase6-endurance.log`     |
+| **PHASE7**  | PipeWire Resilience                   | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling.                           | `phase7-pw-resilience.log` |
+| **PHASE8**  | Live PipeWire & Signals               | Live daemon probe, `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances).       | `phase8-pw-live.log`       |
+| **PHASE9**  | Recording io_uring                    | `io_uring_probe` capability gate, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`).         | `phase9-recording-io-uring.log` |
+| **PHASE10** | Offline f64 Parity & Artifact Smoke   | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used.                       | `phase10-offline-parity.log` |
 
-**Pre-Release Strict Mode**: Running `./utils/tests-long.sh --strict-pre-release` sets `NAM_RT_STRICT=1`, requiring calibrated isolated CPUs (`isolcpus`), pinned affinities, and `SCHED_FIFO` priority. Any uncalibrated environment gap is treated as a release-blocking failure.
+### 3.4 Real-Time Criterion Bench
 
----
+The orphan `utils/tests-performance-regression.sh` wrapper was removed (D-03). [`benches/rt_gate.rs`](../benches/rt_gate.rs) remains available for operator-run Criterion measurements of the RT harness; it is not part of the quick or long disciplines.
 
-### 3.4 Real-Time Regression Gate & Baseline Discipline
-
-[`utils/tests-performance-regression.sh`](../utils/tests-performance-regression.sh) acts as a wrapper around the shared engine binary `nam_perf_gate`. It runs the Criterion benchmark suite ([`benches/rt_gate.rs`](../benches/rt_gate.rs)) pinned to an isolated core.
-
-- **Coverage Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares mandatory scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`). Missing groups or missing historical baselines fail-closed (`BASELINE_COVERAGE_GAP`).
-- **Baseline Storage**: Stored locally in `.performance-baselines/` (gitignored). Baselines are never updated automatically; renewal is an explicit operator action under calibrated host conditions.
-- **Environment Drift**: Detects toolchain, kernel, governor, or CPU frequency shifts, rejecting comparisons when host conditions differ (`INCOMPARABLE_ENVIRONMENT`).
+- **Coverage Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares the scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`).
+- **Baseline Storage**: Baselines, when an operator keeps them, live in `.performance-baselines/` (gitignored) and are never updated automatically.
 
 ---
 
@@ -379,45 +351,42 @@ The following empirical measurements require physical hardware calibration by a 
 
 ---
 
-### 3.7 Host Memory Protections & OOM Defense
+### 3.7 Host Memory Protection (Operator-Owned)
 
-On development systems (e.g., 16 GiB RAM without swap), parallel compilation of release binaries or PGO profiles can exhaust memory, triggering the Linux OOM killer. To protect the host, development tools, and IDEs, `NAM-Audio-Pipe` implements a mandatory **two-layer defense**:
+The repository never hardcodes compiler parallelism and never re-executes itself under a memory limiter:
 
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     Host Memory Defense Architecture                        │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Layer 1: Worker Parallelism Control                                        │
-│    - export CARGO_BUILD_JOBS=4                                              │
-│    - Prevents spawning 16+ simultaneous rustc workers that exhaust RAM.     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  Layer 2: Transient Systemd Cgroup Containment                              │
-│    - utils/mem-guard.sh <command>                                           │
-│    - Enforces MemoryHigh=5G, MemoryMax=6G, and oom_score_adj=500.           │
-│    - Contains runaway builds within cgroups without killing the IDE.        │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-- **IDE Protection**: Lower the IDE process `oom_score_adj` (default `-500`, requires sudo) to ensure compilers are targeted by the kernel before IDE processes.
-- **Opt-Out**: Set `NAM_NO_MEM_GUARD=1` to disable cgroup limits during formal real-time benchmarking where cgroup memory reclamation might introduce timing jitter.
+- **Parallelism** is controlled exclusively from the host shell profile (`~/.bashrc`), for example by exporting `CARGO_BUILD_JOBS` on memory-constrained machines. No script and no `.cargo/config.toml` sets a default.
+- **Heavy release/PGO builds** may be wrapped by the operator in a host-level cgroup limiter. Containment is an external, opt-in decision; the QA disciplines do not provision it.
+- **IDE protection**: lowering the IDE process `oom_score_adj` (requires privileges) keeps the kernel from targeting the editor before compiler workers.
 
 ---
 
-## 4. Compiler Optimization & Packaging Pipeline ([`utils/build-release.sh`](../utils/build-release.sh))
+## 4. Build & Release Chain ([`utils/build-release.sh`](../utils/build-release.sh))
 
-`NAM-Audio-Pipe` employs a multi-stage Profile-Guided Optimization (PGO) and LLVM BOLT pipeline to maximize cache locality and execution speed:
+`NAM-Audio-Pipe` employs a multi-stage Profile-Guided Optimization (PGO) and LLVM BOLT pipeline to maximize cache locality and execution speed. The build discipline **only builds**: it never runs tests, and it always deposits the canonical artifact at `target/dist/nam-audio-pipe` with `target/dist/build-receipt.json`.
 
 ```mermaid
 flowchart TD
-    A["Source Code (x86-64-v3)"] --> B["Phase 1: Environment Verification"]
-    B --> C["Phase 2: Instrument & Profile Workload"]
-    C --> D["Phase 3: PGO Recompilation (-Cprofile-use)"]
-    D --> E["Phase 4: LLVM BOLT Binary Layout Optimization"]
-    E --> F["Phase 4.5: Filtered DSP Hotspot Static Gates"]
-    F --> G["Phase 5: Strip & Install ~/.local/bin/"]
-    G --> H["Phase 6: Standalone Tarball (tar.zst)"]
-    G --> I["Phase 7: Flatpak Application Bundle"]
+    A["Source Code (x86-64-v3)"] --> B["env_verify"]
+    B --> C["pgo_profile: instrument & capture workload"]
+    C --> D["compile_binary: PGO recompilation (-Cprofile-use)"]
+    D --> E["bolt_optimize: LLVM BOLT layout (strict: proof required)"]
+    E --> F["codegen_report: filtered DSP hotspot gates"]
+    F --> G["deliver_artifact: target/dist + build receipt"]
+    G --> H["install: ~/.local/bin (optional)"]
+    G --> I["packaging: tarball / Flatpak (optional)"]
+    G --> J["certify: reconcile artifact + receipts (no recompile)"]
 ```
+
+### 4.0 Release Chain
+
+The operator (or the external release ceremony) runs exactly three steps:
+
+1. `./utils/build-release.sh --strict [--package] [--install]` — builds and emits `build-receipt.json`.
+2. `./utils/tests-long.sh --strict --artifact` — audits the canonical artifact and binds every receipt line to its SHA-256.
+3. `./utils/build-release.sh --certify` — hashes the artifact again, reconciles the build and long receipts, and writes `target/dist/release-receipt.json` with `CERTIFIED` or `REJECTED`. It never recompiles.
+
+> **Prerequisite for BOLT-capable hosts:** run `./utils/ab-opt-ceremony.sh` before the strict build. `build-release.sh --strict` refuses BOLT certification without `target/logs/ab-opt-ceremony-receipt.json` carrying a valid `PGO+BOLT` proof.
 
 ### 4.1 PGO Workload Coverage Matrix
 
@@ -445,7 +414,7 @@ After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disas
 
 ### 4.3 A/B Optimization Ceremony ([`utils/ab-opt-ceremony.sh`](../utils/ab-opt-ceremony.sh))
 
-A human operator script that measures performance deltas across three compilation stages: `Plain` → `PGO` → `PGO+BOLT`. It records CPU cycles, instructions, instruction TLB misses, and I-cache misses using Linux PMU hardware counters. If BOLT degrades tail latency ($p99$) compared to PGO, the pipeline automatically falls back to **PGO-ONLY**.
+Operator-only class D tool. It builds and measures three variants: `plain` → `PGO` → `PGO+BOLT`. Each measured run is pinned through the typed `pipe_perf_gate` (explicit `NAM_BENCH_CORE` → first online isolated CPU → first permitted CPU → unpinned `GAP`) and bounded by a per-variant timeout. `NAM_THERMAL_COOLDOWN_S` (default `0`, integer) inserts the optional settling time between variants. The comparison stage is the typed `pipe_ab_opt` binary, which writes `target/logs/ab-opt-ceremony-receipt.json`. If BOLT degrades the p99 tail latency against PGO, the verdict is the explicit **PGO-ONLY** fallback; a BOLT gain is never announced without measured proof.
 
 ---
 
@@ -455,66 +424,60 @@ All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repo
 
 ### 5.1 Utility Scripts Reference
 
-| Script                                      | Primary Responsibility                                                    | Target Audience / Frequency        |
-|:------------------------------------------- |:------------------------------------------------------------------------- |:---------------------------------- |
-| **`utils/lints.sh`**                        | Static quality checks (`cargo fmt`, `check`, `clippy`, SPDX, XML).        | Continuous / Every commit          |
-| **`utils/tests-quick.sh`**                  | 4-phase agile verification suite (unit, release, live PipeWire, io_uring) | Daily development / Pre-push       |
-| **`utils/tests-long.sh`**                   | Exhaustive 7-phase audit (soak, zero-alloc, RT deadline, endurance).      | Nightly / Release verification     |
-| **`utils/tests-performance-regression.sh`** | Criterion regression gate backed by the engine's `nam_perf_gate`.         | Performance audit / Baseline setup |
-| **`utils/build-release.sh`**                | Full release builder with PGO, BOLT, hotspot filtering, and Flatpak.      | Production releases                |
-| **`utils/ab-opt-ceremony.sh`**              | Hardware PMU counter benchmark measuring optimization deltas.             | Release optimization validation    |
-| **`utils/miri-audit.sh`**                   | Out-of-band formal aliasing and data-race audit for lock-free rings.      | Maintenance / Unsafe code audit    |
+| Script                         | Primary Responsibility                                                                 | Target Audience / Frequency    |
+|:------------------------------ |:-------------------------------------------------------------------------------------- |:------------------------------ |
+| **`utils/lints.sh`**           | Class A: formatting applied (verified in CI), check/clippy matrix, doc, SPDX, text policies, packaging. | Continuous / Every commit |
+| **`utils/tests-quick.sh`**     | Class A: `cargo test --features testing` in dev, skipping `#[ignore]`.                 | End of sprint                  |
+| **`utils/tests-long.sh`**      | Class B: 10-phase audit (soak, zero-alloc, RT, endurance, live PipeWire, io_uring, f64 parity). | Operator / Nightly / Release |
+| **`utils/build-release.sh`**   | Class C: builds the PGO/BOLT artifact and receipt; `--certify` reconciles without recompiling. | Production releases |
+| **`utils/ab-opt-ceremony.sh`** | Class D: operator A/B ceremony (`plain → PGO → PGO+BOLT`) with typed comparison.      | Release optimization validation |
+| **`utils/miri-audit.sh`**      | Class D: out-of-band formal aliasing and data-race audit for lock-free rings.          | Maintenance / Unsafe code audit |
 
 ### 5.2 Direct Command Cheat Sheet
 
 ```bash
 # -----------------------------------------------------------------------------
-# 1. Static Analysis Quality Gate
+# 1. Static Quality Gate
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
-./utils/mem-guard.sh ./utils/lints.sh
+./utils/lints.sh
 
 # -----------------------------------------------------------------------------
-# 2. Agile Test Suite (4-Phase Quick Verification)
+# 2. Quick Discipline (development profile, non-ignored targets)
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 ./utils/tests-quick.sh
 
 # -----------------------------------------------------------------------------
-# 3. Unit Tests Only
+# 3. Unit tests only
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 cargo test --features testing --lib
 
 # -----------------------------------------------------------------------------
-# 4. CLI End-to-End Black-Box Tests
+# 4. CLI end-to-end black-box tests
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 cargo test --features testing --test e2e_cli
 
 # -----------------------------------------------------------------------------
-# 5. Live PipeWire Integration (Requires Running PipeWire Daemon)
+# 5. Live PipeWire integration (requires a running daemon)
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 cargo test --features testing --release --test pw_integration -- --ignored --nocapture
 
 # -----------------------------------------------------------------------------
-# 6. Asynchronous Recording Integration (io_uring)
+# 6. Asynchronous recording integration (io_uring)
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 cargo test --features testing --release --test recording -- --ignored --nocapture
 
 # -----------------------------------------------------------------------------
-# 7. Distribution QA & Packaging Audit
+# 7. Distribution QA & packaging audit
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
 cargo test --features testing --test distribution_qa
 
 # -----------------------------------------------------------------------------
-# 8. Full Release Build (PGO + LLVM BOLT + Flatpak)
+# 8. Release chain (human operator only): build -> long audit -> certify
 # -----------------------------------------------------------------------------
-export CARGO_BUILD_JOBS=4
-./utils/build-release.sh
+./utils/build-release.sh --strict --install
+./utils/tests-long.sh --strict --artifact
+./utils/build-release.sh --certify
+```
 ```
 
 ---
@@ -533,9 +496,8 @@ The following contractual rules are enforced across test suites and CI checks:
 | **RT Quantum Bounds**       | Maximum supported quantum is `MAX_BRIDGE_BUF` (8192 frames / 32,768 bytes). Larger descriptors reject fail-closed.                         | `src/standalone/pw_host/rt_callback/process.rs`            |
 | **RT Deadline Processing**  | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                           | `tests/rt_metrics.rs`, `utils/tests-long.sh` (Phase 3)     |
 | **Target CPU Baseline**     | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                       | `.cargo/config.toml`                                       |
-| **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`.                            | `tests/distribution_qa.rs`, `utils/lints.sh`               |
-| **Release Provenance**      | `release-provenance.json` must record cryptographic SHA-256 hashes and Build-IDs for all distribution artifacts.                           | `tests/distribution_qa.rs`, `utils/build-release.sh`       |
-| **Long-Audit Structure**    | `utils/tests-long.sh` must be executable, SPDX-licensed, declare the AI safety warning and all 7 canonical phases, and parse `--simulate`. | `tests/distribution_qa.rs`, `utils/tests-long.sh`          |
+| **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`; id/name/launchable align with the desktop entry. | `tests/distribution_qa.rs`, `utils/lints.sh`, `utils/build-release.sh` |
+| **Release Provenance**      | `target/dist/build-receipt.json` records the artifact SHA-256, git provenance, engine provenance from `Cargo.lock` and PGO/BOLT evidence; `release-receipt.json` records `CERTIFIED`/`REJECTED`. | `src/receipt/build.rs`, `src/receipt/release.rs`, `utils/build-release.sh` |
 
 ---
 
@@ -556,7 +518,82 @@ Standard builds and CI pipelines use the stable Rust toolchain. To formally veri
 
 ---
 
-## 7. References
+## 7. Script Contract & Automation Disciplines
+
+All automation scripts in `utils/` follow a lean, predictable contract designed for deterministic automation, reproducible CI, and transparent developer workflows.
+
+### 7.1 Script Classes & Error Handling
+
+| Class | Scripts | Error Handling | Rationale |
+|:----- |:------- |:-------------- |:--------- |
+| **Class A — Interactive** | `lints.sh`, `tests-quick.sh` | `set -euo pipefail`; aborts on the first failure; `ERR` trap emits `RESULT: FAIL` | Real-time developer loops; immediate failure conserves cycles. |
+| **Class B — Decoupled Audit** | `tests-long.sh` | `set -o pipefail` (no `-e`, no `-u`); every phase records its status; exit `1` at the end if any phase failed | Nightly/pre-release audits must collect all phase evidence without aborting. |
+| **Class C — Build** | `build-release.sh` | `set -euo pipefail`; aborts on the first failure | An intermediate build failure invalidates all downstream artifacts. |
+| **Class D — Manual Tool** | `ab-opt-ceremony.sh`, `miri-audit.sh`, `mod-update.sh` | `set -euo pipefail` | Operator-supervised, opt-in tools. |
+
+### 7.2 Output Protocol & Exit Codes
+
+1. **Phase announcement:** `PHASE: <phase_name>`
+2. **Phase completion:** `PHASE: <phase_name> PASS|FAIL|GAP ... log=<path>`
+3. **Unified final line:** `RESULT: PASS|PASS_WITH_GAPS|FAIL (<seconds>s) fails=<list|none> gaps=<list|none>`
+4. **Exit codes:** `0` success or `PASS_WITH_GAPS` outside strict mode; `1` failure or a gap under `--strict`; `2` usage error or missing precondition.
+
+Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`. The quick discipline never emits receipts; the long discipline emits the JSONL receipt consumed by the release chain.
+
+### 7.3 Core Automation Principles
+
+- **No tests of test tooling:** suites validate the audio product (DSP, inference, PipeWire host, CLAP/standalone CLI, packaging). Meta-tests over scripts, receipt schemas, or internal QA tools are forbidden.
+- **Quick never provisions:** `tests-quick.sh` uses only fixtures and tooling already present; it never clones, downloads, or builds release artifacts.
+- **Long collects all failures:** `tests-long.sh` completes every preflight and phase, aggregating passes, gaps, and failures without early termination.
+- **Convention over parameterization:** defaults are the host's natural behavior (all cores, zero thermal cooldown, unpinned). Variables only override.
+- **Scripts stay self-contained:** no relative references to sibling repositories and no `source` outside the repository; shell logic is minimal and typed policy lives in Rust binaries.
+
+### 7.4 Canonical Command-Line Flags
+
+| Script | Supported Flags | Notes |
+|:------ |:--------------- |:----- |
+| **All scripts** | `-h`, `--help` | Concise usage; exit 0. |
+| `lints.sh` | None | Zero-flag policy; formatting is applied locally and verified with `CI=true`. |
+| `tests-quick.sh` | None | No gap-allowance or simulation flags. |
+| `tests-long.sh` | `--strict`, `--artifact` | `--strict` turns any `GAP` into `FAIL`; `--artifact` binds the receipt to `target/dist/nam-audio-pipe`. |
+| `build-release.sh` | `--strict`, `--package`, `--install`, `--certify` | `--package` adds tarball/Flatpak; `--install` installs locally; `--certify` validates receipts without recompiling. |
+| `ab-opt-ceremony.sh` | `--runs`, `--blocks`, `--no-pgo`, `--no-bolt`, `--bench-extra` | Operator-only ceremony controls. |
+| `miri-audit.sh`, `mod-update.sh` | None | Manual tools. |
+
+### 7.5 Canonical Environment Variables
+
+#### Interface Variables (User & CI Control)
+
+| Variable | Default | Scope | Purpose & Semantics |
+|:-------- |:------- |:----- |:------------------- |
+| `CARGO_BUILD_JOBS` | Unset (all cores) | Host / Cargo | Set in the host shell profile (`~/.bashrc`) on memory-constrained machines. Scripts never override or hardcode it. |
+| `CI` | Unset | CI runner | When `true`, `lints.sh` verifies formatting with `--check` instead of applying it. |
+| `NAM_THERMAL_COOLDOWN_S` | `0` | A/B ceremony | Non-negative integer seconds between measured variants. An invalid value exits `2`. |
+| `NAM_BENCH_CORE` | `auto` | A/B / RT | Bench-core precedence: explicit CPU → first online isolated CPU → first permitted CPU → unpinned `GAP`. |
+| `NAM_PHASE_TIMEOUT_S` | Per-command default | `tests-long.sh` | Overrides the timeout applied to each long-audit phase command. |
+| `NAM_ENDURANCE_SECONDS` | Harness default | `tests/endurance.rs` | Wall-clock endurance window. |
+
+#### Harness Variables (Internal Script → Rust Communication)
+
+| Variable | Configured By | Read By | Purpose |
+|:-------- |:------------- |:------- |:------- |
+| `NAM_RUN_ID` | `utils/_lib.sh` | Test harnesses | Unique run identifier for logs and receipt isolation. |
+| `NAM_RT_STRICT` | `tests-long.sh --strict` | `tests/rt_metrics.rs` | Promotes RT GAP conditions to hard failures. |
+| `NAM_LOG_ROOT` | `tests-long.sh` | Long suite | Root directory for phase logs and receipts (default `target/logs`). |
+| `NAM_LIB_NO_CD` | Caller script | `utils/_lib.sh` | Keeps the caller's working directory when sourcing the local library. |
+
+### 7.6 Measured Durations
+
+| Discipline / Script | Measured Duration | Budget Ceiling | Notes |
+|:------------------- |:----------------- |:-------------- |:----- |
+| `utils/lints.sh` | ≈2–20 s (warm cache) | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging. |
+| `utils/tests-quick.sh` | ≈45 s (warm cache) | ≤ 5 min | All non-ignored targets in the development profile. |
+| `utils/tests-long.sh` | Not budgeted (per-phase timeouts) | — | Operator-run; collects all failures. |
+| `utils/build-release.sh` | ≈204 s (PGO-only reference run) | — | Full BOLT time depends on the host toolchain and `perf` permissions. |
+
+---
+
+## 8. References
 
 - [NAM-Audio-Pipe Architecture](architecture.md) — Comprehensive threading model, host lifecycle, and memory layout.
 - [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) — Agnostic neural DSP engine.

@@ -31,10 +31,9 @@ name = "pgo_workload"
 path = "src/bin/pgo_workload.rs"
 required-features = ["testing"]
 
-# Fail-closed semantic verifier for the long-suite receipt. Used
-# by utils/build-release.sh --release-ceremony as the strict-receipt gate (no
-# substring search). Deliberately free of `required-features`: the release
-# ceremony must be able to build it without the `testing` feature.
+# Fail-closed semantic verifier for the long-suite text receipt. Operator
+# tooling only: the release gate is `pipe_long_receipt certify`. Deliberately
+# free of `required-features` so it can run without the `testing` feature.
 [[bin]]
 name = "long_receipt_check"
 path = "src/bin/long_receipt_check.rs"
@@ -46,6 +45,13 @@ path = "src/bin/long_receipt_check.rs"
 name = "pipe_long_receipt"
 path = "src/bin/pipe_long_receipt.rs"
 required-features = ["testing"]
+
+# Typed CPU topology helper for the QA scripts: resolves the RT/bench core with
+# the engine policy and applies the affinity before exec'ing a command, so no
+# script needs literal `taskset` or sysfs parsing.
+[[bin]]
+name = "pipe_perf_gate"
+path = "src/bin/pipe_perf_gate.rs"
 
 # A/B benchmark of the recording transports (inline SPSC ring
 # vs preallocated pool + small descriptor). A profiling-only harness like
@@ -64,6 +70,14 @@ required-features = ["testing"]
 name = "ab_opt_bench"
 path = "src/bin/ab_opt_bench.rs"
 required-features = ["testing"]
+
+# Typed comparison stage of the A/B optimization ceremony: reads the variant
+# JSONL receipts, applies the promotion rule and writes the ceremony receipt
+# consumed by the release chain. Free of `required-features` so the operator
+# script can run it without the `testing` feature.
+[[bin]]
+name = "pipe_ab_opt"
+path = "src/bin/pipe_ab_opt.rs"
 
 # RT regression gate Criterion harness: promotes the offline
 # rt_deadline real-load scenario to a per-scenario Criterion suite consumed by
@@ -99,6 +113,10 @@ env_logger = { version = "0.11.11", default-features = false }
 # the cause is emitted to a sibling `*.fail-reasons.json` JSONL. Already in the
 # dependency tree transitively via NeuralAmpModeler-rs.
 serde_json = "1"
+# Typed build/release receipts (`receipt::build`, `receipt::release`):
+# derive-based (de)serialization and file hashing for the artifact chain.
+serde = { version = "1", optional = true, features = ["derive"] }
+sha2 = { version = "0.11", optional = true }
 
 [features]
 default = ["dual-mono"]
@@ -106,7 +124,12 @@ default = ["dual-mono"]
 # L/R pipeline processes each channel independently instead of folding R as a
 # mono copy of L (mono detection becomes dynamic per-block).
 dual-mono = ["NeuralAmpModeler-rs/dual-mono"]
-testing = ["NeuralAmpModeler-rs/testing", "dual-mono"]
+testing = [
+    "NeuralAmpModeler-rs/testing",
+    "dual-mono",
+    "dep:serde",
+    "dep:sha2",
+]
 # Enables the RT heap-audit allocator (CountingAllocator) and the swap
 # zero-allocation gates.
 heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
@@ -124,9 +147,8 @@ proptest = "1.12.0"
 # Distribution QA harness: strict XML well-formedness parsing for
 # the AppStream metainfo audit (tests/distribution_qa.rs).
 quick-xml = "0.42"
-# Distribution QA harness: SHA-256 verification of the release provenance
-# receipt (tests/distribution_qa.rs). JSON parsing uses the normal `serde_json`
-# dependency declared above (available to test targets as well).
+# Test harness: SHA-256 digest of the committed model fixtures
+# (tests/pipe_offline_parity.rs and tests/fixtures_freshness.rs).
 sha2 = "0.11"
 
 [lints.clippy]
@@ -138,9 +160,9 @@ undocumented_unsafe_blocks = "warn"
 
 # Profile Configuration: `dist` intentionally inherits `panic = "unwind"` from `release`.
 #
-# - `release` keeps `panic = "unwind"`: the tests-quick.sh Phase 2 runs the
-#   `--lib` suite in `--release` and relies on `catch_unwind` to prove panics
-#   inside RT callbacks never cross the PipeWire `extern "C"` boundary.
+# - `release` keeps `panic = "unwind"`: the `--release --lib` suite run by
+#   `tests-long.sh` relies on `catch_unwind` to prove panics inside RT callbacks
+#   never cross the PipeWire `extern "C"` boundary.
 #   Uniformizing `release` to `panic = "abort"` would make that evidence unusable.
 # - `dist` is the profile effectively distributed by `utils/build-release.sh`
 #   (stripped, LTO fat) — the exact artifact certified by the release

@@ -31,7 +31,7 @@
 //!   the process to its baseline `/proc/self/fd` and thread counts.
 //!
 //! Tests that require `io_uring` are `#[ignore]`d (they run exclusively in the
-//! io_uring-gated Phase 4 of `utils/tests-quick.sh`, or via
+//! io_uring-gated PHASE9 of `utils/tests-long.sh`, or via
 //! `cargo test --test recording_fault_injection -- --ignored`). The
 //! non-ignored tests validate the RIFF parser itself against the pure header
 //! builder, so the harness always contributes to `cargo test --all-targets`.
@@ -922,7 +922,7 @@ fn stall_rate_change_pool_saturation_records_loss_and_correct_header() {
 /// * the partial file is preserved on disk, bit-exact up to the fault point.
 ///
 /// The rlimit is process-wide, so this test must run with `--test-threads=1`
-/// (Phase 4 of `utils/tests-quick.sh`); `TEST_MUTEX` also serializes it.
+/// (PHASE9 of `utils/tests-long.sh`); `TEST_MUTEX` also serializes it.
 #[test]
 #[ignore = "requires io_uring support and --test-threads=1 (process-wide rlimit mutation)"]
 fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {

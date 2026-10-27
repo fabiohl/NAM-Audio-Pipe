@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
+
+name: Long QA Suite
+
+# Release chain, decoupled: build-release.sh -> tests-long.sh --artifact -> build-release.sh --certify.
+# Hosted runners lack an isolated CPU, BOLT, SCHED_FIFO privileges and a session manager: those
+# surface as typed GAPs. With `strict: true` any GAP fails the run (expected on hosted runners);
+# keep `strict: false` for a hosted dry audit and certify on the operator's host.
+on:
+  workflow_dispatch:
+    inputs:
+      strict:
+        description: 'Strict mode (treat gaps as failures; enables certification)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer run cancels any previous manual run on the same ref.
+concurrency:
+  group: long-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  long-qa:
+    name: long-qa (x86_64-linux)
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
+            appstream desktop-file-utils binutils
+      # Runner images can ship an older preinstalled stable; the crate needs rust-version 1.99.
+      - name: Update Rust toolchain
+        run: |
+          rustup update --no-self-update stable
+          rustup component add llvm-tools-preview
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      # The live PipeWire (PHASE8) and PGO workload need a reachable daemon. A bare daemon (no
+      # session manager) is enough for the application's own capture/playback nodes.
+      - name: Start PipeWire daemon
+        run: |
+          XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          mkdir -p -m 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" setsid nohup pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
+            sleep 0.2
+          done
+          [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || { echo "PipeWire socket did not appear"; cat "$RUNNER_TEMP/pipewire.log"; exit 1; }
+      - name: Build canonical artifact
+        run: |
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict }}" = "true" ]; then STRICT_FLAG="--strict"; fi
+          ./utils/build-release.sh $STRICT_FLAG
+      - name: Long QA Suite (artifact)
+        run: |
+          STRICT_FLAG=""
+          if [ "${{ inputs.strict }}" = "true" ]; then STRICT_FLAG="--strict"; fi
+          ./utils/tests-long.sh $STRICT_FLAG --artifact
+      - name: Certify
+        if: ${{ inputs.strict }}
+        run: ./utils/build-release.sh --certify
+      - name: Publish step summary
+        if: always()
+        run: |
+          echo "### Long QA Suite Run Summary" >> $GITHUB_STEP_SUMMARY
+          if [ -d target/logs ]; then
+            echo '```text' >> $GITHUB_STEP_SUMMARY
+            grep -hE '^(RESULT:|PHASE:|STRICT:|OVERALL:|ERROR:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            for f in target/logs/*.log; do
+              if grep -qE '(FAIL|rc=[1-9])' "$f" 2>/dev/null; then
+                echo "<details><summary>Failure Details: $(basename "$f")</summary>" >> $GITHUB_STEP_SUMMARY
+                echo '' >> $GITHUB_STEP_SUMMARY
+                echo '```text' >> $GITHUB_STEP_SUMMARY
+                tail -n 40 "$f" >> $GITHUB_STEP_SUMMARY
+                echo '```' >> $GITHUB_STEP_SUMMARY
+                echo '</details>' >> $GITHUB_STEP_SUMMARY
+              fi
+            done
+          fi
+      - name: Upload logs and receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-logs-receipts
+          path: |
+            target/logs/**
+            target/dist/build-receipt.json
+            target/dist/release-receipt.json
+          retention-days: 14

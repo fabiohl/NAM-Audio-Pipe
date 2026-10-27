@@ -1,850 +1,426 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
-#
-# Nightly / pre-release long audit suite of NAM-Audio-Pipe.
-#
-# Certifies the claims that the agile `utils/tests-quick.sh` deliberately
-# leaves out: prolonged soak + swap concurrency, strict zero-allocation on the
-# RT thread (heap-audit), nanosecond RT deadline budget, inter-callback jitter
-# dispersion and concurrent state-model checking. Every phase below
-# cross-references its planned harness so scope drift is visible at a glance:
-#
-#   PHASE1 — Accelerated soak (compressed timeline)        phase1-soak.log
-#            tests/swap_stress.rs (--ignored soak battery; extended soak cases)
-#            + tests/soak_extended.rs (320k blocks / ~426s of compressed timeline,
-#            fail-closed windows).
-#   PHASE2 — RT-Safety heap-audit (zero-alloc)            phase2-heap-audit.log
-#            `--features "testing heap-audit"`: lib unit gates
-#            (cabsim_swap::heap_audit_tests) + swap_stress heap-audit battery.
-#   PHASE3 — RT Deadline gate (ns budget)                 phase3-rt-deadline.log
-#            tests/rt_metrics.rs deadline filter.
-#   PHASE4 — RT Jitter gate (inter-callback dispersion)   phase4-rt-jitter.log
-#            tests/rt_metrics.rs jitter filter.
-#   PHASE5 — Concurrency model checking & throughput      phase5-concurrency.log
-#            tests/rt_metrics.rs concurrent filter: the 16-thread
-#            interleaving stress + the production-SPSC throughput gate
-#            (no global mutex on the measured path).
-#   PHASE6 — Endurance real & state-machine throughput    phase6-endurance.log
-#            tests/endurance.rs: real wall-clock endurance, fail-closed
-#            validation windows, periodic raw RSS/faults/threads/FD telemetry.
-#   PHASE7 — PipeWire resilience (private daemon)         phase7-pw-resilience.log
-#            tests/pw_integration.rs (private daemon isolation battery;
-#            bounded reconnect recovery, stream fail-fast SLA, reconnect exhaustion).
-#
-#   The receipt declares each soak suite's purpose — the accelerated timeline soak
-#   (`SOAK_PURPOSE:`) and the real wall-clock endurance (`ENDURANCE_PURPOSE:`)
-#   are separate suites with distinct purposes, and the throughput marker
-#   never labels harness throughput as "audio callbacks".
-#
-#   Under --strict-pre-release, NAM_RT_STRICT=1 is exported so Phases 3/4/5
-#   (tests/rt_metrics.rs) fail hard on an uncalibrated environment instead of
-#   emitting a silent pass; the receipt records `NAM_RT_STRICT:` as the
-#   propagation evidence.
-#
-# Failure isolation: every phase runs independently through `run_phase` so a
-# failure in one test never interrupts the remaining phases — a nightly run
-# that dies on a shell bug would cost a full day of blind spots before the
-# next window. Each completed phase emits one typed line to
-# target/logs/long-receipt.txt (PHASEn: PASS|FAIL|GAP ...) and the suite
-# closes with the `GAP:` reasons plus the `OVERALL:` verdict
-# (PASSED / COMPLETED_WITH_GAPS / FAILED).
-#
-# ────────────────────────────────────────────────────────────────────────────
-# AI GOVERNANCE WARNING (mandatory compliance — rules/testing.md §2)
-#
-#   This script is the NIGHTLY / PRE-RELEASE long audit suite of
-#   NAM-Audio-Pipe. Its full runtime is approximately 30–60 minutes and it
-#   requires an isolated, calibrated real-time environment (dedicated CPU
-#   affinity, low background load, optionally SCHED_FIFO permissions).
-#
-#   AI AGENTS MUST NEVER EXECUTE THIS SCRIPT DIRECTLY. Execution is reserved
-#   for the HUMAN OPERATOR. If structural validation of the suite is needed,
-#   use the non-executing surfaces instead and ask the operator to run the
-#   full audit and report the results:
-#       ./utils/tests-long.sh --help       # usage & phase inventory
-#       ./utils/tests-long.sh --simulate   # registers the 7 planned phases in
-#                                          # target/logs/simulate/ without
-#                                          # running tests and never touching the
-#                                          # real audit artifacts (D1)
-# ────────────────────────────────────────────────────────────────────────────
-
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/$(basename "${BASH_SOURCE[0]}")"
-
-# Shared style helpers (RED/GREEN/YELLOW/BLUE/BOLD/NC), cd to project root,
-# fail-closed executed-test gates, and pick_bench_core helper.
-source "$SCRIPT_DIR/_lib.sh"
-
-# ── Memory guard (OOM containment) ──────────────────────────────────────────
-# Release test builds and the RT measurement phases run alongside
-# rust-analyzer/IDE; on a 16 GiB host the compile peak can trigger a global OOM.
-# Re-exec inside a transient, memory-capped systemd scope (fail-open when
-# unavailable). For RT measurement fidelity the operator may opt out with
-# NAM_NO_MEM_GUARD=1 (keep swap enabled).
-if [ "${NAM_MEM_GUARD:-0}" != "1" ] && [ "${NAM_NO_MEM_GUARD:-0}" != "1" ]; then
-    export NAM_MEM_GUARD=1
-    exec "$SCRIPT_DIR/mem-guard.sh" "$SCRIPT_PATH" "$@"
-fi
-
-# CPU core pinning for the RT measurement phases (Deadline, Jitter).
-# Resolved deterministically via pick_bench_core:
-#   1. Explicit $NAM_BENCH_CORE
-#   2. First online isolated core from /sys/devices/system/cpu/isolated
-#   3. Fallback nproc / 2 with explicit warning
-BENCH_CORE="$(pick_bench_core)"
-HAS_TASKSET=0
-if command -v taskset >/dev/null 2>&1; then
-    HAS_TASKSET=1
-fi
-HAS_CHRT_FIFO=0
-if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then
-    HAS_CHRT_FIFO=1
-fi
-
-STRICT_PRE_RELEASE=0
-SIMULATE=0
-for arg in "$@"; do
-    case "$arg" in
-        --strict-pre-release)
-            STRICT_PRE_RELEASE=1
-            ;;
-        --simulate|--dry-run)
-            SIMULATE=1
-            ;;
-        --help|-h)
-            echo "Usage: $0 [--strict-pre-release] [--simulate|--dry-run]"
-            echo
-            echo "NAM-Audio-Pipe nightly / pre-release long audit suite"
-            echo "(~30-60 min, HUMAN OPERATOR ONLY — AI agents must never execute it directly)."
-            echo
-            echo "Resolved benchmark core: ${BENCH_CORE} (isolated/affinity target)"
-            echo "SCHED_FIFO capability:  $([ "$HAS_CHRT_FIFO" = "1" ] && echo "available (chrt -f 80)" || echo "unavailable (GAP fallback)")"
-            echo
-            echo "Options:"
-            echo "  --strict-pre-release   Promote every GAP to a hard failure (release gate)."
-            echo "                         Certifies the audit only on a calibrated RT machine."
-            echo "                         Propagates NAM_RT_STRICT=1 to tests/rt_metrics.rs."
-            echo "  --simulate, --dry-run  Dry run: register the 7 planned phases and the"
-            echo "                         structured receipt in target/logs/simulate/ without"
-            echo "                         executing any test and WITHOUT touching the real"
-            echo "                         audit artifacts. Safe for AI/CI structural validation."
-            echo "  -h, --help             Show this help and exit."
-            echo
-            echo "Phases (real logs in target/logs/, simulate logs in target/logs/simulate/):"
-            echo "  PHASE1 — Accelerated soak (compressed timeline) phase1-soak.log"
-            echo "  PHASE2 — RT-Safety heap-audit (zero-alloc)      phase2-heap-audit.log"
-            echo "  PHASE3 — RT Deadline gate (ns budget)           phase3-rt-deadline.log (core ${BENCH_CORE})"
-            echo "  PHASE4 — RT Jitter gate (dispersion)            phase4-rt-jitter.log (core ${BENCH_CORE})"
-            echo "  PHASE5 — Concurrency model checking             phase5-concurrency.log"
-            echo "  PHASE6 — Endurance real & state-machine throughput"
-            echo "                                                  phase6-endurance.log"
-            echo "  PHASE7 — PipeWire resilience (private daemon)   phase7-pw-resilience.log"
-            echo
-            echo "The receipt declares each suite's purpose —"
-            echo "  SOAK_PURPOSE:      accelerated_timeline (compressed timeline)"
-            echo "  ENDURANCE_PURPOSE: real_wall_clock (wall-clock, NAM_ENDURANCE_SECONDS)"
-            echo
-            echo "Receipt: target/logs/long-receipt.txt"
-            echo "Dry-run receipt: target/logs/simulate/long-receipt.txt"
-            exit 0
-            ;;
-        *)
-            echo -e "\033[0;31m[FATAL]\033[0m Unknown option: $arg" >&2
-            echo "Usage: $0 [--strict-pre-release] [--simulate|--dry-run]" >&2
-            exit 2
-            ;;
-    esac
-done
-
-# --strict-pre-release propagates NAM_RT_STRICT=1 to the RT metric
-# harness (tests/rt_metrics.rs Phases 3/4/5). Exported before any phase so the
-# child cargo processes inherit it; the value is also recorded in the receipt
-# as `NAM_RT_STRICT:` (the propagation evidence the release ceremony verifies
-# semantically via src/bin/long_receipt_check.rs).
-if [ "$STRICT_PRE_RELEASE" = "1" ]; then
-    export NAM_RT_STRICT=1
-fi
-
-# Defensive error trap (message + abort). Phase failures are isolated via
-# `run_phase ... || true` below and never reach this trap: a command inside a
-# function invoked under `||` is executed with errexit/ERR suppressed.
-trap 'echo -e "\n${RED}${BOLD}❌ Unexpected error: command \"$BASH_COMMAND\" failed at line $LINENO with status $? (phase ${PHASE_NUM:-?}/${PHASE_TOTAL:-?}). Aborting audit suite.${NC}"; exit 1' ERR
-
-PHASE_TOTAL=7
-
-# Log root. `--simulate` must never touch the real audit artifacts (D1): the
-# dry run registers its placeholders under <root>/simulate/ so a simulated or
-# aborted run can never destroy the evidence of a real one. NAM_LOG_ROOT
-# overrides the root for hermetic tests (see tests/receipt_coherence_test.rs).
+# tests-long.sh — long audit suite: soak, RT, live PipeWire, io_uring, offline parity and artifact certification. Classe B.
+# Uso: utils/tests-long.sh [--strict] [--artifact] [-h|--help]
+# AI AGENTS MUST NEVER EXECUTE THIS SCRIPT DIRECTLY: execution is reserved for the human operator.
+# Structural validation is limited to --help.
+set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+set -o pipefail
+cd "$(dirname "$0")/.."
+. utils/_lib.sh
+SCRIPT_NAME=tests-long
 LOG_ROOT="${NAM_LOG_ROOT:-target/logs}"
-if [ "$SIMULATE" = "1" ]; then
-    LOG_DIR="$LOG_ROOT/simulate"
-else
-    LOG_DIR="$LOG_ROOT"
-fi
-
-LONG_RECEIPT="$LOG_DIR/long-receipt.txt"
-# Unified-schema machine-readable receipt: the JSONL is the source of
-# truth; LONG_RECEIPT (the .txt) is the derived human view kept for the
-# transition. Both readers are verified by the release ceremony.
-PIPE_JSONL="$LOG_DIR/long-audit-receipt.jsonl"
-# Typed FAIL causes (D3). The unified schema is engine-owned and carries no
-# `fail_reason` field, so the cause is written to a sibling file whose name is
-# derived by `pipe_long_receipt` from `--out` (keep this in sync).
-PIPE_FAIL_REASONS="$LOG_DIR/long-audit-receipt.fail-reasons.json"
-
-mkdir -p "$LOG_DIR"
-
-# The phase logs owned by this suite (never other tools' logs, quick receipts
-# or release provenance).
-PHASE_LOG_FILES=(
-    phase1-soak.log
-    phase2-heap-audit.log
-    phase3-rt-deadline.log
-    phase4-rt-jitter.log
-    phase5-concurrency.log
-    phase6-endurance.log
-    phase7-pw-resilience.log
-)
-
-# remove_owned_logs — remove only this suite's artifacts from $LOG_DIR.
-remove_owned_logs() {
-    local f
-    for f in "${PHASE_LOG_FILES[@]}"; do
-        rm -f "$LOG_DIR/$f"
-    done
-    rm -f "$LONG_RECEIPT" "$PIPE_JSONL" "$PIPE_FAIL_REASONS"
-}
-
-# rotate_real_logs — before a real run, move the previous run's artifacts into
-# <root>/prev/<UTC-timestamp>/ and keep the 3 most recent snapshots. The
-# evidence of the last real audit survives a new execution (D1).
-rotate_real_logs() {
-    local prev_root="$LOG_ROOT/prev"
-    local -a owned=()
-    local f
-    for f in "${PHASE_LOG_FILES[@]}"; do
-        [ -e "$LOG_ROOT/$f" ] && owned+=("$LOG_ROOT/$f")
-    done
-    [ -e "$LONG_RECEIPT" ] && owned+=("$LONG_RECEIPT")
-    [ -e "$PIPE_JSONL" ] && owned+=("$PIPE_JSONL")
-    [ -e "$PIPE_FAIL_REASONS" ] && owned+=("$PIPE_FAIL_REASONS")
-    if [ "${#owned[@]}" -eq 0 ]; then
-        return 0
-    fi
-    local ts dest n
-    ts="$(date -u +%Y%m%dT%H%M%SZ)"
-    dest="$prev_root/$ts"
-    # Disambiguate same-second snapshots so a second rotation never overwrites
-    # the first snapshot's identically named artifacts.
-    n=1
-    while [ -e "$dest" ]; do
-        n=$((n + 1))
-        dest="$prev_root/${ts}_${n}"
-    done
-    mkdir -p "$dest"
-    for f in "${owned[@]}"; do
-        mv -f "$f" "$dest/" 2>/dev/null || true
-    done
-    # Keep the 3 most recent snapshots, drop older ones.
-    ls -1dt "$prev_root"/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf -- || true
-}
-
-if [ "$SIMULATE" = "1" ]; then
-    # Never touch the real artifacts: clean only the isolated simulate dir.
-    remove_owned_logs
-else
-    # Rotation moves every owned artifact into prev/ before the run; a failed
-    # move leaves the file in place rather than deleting it, so no
-    # unconditional rm follows. Quick receipts, release provenance and other
-    # tools' logs are never touched.
-    rotate_real_logs
-fi
-
-# ── Unified-schema receipt emitter (engine testing::receipt) ────────────────
-# Resolved once, built on demand. Emission is mandatory: a missing emitter
-# fails the suite closed rather than certifying a receipt it could not produce.
-PIPE_RECEIPT_BIN=""
-LONG_RECEIPT_FAILED=0
-ensure_pipe_long_receipt_bin() {
-    if [ -n "$PIPE_RECEIPT_BIN" ] && [ -x "$PIPE_RECEIPT_BIN" ]; then
-        return 0
-    fi
-    if ! cargo build --quiet --features testing --bin pipe_long_receipt >/dev/null 2>&1; then
-        return 1
-    fi
-    PIPE_RECEIPT_BIN="target/debug/pipe_long_receipt"
-    [ -x "$PIPE_RECEIPT_BIN" ]
-}
-
-echo -e "${BLUE}${BOLD}=============================================================${NC}"
-echo -e "${BLUE}${BOLD}  NAM-Audio-Pipe Long-Duration Stress & Audit Suite           ${NC}"
-echo -e "${BLUE}${BOLD}  (~30-60 min · human operator only)                          ${NC}"
-echo -e "${BLUE}${BOLD}=============================================================${NC}"
-
-if [ "$SIMULATE" = "1" ]; then
-    echo -e "${YELLOW}${BOLD}SIMULATION MODE: no test will be executed.${NC}"
-fi
-
-emit_to "$LONG_RECEIPT" "SUITE: tests-long"
-emit_to "$LONG_RECEIPT" "STRICT: ${STRICT_PRE_RELEASE:-0}"
-emit_to "$LONG_RECEIPT" "NAM_RT_STRICT: ${NAM_RT_STRICT:-0}"
-emit_to "$LONG_RECEIPT" "MODE: $([ "$SIMULATE" = "1" ] && echo simulate || echo full)"
-# Each soak suite declares its purpose in the receipt so the
-# accelerated timeline soak and the real wall-clock endurance are never
-# conflated.
-emit_to "$LONG_RECEIPT" "SOAK_PURPOSE: accelerated_timeline — compressed timeline (320k blocks ≈426s nominal), fail-closed validation windows, periodic swaps"
-emit_to "$LONG_RECEIPT" "ENDURANCE_PURPOSE: real_wall_clock — wall-clock (NAM_ENDURANCE_SECONDS), fail-closed windows, periodic raw RSS/faults/threads/FDs"
-
-# ── Global phase trackers ──────────────────────────────────────────────────
+LONG_TARGET_DIR="${CARGO_TARGET_DIR:-target/long}"
+CARGO_TARGET_DIR="$LONG_TARGET_DIR"
+export CARGO_TARGET_DIR
+RECEIPT_BIN=""
+STRICT=0
+USE_ARTIFACT=0
+ARTIFACT_PATH="target/dist/nam-audio-pipe"
+ARTIFACT_SHA256=""
+T0=$SECONDS
 declare -a GAPS=()
 declare -a PHASE_STATUSES=()
+PHASE_NUM=0
 PHASE_RC=0
 PHASE_DUR=0
-PHASE_NUM=0
-
-# record_gap <reason>
-#   Registers a typed environment/implementation gap (never a silent skip).
-record_gap() {
-    GAPS+=("$1")
-    echo -e "  ${YELLOW}ⓘ GAP: $1${NC}"
+CUR_LOG=""
+LONG_RECEIPT_FAILED=0
+usage() {
+    cat <<'EOF'
+Uso: utils/tests-long.sh [OPÇÕES]
+  --strict       GAP converte-se em falha; modo de certificação de release
+  --artifact     Audita target/dist/nam-audio-pipe e amarra todo o receipt ao SHA-256 exato
+  -h, --help     Exibe esta ajuda
+Fases:
+  PHASE1  Soak acelerado e concorrência de swap
+  PHASE2  RT-Safety heap-audit (zero alocação)
+  PHASE3  RT deadline (orçamento em nanossegundos)
+  PHASE4  RT jitter (dispersão entre callbacks)
+  PHASE5  Stress de concorrência e throughput SPSC
+  PHASE6  Endurance real e throughput da máquina de estados
+  PHASE7  Resiliência PipeWire (daemon privado)
+  PHASE8..10  PipeWire ao vivo, io_uring e paridade offline f64
+EOF
 }
-
-# extract_fail_reason <log_path>
-#   First diagnostic line of a failed phase log (`panicked at` / `assertion` /
-#   `TEST_RESULT[...]=FAIL`), used as the typed FAIL cause (D3). Empty when the
-#   log carries no recognizable diagnostic.
-extract_fail_reason() {
-    local log_path="$1"
-    [ -f "$log_path" ] || return 1
-    grep -m1 -E 'panicked at|assertion|TEST_RESULT\[[^]]+\]=FAIL' "$log_path" 2>/dev/null || return 1
-}
-
-# emit_fail_tail <log_file>
-#   On a phase failure, surface the cause on stderr (D2): the last 40 lines of
-#   the phase log, prefixed with [PHASEn FAIL-TAIL], diagnostic lines
-#   highlighted, the whole block capped at 4 KiB. The full log stays on disk.
-emit_fail_tail() {
-    local log_file="$1"
-    local log_path="$LOG_DIR/$log_file"
-    [ -f "$log_path" ] || return 0
-    local tail_out
-    tail_out=$(tail -n 40 "$log_path" 2>/dev/null | head -c 4096 || true)
-    [ -n "$tail_out" ] || return 0
-    echo -e "  ${RED}${BOLD}[PHASE${PHASE_NUM} FAIL-TAIL]${NC} ${log_path}" >&2
-    local line
-    while IFS= read -r line; do
-        case "$line" in
-            *"panicked at"*|*assertion*|*"TEST_RESULT["*)
-                echo -e "  ${RED}[PHASE${PHASE_NUM} FAIL-TAIL]${NC} ${BOLD}${line}${NC}" >&2 ;;
-            *)
-                echo -e "  [PHASE${PHASE_NUM} FAIL-TAIL] ${line}" >&2 ;;
-        esac
-    done <<< "$tail_out"
-}
-
-# run_phase <name> <cmd> <logfile>
-#   Executes <cmd> (a phase function name or a command string) with all
-#   output captured to $LOG_DIR/<logfile>. The phase runs independently:
-#   callers must use `|| true` and inspect $PHASE_RC afterwards, so a failure
-#   never aborts the remaining phases. In --simulate mode the phase is only
-#   registered (placeholder log) and no command is executed.
-run_phase() {
-    local name="$1"
-    local cmd="$2"
-    local log_file="$3"
-    local start_time status
-
-    PHASE_NUM=$((PHASE_NUM + 1))
-    echo -e "\n${BLUE}${BOLD}[${PHASE_NUM}/${PHASE_TOTAL}] ${name}${NC}"
-    echo -e "  Executing: ${YELLOW}${cmd}${NC}"
-    echo -e "  Log:       ${YELLOW}${LOG_DIR}/${log_file}${NC}"
-
-    if [ "$SIMULATE" = "1" ]; then
-        {
-            echo "[SIMULATION] Phase not executed — dry run requested."
-            echo "[SIMULATION] Phase:  ${name}"
-            echo "[SIMULATION] Command: ${cmd}"
-            echo "[SIMULATION] Planned log file: ${LOG_DIR}/${log_file}"
-        } > "${LOG_DIR}/${log_file}"
-        PHASE_RC=0
-        PHASE_DUR=0
-        return 0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --strict) STRICT=1; shift ;;
+        --artifact) USE_ARTIFACT=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "ERRO: flag não reconhecida: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+# --strict propagates NAM_RT_STRICT=1 to tests/rt_metrics.rs.
+if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; fi
+LOG_DIR="$LOG_ROOT"
+TEXT_RECEIPT="$LOG_DIR/long-receipt.txt"
+RECEIPT="$LOG_DIR/long-audit-receipt.jsonl"
+FAIL_REASONS="$LOG_DIR/long-audit-receipt.fail-reasons.json"
+mkdir -p "$LOG_DIR"
+# The long build tree is disposable. Only the script-owned default is removed:
+# a caller-provided CARGO_TARGET_DIR may be a shared cache and is never deleted.
+if [ "$LONG_TARGET_DIR" = "target/long" ]; then rm -rf target/long; fi
+if [ "$USE_ARTIFACT" = 1 ]; then
+    if [ ! -f "$ARTIFACT_PATH" ]; then
+        echo "ERRO: --artifact especificado mas $ARTIFACT_PATH não existe." >&2
+        exit 2
     fi
-
-    start_time=$(date +%s%N)
-    # The phase body captures its own outcome (cargo exit codes, gates and
-    # typed GAP markers) and returns 0 (PASS) / 1 (FAIL) / 2 (GAP).
-    eval "$cmd" > "${LOG_DIR}/${log_file}" 2>&1
-    status=$?
-    PHASE_RC=$status
-    PHASE_DUR=$(( ($(date +%s%N) - start_time) / 1000000 ))
-    local dur_str
-    dur_str=$(format_duration_ms "$PHASE_DUR")
-
-    case "$status" in
-        0) echo -e "  ${GREEN}✓ phase completed (${dur_str})${NC}" ;;
-        1) echo -e "  ${RED}❌ phase FAILED (${dur_str})${NC}"
-           emit_fail_tail "$log_file" ;;
-        2) echo -e "  ${YELLOW}⚠ phase GAP (${dur_str})${NC}" ;;
-        *) echo -e "  ${RED}❌ phase failed with status ${status} (${dur_str})${NC}"
-           emit_fail_tail "$log_file" ;;
+    ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
+fi
+# RT core resolution lives in the typed `pipe_perf_gate` binary (engine policy:
+# NAM_BENCH_CORE → first online isolated CPU → first permitted CPU → GAP).
+PERF_GATE_BIN=""
+HAS_CHRT_FIFO=0
+if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then HAS_CHRT_FIFO=1; fi
+PHASE_LOGS=(phase1-soak.log phase2-heap-audit.log phase3-rt-deadline.log phase4-rt-jitter.log
+    phase5-concurrency.log phase6-endurance.log phase7-pw-resilience.log phase8-pw-live.log
+    phase9-recording-io-uring.log phase10-offline-parity.log)
+rotate_real_logs() {
+    local prev_root="$LOG_ROOT/prev" dest ts n f
+    local -a owned=()
+    for f in "${PHASE_LOGS[@]}"; do [ -e "$LOG_ROOT/$f" ] && owned+=("$LOG_ROOT/$f"); done
+    [ -e "$LOG_ROOT/long-receipt.txt" ] && owned+=("$LOG_ROOT/long-receipt.txt")
+    [ -e "$LOG_ROOT/long-audit-receipt.jsonl" ] && owned+=("$LOG_ROOT/long-audit-receipt.jsonl")
+    [ -e "$LOG_ROOT/long-audit-receipt.fail-reasons.json" ] && owned+=("$LOG_ROOT/long-audit-receipt.fail-reasons.json")
+    [ "${#owned[@]}" -eq 0 ] && return 0
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"; dest="$prev_root/$ts"; n=1
+    while [ -e "$dest" ]; do n=$((n + 1)); dest="$prev_root/${ts}_${n}"; done
+    mkdir -p "$dest"
+    for f in "${owned[@]}"; do mv -f "$f" "$dest/" 2>/dev/null || true; done
+    ls -1dt "$prev_root"/*/ 2>/dev/null | tail -n +4 | xargs -r rm -rf -- || true
+}
+rotate_real_logs
+record_gap() { GAPS+=("$1"); echo "  GAP: $1"; }
+extract_fail_reason() {
+    [ -f "$1" ] || return 1
+    grep -m1 -E 'panicked at|assertion|TEST_RESULT\[[^]]+\]=FAIL' "$1" 2>/dev/null || return 1
+}
+emit_fail_tail() {
+    local log_path="$LOG_DIR/$1" out
+    [ -f "$log_path" ] || return 0
+    out=$(tail -n 40 "$log_path" 2>/dev/null | head -c 4096 || true)
+    [ -n "$out" ] || return 0
+    echo "  [PHASE${PHASE_NUM} FAIL-TAIL] ${log_path}" >&2
+    printf '  [PHASE%s FAIL-TAIL] %s\n' "$PHASE_NUM" "$out" >&2
+}
+ensure_receipt_bin() {
+    if [ -n "$RECEIPT_BIN" ] && [ -x "$RECEIPT_BIN" ]; then return 0; fi
+    if ! cargo build --quiet --release --features testing --bin pipe_long_receipt >/dev/null 2>&1; then
+        return 1
+    fi
+    RECEIPT_BIN="$CARGO_TARGET_DIR/release/pipe_long_receipt"
+    [ -x "$RECEIPT_BIN" ]
+}
+ensure_perf_gate_bin() {
+    if [ -n "$PERF_GATE_BIN" ] && [ -x "$PERF_GATE_BIN" ]; then return 0; fi
+    if ! cargo build --quiet --release --features testing --bin pipe_perf_gate >/dev/null 2>&1; then
+        return 1
+    fi
+    PERF_GATE_BIN="$CARGO_TARGET_DIR/release/pipe_perf_gate"
+    [ -x "$PERF_GATE_BIN" ]
+}
+append_receipt() {
+    local id="$1" name="$2" status="$3" log="$4" duration="$5" gaps="$6" fail_reason="$7"
+    local -a args=(append --phase-id "$id" --name "$name" --status "$status"
+        --duration-ms "$duration" --out "$RECEIPT")
+    [ -n "$log" ] && args+=(--log "$log")
+    [ -n "$gaps" ] && args+=(--gaps "$gaps")
+    [ -n "$fail_reason" ] && args+=(--fail-reason "$fail_reason")
+    if [ -n "$ARTIFACT_SHA256" ]; then args+=(--artifact-sha256 "$ARTIFACT_SHA256"); fi
+    "$RECEIPT_BIN" "${args[@]}" >/dev/null 2>&1 || { echo "ERRO: falha ao gravar receipt JSONL" >&2; LONG_RECEIPT_FAILED=1; return 1; }
+}
+emit_text() { printf '%s\n' "$*" | tee -a "$TEXT_RECEIPT"; }
+emit_text "SUITE: tests-long"
+emit_text "STRICT: $STRICT"
+emit_text "NAM_RT_STRICT: ${NAM_RT_STRICT:-0}"
+emit_text "MODE: full"
+emit_text "SOAK_PURPOSE: accelerated_timeline — compressed timeline (320k blocks), fail-closed validation windows"
+emit_text "ENDURANCE_PURPOSE: real_wall_clock — wall-clock (NAM_ENDURANCE_SECONDS), fail-closed windows"
+run_cmd() { local to="$1"; shift; timeout --kill-after=30 "$to" "$@"; }
+run_rt_cmd() {
+    local to="$1"; shift
+    if ! ensure_perf_gate_bin; then
+        record_gap "rt:pipe_perf_gate_unavailable"
+        run_cmd "$to" "$@"
+        return
+    fi
+    if [ "$HAS_CHRT_FIFO" = 1 ]; then
+        run_cmd "$to" "$PERF_GATE_BIN" pin -- chrt -f 80 "$@"
+    else
+        run_cmd "$to" "$PERF_GATE_BIN" pin -- "$@"
+    fi
+}
+# run_phase <id> <name> <timeout_s> <function>
+run_phase() {
+    local id="$1" name="$2" to="${NAM_PHASE_TIMEOUT_S:-$3}" fn="$4" log
+    log="${PHASE_LOGS[$PHASE_NUM]}"
+    PHASE_NUM=$((PHASE_NUM + 1))
+    echo -e "\n[${PHASE_NUM}/10] ${name}"
+    echo "  Log: ${LOG_DIR}/${log}"
+    local start=$SECONDS
+    CUR_LOG="${LOG_DIR}/${log}"
+    "$fn" "$to" >"$CUR_LOG" 2>&1
+    PHASE_RC=$?
+    PHASE_DUR=$(( (SECONDS - start) * 1000 ))
+    case "$PHASE_RC" in
+        0) echo "  ✓ phase completed" ;;
+        1) echo "  ❌ phase FAILED"; emit_fail_tail "$log" ;;
+        2) echo "  ⚠ phase GAP" ;;
+        *) echo "  ❌ phase failed with status ${PHASE_RC}"; emit_fail_tail "$log"; PHASE_RC=1 ;;
     esac
     return 0
 }
-
-# finish_phase <phase_id> <log_file> <rc>
-#   Emits the typed receipt line for the phase just completed. Status follows
-#   <rc> (0=PASS, 1=FAIL, 2=GAP); --simulate always records SIMULATED.
-#   <rc> is passed explicitly by the caller (never read from a stale global).
 finish_phase() {
-    local phase_id="$1"
-    local log_file="$2"
-    local phase_rc="$3"
-    local status_line
-    local env_suffix=""
-    if [ "$SIMULATE" != "1" ] && [ -f "${LOG_DIR}/${log_file}" ]; then
-        local env_match
-        env_match=$(grep -oP '\benv=\S+' "${LOG_DIR}/${log_file}" | head -n1 || true)
-        if [ -n "$env_match" ]; then
-            env_suffix=" $env_match"
-        fi
+    local id="$1" log="$2" rc="$3" pid_lc status_line jsonl_status="" gaps="" fail_reason="" env_suffix=""
+    pid_lc=$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')
+    if [ -f "${LOG_DIR}/${log}" ]; then
+        env_suffix=$(grep -oE '\benv=[^ ]+' "${LOG_DIR}/${log}" | head -n1 || true)
     fi
-    if [ "$SIMULATE" = "1" ]; then
-        status_line="${phase_id}: SIMULATED log=${LOG_DIR}/${log_file}"
-        PHASE_STATUSES+=("SIMULATED")
-        echo -e "  ${YELLOW}ⓘ ${phase_id}: simulated (no tests executed)${NC}"
-    else
-        case "$phase_rc" in
-            0) status_line="${phase_id}: PASS log=${LOG_DIR}/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
-               PHASE_STATUSES+=("PASS")
-               echo -e "  ${GREEN}✓ ${phase_id}: PASS${NC}" ;;
-            1) status_line="${phase_id}: FAIL log=${LOG_DIR}/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
-               PHASE_STATUSES+=("FAIL")
-               echo -e "  ${RED}❌ ${phase_id}: FAIL${NC}" ;;
-            2) status_line="${phase_id}: GAP log=${LOG_DIR}/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
-               PHASE_STATUSES+=("GAP")
-               echo -e "  ${YELLOW}⚠ ${phase_id}: GAP${NC}" ;;
-            *) status_line="${phase_id}: FAIL log=${LOG_DIR}/${log_file} duration_ms=${PHASE_DUR}${env_suffix}"
-               PHASE_STATUSES+=("FAIL") ;;
-        esac
+    case "$rc" in
+        0) status_line="${id}: PASS log=${LOG_DIR}/${log} duration_ms=${PHASE_DUR}${env_suffix:+ $env_suffix}"
+           PHASE_STATUSES+=("PASS") ;;
+        2) status_line="${id}: GAP log=${LOG_DIR}/${log} duration_ms=${PHASE_DUR}${env_suffix:+ $env_suffix}"
+           PHASE_STATUSES+=("GAP") ;;
+        *) status_line="${id}: FAIL log=${LOG_DIR}/${log} duration_ms=${PHASE_DUR}${env_suffix:+ $env_suffix}"
+           PHASE_STATUSES+=("FAIL") ;;
+    esac
+    emit_text "$status_line"
+    if ! ensure_receipt_bin; then
+        echo "ERRO: pipe_long_receipt indisponível" >&2
+        LONG_RECEIPT_FAILED=1
+        return 1
     fi
-    emit_to "$LONG_RECEIPT" "$status_line"
-
-    # Mirror the phase into the unified-schema JSONL (the source of truth). GAP
-    # maps to the engine's SKIPPED status carrying a typed gap reason. A FAIL
-    # additionally carries a typed cause parsed from the phase log (D3) via the
-    # sibling `*.fail-reasons.json` file (the engine-owned schema is untouched).
-    local pid_lc jsonl_status jsonl_gaps="" fail_reason=""
-    pid_lc=$(printf '%s' "$phase_id" | tr '[:upper:]' '[:lower:]')
     case "$status_line" in
-        *": SIMULATED "*) jsonl_status="SIMULATED" ;;
         *": PASS "*) jsonl_status="PASSED" ;;
-        *": GAP "*) jsonl_status="SKIPPED"; jsonl_gaps="$pid_lc:declared_gap" ;;
+        *": GAP "*) jsonl_status="SKIPPED"; gaps="${pid_lc}:declared_gap" ;;
         *) jsonl_status="FAILED"
-           fail_reason=$(extract_fail_reason "${LOG_DIR}/${log_file}" || true)
+           fail_reason=$(extract_fail_reason "${LOG_DIR}/${log}" || true)
            fail_reason="${fail_reason:0:512}" ;;
     esac
-    if ! ensure_pipe_long_receipt_bin; then
-        LONG_RECEIPT_FAILED=1
-    else
-        local -a jargs=(append --phase-id "$pid_lc" --name "$phase_id" --status "$jsonl_status"
-                        --duration-ms "${PHASE_DUR:-0}" --out "$PIPE_JSONL")
-        if [ -f "${LOG_DIR}/${log_file}" ]; then
-            jargs+=(--log "${LOG_DIR}/${log_file}")
-        fi
-        if [ -n "$jsonl_gaps" ]; then
-            jargs+=(--gaps "$jsonl_gaps")
-        fi
-        if [ -n "$fail_reason" ]; then
-            jargs+=(--fail-reason "$fail_reason")
-        fi
-        "$PIPE_RECEIPT_BIN" "${jargs[@]}" || LONG_RECEIPT_FAILED=1
-    fi
+    append_receipt "$pid_lc" "$id" "$jsonl_status" "${LOG_DIR}/${log}" "${PHASE_DUR:-0}" "$gaps" "$fail_reason"
 }
-
-# empty_target_execution <log_file> <target>
-#   Returns 0 when <target> ran (its "Running <target> " banner exists) but
-#   its summary reports 0 executed tests. Distinguishes a planned-but-empty
-#   soak battery (typed GAP) from a removed/renamed mandatory target
-#   (no banner — hard FAIL).
-empty_target_execution() {
-    local log_file="$1"
-    local target="$2"
-    local run_line run_lineno result_line
-    run_line=$(grep -n -m1 -F "Running ${target} " "$log_file" 2>/dev/null || true)
-    [ -n "$run_line" ] || return 1
-    run_lineno="${run_line%%:*}"
-    result_line=$(sed -n "$((run_lineno + 1)),\$p" "$log_file" | grep -m1 -E 'test result:' 2>/dev/null || true)
-    [ -n "$result_line" ] || return 1
-    printf '%s\n' "$result_line" | grep -qP '\b0\s+passed' && return 0
-    return 1
-}
-
-# gated_target_status <log_file> <target> <min_exec> <gap_reason>
-#   Fail-closed gate used by soak-type phases: verifies real execution of a
-#   mandatory target. Returns 0 on success; when the target ran but executed
-#   fewer than min_exec tests it records the typed GAP <gap_reason> and
-#   returns 2; a missing banner returns 1 (hard failure — target
-#   removed/renamed/filtered out).
-gated_target_status() {
-    local log_file="$1"
-    local target="$2"
-    local min_exec="$3"
-    local gap_reason="$4"
-    if assert_ran_target "$log_file" "$target" "$min_exec"; then
-        return 0
-    fi
-    if empty_target_execution "$log_file" "$target"; then
-        record_gap "$gap_reason"
-        return 2
-    fi
-    return 1
-}
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Phase bodies — one function per phase, passed by name to run_phase so the
-# suite stays easy to scan and extend in an unattended nightly job. Each
-# returns 0 (PASS) / 1 (FAIL) / 2 (GAP).
-# ═══════════════════════════════════════════════════════════════════════════
-
-# --- Phase 1: Accelerated soak & swap concurrency (release, --ignored) ---
-# tests-quick.sh runs the fast swap_stress pass (debug + release, non-ignored);
-# every #[ignore]'d soak/endurance case lives here exclusively (rules/testing.md
-# §1: soak MUST be #[ignore]d and run only in tests-long.sh). The extended
-# soak battery consists of soak_extended.rs + ignored swap_stress cases,
-# and declares this phase's purpose as the accelerated timeline soak.
+phase_passed_target() { assert_ran_target "$CUR_LOG" "$1" "${2:-1}"; }
+# ── Phase bodies (return 0 PASS / 1 FAIL / 2 GAP) ───────────────────────────
 run_soak_phase() {
-    local rc=0
+    local to="$1" rc=0
     local gaps_before=${#GAPS[@]}
     if [ -f tests/soak_extended.rs ]; then
-        echo "  → tests/soak_extended.rs — extended multi-model soak"
-        cargo test --features testing --release --no-fail-fast \
+        run_cmd "$to" cargo test --features testing --release --no-fail-fast \
             --test soak_extended -- --ignored --nocapture --test-threads=1 || rc=1
     else
         record_gap "phase1:soak_extended_harness_missing"
     fi
-    echo "  → tests/swap_stress.rs — ignored soak battery"
-    cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
         --test swap_stress -- --ignored --nocapture --test-threads=1 || rc=1
-    if [ "$rc" -eq 0 ]; then
-        if [ -f tests/soak_extended.rs ]; then
-            gated_target_status "${LOG_DIR}/phase1-soak.log" "tests/soak_extended.rs" 1 \
-                "phase1:soak_extended_no_ignored_tests" || rc=$?
-        fi
-        if [ "$rc" -eq 0 ]; then
-            gated_target_status "${LOG_DIR}/phase1-soak.log" "tests/swap_stress.rs" 1 \
-                "phase1:swap_soak_no_ignored_tests" || rc=$?
-        fi
-    fi
-    if [ "$rc" -eq 0 ] && [ "${#GAPS[@]}" -gt "$gaps_before" ]; then
-        return 2
-    fi
-    return "$rc"
+    [ "$rc" -eq 0 ] || return 1
+    [ -f tests/soak_extended.rs ] && { phase_passed_target "tests/soak_extended.rs" || return 1; }
+    phase_passed_target "tests/swap_stress.rs" || return 1
+    [ "${#GAPS[@]}" -gt "$gaps_before" ] && return 2
+    return 0
 }
-
-# --- Phase 2: RT-Safety heap-audit (release, --features "testing heap-audit") ---
-# Zero-allocation verification on the RT thread under the global counting
-# allocator. No quick-suite equivalent — the heap-audit feature is exclusively
-# a long-suite concern. The lib unit gates (cabsim_swap::heap_audit_tests,
-# rt_callback) and the swap_stress battery assert get_alloc_count() == 0.
 run_heap_audit_phase() {
-    local rc=0
-    local gaps_before=${#GAPS[@]}
-    echo "  → lib unit heap-audit gates (cabsim_swap::heap_audit_tests + RT paths)"
-    cargo test --features "testing heap-audit" --release --no-fail-fast \
+    local to="$1" rc=0
+    run_cmd "$to" cargo test --features "testing heap-audit" --release --no-fail-fast \
         --lib -- --nocapture || rc=1
-    echo "  → integration heap-audit battery (tests/swap_stress.rs)"
-    cargo test --features "testing heap-audit" --release --no-fail-fast \
+    run_cmd "$to" cargo test --features "testing heap-audit" --release --no-fail-fast \
         --test swap_stress -- --nocapture || rc=1
-    if [ "$rc" -eq 0 ]; then
-        if ! assert_ran_tests "${LOG_DIR}/phase2-heap-audit.log" 1; then
-            rc=1
-        fi
+    [ "$rc" -eq 0 ] || return 1
+    assert_ran_tests "$CUR_LOG" 1 || return 1
+    phase_passed_target "tests/swap_stress.rs" || return 1
+    if ! grep -qE "swap_soak_heap_audit|heap_audit_" "$CUR_LOG"; then
+        record_gap "phase2:no_heap_audit_tests_executed"; return 2
     fi
-    if [ "$rc" -eq 0 ]; then
-        if ! assert_ran_target "${LOG_DIR}/phase2-heap-audit.log" "tests/swap_stress.rs" 1; then
-            if empty_target_execution "${LOG_DIR}/phase2-heap-audit.log" "tests/swap_stress.rs"; then
-                record_gap "phase2:heap_audit_tests_not_registered"
-                rc=2
-            else
-                rc=1
-            fi
-        fi
-    fi
-    if [ "$rc" -eq 0 ]; then
-        if ! grep -qE "swap_soak_heap_audit|heap_audit_" "${LOG_DIR}/phase2-heap-audit.log"; then
-            record_gap "phase2:no_heap_audit_tests_executed"
-            rc=2
-        fi
-    fi
-    if [ "$rc" -eq 0 ] && [ "${#GAPS[@]}" -gt "$gaps_before" ]; then
-        return 2
-    fi
-    return "$rc"
+    return 0
 }
-
-# --- Phase 3: RT Deadline Gate (deterministic, nanosecond budget) ---
-# tests/rt_metrics.rs executes 10k quantums of real DSP load and emits
-# typed markers: TEST_RESULT[rt_deadline]=PASS max_ns=... budget_ns=... or
-# TEST_RESULT[rt_deadline]=GAP:uncalibrated_environment. The shell only maps
-# markers; it never reclassifies logs.
 run_rt_deadline_phase() {
-    if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing"
-        record_gap "phase3:rt_metrics_harness_missing"
-        return 2
+    local to="$1" rc=0
+    [ -f tests/rt_metrics.rs ] || { record_gap "phase3:rt_metrics_harness_missing"; return 2; }
+    run_cmd "$to" cargo test --features testing --release --no-run --test rt_metrics || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    run_rt_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    if grep -qF "TEST_RESULT[rt_deadline]=GAP" "$CUR_LOG"; then
+        record_gap "phase3:$(grep -oE 'TEST_RESULT\[rt_deadline\]=GAP:[^ ]+' "$CUR_LOG" | head -n1)"; return 2
     fi
-    local rc=0
-    echo "  → rt_metrics deadline gate (nanosecond budget, core ${BENCH_CORE})"
-    # Pre-compile without CPU affinity so all cores participate in compilation,
-    # leaving BENCH_CORE cool and quiescent before running the RT benchmark.
-    cargo test --features testing --release --no-run --test rt_metrics || rc=1
-    if [ "$rc" -eq 0 ]; then
-        local rt_cmd=(cargo test --features testing --release --no-fail-fast --test rt_metrics -- deadline --ignored --nocapture --test-threads=1)
-        if [ "$HAS_CHRT_FIFO" = "1" ] && [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-            chrt -f 80 taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
-        elif [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-            taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
-        else
-            "${rt_cmd[@]}" || rc=1
-        fi
+    if grep -qF "TEST_RESULT[rt_deadline_full]=GAP" "$CUR_LOG"; then
+        record_gap "phase3:$(grep -oE 'TEST_RESULT\[rt_deadline_full\]=GAP:[^ ]+' "$CUR_LOG" | head -n1)"; return 2
     fi
-    # A real cargo failure is a hard FAIL and must never be masked by a typed
-    # GAP marker lingering in the same log. Marker classification is
-    # fail-closed: the harness emits exactly one
-    # TEST_RESULT[rt_deadline]=... marker per run — a GAP marker means the
-    # measurement was bypassed/inconclusive and is never promoted to PASS.
-    if [ "$rc" -ne 0 ]; then
-        return 1
-    fi
-    if grep -qF "TEST_RESULT[rt_deadline]=GAP" "${LOG_DIR}/phase3-rt-deadline.log"; then
-        record_gap "phase3:$(grep -oP 'TEST_RESULT\[rt_deadline\]=GAP:[^ ]+' ${LOG_DIR}/phase3-rt-deadline.log | head -n1)"
-        return 2
-    fi
-    if grep -qF "TEST_RESULT[rt_deadline_full]=GAP" "${LOG_DIR}/phase3-rt-deadline.log"; then
-        record_gap "phase3:$(grep -oP 'TEST_RESULT\[rt_deadline_full\]=GAP:[^ ]+' ${LOG_DIR}/phase3-rt-deadline.log | head -n1)"
-        return 2
-    fi
-    if ! grep -qF "TEST_RESULT[rt_deadline]=PASS" "${LOG_DIR}/phase3-rt-deadline.log"; then
-        record_gap "phase3:no_typed_deadline_result"
-        return 2
-    fi
-    if ! grep -qF "TEST_RESULT[rt_deadline_full]=PASS" "${LOG_DIR}/phase3-rt-deadline.log"; then
-        record_gap "phase3:no_typed_deadline_full_result"
-        return 2
-    fi
+    grep -qF "TEST_RESULT[rt_deadline]=PASS" "$CUR_LOG" || { record_gap "phase3:no_typed_deadline_result"; return 2; }
+    grep -qF "TEST_RESULT[rt_deadline_full]=PASS" "$CUR_LOG" || { record_gap "phase3:no_typed_deadline_full_result"; return 2; }
     return 0
 }
-
-# --- Phase 4: RT Jitter Gate (inter-callback dispersion under contention) ---
-# Diagnostic telemetry: statistical dispersion of inter-callback intervals.
-# tests/rt_metrics.rs emits TEST_RESULT[rt_jitter]=PASS max_jitter_us=...
-# or a typed GAP when environment preconditions are not met.
 run_rt_jitter_phase() {
-    if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing"
-        record_gap "phase4:rt_metrics_harness_missing"
-        return 2
+    local to="$1" rc=0
+    [ -f tests/rt_metrics.rs ] || { record_gap "phase4:rt_metrics_harness_missing"; return 2; }
+    run_rt_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test rt_metrics -- jitter --ignored --nocapture --test-threads=1 || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    if grep -qF "TEST_RESULT[rt_jitter]=GAP" "$CUR_LOG"; then
+        record_gap "phase4:$(grep -oE 'TEST_RESULT\[rt_jitter\]=GAP:[^ ]+' "$CUR_LOG" | head -n1)"; return 2
     fi
-    local rc=0
-    echo "  → rt_metrics jitter gate (inter-callback dispersion, core ${BENCH_CORE})"
-    local rt_cmd=(cargo test --features testing --release --no-fail-fast --test rt_metrics -- jitter --ignored --nocapture --test-threads=1)
-    if [ "$HAS_CHRT_FIFO" = "1" ] && [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-        chrt -f 80 taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
-    elif [ "$HAS_TASKSET" = "1" ] && [ -n "${BENCH_CORE:-}" ]; then
-        taskset -c "$BENCH_CORE" "${rt_cmd[@]}" || rc=1
-    else
-        "${rt_cmd[@]}" || rc=1
-    fi
-    # Same fail-closed precedence as the deadline gate: a real cargo failure
-    # is a hard FAIL, never masked by a typed GAP marker in the same log.
-    if [ "$rc" -ne 0 ]; then
-        return 1
-    fi
-    if grep -qF "TEST_RESULT[rt_jitter]=GAP" "${LOG_DIR}/phase4-rt-jitter.log"; then
-        record_gap "phase4:$(grep -oP 'TEST_RESULT\[rt_jitter\]=GAP:[^ ]+' ${LOG_DIR}/phase4-rt-jitter.log | head -n1)"
-        return 2
-    fi
-    if ! grep -qF "TEST_RESULT[rt_jitter]=PASS" "${LOG_DIR}/phase4-rt-jitter.log"; then
-        record_gap "phase4:no_typed_jitter_result"
-        return 2
-    fi
+    grep -qF "TEST_RESULT[rt_jitter]=PASS" "$CUR_LOG" || { record_gap "phase4:no_typed_jitter_result"; return 2; }
     return 0
 }
-
-# --- Phase 5: Concurrency interleaving stress, state resilience & throughput ---
-# 16-thread stress over swap requests, stream-state transitions, simulated
-# reconnect cycles and cooperative SHUTDOWN — zero deadlocks, no
-# inconsistent sample-rate reads, no leaked failure state. Plus the
-# production-SPSC state-machine throughput gate
-# (concurrent_spsc_throughput_swap_accounting): no global mutex on the measured
-# path; complete attempted/enqueued/applied/dropped swap accounting. Emits
-# typed markers TEST_RESULT[concurrency_stress]=PASS and
-# TEST_RESULT[spsc_throughput]=PASS/GAP:...
 run_concurrency_phase() {
-    if [ ! -f tests/rt_metrics.rs ]; then
-        echo "  → tests/rt_metrics.rs missing"
-        record_gap "phase5:rt_metrics_harness_missing"
-        return 2
-    fi
-    local rc=0
-    echo "  → rt_metrics concurrent state interleaving stress (16 threads)"
-    echo "  → rt_metrics SPSC state-machine throughput (no global mutex)"
-    cargo test --features testing --release --no-fail-fast \
+    local to="$1" rc=0
+    [ -f tests/rt_metrics.rs ] || { record_gap "phase5:rt_metrics_harness_missing"; return 2; }
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
         --test rt_metrics -- concurrent --ignored --nocapture --test-threads=1 || rc=1
-    # Same fail-closed precedence as the deadline gate: a real cargo failure
-    # is a hard FAIL, never masked by a typed GAP marker in the same log.
-    if [ "$rc" -ne 0 ]; then
-        return 1
+    [ "$rc" -eq 0 ] || return 1
+    if grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=GAP" "$CUR_LOG"; then
+        record_gap "phase5:$(grep -oE 'TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=GAP:[^ ]+' "$CUR_LOG" | head -n1)"; return 2
     fi
-    if grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=GAP" "${LOG_DIR}/phase5-concurrency.log"; then
-        record_gap "phase5:$(grep -oP 'TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=GAP:[^ ]+' ${LOG_DIR}/phase5-concurrency.log | head -n1)"
-        return 2
-    fi
-    if ! grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=PASS" "${LOG_DIR}/phase5-concurrency.log"; then
-        record_gap "phase5:no_typed_concurrency_stress_result"
-        return 2
-    fi
+    grep -qE "TEST_RESULT\[(concurrency_stress|model_check|concurrent|spsc_throughput)\]=PASS" "$CUR_LOG" \
+        || { record_gap "phase5:no_typed_concurrency_stress_result"; return 2; }
     return 0
 }
-
-# --- Phase 6: Endurance real & state-machine throughput (release, --ignored) ---
-# tests/endurance.rs: real wall-clock endurance distinct
-# from the accelerated soak — fail-closed validation windows, periodic raw
-# RSS/faults/threads/FD telemetry. The phase purpose is declared in the receipt
-# as `ENDURANCE_PURPOSE: real_wall_clock`. Override the window with
-# NAM_ENDURANCE_SECONDS (default 30, floor 5).
 run_endurance_phase() {
-    local rc=0
+    local to="$1" rc=0
     local gaps_before=${#GAPS[@]}
-    if [ -f tests/endurance.rs ]; then
-        echo "  → tests/endurance.rs — real wall-clock endurance"
-        echo "  → NAM_ENDURANCE_SECONDS=${NAM_ENDURANCE_SECONDS:-30} (default 30s wall clock)"
-        cargo test --features testing --release --no-fail-fast \
-            --test endurance -- --ignored --nocapture --test-threads=1 || rc=1
-    else
-        record_gap "phase6:endurance_harness_missing"
-        return 2
-    fi
-    if [ "$rc" -eq 0 ]; then
-        gated_target_status "${LOG_DIR}/phase6-endurance.log" "tests/endurance.rs" 1 \
-            "phase6:endurance_no_ignored_tests" || rc=$?
-    fi
-    if [ "$rc" -eq 0 ] && [ "${#GAPS[@]}" -gt "$gaps_before" ]; then
-        return 2
-    fi
-    return "$rc"
+    if [ ! -f tests/endurance.rs ]; then record_gap "phase6:endurance_harness_missing"; return 2; fi
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test endurance -- --ignored --nocapture --test-threads=1 || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    phase_passed_target "tests/endurance.rs" || return 1
+    [ "${#GAPS[@]}" -gt "$gaps_before" ] && return 2
+    return 0
 }
-
-# --- Phase 7: PipeWire resilience (private daemon) ---
-# tests/pw_integration.rs: runs bounded reconnect recovery, stream error fail-fast SLA,
-# and reconnect exhaustion against an isolated private daemon.
-# Emits typed markers TEST_RESULT[...]=PASS or GAP.
 run_pw_resilience_phase() {
-    local rc=0
-    echo "  → tests/pw_integration.rs — private daemon resilience battery"
-    cargo test --features testing --release --no-fail-fast \
+    local to="$1" rc=0
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
         --test pw_integration -- --nocapture --test-threads=1 || rc=1
-
-    if [ "$rc" -ne 0 ]; then
-        return 1
+    [ "$rc" -eq 0 ] || return 1
+    if grep -qE "TEST_RESULT\[.*\]=GAP" "$CUR_LOG"; then
+        record_gap "phase7:$(grep -oE 'TEST_RESULT\[[^]]+\]=GAP:[^ ]+' "$CUR_LOG" | head -n1)"; return 2
     fi
-    if grep -qE "TEST_RESULT\[.*\]=GAP" "${LOG_DIR}/phase7-pw-resilience.log"; then
-        record_gap "phase7:$(grep -oP 'TEST_RESULT\[[^\]]+\]=GAP:[^ ]+' ${LOG_DIR}/phase7-pw-resilience.log | head -n1)"
-        return 2
+    grep -qE "TEST_RESULT\[(daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon)\]=PASS" "$CUR_LOG" \
+        || { record_gap "phase7:no_typed_resilience_result"; return 2; }
+    return 0
+}
+# Absorbed from the former quick-suite Phase 3 (live subprocess acceptances).
+run_pw_live_phase() {
+    local to="$1" rc=0 gaps_before=${#GAPS[@]} marker
+    if ! command -v pw-cli >/dev/null 2>&1 || ! timeout 5 pw-cli info 0 >/dev/null 2>&1; then
+        record_gap "phase8:pw_integration:daemon_unavailable"; return 2
     fi
-    if ! grep -qE "TEST_RESULT\[(daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon)\]=PASS" "${LOG_DIR}/phase7-pw-resilience.log"; then
-        record_gap "phase7:no_typed_resilience_result"
-        return 2
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test pw_integration --test service_resilience -- --ignored --test-threads=1 --nocapture || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    phase_passed_target "tests/pw_integration.rs" || return 1
+    phase_passed_target "tests/service_resilience.rs" || return 1
+    while IFS= read -r marker; do
+        [ -n "$marker" ] && record_gap "phase8:$marker"
+    done < <(grep -oE 'TEST_RESULT\[[^]]+\]=(GAP|SKIP):[^ ()]+' "$CUR_LOG" | sort -u || true)
+    local sigterm_pass
+    sigterm_pass=$(grep -cF "TEST_RESULT[sigterm_acceptance]=PASS" "$CUR_LOG" || true)
+    [ "${sigterm_pass:-0}" -ge 2 ] || { record_gap "phase8:sigterm_acceptance_incomplete"; return 2; }
+    grep -qF "TEST_RESULT[double_signal]=PASS" "$CUR_LOG" \
+        || { record_gap "phase8:double_signal_not_certified"; return 2; }
+    [ "${#GAPS[@]}" -gt "$gaps_before" ] && return 2
+    return 0
+}
+# Absorbed from the former quick-suite Phase 4 (recording disk writer).
+run_recording_phase() {
+    local to="$1" rc=0 probe_rc=0 probe_bin="${CARGO_TARGET_DIR}/debug/io_uring_probe"
+    cargo build --quiet --bin io_uring_probe >/dev/null 2>&1 || probe_rc=2
+    if [ "$probe_rc" -eq 0 ]; then "$probe_bin" >/dev/null 2>&1 || probe_rc=$?; fi
+    case "$probe_rc" in
+        0) ;;
+        1) record_gap "phase9:recording_io_uring:kernel_unsupported"; return 2 ;;
+        *) record_gap "phase9:recording_io_uring:probe_tool_missing"; return 2 ;;
+    esac
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test recording --test recording_fault_injection -- --ignored --test-threads=1 --nocapture || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    phase_passed_target "tests/recording.rs" || return 1
+    phase_passed_target "tests/recording_fault_injection.rs" || return 1
+    if grep -qF "TEST_RESULT[record_e2e]=SKIP:" "$CUR_LOG"; then
+        record_gap "phase9:record_e2e_daemon_or_io_uring_unavailable"; return 2
+    fi
+    grep -qF "TEST_RESULT[record_e2e]=PASS" "$CUR_LOG" \
+        || { record_gap "phase9:no_typed_record_e2e_result"; return 2; }
+    return 0
+}
+run_offline_parity_phase() {
+    local to="$1" rc=0
+    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        --test pipe_offline_parity -- --ignored --nocapture --test-threads=1 || rc=1
+    [ "$rc" -eq 0 ] || return 1
+    phase_passed_target "tests/pipe_offline_parity.rs" || return 1
+    grep -qE 'TEST_RESULT\[offline_parity_' "$CUR_LOG" \
+        || { record_gap "phase10:no_typed_offline_parity_result"; return 2; }
+    if [ "$USE_ARTIFACT" = 1 ]; then
+        run_cmd "$to" "$ARTIFACT_PATH" --diagnose || return 1
+        echo "# artifact smoke: $ARTIFACT_PATH sha256=$ARTIFACT_SHA256"
     fi
     return 0
 }
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Phase execution — every phase is isolated via `|| true`; the phase's own
-# return code (PASS/FAIL/GAP) is consumed by finish_phase immediately after.
-# ═══════════════════════════════════════════════════════════════════════════
-
-run_phase "Phase 1: Accelerated soak (compressed timeline) & swap concurrency" "run_soak_phase" "phase1-soak.log" || true
+run_phase "PHASE1" "Phase 1: Accelerated soak (compressed timeline) & swap concurrency" 1800 run_soak_phase
 finish_phase "PHASE1" "phase1-soak.log" "$PHASE_RC"
-
-run_phase "Phase 2: RT-Safety heap-audit (zero-alloc)" "run_heap_audit_phase" "phase2-heap-audit.log" || true
+run_phase "PHASE2" "Phase 2: RT-Safety heap-audit (zero-alloc)" 1800 run_heap_audit_phase
 finish_phase "PHASE2" "phase2-heap-audit.log" "$PHASE_RC"
-
-run_phase "Phase 3: RT Deadline gate (nanosecond budget)" "run_rt_deadline_phase" "phase3-rt-deadline.log" || true
+run_phase "PHASE3" "Phase 3: RT Deadline gate (nanosecond budget)" 900 run_rt_deadline_phase
 finish_phase "PHASE3" "phase3-rt-deadline.log" "$PHASE_RC"
-
-run_phase "Phase 4: RT Jitter gate (inter-callback dispersion)" "run_rt_jitter_phase" "phase4-rt-jitter.log" || true
+run_phase "PHASE4" "Phase 4: RT Jitter gate (inter-callback dispersion)" 900 run_rt_jitter_phase
 finish_phase "PHASE4" "phase4-rt-jitter.log" "$PHASE_RC"
-
-run_phase "Phase 5: Concurrency interleaving stress & state resilience" "run_concurrency_phase" "phase5-concurrency.log" || true
+run_phase "PHASE5" "Phase 5: Concurrency interleaving stress & state resilience" 900 run_concurrency_phase
 finish_phase "PHASE5" "phase5-concurrency.log" "$PHASE_RC"
-
-run_phase "Phase 6: Real endurance & state-machine throughput" "run_endurance_phase" "phase6-endurance.log" || true
+run_phase "PHASE6" "Phase 6: Real endurance & state-machine throughput" 1800 run_endurance_phase
 finish_phase "PHASE6" "phase6-endurance.log" "$PHASE_RC"
-
-run_phase "Phase 7: PipeWire resilience (private daemon)" "run_pw_resilience_phase" "phase7-pw-resilience.log" || true
+run_phase "PHASE7" "Phase 7: PipeWire resilience (private daemon)" 900 run_pw_resilience_phase
 finish_phase "PHASE7" "phase7-pw-resilience.log" "$PHASE_RC"
-
-# ── Unified-schema receipt: derive the terminal `overall` line in Rust ──────
-if ensure_pipe_long_receipt_bin && "$PIPE_RECEIPT_BIN" summary --out "$PIPE_JSONL" >/dev/null 2>&1; then
-    :
-else
-    LONG_RECEIPT_FAILED=1
-fi
+run_phase "PHASE8" "Phase 8: Live PipeWire and SIGTERM acceptances" 900 run_pw_live_phase
+finish_phase "PHASE8" "phase8-pw-live.log" "$PHASE_RC"
+run_phase "PHASE9" "Phase 9: Recording io_uring and fault injection" 1200 run_recording_phase
+finish_phase "PHASE9" "phase9-recording-io-uring.log" "$PHASE_RC"
+run_phase "PHASE10" "Phase 10: Offline f64 parity and canonical artifact smoke" 900 run_offline_parity_phase
+finish_phase "PHASE10" "phase10-offline-parity.log" "$PHASE_RC"
 if [ "$LONG_RECEIPT_FAILED" -ne 0 ]; then
-    echo -e "${RED}${BOLD}❌ Unified-schema long receipt emission failed — $PIPE_JSONL is missing or incomplete.${NC}" >&2
+    echo "ERRO: emissão do receipt JSONL falhou — auditoria não certificável" >&2
     exit 1
 fi
-
-# ── Summary & verdict ──────────────────────────────────────────────────────
-if [ "${#GAPS[@]}" -gt 0 ]; then
-    for g in "${GAPS[@]}"; do
-        emit_to "$LONG_RECEIPT" "GAP: $g"
-        echo -e "${YELLOW}${BOLD}WARN GAP: $g${NC}"
-    done
-fi
-
-HAS_FAIL=0
-HAS_GAP=0
-for st in "${PHASE_STATUSES[@]}"; do
-    case "$st" in
-        FAIL) HAS_FAIL=1 ;;
-        GAP) HAS_GAP=1 ;;
-    esac
-done
-
-echo -e "\n${BLUE}${BOLD}================ AUDIT SUMMARY ================${NC}"
-for i in "${!PHASE_STATUSES[@]}"; do
-    printf '  Phase %d: %s\n' "$((i + 1))" "${PHASE_STATUSES[$i]}"
-done
-
-if [ "$SIMULATE" = "1" ]; then
-    emit_to "$LONG_RECEIPT" "OVERALL: SIMULATED"
-    echo -e "\n${YELLOW}${BOLD}Simulation only — no test executed. Planned phases registered in ${LOG_DIR}/.${NC}"
-    exit 0
-fi
-
-if [ "$HAS_FAIL" -eq 1 ]; then
-    echo -e "\n${RED}${BOLD}❌ One or more phases failed. Check ${LOG_DIR}/phase*-*.log and ${LONG_RECEIPT}${NC}"
-    emit_to "$LONG_RECEIPT" "OVERALL: FAILED"
-    exit 1
-fi
-
-if [ "$HAS_GAP" -eq 1 ]; then
-    echo -e "\n${YELLOW}${BOLD}⚠ Audit completed with declared gaps (inconclusive / skipped / unexecuted phases).${NC}"
-    emit_to "$LONG_RECEIPT" "OVERALL: COMPLETED_WITH_GAPS"
-    if [ "$STRICT_PRE_RELEASE" -eq 1 ]; then
-        echo -e "${RED}${BOLD}❌ --strict-pre-release: failing audit due to declared gaps. Release requires certification on a calibrated RT machine.${NC}"
+# Artifact binding is checked before the JSONL `overall` line is derived. A
+# mismatch is fatal in every mode: a receipt that cannot be tied to the bytes
+# it audited must never be certified. Tool output goes to a dedicated log — the
+# strict text receipt accepts only its canonical line types.
+if [ "$USE_ARTIFACT" = 1 ]; then
+    if ! "$RECEIPT_BIN" verify-artifact --out "$RECEIPT" --artifact "$ARTIFACT_PATH" \
+        >>"$LOG_DIR/tests-long-verify-artifact.log" 2>&1; then
+        record_gap "artifact:sha_mismatch"
+        for g in ${GAPS[@]+"${GAPS[@]}"}; do emit_text "GAP: $g"; done
+        emit_text "OVERALL: COMPLETED_WITH_GAPS"
+        echo "RESULT: FAIL ($((SECONDS - T0))s) fails=artifact_binding gaps=${GAPS[*]:-artifact:sha_mismatch}" >&2
         exit 1
     fi
+fi
+# Derive the JSONL `overall` line in Rust; a missing emitter fails closed.
+if ! ensure_receipt_bin || ! "$RECEIPT_BIN" summary --out "$RECEIPT" >/dev/null 2>&1; then
+    echo "ERRO: falha ao emitir o receipt JSONL unificado ($RECEIPT)" >&2
+    exit 1
+fi
+for g in ${GAPS[@]+"${GAPS[@]}"}; do emit_text "GAP: $g"; done
+HAS_FAIL=0
+HAS_GAP=0
+for st in ${PHASE_STATUSES[@]+"${PHASE_STATUSES[@]}"}; do
+    case "$st" in FAIL) HAS_FAIL=1 ;; GAP) HAS_GAP=1 ;; esac
+done
+if [ "$HAS_FAIL" -eq 1 ]; then
+    emit_text "OVERALL: FAILED"
+    echo "RESULT: FAIL ($((SECONDS - T0))s) fails=${PHASE_STATUSES[*]} gaps=${GAPS[*]:-none}"
+    exit 1
+fi
+if [ "$HAS_GAP" -eq 1 ] || [ "${#GAPS[@]}" -gt 0 ]; then
+    emit_text "OVERALL: COMPLETED_WITH_GAPS"
+    if [ "$STRICT" = 1 ]; then
+        echo "RESULT: FAIL ($((SECONDS - T0))s) fails=none gaps=${GAPS[*]:-declared_phase_gap}"
+        exit 1
+    fi
+    echo "RESULT: PASS_WITH_GAPS ($((SECONDS - T0))s) fails=none gaps=${GAPS[*]:-declared_phase_gap}"
     exit 0
 fi
-
-echo -e "\n${GREEN}${BOLD}✓ All long-audit phases completed successfully!${NC}"
-emit_to "$LONG_RECEIPT" "OVERALL: PASSED"
+emit_text "OVERALL: PASSED"
+echo "RESULT: PASS ($((SECONDS - T0))s) fails=none gaps=none"
 exit 0

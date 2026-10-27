@@ -4,7 +4,7 @@
 //! Native `io_uring` capability probe.
 //!
 //! Replaces the previous `python3` + `ctypes` syscall probe in
-//! `utils/tests-quick.sh` with a self-contained Rust check that does not
+//! the long suite with a self-contained Rust check that does not
 //! depend on any optional interpreter being present.
 
 /// Outcome of the `io_uring_setup(2)` capability probe.

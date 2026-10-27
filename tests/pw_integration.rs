@@ -7,7 +7,7 @@
 //! SPSC channel setup, gain parameter injection, and graceful shutdown.
 //!
 //! Requires a running PipeWire daemon (session or system). Without it, the test
-//! is skipped by the `#[ignore]` attribute; `utils/tests-quick.sh` Phase 3
+//! is skipped by the `#[ignore]` attribute; `utils/tests-long.sh` PHASE8
 //! auto-detects the daemon via `pw-cli info`.
 
 use nam_audio_pipe::standalone::cli;
@@ -35,7 +35,7 @@ const E2E_MIN_WINDOW: Duration = Duration::from_secs(4);
 /// Hard ceiling for the measurement window (covers 2000 samples at q=256).
 const E2E_MAX_WINDOW: Duration = Duration::from_secs(15);
 
-/// R-17: the script (`utils/tests-quick.sh` Phase 3) only executes
+/// R-17: the script (`utils/tests-long.sh` PHASE8) only executes
 /// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
 /// test therefore means the daemon vanished mid-run or the script↔test
 /// probes diverged — a silent `return` would let the script print
@@ -307,7 +307,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
 /// Tests the basic initialization and communication of the PipeWire pipeline across
 /// multiple buffer sizes (64, 128, 256), asserting zero starvation and emitting E2E_METRICS.
 #[test]
-#[ignore = "requires a running PipeWire daemon (session or system); auto-detected by utils/tests-quick.sh Phase 3"]
+#[ignore = "requires a running PipeWire daemon (session or system); run by utils/tests-long.sh PHASE8"]
 fn test_pipewire_integration() {
     // R-17: fail-closed divergence check — never a silent skip here (the
     // script probe already gated on the daemon).
