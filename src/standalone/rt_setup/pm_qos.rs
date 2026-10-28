@@ -15,7 +15,7 @@
 /// or `pw-metadata` is unresponsive; the timeout path terminates the probe
 /// through the owned [`std::process::Child`] handle (immune to PID recycling).
 /// stdout is consumed concurrently with the wait (`poll(2)` deadline slices)
-/// and captured up to the [`STDOUT_CAPTURE_CAP`] byte ceiling; output beyond
+/// and captured up to the `STDOUT_CAPTURE_CAP` byte ceiling; output beyond
 /// the ceiling is truncated with a logged record so a chatty child can never
 /// deadlock the pipe or blow the parse window.
 ///
@@ -99,7 +99,7 @@ fn force_nonblocking(fd: std::os::fd::RawFd) {
 /// Bounded non-blocking stdout capture consumed concurrently with the child
 /// wait. Reads happen only under [`libc::poll`] readiness on an `O_NONBLOCK`
 /// descriptor (a slice never blocks past its deadline) and are clamped to
-/// [`STDOUT_CAPTURE_CAP`]; bytes beyond the ceiling are drained and dropped
+/// `STDOUT_CAPTURE_CAP`; bytes beyond the ceiling are drained and dropped
 /// with [`Self::truncated`] set.
 struct StdoutCapture {
     out: Option<std::process::ChildStdout>,

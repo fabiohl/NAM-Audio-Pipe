@@ -254,9 +254,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     );
 
     let env = common::rt_env::RtCalibration::probe();
-    let force_legacy = std::env::var("NAM_E2E_LEGACY_GATE").as_deref() == Ok("1");
-
-    if env.calibrated() && !force_legacy {
+    if env.calibrated() {
         // Tight gate relative to the host quantum: the bridge is one quantum
         // deep, so p99 must stay under 1.25·q + 100 µs and the maximum under
         // 1.5·q (F-PR-07).
@@ -276,11 +274,6 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
             env.format_env()
         );
     } else {
-        let reason = if force_legacy {
-            "forced_legacy_gate"
-        } else {
-            "non_isolated_env"
-        };
         // Legacy permissive threshold as an explicit fallback on uncertified hosts.
         let max_allowed_p99 = 2 * quantum_ns + 15_000_000;
         assert!(
@@ -288,7 +281,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
             "p99 e2e ({p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
         );
         println!(
-            "TEST_RESULT[e2e_tight_gate]=GAP:{reason} buffer_size={buffer_size} p99_ns={p99_ns} \
+            "TEST_RESULT[e2e_tight_gate]=GAP:non_isolated_env buffer_size={buffer_size} p99_ns={p99_ns} \
              max_ns={max_ns} quantum_ns={quantum_ns}"
         );
     }

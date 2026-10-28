@@ -3,24 +3,24 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # lints.sh — formatação, análise estática e conformidade textual. Classe A.
 # Uso: utils/lints.sh [-h|--help]
+# Orçamento: 100
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . utils/_lib.sh
-[ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ] && { echo "Uso: utils/lints.sh"; exit 0; }
-trap 'echo "RESULT: FAIL ($((SECONDS - T0))s) fails=${PHASE_NAME:-step} gaps=none"' ERR
+case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/lints.sh"; exit 0 ;; *) echo "RESULT: FAIL (uso)"; exit 2 ;; esac
+trap 'emit "RESULT: FAIL ($((SECONDS - T0))s) fails=${PHASE_NAME:-step} gaps=none"' ERR
 run_step() {
-  local name="$1"; shift
-  PHASE_NAME="$name"; phase "$name"
-  local log="$LOG_DIR/lints-$name.log" rc=0
-  "$@" 2>&1 | tee "$log" || rc=${PIPESTATUS[0]}
-  [ "$rc" -eq 0 ] || { FAILS+=("$name"); echo "PHASE: $name FAIL rc=$rc log=$log"; finish; exit 1; }
-  echo "PHASE: $name PASS log=$log"
+  local name=$1; shift; PHASE_NAME=$name; phase "$name"
+  local log="$LOG_DIR/lints-$name.log" rc
+  set +e; ( set -e; "$@" ) 2>&1 | tee "$log"; rc=${PIPESTATUS[0]}; set -e
+  [ "$rc" -eq 0 ] || { FAILS+=("$name"); emit "PHASE: $name FAIL rc=$rc log=$log"; finish || true; exit 1; }
+  emit "PHASE: $name PASS log=$log"
 }
 
 # N-5: formatting is applied locally; CI only verifies it.
 phase_fmt() {
-  if [ "${CI:-}" = "true" ]; then cargo fmt --all -- --check; else cargo fmt --all; git diff --stat; fi
+  if [ "${CI:-}" = "true" ]; then cargo fmt --all -- --check; else cargo fmt --all && git diff --stat; fi
 }
 run_step fmt phase_fmt
 
@@ -37,9 +37,7 @@ phase_clippy() {
   cargo clippy --locked --all-targets --no-default-features -- -D warnings
 }
 run_step clippy phase_clippy
-# Rustdoc warnings are capped while the pre-existing intra-doc link debt is
-# addressed; genuine documentation build errors still fail.
-phase_doc() { RUSTDOCFLAGS="--cap-lints allow" cargo doc --locked --no-deps --all-features; }
+phase_doc() { RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features; }
 run_step doc phase_doc
 
 phase_spdx() {
@@ -96,5 +94,7 @@ phase_packaging() {
   desktop-file-validate "$x"
 }
 run_step packaging phase_packaging
+phase_script_budget() { local f b; for f in $(find utils -name '*.sh'); do b=$(sed -n 's/^# Orçamento: *\([0-9]*\).*/\1/p;T;q' "$f"); [ -n "$b" ] && [ "$(wc -l < "$f")" -le "$b" ] || { echo "ORÇAMENTO: $f teto=${b:-AUSENTE} linhas=$(wc -l < "$f")" >&2; return 1; }; done; }
+run_step script-budget phase_script_budget
 
 finish

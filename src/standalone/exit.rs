@@ -37,7 +37,7 @@ pub const EXIT_GENERIC: i32 = 1;
 /// Shared remediation hint for a PipeWire backend that cannot be reached.
 ///
 /// Single source of truth for the "daemon unreachable" text printed by both the
-/// first-connection diagnostic ([`crate::standalone::pw_host::run`]) and the
+/// first-connection diagnostic (`crate::standalone::pw_host::run`) and the
 /// classified `Backend` exit in `main`, so the two never drift into showing
 /// different commands for the same failure.
 pub const BACKEND_UNREACHABLE_HINT: &str = "Check that the PipeWire daemon is running (`systemctl --user status pipewire \

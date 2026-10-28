@@ -36,7 +36,7 @@
 //! ```
 //!
 //! The receipt is written to `target/logs/recording-ab-receipt.jsonl`
-//! (override with `NAM_AB_RECEIPT`) plus a human-readable
+//! plus a human-readable
 //! `target/logs/recording-ab-receipt.txt`.
 //!
 //! > **Dev-environment caveat (per project guidance):** micro-benchmarks on a
@@ -60,7 +60,6 @@ use nam_audio_pipe::standalone::rt_setup::{PinThreadError, pin_current_thread};
 
 const DEFAULT_RECEIPT_JSONL: &str = "target/logs/recording-ab-receipt.jsonl";
 const DEFAULT_RECEIPT_TXT: &str = "target/logs/recording-ab-receipt.txt";
-const RECEIPT_ENV: &str = "NAM_AB_RECEIPT";
 
 const QUANTUM_SIZES: [usize; 5] = [64, 256, 512, 2048, 8192];
 const DEFAULT_QUANTA: usize = 50_000;
@@ -1050,10 +1049,6 @@ fn parse_args_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cfg, Strin
             }
             other => return Err(format!("unknown argument {other}")),
         }
-    }
-    if let Ok(path) = std::env::var(RECEIPT_ENV) {
-        cfg.receipt_jsonl = PathBuf::from(path);
-        cfg.receipt_txt = cfg.receipt_jsonl.with_extension("txt");
     }
     if cfg.producer_cpu.is_none() {
         cfg.producer_cpu = select_optimal_cpu();

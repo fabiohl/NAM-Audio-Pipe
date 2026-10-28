@@ -138,7 +138,7 @@ pub struct Descriptor {
     pub slot: u16,
     /// Valid f32 samples in the slot (`2 * frames`), as published by
     /// `fill_planar`. For a control barrier (`slot == CONTROL_BARRIER_SLOT`),
-    /// this carries the sequence number `seq: u16` matching [`ControlPayload::Metadata`].
+    /// this carries the sequence number `seq: u16` matching `ControlPayload::Metadata`.
     pub valid_len: u16,
 }
 

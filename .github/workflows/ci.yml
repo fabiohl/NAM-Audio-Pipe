@@ -23,6 +23,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  NAM_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   # x86_64 is the reference platform: canonical lints + quick QA suite disciplines.
@@ -53,23 +54,9 @@ jobs:
         run: ./utils/tests-quick.sh
       - name: Publish step summary
         if: always()
-        run: |
-          echo "### Run Summary: x86_64-linux" >> $GITHUB_STEP_SUMMARY
-          if [ -d target/logs ]; then
-            echo '```text' >> $GITHUB_STEP_SUMMARY
-            grep -hE '^(RESULT:|PHASE:|Tests summary:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            for f in target/logs/*.log; do
-              if grep -qE '(FAILED|panicked at|FAIL rc=)' "$f" 2>/dev/null; then
-                echo "<details><summary>Failure Details: $(basename "$f")</summary>" >> $GITHUB_STEP_SUMMARY
-                echo '' >> $GITHUB_STEP_SUMMARY
-                echo '```text' >> $GITHUB_STEP_SUMMARY
-                grep -E 'FAILED|panicked at|FAIL rc=' "$f" | head -n 40 >> $GITHUB_STEP_SUMMARY
-                echo '```' >> $GITHUB_STEP_SUMMARY
-                echo '</details>' >> $GITHUB_STEP_SUMMARY
-              fi
-            done
-          fi
+        uses: ./.github/actions/qa-summary
+        with:
+          title: x86_64-linux
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -93,25 +80,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config clang libclang-dev \
-            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
+            appstream desktop-file-utils
       - name: Update Rust toolchain
         run: rustup update --no-self-update stable && rustc --version
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --features testing -- -D warnings
+      - name: Lints (fmt, check, clippy, doc, policies, packaging)
+        run: ./utils/lints.sh
       - name: Quick QA suite
         run: ./utils/tests-quick.sh
       - name: Publish step summary
         if: always()
-        run: |
-          echo "### Run Summary: linux-arm64" >> $GITHUB_STEP_SUMMARY
-          if [ -d target/logs ]; then
-            echo '```text' >> $GITHUB_STEP_SUMMARY
-            grep -hE '^(RESULT:|PHASE:|Tests summary:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
+        uses: ./.github/actions/qa-summary
+        with:
+          title: linux-arm64
+          note: "${{ job.status != 'success' && 'ARM64: upstream engine 1.0.1 requires x86-64-v3; gated with continue-on-error until v1.1.0 is resolved in Cargo.lock.' || '' }}"
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -145,10 +130,7 @@ jobs:
         run: cargo check --locked --all-targets --features testing
       - name: Publish step summary
         if: always()
-        run: |
-          echo "### Run Summary: msrv (1.99.0)" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ job.status }}" = "success" ]; then
-            echo "MSRV cargo check passed." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "MSRV cargo check failed." >> $GITHUB_STEP_SUMMARY
-          fi
+        uses: ./.github/actions/qa-summary
+        with:
+          title: msrv (1.99.0)
+          note: ${{ job.status == 'success' && 'MSRV cargo check passed.' || 'MSRV cargo check failed.' }}

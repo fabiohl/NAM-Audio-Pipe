@@ -5,10 +5,8 @@
 //! (`target/logs/long-receipt.txt`, emitted by `utils/tests-long.sh`).
 //!
 //! This is the single source of truth for the long-receipt format, consumed
-//! by `src/bin/long_receipt_check.rs` — the standalone strict-release gate —
-//! and by `src/receipt/release.rs` during certification. Both verify the
-//! receipt via
-//! [`verify_release_certification_file`] instead of a substring search.
+//! by `src/receipt/release.rs` during certification. It verifies the receipt
+//! via [`verify_release_certification_file`] instead of a substring search.
 //!
 //! The format:
 //!
@@ -410,8 +408,8 @@ impl LongReceipt {
 }
 
 /// Reads `path`, parses the long-suite receipt fail-closed and verifies strict
-/// release certification. Entry point for `src/bin/long_receipt_check.rs` and
-/// any non-executing structural validation of `utils/tests-long.sh`.
+/// release certification. Entry point for `src/receipt/release.rs` and any
+/// non-executing structural validation of `utils/tests-long.sh`.
 pub fn verify_release_certification_file(path: &Path) -> Result<LongReceipt, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read long-suite receipt {}: {e}", path.display()))?;

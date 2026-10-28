@@ -262,7 +262,7 @@ impl SharedBackendStatus {
             .store(in_progress, Ordering::Release);
     }
 
-    /// Enters the teardown phase, raising the [`teardown_in_progress`] latch
+    /// Enters the teardown phase, raising the `teardown_in_progress` latch
     /// and returning an RAII [`TeardownGuard`] that clears the latch on drop.
     pub fn enter_teardown(&self) -> TeardownGuard<'_> {
         self.set_teardown_in_progress(true);
@@ -286,7 +286,7 @@ impl SharedBackendStatus {
     /// Lock-free fast-path poll of the `Running` gate.
     ///
     /// Mirror of `state() == BackendState::Running`, refreshed inside the state
-    /// lock by every transition ([`set_state_locked`](Self::set_state_locked)),
+    /// lock by every transition (`set_state_locked`),
     /// so the main control loop can feed the reconnect stability window without
     /// acquiring the mutex on every iteration.
     pub fn is_running(&self) -> bool {

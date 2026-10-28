@@ -6,7 +6,7 @@
 //! using the **`io_uring`** subsystem for 100% asynchronous, non-blocking disk I/O.
 //! To maintain truly zero-blocking semantics, WAV headers are generated manually
 //! (standard 44-byte RIFF/WAVE header for Float32) and samples are written directly
-//! via the short-write-safe [`crate::recording::io::write_all_at`] (a single
+//! via the short-write-safe `crate::recording::io::write_all_at` (a single
 //! `write_at` may persist only a prefix of the buffer; looping guarantees full
 //! persistence or an explicit, observable failure). Capture files
 //! are opened exclusively with `create_new(true)` (O_CREAT|O_EXCL, no `truncate`)
@@ -22,7 +22,7 @@
 //! RT-observable atomic failure flag. Before the main loop starts it (a) fails
 //! fast if `io_uring` is unavailable ([`spawn_recording_worker`] probes before
 //! entering the runtime), (b) validates that the output directory is a real,
-//! writable directory via [`validate_output_dir`], and only then (c) publishes
+//! writable directory via `validate_output_dir`, and only then (c) publishes
 //! `Active` over the handshake. If any startup step fails the worker reports
 //! `Failed { reason }` on the handshake and the main thread aborts **before**
 //! connecting any PipeWire stream. A fatal runtime error (`EIO`, `ENOSPC`)
@@ -66,7 +66,7 @@
 //! The RIFF/WAV format uses `u32` fields for chunk sizes, limiting the data payload
 //! to `u32::MAX - (header_len - 8)` (~4 GiB — the 8-byte `RIFF`+size envelope is
 //! accounted for). The limit is enforced with checked arithmetic in
-//! [`AsyncWavWriter::would_overflow`], which triggers a sequential `_partN` rollover
+//! `AsyncWavWriter::would_overflow`, which triggers a sequential `_partN` rollover
 //! before the `u32` fields can wrap. In practice, this limit is not reachable for
 //! NAM-Audio-Pipe's intended use cases (short captures via qpwgraph).
 
@@ -100,7 +100,7 @@ use crate::recording::wav_header::{build_wav_header, capture_filename, current_c
 /// Monotonic sequence suffix for the writability probe file.
 ///
 /// Multiple recording workers running **in the same process** (e.g. concurrent
-/// integration tests in one output directory) each call [`validate_output_dir`]
+/// integration tests in one output directory) each call `validate_output_dir`
 /// at startup. A probe name derived only from `std::process::id()` would collide
 /// between those workers — the second `create_new(true)` would fail with
 /// `AlreadyExists` and a writable directory would be wrongly rejected. The atomic
@@ -159,7 +159,7 @@ struct AsyncWavWriter<W: WriteAt> {
     metadata: AudioMetadata,
     /// Length of the WAV header in bytes (constant for a given format).
     /// Used to compute the exact RIFF 32-bit data-payload ceiling in
-    /// [`AsyncWavWriter::would_overflow`].
+    /// `AsyncWavWriter::would_overflow`.
     header_len: u64,
     /// Total audio data bytes written (excludes the WAV header).
     /// Bounded by `u32::MAX - (header_len - 8)` (the RIFF/WAV 32-bit limit).
@@ -478,7 +478,7 @@ impl WavSink for TokioUringSink<'_> {
 ///
 /// Before consuming anything it completes the startup handshake: validates
 /// that the output directory is a real writable directory
-/// ([`validate_output_dir`]), publishes `Active` on the handshake, then runs
+/// (`validate_output_dir`), publishes `Active` on the handshake, then runs
 /// the drain loop. The drain loop ignores the process-global `SHUTDOWN` flag:
 /// it terminates only when the [`RingPayload::StreamStop`] token is consumed
 /// or the ring `Producer` is dropped with the ring fully drained — never

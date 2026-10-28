@@ -1,96 +1,24 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
-#
-# Supply chain update utility for NAM-Audio-Pipe.
-# Updates the Rust toolchain, Cargo package indexes, and dependencies in Cargo.toml/Cargo.lock.
-
+# mod-update.sh — atualiza toolchain, dependências e lockfile. Classe D.
+# Uso: utils/mod-update.sh [-h|--help]
+# Orçamento: 40
+set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
+cd "$(dirname "$0")/.."
+. utils/_lib.sh
+case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/mod-update.sh"; exit 0 ;; *) echo "RESULT: FAIL (uso)"; exit 2 ;; esac
 
-PHASE_TOTAL=3
-source "$(dirname "$0")/_lib.sh"
+phase rustup
+if command -v rustup >/dev/null 2>&1; then rustup update || FAILS+=(rustup)
+else GAPS+=(rustup_missing); echo "PHASE: rustup GAP rustup_missing"; fi
 
-echo -e "${BLUE}${BOLD}================================================================${NC}"
-echo -e "${BLUE}${BOLD}      NAM-Audio-Pipe Supply Chain Update Pipeline               ${NC}"
-echo -e "${BLUE}${BOLD}================================================================${NC}"
+phase cargo-upgrade
+if command -v cargo-upgrade >/dev/null 2>&1; then cargo upgrade --verbose || FAILS+=(cargo-upgrade)
+else GAPS+=(cargo_edit_missing); echo "PHASE: cargo-upgrade GAP cargo_edit_missing"; fi
 
-# Every stage tracks a typed status (UPDATED, SKIPPED_TOOL_MISSING or FAILED)
-# so a partial/failed update can never be falsely declared as fully updated.
-STATUS_RUSTUP="PENDING"
-STATUS_CARGO_UPGRADE="PENDING"
-STATUS_CARGO_UPDATE="PENDING"
+phase cargo-update
+cargo update --verbose || FAILS+=(cargo-update)
 
-# 1. Update Rust Toolchain
-phase "Updating active Rust toolchain (rustup)..."
-if command -v rustup &>/dev/null; then
-    if rustup update; then
-        STATUS_RUSTUP="UPDATED"
-        ok "rustup toolchain updated."
-    else
-        STATUS_RUSTUP="FAILED"
-        echo -e "${RED}${BOLD}Error: rustup update failed.${NC}" >&2
-    fi
-else
-    STATUS_RUSTUP="SKIPPED_TOOL_MISSING"
-    echo -e "${YELLOW}Notice: rustup not found. Skipping toolchain update.${NC}"
-fi
-
-# 2. Upgrade dependencies in Cargo.toml
-phase "Updating dependency specifications (Cargo.toml)..."
-cargo --list >/dev/null 2>&1 || die "cargo --list failed — check cargo installation"
-if cargo --list | grep -q "upgrade"; then
-    if cargo upgrade --verbose; then
-        STATUS_CARGO_UPGRADE="UPDATED"
-        ok "Cargo.toml updated via cargo-upgrade."
-    else
-        STATUS_CARGO_UPGRADE="FAILED"
-        echo -e "${RED}${BOLD}Error: cargo upgrade failed.${NC}" >&2
-    fi
-else
-    STATUS_CARGO_UPGRADE="SKIPPED_TOOL_MISSING"
-    echo -e "${YELLOW}Notice: cargo-edit (cargo-upgrade) not found.${NC}"
-    echo -e "${YELLOW}Install with: cargo install cargo-edit${NC}"
-fi
-
-# 3. Update Cargo.lock
-phase "Updating resolved versions in Cargo.lock..."
-if cargo update --verbose; then
-    STATUS_CARGO_UPDATE="UPDATED"
-    ok "Cargo.lock updated."
-else
-    STATUS_CARGO_UPDATE="FAILED"
-    echo -e "${RED}${BOLD}Error: cargo update failed.${NC}" >&2
-fi
-
-# ---------------------------------------------------------------------------
-# Typed summary + fail-closed exit policy
-# ---------------------------------------------------------------------------
-echo ""
-echo -e "${BLUE}${BOLD}Supply chain update summary:${NC}"
-printf '  %-22s %s\n' "Stage" "Status"
-printf '  %-22s %s\n' "-----" "------"
-printf '  %-22s %s\n' "rustup" "$STATUS_RUSTUP"
-printf '  %-22s %s\n' "cargo-upgrade" "$STATUS_CARGO_UPGRADE"
-printf '  %-22s %s\n' "cargo-update" "$STATUS_CARGO_UPDATE"
-
-if [ "$STATUS_RUSTUP" = "FAILED" ] \
-    || [ "$STATUS_CARGO_UPGRADE" = "FAILED" ] \
-    || [ "$STATUS_CARGO_UPDATE" = "FAILED" ]; then
-    echo -e "${RED}${BOLD}================================================================${NC}"
-    echo -e "${RED}${BOLD}       Supply chain update failed (see summary above)           ${NC}"
-    echo -e "${RED}${BOLD}================================================================${NC}"
-    exit 1
-fi
-
-if [ "$STATUS_RUSTUP" != "UPDATED" ] \
-    || [ "$STATUS_CARGO_UPGRADE" != "UPDATED" ] \
-    || [ "$STATUS_CARGO_UPDATE" != "UPDATED" ]; then
-    echo -e "${YELLOW}${BOLD}================================================================${NC}"
-    echo -e "${YELLOW}${BOLD}  Supply chain partially updated (some steps were skipped)      ${NC}"
-    echo -e "${YELLOW}${BOLD}================================================================${NC}"
-    exit 0
-fi
-
-echo -e "${GREEN}${BOLD}================================================================${NC}"
-echo -e "${GREEN}${BOLD}          Entire supply chain was successfully updated!         ${NC}"
-echo -e "${GREEN}${BOLD}================================================================${NC}"
+finish

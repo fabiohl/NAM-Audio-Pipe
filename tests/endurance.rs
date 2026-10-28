@@ -116,13 +116,6 @@ const MAX_VALIDATION_ATTEMPTS: usize = 64;
 /// -10452 / -31656 KiB, `minflt_thread` = 0.
 const MAX_RSS_DRIFT_KB: usize = 512;
 
-fn max_rss_drift_kb() -> usize {
-    std::env::var("NAM_MAX_RSS_DRIFT_KB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(MAX_RSS_DRIFT_KB)
-}
-
 /// Default wall-clock window in seconds (overridable via `NAM_ENDURANCE_SECONDS`).
 const DEFAULT_WINDOW_SECS: u64 = 30;
 
@@ -442,7 +435,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     );
     assert!(first.rss_kb > 0, "VmRSS unavailable on this platform");
     assert!(last.rss_kb > 0, "VmRSS unavailable on this platform");
-    let drift_limit = max_rss_drift_kb();
+    let drift_limit = MAX_RSS_DRIFT_KB;
     assert!(
         rss_delta_kb <= drift_limit as i64,
         "RSS growth of {rss_delta_kb} KiB (first {} → last {}) exceeds \

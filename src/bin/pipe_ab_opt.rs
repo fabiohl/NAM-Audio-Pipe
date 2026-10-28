@@ -10,8 +10,8 @@
 //! writes `target/logs/ab-opt-ceremony-receipt.json` for the release chain.
 //!
 //! Usage:
-//!   pipe_ab_opt compare --dir <dir> --out <file> --runs <N> [--bolt-applied 0|1]
-//!                       [--bolt-cause <text>]
+//!   pipe_ab_opt compare --dir `<dir>` --out `<file>` --runs `<N>` [--bolt-applied 0|1]
+//!                       [--bolt-cause `<text>`]
 //!
 //! Exit codes: 0 proven/fallback verdict; 1 unoptimized or unusable receipts;
 //! 2 usage error.

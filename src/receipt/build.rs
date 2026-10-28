@@ -229,7 +229,7 @@ fn get_u64(doc: &serde_json::Value, path: &[&str]) -> u64 {
 /// Fail-closed validation of the PGO coverage matrix receipt.
 ///
 /// Mirrors the worked contract of `pgo_workload`: every topology must advance
-/// at least [`MIN_TOTAL_BLOCKS`] and [`MIN_CELL_BLOCKS`] per matrix cell, every
+/// at least `MIN_TOTAL_BLOCKS` and `MIN_CELL_BLOCKS` per matrix cell, every
 /// DSP group must advance frames, every matrix dimension value must be
 /// exercised and no mandatory stage may be skipped.
 pub fn validate_pgo_matrix<P: AsRef<Path>>(path: P) -> Result<String, String> {

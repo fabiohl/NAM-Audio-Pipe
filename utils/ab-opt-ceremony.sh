@@ -4,6 +4,7 @@
 # ab-opt-ceremony.sh — A/B optimization ceremony (operator-only: plain → PGO → PGO+BOLT). Classe D.
 # Uso: utils/ab-opt-ceremony.sh [--runs N] [--blocks N] [--no-pgo] [--no-bolt] [--bench-extra 'ARGS'] [-h|--help]
 # AI agents must not execute this script; it belongs to the operator release ceremony.
+# Orçamento: 350
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -69,10 +70,10 @@ COMPARE_BIN="$AB_BUILD_DIR/release/pipe_ab_opt"
 # §4.2: explicit NAM_BENCH_CORE → first online isolated CPU → first permitted
 # CPU → unpinned GAP. The typed helper owns the topology policy.
 PIN=()
-BENCH_CORE=""
-if BENCH_CORE=$("$PERF_GATE_BIN" pick-core 2>/dev/null); then
-    PIN=("$PERF_GATE_BIN" pin --bench-core "$BENCH_CORE" --)
-    echo "bench core: $BENCH_CORE"
+bench_core=""
+if bench_core=$("$PERF_GATE_BIN" pick-core 2>/dev/null); then
+    PIN=("$PERF_GATE_BIN" pin --bench-core "$bench_core" --)
+    echo "bench core: $bench_core"
 else
     gap bench_core_unavailable; echo "  reason: no explicit/isolated/permitted core (running unpinned)"
 fi

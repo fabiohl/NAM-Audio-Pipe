@@ -25,6 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  NAM_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
   long-qa:
@@ -76,23 +77,9 @@ jobs:
         run: ./utils/build-release.sh --certify
       - name: Publish step summary
         if: always()
-        run: |
-          echo "### Long QA Suite Run Summary" >> $GITHUB_STEP_SUMMARY
-          if [ -d target/logs ]; then
-            echo '```text' >> $GITHUB_STEP_SUMMARY
-            grep -hE '^(RESULT:|PHASE:|STRICT:|OVERALL:|ERROR:)' target/logs/*.log 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            for f in target/logs/*.log; do
-              if grep -qE '(FAIL|rc=[1-9])' "$f" 2>/dev/null; then
-                echo "<details><summary>Failure Details: $(basename "$f")</summary>" >> $GITHUB_STEP_SUMMARY
-                echo '' >> $GITHUB_STEP_SUMMARY
-                echo '```text' >> $GITHUB_STEP_SUMMARY
-                tail -n 40 "$f" >> $GITHUB_STEP_SUMMARY
-                echo '```' >> $GITHUB_STEP_SUMMARY
-                echo '</details>' >> $GITHUB_STEP_SUMMARY
-              fi
-            done
-          fi
+        uses: ./.github/actions/qa-summary
+        with:
+          title: Long QA Suite
       - name: Upload logs and receipts
         if: always()
         uses: actions/upload-artifact@v4

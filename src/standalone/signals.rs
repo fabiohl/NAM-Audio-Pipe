@@ -9,7 +9,7 @@
 //! launcher window is dismissed — the default action would otherwise kill the
 //! process with no graceful teardown and no WAV finalization) and `SIGQUIT`.
 //! The first signal flips the process-global cooperative
-//! [`SHUTDOWN`](neural_amp_modeler_rs::common::spsc::SHUTDOWN) flag so the main
+//! [`SHUTDOWN`] flag so the main
 //! control loop in `pw_host::run` can stop the PipeWire loop, drain the
 //! recording ring and finalize WAV headers.
 //!
@@ -310,7 +310,7 @@ pub(crate) fn termination_stage_snapshot_for_tests() -> u64 {
     TERMINATION_STATE.load(Ordering::Acquire)
 }
 
-/// Installs the unified [`termination_signal_handler`] for `SIGINT`, `SIGTERM`,
+/// Installs the unified `termination_signal_handler` for `SIGINT`, `SIGTERM`,
 /// `SIGHUP` and `SIGQUIT`.
 ///
 /// Every `libc::sigaction` call is formally validated: a non-zero return code

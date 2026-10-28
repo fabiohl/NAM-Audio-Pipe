@@ -36,8 +36,7 @@
 //!   -- --variant plain --runs 3 --blocks 20000
 //! ```
 //!
-//! Receipt: `target/logs/ab-opt-receipt-<variant>.json` (+ `.txt`), override
-//! with `NAM_AB_OPT_RECEIPT`.
+//! Receipt: `target/logs/ab-opt-receipt-<variant>.json` (+ `.txt`).
 //!
 //! > **Dev-environment caveat (per project guidance):** micro-benchmarks on a
 //! > shared host are noisy. The harness truncates a warmup prefix of every run
@@ -75,7 +74,6 @@ use nam_audio_pipe::standalone::rt_setup::{PinThreadError, pin_current_thread};
 const IR_FILENAME: &str = "cabsim_ir_pgo.wav";
 
 const DEFAULT_RECEIPT_JSON: &str = "target/logs/ab-opt-receipt.json";
-const RECEIPT_ENV: &str = "NAM_AB_OPT_RECEIPT";
 
 const DEFAULT_RATE: u32 = 48_000;
 /// Production capture quantum (PipeWire default in NAM-Audio-Pipe): the
@@ -907,9 +905,6 @@ fn parse_args_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cfg, Strin
             }
             other => return Err(format!("unknown argument {other}")),
         }
-    }
-    if let Ok(path) = std::env::var(RECEIPT_ENV) {
-        cfg.receipt_json = PathBuf::from(path);
     }
     if cfg.runs < 1 {
         return Err("--runs must be >= 1".to_string());

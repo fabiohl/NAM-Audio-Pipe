@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # miri-audit.sh — optional Miri concurrency/aliasing audit (RecordingPool + DspBridge). Classe D.
 # Uso: utils/miri-audit.sh [-h|--help]
+# Orçamento: 60
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."

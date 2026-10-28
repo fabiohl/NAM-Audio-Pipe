@@ -31,13 +31,6 @@ name = "pgo_workload"
 path = "src/bin/pgo_workload.rs"
 required-features = ["testing"]
 
-# Fail-closed semantic verifier for the long-suite text receipt. Operator
-# tooling only: the release gate is `pipe_long_receipt certify`. Deliberately
-# free of `required-features` so it can run without the `testing` feature.
-[[bin]]
-name = "long_receipt_check"
-path = "src/bin/long_receipt_check.rs"
-
 # Unified-schema (engine `testing::receipt`) emitter/verifier for the
 # machine-readable long receipt (target/logs/long-audit-receipt.jsonl).
 # Testing-only because it reuses the engine receipt schema.

@@ -166,7 +166,7 @@ fn try_zero_region(ptr: usize, bytes: usize) -> usize {
 ///
 /// Defensive by construction: a null or misaligned chunk pointer is simply
 /// ignored (there is no descriptor to stamp), matching the fail-closed
-/// contract of [`read_chunk_meta`]. Zero allocations, zero panics.
+/// contract of `read_chunk_meta`. Zero allocations, zero panics.
 #[inline(always)]
 fn stamp_chunk(chunk: *mut pw::spa::sys::spa_chunk, bytes: usize) {
     if chunk.is_null()
@@ -269,11 +269,11 @@ pub(crate) enum ChunkWindow {
 /// Reads `(offset, size)` from an SPA chunk descriptor, classifying the
 /// outcome per [`ChunkWindow`]:
 ///
-/// - [`ChunkWindow::Absent`] — chunk pointer is null or misaligned (no
+/// - `ChunkWindow::Absent` — chunk pointer is null or misaligned (no
 ///   descriptor to read);
-/// - [`ChunkWindow::Malformed`] — non-null chunk with an invalid stride or the
+/// - `ChunkWindow::Malformed` — non-null chunk with an invalid stride or the
 ///   corrupted flag set;
-/// - [`ChunkWindow::Valid`] — the host-declared valid-data window.
+/// - `ChunkWindow::Valid` — the host-declared valid-data window.
 ///
 /// The capture path uses the host-declared chunk metadata to learn how many
 /// valid audio bytes the host published this quantum. Reading the scalar
@@ -299,11 +299,11 @@ pub(crate) fn read_chunk_meta(chunk: *const pw::spa::sys::spa_chunk) -> ChunkWin
 /// Resolves one channel's capture-path valid-data window, applying the
 /// fail-closed classification.
 ///
-/// - [`ChunkWindow::Valid`] → `Some((offset, size))` — the host-declared window;
-/// - [`ChunkWindow::Absent`] → `Some((0, 0))` — no descriptor to read; the
+/// - `ChunkWindow::Valid` → `Some((offset, size))` — the host-declared window;
+/// - `ChunkWindow::Absent` → `Some((0, 0))` — no descriptor to read; the
 ///   consolidated [`handle_spa_pair_fail_closed`] harness below still rejects a
 ///   null/misaligned chunk pair via its own proof;
-/// - [`ChunkWindow::Malformed`] → raises the fail-closed contract violation
+/// - `ChunkWindow::Malformed` → raises the fail-closed contract violation
 ///   (`RT_STATUS_HOST_CONTRACT_VIOLATION` / `E2304`) and silences both
 ///   channels, returning `None` — a corrupted non-null chunk never degrades
 ///   silently to `(0, 0)` with clean telemetry.
@@ -398,7 +398,7 @@ fn validate_spa_channel_pair(
 ///
 /// `chunk_l`/`chunk_r` must be non-null and correctly aligned;
 /// `offset_l`/`size_l` are the resolved valid-data window — capture reads them
-/// from the host chunk via [`read_chunk_meta`], playback passes `(0, n_bytes)`.
+/// from the host chunk via `read_chunk_meta`, playback passes `(0, n_bytes)`.
 ///
 /// On any violation — null data pointer, null/misaligned chunk, misaligned base or offset,
 /// non-cardinal size, out-of-bounds region, asymmetric frame counts or

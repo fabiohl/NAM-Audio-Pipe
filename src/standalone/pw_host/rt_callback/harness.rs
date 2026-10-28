@@ -685,7 +685,7 @@ impl SwapRtSide {
 
 /// Offline RT swap-stress harness — full drain sequence + DSP in one quantum.
 ///
-/// Thin wrapper over the two production faces ([`SwapProducer`] + [`SwapRtSide`]).
+/// Thin wrapper over the two production faces (`SwapProducer` + `SwapRtSide`).
 /// Single-threaded callers keep the single-handle API; concurrency-throughput
 /// tests split it via [`RtSwapHarness::into_parts`] to remove the global mutex
 /// from the measured path.
@@ -729,7 +729,7 @@ impl RtSwapHarness {
     /// immediately without a resampler renegotiation) with an explicit
     /// [`GateConfig`] — the parametric entry point for RT tests that need
     /// custom threshold variants without re-implementing the construction
-    /// sequence around [`CaptureState::init`].
+    /// sequence around `CaptureState::init`.
     pub fn new_with_gate_config(
         host_rate: u32,
         nam_rate: u32,
@@ -874,7 +874,7 @@ impl RtSwapHarness {
 
     // ── RT face ─────────────────────────────────────────────────────────────
 
-    /// Executes one audio quantum (see [`SwapRtSide::run_callback`]).
+    /// Executes one audio quantum (see `SwapRtSide::run_callback`).
     pub fn run_callback(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize) -> usize {
         self.rt.run_callback(in_l, in_r, n)
     }

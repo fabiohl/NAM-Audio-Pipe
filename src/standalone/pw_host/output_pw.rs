@@ -321,7 +321,7 @@ pub unsafe fn deliver_playback_pair_fail_closed(
 /// stamps `offset = 0`, `size = silence_bytes`, `stride = 4` on both chunks
 /// and registers the starvation occurrence on `rt_status`.
 ///
-/// The caller ([`deliver_silence_block`]) quantizes `silence_bytes` from the
+/// The caller (`deliver_silence_block`) quantizes `silence_bytes` from the
 /// active stream quantum (`last_n_samples`/`requested_buffer_frames`, 128-frame
 /// fallback), bounded by both channel capacities and `MAX_BRIDGE_BUF × 4`, so
 /// pausing the input or starting before the first block never raises

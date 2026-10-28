@@ -14,7 +14,7 @@
 //! with `try_lock` (never blocking the 100 ms health loop, never touching the RT
 //! callback) and gets:
 //!
-//! * [`Alert::First`]-like emission the moment a failure or a new low-space
+//! * `Alert::First`-like emission the moment a failure or a new low-space
 //!   warning is observed; and
 //! * a [`Alert`] reminder every [`ALERT_REMINDER_INTERVAL`] while the condition
 //!   persists — a non-spam cadence so a long session does not drown in logs.

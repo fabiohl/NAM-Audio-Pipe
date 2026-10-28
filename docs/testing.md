@@ -19,7 +19,7 @@ This document details the automated testing architecture, verification suites, r
 |:---------------- |:---------------------------------------------------------------------- |:------------------------------------------------------------------ |
 | **`default`**    | Empty feature set for standalone production binaries.                  | Production builds and baseline compilation checks.                 |
 | **`testing`**    | Propagates `NeuralAmpModeler-rs/testing`, exposing mocks and fixtures. | Mandatory for executing unit, integration, and verification tests. |
-| **`heap-audit`** | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in Phase 2 of the long audit and RT callback safety tests.    |
+| **`heap-audit`** | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in the long suite's `heap-audit` phase and RT callback safety tests.    |
 
 ---
 
@@ -304,18 +304,23 @@ Class B, operator-only. It records every phase result instead of aborting on the
 
 `--strict` promotes any `GAP` to `FAIL` and exports `NAM_RT_STRICT=1`; `NAM_PHASE_TIMEOUT_S` overrides the timeout used by every phase command. The phases are:
 
-| Phase       | Canonical Name                        | Harness & Invariant Evaluated                                                                                              | Output Log File            |
-|:----------- |:------------------------------------- |:-------------------------------------------------------------------------------------------------------------------------- |:-------------------------- |
-| **PHASE1**  | Accelerated Soak & Swap Concurrency   | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                  | `phase1-soak.log`          |
-| **PHASE2**  | RT-Safety Heap Audit (Zero-Alloc)     | `cargo test --features "testing heap-audit" --release`; asserts zero heap allocations on RT paths.                          | `phase2-heap-audit.log`    |
-| **PHASE3**  | Real-Time Deadline Gate               | `tests/rt_metrics.rs` (10k quantums, DSP load < 85% of the quantum budget under `SCHED_FIFO`).                              | `phase3-rt-deadline.log`   |
-| **PHASE4**  | Real-Time Jitter Gate                 | `tests/rt_metrics.rs` (10k callbacks under contention; bounded inter-callback dispersion).                                  | `phase4-rt-jitter.log`     |
-| **PHASE5**  | Concurrency Interleaving & Throughput | `tests/rt_metrics.rs` (16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks).              | `phase5-concurrency.log`   |
-| **PHASE6**  | Real Wall-Clock Endurance             | `tests/endurance.rs` (real timeline at 48 kHz/64 frames; fail-closed validation windows and zero leaks).                    | `phase6-endurance.log`     |
-| **PHASE7**  | PipeWire Resilience                   | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling.                           | `phase7-pw-resilience.log` |
-| **PHASE8**  | Live PipeWire & Signals               | Live daemon probe, `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances).       | `phase8-pw-live.log`       |
-| **PHASE9**  | Recording io_uring                    | `io_uring_probe` capability gate, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`).         | `phase9-recording-io-uring.log` |
-| **PHASE10** | Offline f64 Parity & Artifact Smoke   | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used.                       | `phase10-offline-parity.log` |
+| Receipt `phase_id` | Canonical phase | Harness & Invariant Evaluated                                                                                              | Output Log File                       |
+|:------------------ |:--------------- |:-------------------------------------------------------------------------------------------------------------------------- |:------------------------------------- |
+| **`phase0`**  | `catch-all`    | `cargo test --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `--lib`). | `target/logs/long-catch-all.log`      |
+| **`phase1`**  | `soak`         | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                  | `target/logs/long-soak.log`           |
+| **`phase2`**  | `heap-audit`   | `cargo test --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths. | `target/logs/long-heap-audit.log`     |
+| **`phase3`**  | `rt-deadline`  | `tests/rt_metrics.rs` (`deadline`, 10k quantums, DSP load < 85% of the quantum budget; `SCHED_FIFO` when available).      | `target/logs/long-rt-deadline.log`    |
+| **`phase4`**  | `rt-jitter`    | `tests/rt_metrics.rs` (`jitter`, 10k callbacks under contention; bounded inter-callback dispersion).                       | `target/logs/long-rt-jitter.log`      |
+| **`phase5`**  | `concurrency`  | `tests/rt_metrics.rs` (`concurrent`; 16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks). | `target/logs/long-concurrency.log`    |
+| **`phase6`**  | `endurance`    | `tests/endurance.rs` (real timeline at 48 kHz/64 frames, `NAM_ENDURANCE_SECONDS`; fail-closed validation windows and zero leaks). | `target/logs/long-endurance.log`      |
+| **`phase7`**  | `pw-resilience` | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling.                          | `target/logs/long-pw-resilience.log`  |
+| **`phase8`**  | `pw-live`      | Live daemon probe, `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances).     | `target/logs/long-pw-live.log`        |
+| **`phase9`**  | `recording`    | `io_uring_probe` capability gate, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`).        | `target/logs/long-recording.log`      |
+| **`phase10`** | `offline-parity` | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used.                      | `target/logs/long-offline-parity.log` |
+
+Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
+
+`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and produces a partial receipt: non-selected phases are recorded as `SKIPPED`, no overall line is written, and the text receipt ends with `OVERALL: PARTIAL (--only: recibo sem overall, não certificável)` — or `OVERALL: FAILED` if any selected phase failed. A partial receipt is not certifiable. Without `--only`, `target/long` is removed and the receipt can be summarized and certified.
 
 ### 3.4 Real-Time Criterion Bench
 
@@ -494,7 +499,7 @@ The following contractual rules are enforced across test suites and CI checks:
 | **Buffer Size Domain**      | Strictly `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`. Out-of-domain inputs reject fail-fast with typed `BufferSizeError`.                             | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                |
 | **Silence Gate Domain**     | Polymorphic mode: `on`/`off` or `[-96.0, -20.0]` dBFS threshold with 10 dB Schmitt hysteresis. Rejected fail-fast on malformed inputs.     | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                |
 | **RT Quantum Bounds**       | Maximum supported quantum is `MAX_BRIDGE_BUF` (8192 frames / 32,768 bytes). Larger descriptors reject fail-closed.                         | `src/standalone/pw_host/rt_callback/process.rs`            |
-| **RT Deadline Processing**  | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                           | `tests/rt_metrics.rs`, `utils/tests-long.sh` (Phase 3)     |
+| **RT Deadline Processing**  | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                           | `tests/rt_metrics.rs`, `utils/tests-long.sh` (`rt-deadline` phase)     |
 | **Target CPU Baseline**     | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                       | `.cargo/config.toml`                                       |
 | **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`; id/name/launchable align with the desktop entry. | `tests/distribution_qa.rs`, `utils/lints.sh`, `utils/build-release.sh` |
 | **Release Provenance**      | `target/dist/build-receipt.json` records the artifact SHA-256, git provenance, engine provenance from `Cargo.lock` and PGO/BOLT evidence; `release-receipt.json` records `CERTIFIED`/`REJECTED`. | `src/receipt/build.rs`, `src/receipt/release.rs`, `utils/build-release.sh` |
@@ -538,7 +543,7 @@ All automation scripts in `utils/` follow a lean, predictable contract designed 
 3. **Unified final line:** `RESULT: PASS|PASS_WITH_GAPS|FAIL (<seconds>s) fails=<list|none> gaps=<list|none>`
 4. **Exit codes:** `0` success or `PASS_WITH_GAPS` outside strict mode; `1` failure or a gap under `--strict`; `2` usage error or missing precondition.
 
-Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`. The quick discipline never emits receipts; the long discipline emits the JSONL receipt consumed by the release chain.
+Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long suite uses `target/logs/long-<name>.log`. The canonical `PHASE:`/`RESULT:` lines are also appended to `target/logs/summary.txt` and published by the local `.github/actions/qa-summary` composite action; the ARM CI job now invokes `utils/lints.sh` (with the packaging dependencies installed) instead of an inline clippy command. The quick discipline never emits receipts; the long discipline emits the JSONL receipt consumed by the release chain.
 
 ### 7.3 Core Automation Principles
 
@@ -555,7 +560,7 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`. The quick 
 | **All scripts** | `-h`, `--help` | Concise usage; exit 0. |
 | `lints.sh` | None | Zero-flag policy; formatting is applied locally and verified with `CI=true`. |
 | `tests-quick.sh` | None | No gap-allowance or simulation flags. |
-| `tests-long.sh` | `--strict`, `--artifact` | `--strict` turns any `GAP` into `FAIL`; `--artifact` binds the receipt to `target/dist/nam-audio-pipe`. |
+| `tests-long.sh` | `--strict`, `--artifact`, `--only <name>[,<name>]` | `--strict` turns any `GAP` into `FAIL`; `--artifact` binds the receipt to `target/dist/nam-audio-pipe`; `--only` selects canonical phases and yields a partial, non-certifiable receipt. |
 | `build-release.sh` | `--strict`, `--package`, `--install`, `--certify` | `--package` adds tarball/Flatpak; `--install` installs locally; `--certify` validates receipts without recompiling. |
 | `ab-opt-ceremony.sh` | `--runs`, `--blocks`, `--no-pgo`, `--no-bolt`, `--bench-extra` | Operator-only ceremony controls. |
 | `miri-audit.sh`, `mod-update.sh` | None | Manual tools. |
@@ -566,7 +571,6 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`. The quick 
 
 | Variable | Default | Scope | Purpose & Semantics |
 |:-------- |:------- |:----- |:------------------- |
-| `CARGO_BUILD_JOBS` | Unset (all cores) | Host / Cargo | Set in the host shell profile (`~/.bashrc`) on memory-constrained machines. Scripts never override or hardcode it. |
 | `CI` | Unset | CI runner | When `true`, `lints.sh` verifies formatting with `--check` instead of applying it. |
 | `NAM_THERMAL_COOLDOWN_S` | `0` | A/B ceremony | Non-negative integer seconds between measured variants. An invalid value exits `2`. |
 | `NAM_BENCH_CORE` | `auto` | A/B / RT | Bench-core precedence: explicit CPU → first online isolated CPU → first permitted CPU → unpinned `GAP`. |
@@ -579,17 +583,21 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`. The quick 
 |:-------- |:------------- |:------- |:------- |
 | `NAM_RUN_ID` | `utils/_lib.sh` | Test harnesses | Unique run identifier for logs and receipt isolation. |
 | `NAM_RT_STRICT` | `tests-long.sh --strict` | `tests/rt_metrics.rs` | Promotes RT GAP conditions to hard failures. |
-| `NAM_LOG_ROOT` | `tests-long.sh` | Long suite | Root directory for phase logs and receipts (default `target/logs`). |
-| `NAM_LIB_NO_CD` | Caller script | `utils/_lib.sh` | Keeps the caller's working directory when sourcing the local library. |
 
 ### 7.6 Measured Durations
 
 | Discipline / Script | Measured Duration | Budget Ceiling | Notes |
 |:------------------- |:----------------- |:-------------- |:----- |
-| `utils/lints.sh` | ≈2–20 s (warm cache) | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging. |
-| `utils/tests-quick.sh` | ≈45 s (warm cache) | ≤ 5 min | All non-ignored targets in the development profile. |
-| `utils/tests-long.sh` | Not budgeted (per-phase timeouts) | — | Operator-run; collects all failures. |
+| `utils/lints.sh` | ≈13 s (warm cache, 2026-10-27) a ≈20 s | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging. |
+| `utils/tests-quick.sh` | ≈41 s (warm cache, 2026-10-27) | ≤ 5 min | All non-ignored targets in the development profile. |
+| `utils/tests-long.sh` | Not measured (per-phase timeouts) | — | Operator-run; collects all failures. |
 | `utils/build-release.sh` | ≈204 s (PGO-only reference run) | — | Full BOLT time depends on the host toolchain and `perf` permissions. |
+
+#### QA footprint (métrica F-2, 2026-10-27)
+
+`wc -l`: shell **1.502**, py/awk **362**, Rust QA (`src/bin/*`) **6.024** →
+**7.888 linhas** de QA total. O bin órfão `long_receipt_check` (39 linhas) foi
+removido; os demais bins têm chamador ou são instrumento manual documentado.
 
 ---
 

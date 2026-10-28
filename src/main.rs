@@ -51,7 +51,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     #[cfg(feature = "testing")]
-    if std::env::var("NAM_DISABLE_GATE").is_ok() {
+    if std::env::var("NAM_DISABLE_GATE").as_deref() == Ok("1") {
         neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE.store(true, Ordering::Relaxed);
         log::info!("⚡ Noise gate disabled via NAM_DISABLE_GATE environment variable.");
     }

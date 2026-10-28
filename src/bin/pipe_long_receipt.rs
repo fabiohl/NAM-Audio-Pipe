@@ -31,6 +31,7 @@ use nam_audio_pipe::receipt::build::{
 };
 use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
 use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict};
+use nam_audio_pipe::receipt::phase_log::{self, Requirement, Verdict};
 use nam_audio_pipe::receipt::release::{evaluate_certification, verify_receipt_artifact};
 use neural_amp_modeler_rs::testing::receipt::{
     LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, count_tests_executed_from_log,
@@ -74,6 +75,10 @@ fn print_help() {
     println!("                      [--gaps <a,b,...>] [--out <file>] [--fail-reason <text>]");
     println!("                      [--oracle-sha256 <hex>] [--fixture-sha256 <hex>]");
     println!("                      [--artifact-sha256 <hex>]");
+    println!("  pipe_long_receipt append --phase-id <id> --name <name> --from-log <path>");
+    println!("                      --duration-ms <ms> [--rc <n>] [--require <a|b[*][:min],...>]");
+    println!("                      [--require-target <tests/x.rs,...>] [--gaps <a,b,...>]");
+    println!("                      [--out <file>] [--artifact-sha256 <hex>]");
     println!("  pipe_long_receipt summary [--out <file>]");
     println!("  pipe_long_receipt validate [--out <file>] [--strict]");
     println!("  pipe_long_receipt pgo-check --receipt <file>");
@@ -88,6 +93,9 @@ fn print_help() {
     println!();
     println!(
         "Status values: PASSED, FAILED, SKIPPED, INCONCLUSIVE, SKIP_CAPABILITY, NOT_RUN, SIMULATED"
+    );
+    println!(
+        "append exit codes: 0 PASSED, 10 SKIPPED (GAP lines on stdout), 11 FAILED, other = I/O or usage"
     );
     println!("Canonical roster: {}", LONG_ROSTER.join(", "));
     println!("Default output file: {DEFAULT_OUT}");
@@ -128,6 +136,18 @@ fn required<'a>(
         .ok_or_else(|| format!("missing required flag --{name}"))
 }
 
+fn split_list(value: Option<&String>) -> Vec<String> {
+    value
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn cmd_append(args: &[String]) {
     let flags = match parse_flags(args) {
         Ok(f) => f,
@@ -150,10 +170,6 @@ fn cmd_append(args: &[String]) {
         Ok(v) => v.clone(),
         Err(e) => die_usage("append", &e),
     };
-    let status = match required(&flags, "status").and_then(|s| LongPhaseStatus::from_str(s)) {
-        Ok(s) => s,
-        Err(e) => die_usage("append", &e),
-    };
     let duration_ms: u64 = match required(&flags, "duration-ms") {
         Ok(v) => match v.parse() {
             Ok(n) => n,
@@ -165,38 +181,75 @@ fn cmd_append(args: &[String]) {
         .get("out")
         .cloned()
         .unwrap_or_else(|| DEFAULT_OUT.to_string());
+    let mut gaps: Vec<String> = split_list(flags.get("gaps"));
 
-    let log_path = flags.get("log").map(PathBuf::from);
-    let tests_executed = match flags.get("tests-executed") {
-        Some(v) => match v.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => die_usage("append", "--tests-executed must be a non-negative integer"),
-        },
-        None => log_path
-            .as_deref()
-            .map(count_tests_executed_from_log)
-            .unwrap_or(0),
+    let (status, tests_executed, fail_reason) = match flags.get("from-log") {
+        Some(log) => {
+            let rc: i32 = match flags.get("rc") {
+                Some(v) => match v.parse() {
+                    Ok(n) => n,
+                    Err(_) => die_usage("append", "--rc must be an integer"),
+                },
+                None => 0,
+            };
+            let requirements: Vec<Requirement> = split_list(flags.get("require"))
+                .iter()
+                .map(|spec| Requirement::parse(spec).unwrap_or_else(|e| die_usage("append", &e)))
+                .collect();
+            let targets = split_list(flags.get("require-target"));
+            let verdict = match phase_log::derive(Path::new(log), rc, &requirements, &targets) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("append: {e}");
+                    exit(1);
+                }
+            };
+            for gap in verdict.gaps {
+                if !gaps.contains(&gap) {
+                    gaps.push(gap);
+                }
+            }
+            let status = match verdict.verdict {
+                Verdict::Passed => LongPhaseStatus::Passed,
+                Verdict::Skipped => LongPhaseStatus::Skipped,
+                Verdict::Failed => LongPhaseStatus::Failed,
+            };
+            (status, verdict.tests_executed, verdict.fail_reason)
+        }
+        None => {
+            let status = match required(&flags, "status").and_then(|s| LongPhaseStatus::from_str(s))
+            {
+                Ok(s) => s,
+                Err(e) => die_usage("append", &e),
+            };
+            let log_path = flags.get("log").map(PathBuf::from);
+            let tests_executed = match flags.get("tests-executed") {
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        die_usage("append", "--tests-executed must be a non-negative integer")
+                    }
+                },
+                None => log_path
+                    .as_deref()
+                    .map(count_tests_executed_from_log)
+                    .unwrap_or(0),
+            };
+            if gaps.is_empty()
+                && let Some(id) = status.gap_id()
+            {
+                gaps.push(id.to_string());
+            }
+            if let Some(path) = log_path.as_deref() {
+                for marker in detect_gap_markers(path) {
+                    if !gaps.contains(&marker) {
+                        gaps.push(marker);
+                    }
+                }
+            }
+            (status, tests_executed, flags.get("fail-reason").cloned())
+        }
     };
-
-    let mut gaps: Vec<String> = Vec::new();
-    if let Some(list) = flags.get("gaps") {
-        for g in list.split(',') {
-            let g = g.trim();
-            if !g.is_empty() {
-                gaps.push(g.to_string());
-            }
-        }
-    }
-    if let Some(id) = status.gap_id() {
-        gaps.push(id.to_string());
-    }
-    if let Some(path) = log_path.as_deref() {
-        for marker in detect_gap_markers(path) {
-            if !gaps.contains(&marker) {
-                gaps.push(marker);
-            }
-        }
-    }
 
     let receipt = LongPhaseReceipt {
         phase_id,
@@ -216,10 +269,10 @@ fn cmd_append(args: &[String]) {
     }
     // Typed FAIL cause: the engine-owned unified schema has no `fail_reason`
     // field, so it is written to a sibling JSONL (see receipt::fail_reasons).
-    if let Some(reason) = flags.get("fail-reason") {
+    if let Some(reason) = fail_reason {
         let record = FailReasonRecord {
             phase_id: receipt.phase_id.clone(),
-            fail_reason: reason.clone(),
+            fail_reason: reason,
             timestamp: receipt.timestamp.clone(),
         };
         if let Err(e) = fail_reasons::append(&out, &record) {
@@ -234,7 +287,15 @@ fn cmd_append(args: &[String]) {
         "✓ pipe long-audit receipt: {} {} ({} tests, {} ms)",
         receipt.phase_id, receipt.status, receipt.tests_executed, receipt.duration_ms
     );
-    exit(0);
+    for gap in &receipt.gaps {
+        println!("GAP {gap}");
+    }
+    exit(match receipt.status {
+        LongPhaseStatus::Passed => 0,
+        LongPhaseStatus::Skipped => 10,
+        LongPhaseStatus::Failed => 11,
+        _ => 12,
+    });
 }
 
 fn cmd_summary(args: &[String]) {

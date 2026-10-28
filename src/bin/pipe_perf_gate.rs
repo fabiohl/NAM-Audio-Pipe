@@ -9,8 +9,8 @@
 //! process before exec'ing the command.
 //!
 //! Usage:
-//!   pipe_perf_gate pick-core [--bench-core <N>]
-//!   pipe_perf_gate pin [--bench-core <N>] -- <command> [args...]
+//!   pipe_perf_gate pick-core [--bench-core `<N>`]
+//!   pipe_perf_gate pin [--bench-core `<N>`] -- `<command>` [args...]
 
 #[cfg(target_os = "linux")]
 fn main() {

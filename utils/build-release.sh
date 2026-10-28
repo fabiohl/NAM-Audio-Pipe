@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # build-release.sh — builds the canonical Pipe artifact (PGO+BOLT), packages it and emits the typed build receipt. Classe C.
 # Uso: utils/build-release.sh [--strict] [--package] [--install] [--certify] [-h|--help]
+# Orçamento: 900
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -29,18 +30,18 @@ GAPS=()
 T0=$SECONDS
 mkdir -p "$LOG_DIR" "$DIST_DIR"
 
-phase() { echo "PHASE: $1"; }
+phase() { emit "PHASE: $1"; }
 gap() {
     local known
     for known in ${GAPS[@]+"${GAPS[@]}"}; do
         if [ "$known" = "$1" ]; then return 0; fi
     done
     GAPS+=("$1")
-    echo "PHASE: $1 GAP"
+    emit "PHASE: $1 GAP"
 }
 fail_phase() {
     FAILS+=("$1")
-    echo "PHASE: $1 FAIL rc=$2 log=$3"
+    emit "PHASE: $1 FAIL rc=$2 log=$3"
 }
 finish() {
     local status=PASS fails=none gaps=none
@@ -48,7 +49,7 @@ finish() {
     if [ ${#GAPS[@]} -gt 0 ]; then gaps="${GAPS[*]}"; fi
     if [ ${#GAPS[@]} -gt 0 ]; then status=PASS_WITH_GAPS; fi
     if [ ${#FAILS[@]} -gt 0 ] || { [ "$STRICT" = 1 ] && [ ${#GAPS[@]} -gt 0 ]; }; then status=FAIL; fi
-    echo "RESULT: $status ($((SECONDS - T0))s) fails=$fails gaps=$gaps"
+    emit "RESULT: $status ($((SECONDS - T0))s) fails=$fails gaps=$gaps"
     [ "$status" != FAIL ]
 }
 

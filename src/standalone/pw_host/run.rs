@@ -65,13 +65,13 @@ use pipewire as pw;
 /// The PipeWire daemon may be restarted by the package manager, by the user or
 /// by a USB interface reconnect. Instead of aborting immediately, the host
 /// re-instantiates the streams inside a **strictly bounded** retry cycle
-/// ([`ReconnectCycle`], default 6 attempts with progressive 250 ms → 4 s
+/// (`ReconnectCycle`, default 6 attempts with progressive 250 ms → 4 s
 /// exponential backoff — disabled under `--fail-fast` or `max_attempts == 0`).
 /// The budget is bounded **per episode** and replenished after
-/// [`STABLE_RESET`] of uninterrupted healthy streaming (F-UX-09), so isolated
+/// `STABLE_RESET` of uninterrupted healthy streaming (F-UX-09), so isolated
 /// drops spread over a long session never accumulate into an exhaustion.
-/// The DSP state ([`CaptureState`]: models, resampler, cab-sim, gains) and the
-/// RT-side SPSC channels ([`RtHostChannels`]) live in heap `Box`es reached via
+/// The DSP state (`CaptureState`: models, resampler, cab-sim, gains) and the
+/// RT-side SPSC channels (`RtHostChannels`) live in heap `Box`es reached via
 /// raw pointers, so **no internal state is lost** across a re-instantiation —
 /// audio resumes with the same models/IRs/recorder. When the budget is
 /// exhausted the host falls back to the fail-fast teardown (RT loop stop,

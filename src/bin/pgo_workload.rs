@@ -91,7 +91,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const IR_FILENAME: &str = "cabsim_ir_pgo.wav";
 const DEFAULT_RECEIPT_PATH: &str = "target/logs/pgo-workload-receipt.json";
-const RECEIPT_PATH_ENV: &str = "NAM_PGO_RECEIPT";
 
 const TOPOLOGY_WAVENET_A1: &str = "wavenet_a1";
 const TOPOLOGY_WAVENET_A2: &str = "wavenet_a2";
@@ -1241,9 +1240,6 @@ fn parse_cli_from<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, String
     }
     if cli.min_blocks < 1 {
         return Err("--min-blocks must be >= 1".to_string());
-    }
-    if let Ok(path) = std::env::var(RECEIPT_PATH_ENV) {
-        cli.receipt_path = PathBuf::from(path);
     }
     Ok(cli)
 }

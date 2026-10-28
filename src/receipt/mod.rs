@@ -30,9 +30,15 @@ pub mod release;
 #[cfg(feature = "testing")]
 pub mod fail_reasons;
 
-/// Canonical phase roster of the long-audit suite: `phase1`..`phase10` plus the
-/// terminal `overall` line. Shared by the JSONL emitter/verifier and the tests.
-pub const LONG_ROSTER: [&str; 11] = [
-    "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "phase9",
-    "phase10", "overall",
+/// Typed phase verdicts derived from long-suite logs (`append --from-log`).
+/// Testing-only: it reuses the engine's log counters and gap markers.
+#[cfg(feature = "testing")]
+pub mod phase_log;
+
+/// Canonical phase roster of the long-audit suite: `phase0` (catch-all release)
+/// and `phase1`..`phase10` plus the terminal `overall` line. Shared by the JSONL
+/// emitter/verifier and the tests.
+pub const LONG_ROSTER: [&str; 12] = [
+    "phase0", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8",
+    "phase9", "phase10", "overall",
 ];

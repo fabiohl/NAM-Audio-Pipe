@@ -5,11 +5,11 @@
 //!
 //! Production recording audio travels through the **promoted preallocated
 //! pool** (`src/recording/pool.rs`): the RT thread `try_acquire`s a slot,
-//! fills it in place and `publish`es a 4-byte [`Descriptor`]; the I/O thread
+//! fills it in place and `publish`es a 4-byte `Descriptor`; the I/O thread
 //! pops the descriptor, writes the 64 KiB block **in place** and `release`s
 //! the slot back to the free ring. The pool only carries audio —
 //! [`ControlPayload::Metadata`] and [`ControlPayload::StreamStop`] travel on
-//! a small dedicated control ring ([`CONTROL_CAPACITY`] slots).
+//! a small dedicated control ring (`CONTROL_CAPACITY` slots).
 //!
 //! # Rollback path (inline ring)
 //!
