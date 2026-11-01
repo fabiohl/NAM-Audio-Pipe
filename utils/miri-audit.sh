@@ -3,19 +3,18 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # miri-audit.sh — optional Miri concurrency/aliasing audit (RecordingPool + DspBridge). Classe D.
 # Uso: utils/miri-audit.sh [-h|--help]
-# Orçamento: 60
+# Orçamento: 75
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . utils/_lib.sh
 
-if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-    echo "Uso: utils/miri-audit.sh"
-    exit 0
-fi
+case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/miri-audit.sh"; exit 0 ;; *) usage_fail "miri-audit.sh aceita apenas -h/--help" ;; esac
+lib_init
+trap 'trap_fail $?' ERR
 
 echo "Miri concurrency & UB audit gate"
-echo "  TARGET: recording::pool::pool_test (RecordingPool SPSC ring, 11/11)"
+echo "  TARGET: recording::pool::pool_test (RecordingPool SPSC ring, 13/13)"
 echo "  TARGET: standalone::pw_host::pw_host_test (DspBridge handshake)"
 echo "  EXCLUDED: rt_callback/harness.rs (AVX2/FMA intrinsics, ~10,000x slowdown)"
 
@@ -34,23 +33,21 @@ cargo +nightly miri --version >/dev/null 2>&1 || {
     exit 2
 }
 
-cargo +nightly miri --version
+PHASE_NAME=preflight; CUR_LOG="$LOG_DIR/miri-audit-preflight.log"; phase preflight
 # A failed sysroot build invalidates the whole audit: never ignore it.
-CARGO_BUILD_WARNINGS=allow cargo +nightly miri setup
+CARGO_BUILD_WARNINGS=allow cargo +nightly miri setup >"$CUR_LOG" 2>&1
+emit "PHASE: preflight PASS log=$CUR_LOG"
 
 # -Zmiri-disable-isolation: allow host clock / pseudo-sleeps.
 export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}"
 
-echo "Target: RecordingPool SPSC lock-free ring (pool_test)..."
-MIRI_LOG=$(mktemp)
-BRIDGE_MIRI_LOG=$(mktemp)
-trap 'rm -f "$MIRI_LOG" "$BRIDGE_MIRI_LOG"' EXIT
-cargo +nightly miri test --lib recording::pool::pool_test 2>&1 | tee "$MIRI_LOG"
-assert_ran_tests "$MIRI_LOG" 11
+PHASE_NAME=pool; CUR_LOG="$LOG_DIR/miri-audit-pool.log"; phase pool
+cargo +nightly miri test --lib recording::pool::pool_test 2>&1 | tee "$CUR_LOG"
+assert_ran_tests "$CUR_LOG" 13
 
-echo ""
-echo "Target: DspBridge concurrent handshake (pw_host_test)..."
-cargo +nightly miri test --lib standalone::pw_host::pw_host_test 2>&1 | tee "$BRIDGE_MIRI_LOG"
-assert_ran_tests "$BRIDGE_MIRI_LOG" 1
+PHASE_NAME=bridge; CUR_LOG="$LOG_DIR/miri-audit-bridge.log"; phase bridge
+cargo +nightly miri test --lib standalone::pw_host::pw_host_test 2>&1 | tee "$CUR_LOG"
+assert_ran_tests "$CUR_LOG" 1
 
-ok "Miri concurrency and aliasing audit completed successfully (pool 11/11 + bridge handshake)!"
+ok "Miri concurrency and aliasing audit completed successfully (pool 13/13 + bridge handshake)!"
+finish || exit 1

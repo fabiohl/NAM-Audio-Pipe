@@ -8,15 +8,9 @@ set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . utils/_lib.sh
-case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/lints.sh"; exit 0 ;; *) echo "RESULT: FAIL (uso)"; exit 2 ;; esac
-trap 'emit "RESULT: FAIL ($((SECONDS - T0))s) fails=${PHASE_NAME:-step} gaps=none"' ERR
-run_step() {
-  local name=$1; shift; PHASE_NAME=$name; phase "$name"
-  local log="$LOG_DIR/lints-$name.log" rc
-  set +e; ( set -e; "$@" ) 2>&1 | tee "$log"; rc=${PIPESTATUS[0]}; set -e
-  [ "$rc" -eq 0 ] || { FAILS+=("$name"); emit "PHASE: $name FAIL rc=$rc log=$log"; finish || true; exit 1; }
-  emit "PHASE: $name PASS log=$log"
-}
+case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/lints.sh"; exit 0 ;; *) usage_fail "lints.sh aceita apenas -h/--help" ;; esac
+lib_init
+trap 'trap_fail $?' ERR
 
 # N-5: formatting is applied locally; CI only verifies it.
 phase_fmt() {
@@ -41,8 +35,11 @@ phase_doc() { RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-feat
 run_step doc phase_doc
 
 phase_spdx() {
-  local files=() missing=() f rc
-  mapfile -t files < <(git ls-files '*.rs' '*.sh' '*.py' 'build.rs' 'Cargo.toml')
+  local files=() missing=() f rc listing
+  listing=$(git ls-files '*.rs' '*.sh' '*.py' 'build.rs' 'Cargo.toml') \
+    || { echo "SPDX scan failed: git ls-files failed" >&2; return 1; }
+  [ -n "$listing" ] || { echo "SPDX scan failed: git ls-files returned no files" >&2; return 1; }
+  mapfile -t files <<< "$listing"
   for f in "${files[@]}"; do
     grep -qE "SPDX-License-Identifier: (GPL-3\.0-or-later|MIT)" "$f"; rc=$?
     [ "$rc" -eq 0 ] && continue

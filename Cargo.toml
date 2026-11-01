@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 [package]
 name = "nam-audio-pipe"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "GPL-3.0-or-later"
@@ -88,18 +88,18 @@ required-features = ["testing"]
 # Cargo would pull the engine's default features and `--no-default-features`
 # could never reach the lean single-inference path (the engine default is
 # `dual-mono`).
-NeuralAmpModeler-rs = { version = "1.0.1", default-features = false, features = [
+NeuralAmpModeler-rs = { version = "2.0.0", default-features = false, features = [
     "rt-hardening",
 ] }
 pipewire = "0.10"
 lexopt = "0.3.2"
 hound = "3.5"
-rtrb = "0.4.0"
+rtrb = "0.4.1"
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tokio-uring = "0.5"
 anyhow = "1.0.104"
 libc = "0.2.191"
-log = "0.4.34"
+log = "0.4.35"
 env_logger = { version = "0.11.11", default-features = false }
 # Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs):
 # the engine-owned unified receipt schema has no `fail_reason` field, so
@@ -117,12 +117,7 @@ default = ["dual-mono"]
 # L/R pipeline processes each channel independently instead of folding R as a
 # mono copy of L (mono detection becomes dynamic per-block).
 dual-mono = ["NeuralAmpModeler-rs/dual-mono"]
-testing = [
-    "NeuralAmpModeler-rs/testing",
-    "dual-mono",
-    "dep:serde",
-    "dep:sha2",
-]
+testing = ["NeuralAmpModeler-rs/testing", "dual-mono", "dep:serde", "dep:sha2"]
 # Enables the RT heap-audit allocator (CountingAllocator) and the swap
 # zero-allocation gates.
 heap-audit = ["NeuralAmpModeler-rs/heap-audit"]
@@ -195,3 +190,6 @@ split-debuginfo = "unpacked"
 
 [lints.rust]
 raw_borrows_via_references = "warn"
+
+[patch.crates-io]
+NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }

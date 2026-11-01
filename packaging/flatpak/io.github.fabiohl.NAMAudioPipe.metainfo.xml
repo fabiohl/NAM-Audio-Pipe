@@ -66,17 +66,15 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="1.0.0" date="2026-10-20" type="stable">
+    <release version="1.1.0" date="2026-11-01" type="stable">
       <description>
-        <p>First official release of NAM-Audio-Pipe: standalone low-latency PipeWire host for Neural Amp Modeler.</p>
+        <p>NAM-Audio-Pipe 1.1.0:</p>
         <ul>
-          <li>Native integration with PipeWire (libpipewire-0.3) at low quantum buffer sizes down to 64 samples (1.33 ms).</li>
-          <li>Inherited NeuralAmpModeler-rs DSP core supporting WaveNet (A1/A2), LSTM, ConvNet, and Linear models.</li>
-          <li>Strict real-time safety: zero heap allocations, zero mutex locks, and zero blocking calls on the audio loop.</li>
-          <li>Zero-latency UPOLS partitioned convolution engine for cabinet impulse responses (.wav).</li>
-          <li>Concurrent asynchronous 32-bit float WAV recording powered by io_uring with 4 GiB auto-split and noise gate trim.</li>
-          <li>Polyphase half-band oversampling (2×, 4×) and adaptive compute auto-slimming.</li>
-          <li>Automated PipeWire graph routing, bounded daemon reconnection, and crash-resilient session finalization.</li>
+          <li>PipeWire latency reporting and stream properties driven by the live graph.</li>
+          <li>Rust-based long-phase receipts with run-id provenance and unified phase logging.</li>
+          <li>Partition-aligned UPOLS cab-sim latency (constant partition priming, declared to the host).</li>
+          <li>Hardened recording, receipt and standalone modules; memory-guarded test and build scripts.</li>
+          <li>Independent CI lint and quick jobs with engine provenance and always-uploaded evidence.</li>
         </ul>
       </description>
     </release>

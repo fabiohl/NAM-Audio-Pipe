@@ -286,11 +286,10 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let _cwd = CwdGuard::enter(&dir);
     let _guard = DirGuard::new(dir.clone());
 
-    if !common::probe_pipewire_daemon() {
-        eprintln!("TEST_RESULT[record_e2e]=SKIP:daemon_unavailable");
-        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
-        return;
-    }
+    assert!(
+        common::probe_pipewire_daemon(),
+        "PipeWire daemon is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
 
     pipewire::init();
 

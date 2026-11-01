@@ -224,6 +224,7 @@ pub fn verify_receipt_artifact(receipt_path: &Path, artifact_path: &Path) -> Art
 
 fn summarize_long_audit(
     content: &str,
+    expected_run_id: Option<&str>,
     fails: &mut Vec<String>,
     gaps: &mut Vec<String>,
     reasons: &mut Vec<String>,
@@ -271,6 +272,27 @@ fn summarize_long_audit(
                     gaps.push(format!("{phase_id}:{gap}"));
                     reasons.push(format!(
                         "long audit phase '{phase_id}' declares gap: '{gap}'"
+                    ));
+                }
+            }
+        }
+        if let Some(expected) = expected_run_id
+            && phase_id != "overall"
+        {
+            match value.get("run_id").and_then(|v| v.as_str()) {
+                Some(rid) if !rid.is_empty() && rid != expected => {
+                    fails.push("run_id_mismatch_long".to_string());
+                    reasons.push(format!(
+                        "long audit line {} run_id ({rid}) != build receipt ({expected})",
+                        idx + 1
+                    ));
+                }
+                Some(rid) if !rid.is_empty() => {}
+                _ => {
+                    fails.push("run_id_missing_long".to_string());
+                    reasons.push(format!(
+                        "long audit line {} has no run_id to reconcile with the build receipt",
+                        idx + 1
                     ));
                 }
             }
@@ -499,7 +521,16 @@ pub fn evaluate_certification(
         }
         match fs::read_to_string(long_receipt_path) {
             Ok(content) => {
-                long_audit = summarize_long_audit(&content, &mut fails, &mut gaps, &mut reasons);
+                let expected_run_id = build_receipt
+                    .as_ref()
+                    .and_then(|receipt| receipt.provenance.run_id.as_deref());
+                long_audit = summarize_long_audit(
+                    &content,
+                    expected_run_id,
+                    &mut fails,
+                    &mut gaps,
+                    &mut reasons,
+                );
                 long_audit.receipt_path = long_receipt_path.display().to_string();
                 let seen: BTreeSet<&str> = long_audit
                     .phases

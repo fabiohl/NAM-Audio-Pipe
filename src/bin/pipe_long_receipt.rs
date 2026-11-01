@@ -34,7 +34,7 @@ use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict
 use nam_audio_pipe::receipt::phase_log::{self, Requirement, Verdict};
 use nam_audio_pipe::receipt::release::{evaluate_certification, verify_receipt_artifact};
 use neural_amp_modeler_rs::testing::receipt::{
-    LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, count_tests_executed_from_log,
+    LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, LongReason, count_tests_executed_from_log,
     detect_gap_markers, now_iso8601,
 };
 
@@ -251,6 +251,24 @@ fn cmd_append(args: &[String]) {
         }
     };
 
+    let run_id = flags
+        .get("run-id")
+        .cloned()
+        .or_else(|| env::var("NAM_RUN_ID").ok().filter(|v| !v.is_empty()));
+
+    // A FAILED phase gets the typed cause required by strict validation. The
+    // distinction is derived from the phase log, never invented: tests ran and
+    // failed, or the phase failed before executing any test.
+    let reason = if status == LongPhaseStatus::Failed {
+        Some(if tests_executed > 0 {
+            LongReason::TestFailure
+        } else {
+            LongReason::PreflightFailure
+        })
+    } else {
+        None
+    };
+
     let receipt = LongPhaseReceipt {
         phase_id,
         name,
@@ -262,6 +280,9 @@ fn cmd_append(args: &[String]) {
         oracle_sha256: flags.get("oracle-sha256").cloned(),
         fixture_sha256: flags.get("fixture-sha256").cloned(),
         artifact_sha256: flags.get("artifact-sha256").cloned(),
+        run_id,
+        reason,
+        ..Default::default()
     };
     if let Err(e) = append_line(&out, &receipt.render_jsonl_line()) {
         eprintln!("append: failed to write receipt to {out}: {e}");

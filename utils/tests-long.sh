@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # tests-long.sh — long audit suite: soak, RT, live PipeWire, io_uring, offline parity and artifact certification. Classe B.
 # Uso: utils/tests-long.sh [--strict] [--artifact] [--only <nome>[,<nome>]] [-h|--help]
-# Orçamento: 300
+# Orçamento: 340
 # AI AGENTS MUST NEVER EXECUTE THIS SCRIPT DIRECTLY: execution is reserved for the human operator.
 # Structural validation is limited to --help.
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
@@ -60,9 +60,16 @@ while [ $# -gt 0 ]; do
         --only) IFS=',' read -r -a ONLY_PHASES <<<"${2:?--only requer lista}"; shift 2 ;;
         --only=*) IFS=',' read -r -a ONLY_PHASES <<<"${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
-        *) echo "ERRO: flag não reconhecida: $1" >&2; usage >&2; exit 2 ;;
+        *) usage_fail "tests-long.sh: flag não reconhecida '$1'" ;;
     esac
 done
+# Reuse the build run id so the independent build/long/certify processes
+# reconcile instead of each generating a different id.
+if [ -z "${NAM_RUN_ID:-}" ] && [ -s target/logs/build-run-id ]; then
+    IFS= read -r NAM_RUN_ID < target/logs/build-run-id || true
+    export NAM_RUN_ID
+fi
+lib_init; PHASE_NAME=phase-selection
 for o in ${ONLY_PHASES[@]+"${ONLY_PHASES[@]}"}; do
     o=$(printf '%s' "$o" | tr '[:upper:]_' '[:lower:]-'); valid=0
     for p in "${PHASES[@]}"; do [ "${p%%|*}" = "$o" ] && valid=1; done
@@ -79,6 +86,13 @@ is_phase_selected() {
     return 1
 }
 if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; export NAM_REQUIRE_CPP_ORACLE=1; fi
+# A partial run must never destroy the previous full receipt: it writes to a
+# sibling set of paths that cannot be mistaken for a certifiable audit.
+if [ ${#ONLY_PHASES[@]} -gt 0 ]; then
+    TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"
+    RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"
+    FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"
+fi
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_TARGET_DIR" = "target/long" ]; then rm -rf target/long; fi
 rm -f "$RECEIPT" "$FAIL_REASONS" "$TEXT_RECEIPT"
 if [ "$USE_ARTIFACT" = 1 ]; then
@@ -92,15 +106,22 @@ HAS_CHRT_FIFO=0
 if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then HAS_CHRT_FIFO=1; fi
 ensure_receipt_bin() {
     if [ -n "$RECEIPT_BIN" ] && [ -x "$RECEIPT_BIN" ]; then return 0; fi
-    cargo build --quiet --release --features testing --bin pipe_long_receipt >/dev/null 2>&1 || return 1
+    cargo build --locked --quiet --release --features testing --bin pipe_long_receipt >/dev/null 2>&1 || return 1
     RECEIPT_BIN="$CARGO_TARGET_DIR/release/pipe_long_receipt"
     [ -x "$RECEIPT_BIN" ]
 }
 ensure_perf_gate_bin() {
     if [ -n "$PERF_GATE_BIN" ] && [ -x "$PERF_GATE_BIN" ]; then return 0; fi
-    cargo build --quiet --release --features testing --bin pipe_perf_gate >/dev/null 2>&1 || return 1
+    cargo build --locked --quiet --release --features testing --bin pipe_perf_gate >/dev/null 2>&1 || return 1
     PERF_GATE_BIN="$CARGO_TARGET_DIR/release/pipe_perf_gate"
     [ -x "$PERF_GATE_BIN" ]
+}
+# Returns 0 available, 1 kernel/security unsupported, 2 probe failure/tool error.
+probe_io_uring_capability() {
+    local to="$1" bin="${CARGO_TARGET_DIR}/debug/io_uring_probe" rc=0
+    cargo build --locked --quiet --bin io_uring_probe >/dev/null 2>&1 || return 2
+    run_cmd "$to" "$bin" >/dev/null 2>&1; rc=$?
+    return "$rc"
 }
 emit_text() { printf '%s\n' "$*" | tee -a "$TEXT_RECEIPT"; }
 run_cmd() { local to="$1"; shift; timeout --kill-after=30 "$to" "$@"; }
@@ -164,32 +185,30 @@ run_phase() {
         FAIL) FAILS+=("$id"); emit "PHASE: $name FAIL rc=$rc log=$log"; tail -n 40 "$log" >&2 ;;
     esac
     if [ "$st" != ERROR ]; then
-        local env_suffix
-        env_suffix=$(grep -oE '\benv=[^ ]+' "$log" | head -n1 || true)
-        emit_text "PHASE${n}: $st log=$log duration_ms=$dur${env_suffix:+ $env_suffix}"
+        emit_text "PHASE${n}: $st log=$log duration_ms=$dur"
     fi
 }
 # ── Phase bodies (return 0 when the commands succeeded, 1 otherwise) ─────────
-body_catch_all() { run_cmd "$1" cargo test --features testing --release --no-fail-fast; }
+body_catch_all() { run_cmd "$1" cargo test --locked --features testing --release --no-fail-fast; }
 body_soak() {
     local to="$1" rc=0
     if [ -f tests/soak_extended.rs ]; then
-        run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+        run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
             --test soak_extended -- --ignored --nocapture --test-threads=1 || rc=1
         TGTS+=(tests/soak_extended.rs)
     else
         pre_gap soak_extended_harness_missing
     fi
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test swap_stress -- --ignored --nocapture --test-threads=1 || rc=1
     TGTS+=(tests/swap_stress.rs)
     return "$rc"
 }
 body_heap_audit() {
     local to="$1" rc=0
-    run_cmd "$to" cargo test --features "testing heap-audit" --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features "testing heap-audit" --release --no-fail-fast \
         --lib -- --nocapture || rc=1
-    run_cmd "$to" cargo test --features "testing heap-audit" --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features "testing heap-audit" --release --no-fail-fast \
         --test swap_stress -- --nocapture || rc=1
     TGTS+=(tests/swap_stress.rs)
     return "$rc"
@@ -197,35 +216,35 @@ body_heap_audit() {
 body_rt_deadline() {
     local to="$1"
     if [ ! -f tests/rt_metrics.rs ]; then NOT_RUN=1; pre_gap rt_metrics_harness_missing; return 0; fi
-    run_cmd "$to" cargo test --features testing --release --no-run --test rt_metrics || return 1
-    run_rt_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-run --test rt_metrics || return 1
+    run_rt_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test rt_metrics -- deadline --ignored --nocapture --test-threads=1 || return 1
     REQS+=(rt_deadline rt_deadline_full)
 }
 body_rt_jitter() {
     local to="$1"
     if [ ! -f tests/rt_metrics.rs ]; then NOT_RUN=1; pre_gap rt_metrics_harness_missing; return 0; fi
-    run_rt_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_rt_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test rt_metrics -- jitter --ignored --nocapture --test-threads=1 || return 1
     REQS+=(rt_jitter)
 }
 body_concurrency() {
     local to="$1"
     if [ ! -f tests/rt_metrics.rs ]; then NOT_RUN=1; pre_gap rt_metrics_harness_missing; return 0; fi
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test rt_metrics -- concurrent --ignored --nocapture --test-threads=1 || return 1
     REQS+=("concurrency_stress|model_check|concurrent|spsc_throughput")
 }
 body_endurance() {
     local to="$1"
     if [ ! -f tests/endurance.rs ]; then NOT_RUN=1; pre_gap endurance_harness_missing; return 0; fi
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test endurance -- --ignored --nocapture --test-threads=1 || return 1
     TGTS+=(tests/endurance.rs)
 }
 body_pw_resilience() {
     local to="$1"
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pw_integration -- --nocapture --test-threads=1 || return 1
     REQS+=("daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon")
 }
@@ -234,28 +253,36 @@ body_pw_live() {
     if ! command -v pw-cli >/dev/null 2>&1 || ! timeout 5 pw-cli info 0 >/dev/null 2>&1; then
         NOT_RUN=1; pre_gap pw_integration_daemon_unavailable; return 0
     fi
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    if ! command -v pw-play >/dev/null 2>&1 || ! timeout 5 pw-play --version >/dev/null 2>&1; then
+        NOT_RUN=1; pre_gap pw_play_unavailable; return 0
+    fi
+    probe_io_uring_capability "$to"; local probe_rc=$?
+    if [ "$probe_rc" -eq 1 ]; then NOT_RUN=1; pre_gap io_uring_kernel_unsupported; return 0; fi
+    [ "$probe_rc" -eq 0 ] || return 1
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pw_integration --test service_resilience -- --ignored --test-threads=1 --nocapture || return 1
     TGTS+=(tests/pw_integration.rs tests/service_resilience.rs)
     REQS+=("sigterm_acceptance:2" double_signal)
 }
 body_recording() {
-    local to="$1" probe_rc=0 probe_bin="${CARGO_TARGET_DIR}/debug/io_uring_probe"
-    cargo build --quiet --bin io_uring_probe >/dev/null 2>&1 || probe_rc=2
-    if [ "$probe_rc" -eq 0 ]; then "$probe_bin" >/dev/null 2>&1 || probe_rc=$?; fi
+    local to="$1" probe_rc=0
+    probe_io_uring_capability "$to"; probe_rc=$?
     case "$probe_rc" in
         0) ;;
         1) NOT_RUN=1; pre_gap recording_io_uring_kernel_unsupported; return 0 ;;
-        *) NOT_RUN=1; pre_gap recording_io_uring_probe_tool_missing; return 0 ;;
+        *) return 1 ;;
     esac
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    if ! command -v pw-cli >/dev/null 2>&1 || ! timeout 5 pw-cli info 0 >/dev/null 2>&1; then
+        NOT_RUN=1; pre_gap recording_pipewire_daemon_unavailable; return 0
+    fi
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test recording --test recording_fault_injection -- --ignored --test-threads=1 --nocapture || return 1
     TGTS+=(tests/recording.rs tests/recording_fault_injection.rs)
     REQS+=(record_e2e)
 }
 body_offline_parity() {
     local to="$1"
-    run_cmd "$to" cargo test --features testing --release --no-fail-fast \
+    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pipe_offline_parity -- --ignored --nocapture --test-threads=1 || return 1
     TGTS+=(tests/pipe_offline_parity.rs)
     REQS+=("offline_parity_*")
@@ -264,7 +291,7 @@ body_offline_parity() {
         echo "# artifact smoke: $ARTIFACT_PATH sha256=$ARTIFACT_SHA256"
     fi
 }
-ensure_receipt_bin || { echo "ERRO: pipe_long_receipt indisponível" >&2; LONG_RECEIPT_FAILED=1; }
+ensure_receipt_bin || { echo "ERRO: pipe_long_receipt indisponível" >&2; LONG_RECEIPT_FAILED=1; FAILS+=("receipt-bin"); }
 emit_text "SUITE: tests-long"
 emit_text "STRICT: $STRICT"
 emit_text "NAM_RT_STRICT: ${NAM_RT_STRICT:-0}"
@@ -291,6 +318,13 @@ fi
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ] && [ ${#FAILS[@]} -eq 0 ]; then
     "$RECEIPT_BIN" summary --out "$RECEIPT" >/dev/null 2>&1 || FAILS+=(summary)
 fi
+val_args=(--out "$RECEIPT")
+[ "$STRICT" = 1 ] && val_args+=(--strict)
+if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ]; then
+    "$RECEIPT_BIN" validate "${val_args[@]}" >>"$LOG_DIR/tests-long-validate.log" 2>&1 \
+        || FAILS+=(receipt_validation)
+fi
+if [ ${#ONLY_PHASES[@]} -gt 0 ]; then gap "only-subset:${ONLY_PHASES[*]}"; fi
 for g in ${GAPS[@]+"${GAPS[@]}"}; do emit_text "GAP: $g"; done
 if [ ${#FAILS[@]} -gt 0 ]; then emit_text "OVERALL: FAILED"
 elif [ ${#ONLY_PHASES[@]} -gt 0 ]; then emit_text "OVERALL: PARTIAL (--only: recibo sem overall, não certificável)"

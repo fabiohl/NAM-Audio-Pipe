@@ -306,21 +306,28 @@ Class B, operator-only. It records every phase result instead of aborting on the
 
 | Receipt `phase_id` | Canonical phase | Harness & Invariant Evaluated                                                                                              | Output Log File                       |
 |:------------------ |:--------------- |:-------------------------------------------------------------------------------------------------------------------------- |:------------------------------------- |
-| **`phase0`**  | `catch-all`    | `cargo test --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `--lib`). | `target/logs/long-catch-all.log`      |
+| **`phase0`**  | `catch-all`    | `cargo test --locked --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `--lib`). | `target/logs/long-catch-all.log`      |
 | **`phase1`**  | `soak`         | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                  | `target/logs/long-soak.log`           |
-| **`phase2`**  | `heap-audit`   | `cargo test --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths. | `target/logs/long-heap-audit.log`     |
+| **`phase2`**  | `heap-audit`   | `cargo test --locked --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths. | `target/logs/long-heap-audit.log`     |
 | **`phase3`**  | `rt-deadline`  | `tests/rt_metrics.rs` (`deadline`, 10k quantums, DSP load < 85% of the quantum budget; `SCHED_FIFO` when available).      | `target/logs/long-rt-deadline.log`    |
 | **`phase4`**  | `rt-jitter`    | `tests/rt_metrics.rs` (`jitter`, 10k callbacks under contention; bounded inter-callback dispersion).                       | `target/logs/long-rt-jitter.log`      |
 | **`phase5`**  | `concurrency`  | `tests/rt_metrics.rs` (`concurrent`; 16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks). | `target/logs/long-concurrency.log`    |
 | **`phase6`**  | `endurance`    | `tests/endurance.rs` (real timeline at 48 kHz/64 frames, `NAM_ENDURANCE_SECONDS`; fail-closed validation windows and zero leaks). | `target/logs/long-endurance.log`      |
 | **`phase7`**  | `pw-resilience` | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling.                          | `target/logs/long-pw-resilience.log`  |
-| **`phase8`**  | `pw-live`      | Live daemon probe, `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances).     | `target/logs/long-pw-live.log`        |
-| **`phase9`**  | `recording`    | `io_uring_probe` capability gate, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`).        | `target/logs/long-recording.log`      |
+| **`phase8`**  | `pw-live`      | Live daemon + `pw-play` + `io_uring` capability probe, then `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances). An absent capability is a typed GAP; the tests fail closed if executed without it. | `target/logs/long-pw-live.log`        |
+| **`phase9`**  | `recording`    | `io_uring_probe` and live PipeWire capability gates, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`); a probe tool/build failure is a phase failure, not a GAP. | `target/logs/long-recording.log`      |
 | **`phase10`** | `offline-parity` | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used.                      | `target/logs/long-offline-parity.log` |
 
 Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
 
-`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and produces a partial receipt: non-selected phases are recorded as `SKIPPED`, no overall line is written, and the text receipt ends with `OVERALL: PARTIAL (--only: recibo sem overall, não certificável)` — or `OVERALL: FAILED` if any selected phase failed. A partial receipt is not certifiable. Without `--only`, `target/long` is removed and the receipt can be summarized and certified.
+`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and writes `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file); it never deletes the previous full `long-audit-receipt.jsonl`. Non-selected phases are recorded as `SKIPPED`, no overall line is written, and the text receipt ends with `OVERALL: PARTIAL (--only: recibo sem overall, não certificável)` — or `OVERALL: FAILED` if any selected phase failed. A partial receipt is not certifiable. Without `--only`, `target/long` is removed and the receipt can be summarized and certified. After a full run, `pipe_long_receipt validate [--strict]` verifies the JSONL; strict failures now require the typed `reason` emitted for FAILED phases.
+
+#### 3.3.1 Hosted CI and Manual Long Workflow (GitHub Actions)
+
+- **`ci.yml`:** lints and quick run as separate jobs per platform (`x86_64-linux-lints`, `x86_64-linux-quick`, `linux-arm64-lints`, `linux-arm64-quick`), so a lint failure cannot suppress the functional evidence, plus the `msrv` check. The x86_64 jobs are blocking; the ARM64 jobs are `continue-on-error` (experimental) until a native aarch64 execution is approved. Each job, including `msrv`, writes `target/logs/ci-provenance.log` and uploads `target/logs/**` (including the `*-status.tsv` carriers) with `if: always()`.
+- **Provenance:** each job writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine=…`). When `../NeuralAmpModeler-rs` is absent, the line records `engine=GAP engine_sibling_absent`.
+- **Engine source is a GAP:** `Cargo.toml` resolves `NeuralAmpModeler-rs` through `[patch.crates-io]` path `../NeuralAmpModeler-rs`. A hosted runner that checks out only this repository cannot resolve it, so remote lints and quick are not evidence until the product owner authorizes an engine source and SHA. The patch is intentional and is preserved.
+- **`long.yml`:** `workflow_dispatch` only, operator-triggered; `timeout-minutes: 300`. Hosted runs explicitly select all phases except `rt-deadline` and `rt-jitter`, because a hosted runner is not a comparable speed/RT gate. The workflow never certifies; the operator runs `build-release.sh --certify` on the isolated host.
 
 ### 3.4 Real-Time Criterion Bench
 
@@ -517,7 +524,7 @@ Standard builds and CI pipelines use the stable Rust toolchain. To formally veri
 
 **Miri Audit Scope**:
 
-1. **`src/recording/pool_test.rs` (`RecordingPool`)**: 11/11 tests pass under Miri, verifying lock-free SPSC ring ordering and atomic descriptor ownership without data races.
+1. **`src/recording/pool_test.rs` (`RecordingPool`)**: 13/13 tests pass under Miri, verifying lock-free SPSC ring ordering and atomic descriptor ownership without data races.
 2. **`src/standalone/pw_host/pw_host_test.rs` (`test_dsp_bridge_concurrent_access`)**: Exercises the shared ping-pong memory bridge under concurrent writer and reader threads. `DspBridge::buffers` wraps storage in `UnsafeCell`, accessing payloads through raw pointers to avoid invalid whole-struct retags.
 3. **Exclusions**: Full neural network SIMD evaluation kernels are excluded from Miri due to vector intrinsic emulation overhead (~10,000× slowdown).
 
@@ -544,6 +551,15 @@ All automation scripts in `utils/` follow a lean, predictable contract designed 
 4. **Exit codes:** `0` success or `PASS_WITH_GAPS` outside strict mode; `1` failure or a gap under `--strict`; `2` usage error or missing precondition.
 
 Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long suite uses `target/logs/long-<name>.log`. The canonical `PHASE:`/`RESULT:` lines are also appended to `target/logs/summary.txt` and published by the local `.github/actions/qa-summary` composite action; the ARM CI job now invokes `utils/lints.sh` (with the packaging dependencies installed) instead of an inline clippy command. The quick discipline never emits receipts; the long discipline emits the JSONL receipt consumed by the release chain.
+
+### 7.2.1 Evidence Lifecycle (`utils/_lib.sh`)
+
+`utils/_lib.sh` is a pure definition file: sourcing it has no side effects. Every script parses `-h`/`--help` and rejects unknown flags **before** calling `lib_init`, so help never destroys evidence. `lib_init` is the single point that creates `target/logs`, resolves `NAM_RUN_ID` (honoring a pre-exported value, as CI does per run/attempt), truncates `target/logs/summary.txt` only when the run id differs from `target/logs/.summary-run`, and removes the script's own stale carrier. `utils/build-release.sh` writes `target/logs/build-run-id` after a successful build; `utils/tests-long.sh` reuses it when `NAM_RUN_ID` is not pre-exported, so the three local release commands reconcile. A discipline invoked as a child inside another discipline's phase sets `lib_quiet=1`, which suppresses its writes to `summary.txt`: the parent's verdict can never be replaced by a child's `PASS`.
+
+- **One RESULT per invocation.** Every path — success, phase failure, unexpected error (`ERR` trap → `trap_fail`), usage error — terminates with exactly one `RESULT:` line and exit codes `0`/`1`/`2` as above.
+- **Typed status carrier.** Each `finish` writes `target/logs/<script>-status.tsv`: one line, four TAB-separated columns — `<discipline>\t<PASS|PASS_WITH_GAPS|FAIL>\t<gaps|none>\t<fails|none>` (lists comma-separated). A carrier write failure forces `FAIL` and appends `carrier` to the fails list; a missing or invalid carrier is never treated as success. `summary.txt` remains the human/AI-readable record, not the decision source.
+- **GAP grammar.** Gap markers follow `PHASE: <phase_name> GAP <technical_reason>`, emitted by the `gap` helper with the current `PHASE_NAME`.
+- **Write failures are failures.** `emit` records a failed `summary.txt` append in `EMIT_RC` without returning error (a `return 1` would escape the ERR trap under `set -e` and abort with neither `RESULT` nor carrier); `finish` then downgrades the verdict to `FAIL`, rewrites the carrier with `fails=emit` and prints a single `RESULT: FAIL`. `run_step` captures both `PIPESTATUS[0]` (the producer) and the `tee` status. Neither path can silently report `PASS`.
 
 ### 7.3 Core Automation Principles
 

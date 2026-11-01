@@ -10,6 +10,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Long audit evidence:** partial `--only` runs write sibling receipts and preserve the previous full audit; full runs are validated with `pipe_long_receipt validate --strict`, and FAILED phases carry a typed `reason`.
+- **PipeWire capabilities:** live/recording tests fail closed instead of silently passing when the daemon, `pw-play` or `io_uring` is unavailable; the long suite declares those absences as typed GAPs before running them.
+- **Release provenance and packaging:** `--certify` never recompiles, the verifier is located without parsing help text, build and long `run_id` values are reconciled through `target/logs/build-run-id`, a stale release receipt is removed before a failed certification, and `LICENSE.txt` plus the engine `NOTICE` are included in the tarball and Flatpak.
+- **CI:** hosted long runs exclude `rt-deadline`/`rt-jitter`, and the MSRV job records and uploads provenance.
+
+## [1.1.0] - 2026-11-01
+
+### Added
+
+- **PipeWire Latency Reporting:** Stream properties and latency reporting driven by the real PipeWire graph.
+- **Rust QA Receipts:** Long-phase receipt tooling in Rust with `run_id` support (flags or `NAM_RUN_ID`), unified phase logging and script-budget validation.
+- **CI Provenance:** Independent lint and quick jobs, engine provenance logging and an adjusted long-workflow timeout.
+
+### Changed
+
+- **Receipt and Workflow Architecture:** Migrated the QA script architecture to Rust-based receipts and workflows; cleaned up RT log-ring tests and modularized test log utilities.
+- **Recording and Standalone Modules:** Improved recording, receipt and standalone module structure with hardened error handling.
+- **CPU Headroom Documentation:** Updated CPU headroom benchmarks and PipeWire host execution metrics.
+- **Memory Guard:** Test and build scripts run under the project's memory guard to protect the host from OOM.
+
+### Fixed
+
+- **Telemetry Startup:** Suppressed false-positive telemetry startup drops and updated the Flatpak PipeWire permissions.
+- **Cab-sim Latency Tests:** Consumer tests now follow the engine's constant partition-sized priming latency (the ESR stream is compared after the full partition prefix).
+
+---
+
 ## [1.0.0] - 2026-10-20
 
 ### Added

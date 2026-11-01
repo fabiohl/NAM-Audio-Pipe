@@ -70,3 +70,6 @@ __pycache__/
 
 # Performance baselines
 .performance-baselines/
+
+# Sibling checkout in CI
+/NeuralAmpModeler-rs/

@@ -12,11 +12,10 @@
 //!
 //! 1. **Partition policy is really in effect end-to-end** — feeding
 //!    sub-partition host blocks (16-sample, the sample-accurate automation
-//!    regime) through the production pipeline yields the exact UPOLS FIFO
-//!    underrun prefix documented by the engine
-//!    (`block * (ceil(P / block) - 1)`), which scales strictly with the
-//!    policy value; the audible stream after the prefix is the direct causal
-//!    FIR of the chosen IR (ESR gate).
+//!    regime) through the production pipeline yields the engine's constant
+//!    `partition`-sample priming latency, independent of the host block size
+//!    and scaling strictly with the policy value; the audible stream after
+//!    the prefix is the direct causal FIR of the chosen IR (ESR gate).
 //! 2. **Partition < quantum safety** — a 32-sample policy under a 512-sample
 //!    host quantum never raises `RT_STATUS_CABSIM_CONTRACT_VIOLATION`,
 //!    neither on the active path (`process_block`) nor on the gate-closed
@@ -79,11 +78,11 @@ fn direct_convolve(ir: &[f32], signal: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Causal silence prefix of a fresh adapter driven with host blocks of
-/// `block` samples (`block <= partition`): the samples delivered before the
-/// first partition completes. Same formula the engine's ESR suite pins.
-fn accumulation_prefix(partition: usize, block: usize) -> usize {
-    block * (partition.div_ceil(block) - 1)
+/// Silence prefix of a fresh adapter driven with host blocks of `block`
+/// (`block <= partition`): the adapter primes its output queue with one full
+/// partition, so the delay is exactly `partition` for every blocking.
+fn accumulation_prefix(partition: usize, _block: usize) -> usize {
+    partition
 }
 
 /// Invariant 1: the partition policy is really in effect end-to-end.
@@ -123,8 +122,8 @@ fn cabsim_partition_policy_shapes_the_rt_output_stream() {
             produced.extend_from_slice(harness.out_l());
         }
 
-        // The documented underrun prefix: silence until the first partition
-        // completes, then the direct causal FIR, block-aligned. The prefix is
+        // The engine's constant latency: one partition of silence (the
+        // primed output queue), then the direct causal FIR. The prefix is
         // not bit-silent: the pipeline's denormal dither (1e-11) accumulates
         // through the FIR to ~1e-6 over the prefix — 120 dB below the signal,
         // so the inaudibility floor for the prefix is 1e-4.
@@ -156,8 +155,8 @@ fn cabsim_partition_policy_shapes_the_rt_output_stream() {
         );
         prev_prefix = expected_prefix;
     }
-    // Prefix at the top of the CLI domain: P - block.
-    assert_eq!(prev_prefix, 256 - block);
+    // Constant latency across the whole CLI partition domain.
+    assert_eq!(prev_prefix, 256);
 }
 
 /// Invariant 2: with the partition policy below

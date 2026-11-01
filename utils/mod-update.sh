@@ -8,17 +8,19 @@ set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . utils/_lib.sh
-case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/mod-update.sh"; exit 0 ;; *) echo "RESULT: FAIL (uso)"; exit 2 ;; esac
+case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/mod-update.sh"; exit 0 ;; *) usage_fail "mod-update.sh aceita apenas -h/--help" ;; esac
+lib_init
+trap 'trap_fail $?' ERR
 
-phase rustup
+PHASE_NAME=rustup; phase rustup
 if command -v rustup >/dev/null 2>&1; then rustup update || FAILS+=(rustup)
-else GAPS+=(rustup_missing); echo "PHASE: rustup GAP rustup_missing"; fi
+else gap "rustup-missing"; fi
 
-phase cargo-upgrade
+PHASE_NAME=cargo-upgrade; phase cargo-upgrade
 if command -v cargo-upgrade >/dev/null 2>&1; then cargo upgrade --verbose || FAILS+=(cargo-upgrade)
-else GAPS+=(cargo_edit_missing); echo "PHASE: cargo-upgrade GAP cargo_edit_missing"; fi
+else gap "cargo-upgrade-missing"; fi
 
-phase cargo-update
+PHASE_NAME=cargo-update; phase cargo-update
 cargo update --verbose || FAILS+=(cargo-update)
 
-finish
+finish || exit 1

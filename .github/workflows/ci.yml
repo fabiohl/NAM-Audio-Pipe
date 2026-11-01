@@ -5,7 +5,8 @@ name: CI
 
 # Fast disciplines only: utils/lints.sh (fmt check, check/clippy matrix, rustdoc, SPDX, policies,
 # AppStream/desktop packaging) and utils/tests-quick.sh (cargo test --features testing, dev profile,
-# private PipeWire daemon). Heavy/RT/certification work lives in long.yml (manual dispatch).
+# private PipeWire daemon). Lints and quick run as separate jobs so one cannot hide the other.
+# Heavy/RT/certification work lives in long.yml (manual dispatch).
 # Linux only: the product is a PipeWire host (x86_64 reference + aarch64).
 on:
   push:
@@ -26,15 +27,22 @@ env:
   NAM_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
-  # x86_64 is the reference platform: canonical lints + quick QA suite disciplines.
-  x86_64-linux:
+  # x86_64 is the reference platform: canonical lints and quick QA suite disciplines.
+  # libpipewire/libspa headers + clang feed pipewire-sys bindgen; `pipewire` + `pipewire-bin`
+  # provide the private daemon, pw-cli and pw-play used by the integration tests;
+  # appstream/desktop-file-utils feed the packaging lint phase.
+  x86_64-linux-lints:
     runs-on: ubuntu-26.04
-    timeout-minutes: 35
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      # libpipewire/libspa headers + clang feed pipewire-sys bindgen; `pipewire` + `pipewire-bin`
-      # provide the private daemon, pw-cli and pw-play used by the integration tests;
-      # appstream/desktop-file-utils feed the packaging lint phase.
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -47,35 +55,45 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
       # GitHub sets CI=true, so lints.sh verifies formatting (--check) instead of applying it.
       - name: Lints (fmt, check, clippy, doc, policies, packaging)
         run: ./utils/lints.sh
-      - name: Quick QA suite
-        run: ./utils/tests-quick.sh
       - name: Publish step summary
         if: always()
         uses: ./.github/actions/qa-summary
         with:
-          title: x86_64-linux
+          title: x86_64-linux-lints
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-x86_64-linux
+          name: logs-x86_64-linux-lints
           path: target/logs/**
           retention-days: 14
 
-  # linux-arm64 (NEON engine backend): clippy + quick QA suite.
-  # Non-blocking until the engine release consumed through crates.io supports aarch64: the
-  # published NeuralAmpModeler-rs 1.0.1 build script rejects every target without x86-64-v3,
-  # and src/standalone/rt_setup + rt_callback/harness are still gated on x86_64. Flip
-  # `continue-on-error` to false once Cargo.lock resolves an aarch64-capable engine.
-  linux-arm64:
-    runs-on: ubuntu-26.04-arm
-    timeout-minutes: 40
-    continue-on-error: true
+  x86_64-linux-quick:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -87,21 +105,135 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
-      - name: Lints (fmt, check, clippy, doc, policies, packaging)
-        run: ./utils/lints.sh
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
       - name: Quick QA suite
         run: ./utils/tests-quick.sh
       - name: Publish step summary
         if: always()
         uses: ./.github/actions/qa-summary
         with:
-          title: linux-arm64
-          note: "${{ job.status != 'success' && 'ARM64: upstream engine 1.0.1 requires x86-64-v3; gated with continue-on-error until v1.1.0 is resolved in Cargo.lock.' || '' }}"
+          title: x86_64-linux-quick
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-linux-arm64
+          name: logs-x86_64-linux-quick
+          path: target/logs/**
+          retention-days: 14
+
+  # linux-arm64 (NEON engine backend) is experimental. Non-blocking until the engine consumed by the
+  # path patch supports aarch64: the engine 1.0.1 build script rejects every target without
+  # x86-64-v3, and src/standalone/rt_setup + rt_callback/harness are still gated on x86_64. Flip
+  # `continue-on-error` to false only after a native aarch64 execution is approved.
+  linux-arm64-lints:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
+            appstream desktop-file-utils
+      - name: Update Rust toolchain
+        run: rustup update --no-self-update stable && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
+      - name: Lints (fmt, check, clippy, doc, policies, packaging)
+        run: ./utils/lints.sh
+      - name: Publish step summary
+        if: always()
+        uses: ./.github/actions/qa-summary
+        with:
+          title: linux-arm64-lints
+          note: "ARM64 experimental: non-blocking (continue-on-error) until a native aarch64 execution is approved."
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-arm64-lints
+          path: target/logs/**
+          retention-days: 14
+
+  linux-arm64-quick:
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 40
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config clang libclang-dev \
+            libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
+            appstream desktop-file-utils
+      - name: Update Rust toolchain
+        run: rustup update --no-self-update stable && rustc --version
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
+      - name: Quick QA suite
+        run: ./utils/tests-quick.sh
+      - name: Publish step summary
+        if: always()
+        uses: ./.github/actions/qa-summary
+        with:
+          title: linux-arm64-quick
+          note: "ARM64 experimental: non-blocking (continue-on-error) until a native aarch64 execution is approved."
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-linux-arm64-quick
           path: target/logs/**
           retention-days: 14
 
@@ -116,6 +248,13 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.99.0
     steps:
       - uses: actions/checkout@v7
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -126,11 +265,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          rustc_version=$(rustc --version)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s rustc=%s toolchain=msrv-1.99.0\n' "$sha" "$version" "$engine" "$rustc_version" | tee target/logs/ci-provenance.log
       - name: Cargo check (MSRV)
-        run: cargo check --locked --all-targets --features testing
+        run: |
+          mkdir -p target/logs
+          echo "PHASE: msrv" | tee -a target/logs/summary.txt
+          rc=0
+          cargo check --locked --all-targets --features testing 2>&1 | tee target/logs/msrv-check.log || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "PHASE: msrv PASS log=target/logs/msrv-check.log" | tee -a target/logs/summary.txt
+            echo "RESULT: PASS (0s) fails=none gaps=none" | tee -a target/logs/summary.txt
+          else
+            echo "PHASE: msrv FAIL rc=$rc log=target/logs/msrv-check.log" | tee -a target/logs/summary.txt
+            echo "RESULT: FAIL (0s) fails=msrv gaps=none" | tee -a target/logs/summary.txt
+            exit "$rc"
+          fi
       - name: Publish step summary
         if: always()
         uses: ./.github/actions/qa-summary
         with:
           title: msrv (1.99.0)
           note: ${{ job.status == 'success' && 'MSRV cargo check passed.' || 'MSRV cargo check failed.' }}
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-msrv
+          path: target/logs/**
+          retention-days: 14

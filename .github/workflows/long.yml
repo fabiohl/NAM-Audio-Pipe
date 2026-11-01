@@ -4,14 +4,14 @@
 name: Long QA Suite
 
 # Release chain, decoupled: build-release.sh -> tests-long.sh --artifact -> build-release.sh --certify.
+# This hosted workflow never certifies and never runs rt-deadline/rt-jitter.
 # Hosted runners lack an isolated CPU, BOLT, SCHED_FIFO privileges and a session manager: those
-# surface as typed GAPs. With `strict: true` any GAP fails the run (expected on hosted runners);
-# keep `strict: false` for a hosted dry audit and certify on the operator's host.
+# surface as typed GAPs. With `strict: true` any GAP fails the run.
 on:
   workflow_dispatch:
     inputs:
       strict:
-        description: 'Strict mode (treat gaps as failures; enables certification)'
+        description: 'Strict mode (treat gaps as failures)'
         type: boolean
         default: false
 
@@ -31,9 +31,16 @@ jobs:
   long-qa:
     name: long-qa (x86_64-linux)
     runs-on: ubuntu-26.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
+      - name: Checkout NeuralAmpModeler-rs (engine sibling)
+        uses: actions/checkout@v7
+        with:
+          repository: fabiohl/NeuralAmpModeler-rs
+          path: NeuralAmpModeler-rs
+      - name: Set up engine sibling symlink
+        run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -62,19 +69,34 @@ jobs:
             sleep 0.2
           done
           [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || { echo "PipeWire socket did not appear"; cat "$RUNNER_TEMP/pipewire.log"; exit 1; }
+      - name: Record provenance
+        run: |
+          mkdir -p target/logs
+          sha=$(git rev-parse HEAD)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            engine="sha=$engine_sha"
+          else
+            engine="GAP engine_sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
       - name: Build canonical artifact
+        env:
+          STRICT_INPUT: ${{ inputs.strict }}
         run: |
           STRICT_FLAG=""
-          if [ "${{ inputs.strict }}" = "true" ]; then STRICT_FLAG="--strict"; fi
+          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
           ./utils/build-release.sh $STRICT_FLAG
       - name: Long QA Suite (artifact)
+        env:
+          STRICT_INPUT: ${{ inputs.strict }}
         run: |
           STRICT_FLAG=""
-          if [ "${{ inputs.strict }}" = "true" ]; then STRICT_FLAG="--strict"; fi
-          ./utils/tests-long.sh $STRICT_FLAG --artifact
-      - name: Certify
-        if: ${{ inputs.strict }}
-        run: ./utils/build-release.sh --certify
+          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
+          # Hosted runners are not a comparable speed/RT gate: rt-deadline and
+          # rt-jitter are reserved for the operator's isolated host.
+          ./utils/tests-long.sh $STRICT_FLAG --artifact \
+            --only "catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity"
       - name: Publish step summary
         if: always()
         uses: ./.github/actions/qa-summary

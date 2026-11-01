@@ -46,7 +46,7 @@ while [ $# -gt 0 ]; do
             shift 2
             ;;
         -h|--help) usage; exit 0 ;;
-        *) echo "ERRO: opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
+        *) usage_fail "ab-opt-ceremony.sh: opção desconhecida '$1'" ;;
     esac
 done
 
@@ -57,6 +57,7 @@ AB_BENCH_FLAGS=(--blocks "$BLOCKS" ${AB_BENCH_FLAGS[@]+"${AB_BENCH_FLAGS[@]}"})
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERRO: '$1' não encontrado no PATH." >&2; exit 2; }; }
 need rustc; need cargo; need timeout
+lib_init
 mkdir -p "$AB_DIR"
 rm -f "$AB_DIR"/ab-opt-plain.json "$AB_DIR"/ab-opt-pgo.json "$AB_DIR"/ab-opt-pgo+bolt.json
 rm -f "$AB_DIR"/ab-opt-pgo-gen.json "$AB_DIR"/ab-opt-bolt-probe.json "$AB_DIR"/ab-opt-ceremony-receipt.json

@@ -308,7 +308,7 @@ NAM-Audio-Pipe is packaged as an autonomous desktop Flatpak (`io.github.fabiohl.
 #### Install Local Bundle
 
 ```bash
-flatpak install --user --reinstall ~/nam-audio-pipe-v1.0.0-linux-x86_64-v3.flatpak
+flatpak install --user --reinstall target/dist/nam-audio-pipe-v1.1.0-linux-x86_64-v3.flatpak
 ```
 
 #### Run via Flatpak
@@ -473,4 +473,4 @@ The software architecture, real-time safety guarantees, DSP pipeline design, and
 
 ### License
 
-This project is licensed under the **GNU General Public License v3.0 or later** (**GPL-3.0-or-later**). See [LICENSE.txt](LICENSE.txt) for complete license terms.
+This project is licensed under the **GNU General Public License v3.0 or later** (**GPL-3.0-or-later**). See [LICENSE.txt](LICENSE.txt) for complete license terms. Third-party attribution for the Apache-2.0 `NeuralAmpModeler-rs` engine is in [NOTICE](NOTICE), which is included in the distributed tarball and Flatpak bundle.

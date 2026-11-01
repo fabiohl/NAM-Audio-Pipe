@@ -401,18 +401,18 @@ fn assert_valid_finalized_wav(path: &std::path::Path, expect_silence: bool) {
 #[test]
 #[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-long PHASE8"]
 fn sigterm_subprocess_finalizes_wav_gracefully() {
-    if !common::probe_pipewire_daemon() {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
-        return;
-    }
-    if !common::pw_play_available() {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable");
-        return;
-    }
-    if probe_io_uring() != IoUringSupport::Available {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:io_uring_unavailable");
-        return;
-    }
+    assert!(
+        common::probe_pipewire_daemon(),
+        "PipeWire daemon is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
+    assert!(
+        common::pw_play_available(),
+        "pw-play is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
+    assert!(
+        probe_io_uring() == IoUringSupport::Available,
+        "io_uring is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
 
     let _lock = common::TEST_MUTEX
         .lock()
@@ -472,18 +472,18 @@ fn sigterm_subprocess_finalizes_wav_gracefully() {
 #[test]
 #[ignore = "requires a running PipeWire daemon + pw-play + io_uring; runs in tests-long PHASE8"]
 fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
-    if !common::probe_pipewire_daemon() {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:daemon_unavailable");
-        return;
-    }
-    if !common::pw_play_available() {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:pw_play_unavailable");
-        return;
-    }
-    if probe_io_uring() != IoUringSupport::Available {
-        eprintln!("TEST_RESULT[sigterm_acceptance]=SKIP:io_uring_unavailable");
-        return;
-    }
+    assert!(
+        common::probe_pipewire_daemon(),
+        "PipeWire daemon is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
+    assert!(
+        common::pw_play_available(),
+        "pw-play is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
+    assert!(
+        probe_io_uring() == IoUringSupport::Available,
+        "io_uring is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
 
     let _lock = common::TEST_MUTEX
         .lock()
@@ -553,11 +553,10 @@ fn sigterm_subprocess_finalizes_wav_gracefully_gate_off() {
 #[test]
 #[ignore = "requires a running PipeWire daemon; runs in tests-long PHASE8"]
 fn double_signal_burst_within_grace_window_stays_graceful() {
-    if !common::probe_pipewire_daemon() {
-        eprintln!("TEST_RESULT[double_signal]=SKIP:daemon_unavailable");
-        eprintln!("SKIP: PipeWire daemon not detected (pw-cli info 0 failed).");
-        return;
-    }
+    assert!(
+        common::probe_pipewire_daemon(),
+        "PipeWire daemon is required; utils/tests-long.sh must declare this capability gap before running the test"
+    );
 
     let _lock = common::TEST_MUTEX
         .lock()

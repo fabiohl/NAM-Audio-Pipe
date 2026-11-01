@@ -25,32 +25,19 @@ DO_STRICT=0
 DO_PACKAGE=0
 DO_INSTALL=0
 DO_CERTIFY=0
-FAILS=()
-GAPS=()
-T0=$SECONDS
-mkdir -p "$LOG_DIR" "$DIST_DIR"
 
-phase() { emit "PHASE: $1"; }
+# gap deduplicado: uma lacuna repetida é um registro único no carrier.
 gap() {
     local known
     for known in ${GAPS[@]+"${GAPS[@]}"}; do
         if [ "$known" = "$1" ]; then return 0; fi
     done
     GAPS+=("$1")
-    emit "PHASE: $1 GAP"
+    emit "PHASE: ${PHASE_NAME:-$1} GAP $1"
 }
 fail_phase() {
     FAILS+=("$1")
     emit "PHASE: $1 FAIL rc=$2 log=$3"
-}
-finish() {
-    local status=PASS fails=none gaps=none
-    if [ ${#FAILS[@]} -gt 0 ]; then fails="${FAILS[*]}"; fi
-    if [ ${#GAPS[@]} -gt 0 ]; then gaps="${GAPS[*]}"; fi
-    if [ ${#GAPS[@]} -gt 0 ]; then status=PASS_WITH_GAPS; fi
-    if [ ${#FAILS[@]} -gt 0 ] || { [ "$STRICT" = 1 ] && [ ${#GAPS[@]} -gt 0 ]; }; then status=FAIL; fi
-    emit "RESULT: $status ($((SECONDS - T0))s) fails=$fails gaps=$gaps"
-    [ "$status" != FAIL ]
 }
 
 show_help() {
@@ -76,10 +63,17 @@ while [ $# -gt 0 ]; do
         --install) DO_INSTALL=1; shift ;;
         --certify) DO_CERTIFY=1; shift ;;
         -h|--help) show_help; exit 0 ;;
-        *) echo "build-release.sh: unknown flag '$1'" >&2; exit 2 ;;
+        *) usage_fail "build-release.sh: flag desconhecida '$1'" ;;
     esac
 done
 
+lib_init
+trap 'trap_fail $?' ERR
+mkdir -p "$DIST_DIR"
+if [ "$DO_CERTIFY" != 1 ]; then
+    # Never let a failed build inherit the previous build's run id.
+    rm -f "$LOG_DIR/build-run-id"
+fi
 VERSION=$(awk -F'"' '/^version = / {print $2; exit}' Cargo.toml)
 ARCHIVE_NAME="nam-audio-pipe-v${VERSION}-linux-x86_64-v3"
 TARBALL="$DIST_DIR/$ARCHIVE_NAME.tar.zst"
@@ -92,7 +86,7 @@ if [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then GIT_DIRTY=true; 
 find_receipt_bin() {
     local candidate
     for candidate in target/long/release/pipe_long_receipt target/release/pipe_long_receipt target/debug/pipe_long_receipt; do
-        if [ -x "$candidate" ] && "$candidate" --help 2>/dev/null | grep 'text-receipt' >/dev/null; then
+        if [ -x "$candidate" ]; then
             echo "$candidate"
             return 0
         fi
@@ -104,6 +98,8 @@ find_receipt_bin() {
 # --certify: validation only, never compiles or re-runs the artifact.
 # ---------------------------------------------------------------------------
 if [ "$DO_CERTIFY" = 1 ]; then
+    # A failed certification must not leave a previous CERTIFIED receipt behind.
+    rm -f "$RELEASE_RECEIPT"
     phase certify
     CERT_LOG="$LOG_DIR/build-release-certify.log"
     CERT_ARGS=(--artifact "$DIST_BIN" --build-receipt "$BUILD_RECEIPT" --long-receipt "$LONG_JSONL" --text-receipt "$LONG_TEXT" --out "$RELEASE_RECEIPT")
@@ -112,8 +108,9 @@ if [ "$DO_CERTIFY" = 1 ]; then
     if CERT_BIN=$(find_receipt_bin); then
         if ! "$CERT_BIN" certify "${CERT_ARGS[@]}" 2>&1 | tee "$CERT_LOG"; then RC=${PIPESTATUS[0]}; fi
     else
-        if ! cargo run --release --quiet --locked --features testing --bin pipe_long_receipt -- \
-            certify "${CERT_ARGS[@]}" 2>&1 | tee "$CERT_LOG"; then RC=${PIPESTATUS[0]}; fi
+        fail_phase certify 2 "$CERT_LOG (pipe_long_receipt unavailable; --certify never recompiles)"
+        finish
+        exit 1
     fi
     if [ "$RC" -eq 0 ]; then ok "release certified: $RELEASE_RECEIPT"; else fail_phase certify "$RC" "$CERT_LOG"; fi
     finish
@@ -522,7 +519,8 @@ if [ "$DO_PACKAGE" = 1 ]; then
     mkdir -p "$PKG_DIR/$ARCHIVE_NAME"
     cp "$DIST_BIN" "$PKG_DIR/$ARCHIVE_NAME/nam-audio-pipe"
     cp README.md "$PKG_DIR/$ARCHIVE_NAME/" 2>/dev/null || true
-    cp LICENSE.txt "$PKG_DIR/$ARCHIVE_NAME/" 2>/dev/null || cp LICENSE "$PKG_DIR/$ARCHIVE_NAME/" 2>/dev/null || true
+    if [ -f LICENSE.txt ]; then cp LICENSE.txt "$PKG_DIR/$ARCHIVE_NAME/"; else echo "ERROR: LICENSE.txt missing" >&2; exit 1; fi
+    if [ -f NOTICE ]; then cp NOTICE "$PKG_DIR/$ARCHIVE_NAME/"; else echo "ERROR: NOTICE missing" >&2; exit 1; fi
     cat > "$PKG_DIR/$ARCHIVE_NAME/install.sh" <<'EOF'
 #!/usr/bin/env bash
 set -e
@@ -561,7 +559,8 @@ EOF
         mkdir -p "$target_dir"
         cp "$size_dir/apps"/* "$target_dir/"
     done
-    cp LICENSE.txt "$FLATPAK_BUILD_DIR/files/share/licenses/$APP_ID/" 2>/dev/null || cp LICENSE "$FLATPAK_BUILD_DIR/files/share/licenses/$APP_ID/" 2>/dev/null || true
+    if [ -f LICENSE.txt ]; then cp LICENSE.txt "$FLATPAK_BUILD_DIR/files/share/licenses/$APP_ID/"; else echo "ERROR: LICENSE.txt missing" >&2; exit 1; fi
+    if [ -f NOTICE ]; then cp NOTICE "$FLATPAK_BUILD_DIR/files/share/licenses/$APP_ID/"; else echo "ERROR: NOTICE missing" >&2; exit 1; fi
     APP_INFO_XMLS="$FLATPAK_BUILD_DIR/files/share/app-info/xmls"
     mkdir -p "$APP_INFO_XMLS"
     {
@@ -669,5 +668,8 @@ if ! "$RECEIPT_BIN" build-receipt "${RCPT_ARGS[@]}" 2>&1 | tee "$RECEIPT_LOG"; t
     exit 1
 fi
 ok "build receipt: $BUILD_RECEIPT"
+# The long audit reuses this id so build and long receipts reconcile even when
+# the three commands run as independent processes.
+printf '%s\n' "$NAM_RUN_ID" > "$LOG_DIR/build-run-id"
 
 finish
