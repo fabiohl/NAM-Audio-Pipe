@@ -455,24 +455,23 @@ impl<const N: usize> PoolConsumer<N> {
     pub fn try_pop(&mut self) -> Option<InFlightBlock<'_, N>> {
         let desc = self.work.pop().ok()?;
         if desc.slot == CONTROL_BARRIER_SLOT {
-            // SAFETY-free path: no slot is associated with a barrier; the
-            // block pointer stays null and `InFlightBlock::block` rejects it.
+            // No slot is associated with a barrier.
             return Some(InFlightBlock {
                 consumer: self,
                 desc,
-                block: std::ptr::null(),
+                block: None,
             });
         }
         // SAFETY: `desc` was popped from the `work` ring, whose SPSC producer
-        // (RT thread) pushed it only after finishing writing the slot and
-        // before the slot can be re-acquired (the index is not in `free` until
-        // we release it). No other thread touches this slot while we own it
-        // (state I/O-owned).
-        let block = self.inner.slots[desc.slot as usize].get();
+        // (RT thread) only publishes an in-bounds slot after finishing its
+        // write. The bounds-checked array access yields the initialized slot's
+        // non-null pointer. It cannot be re-acquired until release, so no other
+        // thread touches this slot while we own it (state I/O-owned).
+        let block = unsafe { &*self.inner.slots[desc.slot as usize].get() };
         Some(InFlightBlock {
             consumer: self,
             desc,
-            block,
+            block: Some(block),
         })
     }
 
@@ -491,7 +490,7 @@ impl<const N: usize> PoolConsumer<N> {
 pub struct InFlightBlock<'a, const N: usize> {
     consumer: &'a mut PoolConsumer<N>,
     desc: Descriptor,
-    block: *const AlignedBlock<MAX_BLOCK_SIZE>,
+    block: Option<&'a AlignedBlock<MAX_BLOCK_SIZE>>,
 }
 
 impl<const N: usize> InFlightBlock<'_, N> {
@@ -527,14 +526,8 @@ impl<const N: usize> InFlightBlock<'_, N> {
     /// audio block; check [`is_barrier`](Self::is_barrier) first.
     #[inline]
     pub fn block(&self) -> &AlignedBlock<MAX_BLOCK_SIZE> {
-        assert!(
-            !self.is_barrier(),
-            "a control barrier carries no audio block"
-        );
-        // SAFETY: this slot is exclusively owned by the I/O thread (popped
-        // from `work`, not yet released), so forming `&` is sound and cannot
-        // alias the RT thread's writes.
-        unsafe { &*self.block }
+        self.block
+            .expect("a control barrier carries no audio block")
     }
 
     /// The descriptor that carried this block (slot index + valid length), or

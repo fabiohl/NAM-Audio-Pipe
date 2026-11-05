@@ -268,6 +268,13 @@ fn control_barrier_preserves_fifo_position_and_slot_ownership() {
     assert_eq!(barrier.barrier_seq(), 42);
     assert_eq!(barrier.descriptor().slot, CONTROL_BARRIER_SLOT);
     assert_eq!(barrier.descriptor().valid_len, 42);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = barrier.block();
+        }))
+        .is_err(),
+        "a control barrier has no audio block"
+    );
     assert!(barrier.release(), "barrier release is a no-op success");
 
     let b = consumer.try_pop().expect("audio B");
