@@ -831,7 +831,7 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
         .lock()
         .expect("shutdown test lock");
-    // `InFlightBlock` owns a raw pointer into the pool slot and crosses an
+    // `InFlightBlock` borrows the pool slot and crosses an
     // `.await` inside the drain loop, so the worker future is `!Send`; it must
     // run inside a `LocalSet` (the production worker runs under the
     // single-threaded `tokio_uring` runtime, which has the same shape).
