@@ -280,10 +280,14 @@ def main() -> int:
 
     gate_lines: list[str] = []
     for target in targets:
-        if target["required"] and target_symbol_count[target["id"]] == 0:
-            failures.append(f"target '{target['id']}': zero matching symbols (required, fail-closed)")
-            gate_lines.append(f"target {target['id']}: MISSING (required)")
+        if target_symbol_count[target["id"]] == 0:
+            if target["required"]:
+                failures.append(f"target '{target['id']}': zero matching symbols (required, fail-closed)")
+                gate_lines.append(f"target {target['id']}: MISSING (required)")
+            else:
+                gate_lines.append(f"target {target['id']}: ABSENT (optional/inlined)")
             continue
+        gate_lines.append(f"target {target['id']}: PRESENT ({target_symbol_count[target['id']]} symbol(s))")
         for key in GATE_KEYS:
             budget = target["gates"].get(key)
             if budget is None:

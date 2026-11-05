@@ -8,8 +8,8 @@ use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::identity;
 use crate::standalone::pw_host::latency;
 use crate::standalone::pw_host::output_pw::{
-    SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, mark_format_contract_ok,
-    playback_dsp_cycle, reject_negotiated_format_violation, validate_audio_raw_format,
+    SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, playback_dsp_cycle,
+    reject_negotiated_format_violation, validate_audio_raw_format,
 };
 use crate::standalone::pw_host::rt_callback;
 use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
@@ -86,7 +86,7 @@ pub fn playback_param_changed_handler(
                 .stream_status()
                 .playback_negotiated_rate
                 .store(rate, Ordering::Release);
-            mark_format_contract_ok(backend.stream_status(), "playback");
+            backend.mark_format_ok("playback");
             check_negotiated_rate_mismatch(backend.stream_status());
             backend.notify_wakeup();
         }
@@ -231,7 +231,8 @@ pub fn setup_playback_stream<'c>(
 
     let mut proc_storage = SpaPodStorage::new();
     let mut lat_storage = SpaPodStorage::new();
-    let (init_samples, init_ns) = latency::compute_dsp_latency(initial_latency_samples, 0, 48_000);
+    let (init_samples, init_ns) =
+        latency::compute_dsp_latency(initial_latency_samples, 0, 0, 48_000);
     // SAFETY: `proc_storage` and `lat_storage` remain valid and unmodified for the duration
     // of the synchronous `connect` call below.
     let proc_pod =

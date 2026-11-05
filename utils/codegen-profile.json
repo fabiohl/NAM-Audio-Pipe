@@ -1,4 +1,65 @@
 {
-  "symbols": "process_block_internal|tanh_and_|gated_|ResamplerCore::process|NamResampler::process|capture_dsp_pipeline_streaming|capture_dsp_pipeline$|capture_dsp_pipeline_inner|process_dsp_buffer|playback_dsp_cycle|CabSimAdapter::process_block|ConvEngine::process|LatencyHistogram::record",
-  "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+  "sections": [".text", ".text.cold"],
+  "targets": [
+    {
+      "id": "capture_dsp_pipeline",
+      "pattern": "capture_dsp_pipeline_streaming|capture_dsp_pipeline$|capture_dsp_pipeline_inner",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "playback_dsp_cycle",
+      "pattern": "playback_dsp_cycle",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "process_dsp_buffer",
+      "pattern": "process_dsp_buffer",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "process_block_internal",
+      "pattern": "process_block_internal",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "tanh_and_accumulate",
+      "pattern": "tanh_and_",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "cabsim_adapter",
+      "pattern": "CabSimAdapter.*process_block|CabSimAdapter.*process",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "conv_engine",
+      "pattern": "ConvEngine.*process",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "resampler",
+      "pattern": "ResamplerCore.*process|NamResampler.*process",
+      "required": true,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "gated",
+      "pattern": "gated_",
+      "required": false,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "latency_histogram",
+      "pattern": "LatencyHistogram.*record",
+      "required": false,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    }
+  ]
 }

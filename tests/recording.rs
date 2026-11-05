@@ -350,6 +350,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 stream_status: None,
                 recording_status: None,
                 banner: Default::default(),
+                activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
             },
             gc_cons,
             sl_cons,

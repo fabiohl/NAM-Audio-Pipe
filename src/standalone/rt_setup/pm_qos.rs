@@ -373,48 +373,39 @@ pub(crate) fn parse_sink_name_from_metadata(raw_stdout: &[u8]) -> Option<String>
 /// Prevents the processor from entering power-saving C-States,
 /// guaranteeing 0ms wake-up latency for RT audio processing.
 ///
-/// Delegates to the engine's `rt_hardening::request_cpu_dma_latency(0)`.
-/// The engine guard is released at return (fd closed); the local `File`
-/// reopen keeps the historical `Option<File>` contract for the caller.
+/// Reuses the engine's canonical RAII guard `neural_amp_modeler_rs::rt_hardening::PmQosGuard`
+/// without redundant local re-openings or duplicate system calls (D-09).
 ///
 /// **Warning:** This protection is **system-wide (global)** and affects all CPU cores,
 /// not just the thread executing this function.
 ///
 /// Uses the Linux kernel PM QoS interface to request zero latency.
 ///
-/// RETURN: The `File` handle. It MUST be kept alive in the main scope.
+/// RETURN: The `PmQosGuard` handle. It MUST be kept alive in the main scope.
 /// If the file descriptor is closed (drop), the kernel revokes the protection.
-pub fn lock_cpu_c_states() -> Option<std::fs::File> {
-    // Engine equivalent validates the path with log + graceful fallback
-    // (returns Err instead of None); keep the local handle open so the
-    // caller's RAII lifetime still owns the protection.
-    let _ = neural_amp_modeler_rs::rt_hardening::request_cpu_dma_latency(0);
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .open("/dev/cpu_dma_latency")
-    {
-        Ok(mut file) => {
-            // Value 0 indicates zero tolerance to power transition latency.
-            let zero: i32 = 0;
-            if std::io::Write::write_all(&mut file, &zero.to_ne_bytes()).is_ok() {
-                log::info!("⚡ PM QoS Lock: Deep CPU C-States disabled (Zero DMA Latency).");
-                return Some(file);
-            }
-            log::warn!(
-                "[E2111 | PM_QOS_WRITE_FAILED] PM QoS: Failed to write zero-latency request to \
-                 /dev/cpu_dma_latency — C-state deep sleep prevention is inactive. \
-                 Audio latency jitter from CPU power transitions may occur."
-            );
-            None
+pub fn lock_cpu_c_states() -> Option<neural_amp_modeler_rs::rt_hardening::PmQosGuard> {
+    match neural_amp_modeler_rs::rt_hardening::request_cpu_dma_latency(0) {
+        Ok(guard) => {
+            log::info!("⚡ PM QoS Lock: Deep CPU C-States disabled (Zero DMA Latency).");
+            Some(guard)
         }
         Err(e) => {
-            // Often fails if write permission is missing or the file does not exist.
-            log::warn!(
-                "[E2112 | PM_QOS_ACCESS_DENIED] PM QoS: Access denied to /dev/cpu_dma_latency ({e}). \
-                 Deep CPU C-State prevention is inactive — audio latency jitter from CPU power \
-                 transitions may occur. \
-                 Consider creating a udev rule for the 'audio' group."
-            );
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::NotFound
+            {
+                log::warn!(
+                    "[E2112 | PM_QOS_ACCESS_DENIED] PM QoS: Access denied to /dev/cpu_dma_latency ({e}). \
+                     Deep CPU C-State prevention is inactive — audio latency jitter from CPU power \
+                     transitions may occur. \
+                     Consider creating a udev rule for the 'audio' group."
+                );
+            } else {
+                log::warn!(
+                    "[E2111 | PM_QOS_WRITE_FAILED] PM QoS: Failed to write zero-latency request to \
+                     /dev/cpu_dma_latency ({e}) — C-state deep sleep prevention is inactive. \
+                     Audio latency jitter from CPU power transitions may occur."
+                );
+            }
             None
         }
     }

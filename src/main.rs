@@ -424,6 +424,9 @@ fn main() -> anyhow::Result<()> {
             stream_status: None,
             recording_status: recording_status.clone(),
             banner: banner_request,
+            activation: args
+                .activation
+                .unwrap_or(neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard),
         },
         gc_consumer,
         slimmable_consumer,

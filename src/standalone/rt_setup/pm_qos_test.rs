@@ -190,3 +190,13 @@ fn force_nonblocking_surfaces_invalid_fd_without_panicking() {
         );
     });
 }
+
+#[test]
+fn test_lock_cpu_c_states_executes_without_panic() {
+    // Calling `lock_cpu_c_states()` executes off-RT, delegates to engine's `request_cpu_dma_latency(0)`,
+    // and returns Some(guard) or None without panicking.
+    let guard = lock_cpu_c_states();
+    if let Some(ref g) = guard {
+        assert_eq!(g.latency_us(), 0);
+    }
+}

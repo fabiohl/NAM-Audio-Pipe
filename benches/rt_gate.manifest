@@ -2,11 +2,12 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #
 # Expected Criterion benchmark groups of benches/rt_gate.rs.
-# Consumed by `nam_perf_gate coverage|verdict --suite rt_gate --manifest`.
-# A trailing '*' matches any executed id with that prefix; a group that did not
-# run makes the coverage cross-check fail closed (partial/filtered runs cannot
-# certify). `PIPE_Host` drives the production RtSwapHarness real load (WaveNet
-# A1/A2, LSTM, CabSim); `PIPE_AbOpt` anchors the per-topology envelopes shared
-# with the ab_opt_bench ceremony.
+# Operator diagnostic manifest: documents the expected Criterion groups for
+# manual operator benchmarking (`cargo bench --bench rt_gate`). Not consumed
+# by an automated gate (rt_gate is outside quick and long disciplines; RT
+# deadline and jitter are certified via tests/rt_metrics.rs and pipe_long_receipt).
+# `PIPE_Host` drives the production RtSwapHarness real load (WaveNet A1/A2,
+# LSTM, CabSim); `PIPE_AbOpt` anchors the per-topology envelopes shared with
+# the ab_opt_bench ceremony.
 PIPE_Host/*
 PIPE_AbOpt/*

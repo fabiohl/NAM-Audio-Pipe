@@ -32,7 +32,7 @@
 # of them if a dependency's feature set changes.
 #
 # For regression checks, see the activation tests and ELF verification checklists.
-{
+NAM_LIBM_SHADOW {
   local:
     /* f64 */
     acos; acosh; asin; asinh; atan; atan2; atanh; cbrt; ceil; copysign;

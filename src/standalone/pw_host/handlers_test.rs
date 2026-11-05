@@ -626,6 +626,8 @@ fn cabsim_full_protocol_installs_latest_and_gcs_retired_pair() {
         cabsim_drain.as_mut().unwrap(),
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -763,6 +765,7 @@ fn resampler_failure_preserves_newer_generation() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -865,6 +868,7 @@ fn superseded_delivery_is_discarded_latest_is_applied() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -935,6 +939,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -955,6 +960,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_prod,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -992,7 +998,7 @@ fn full_protocol_discards_stale_and_applies_latest() {
 /// must never be installed, and a pending request must never be lost.
 #[test]
 fn lost_wakeup_stress_invariant() {
-    use crate::standalone::pw_host::rt_callback::{drain_resamplers, sync_rate};
+    use crate::standalone::pw_host::rt_callback::{RateSyncState, drain_resamplers, sync_rate};
     use neural_amp_modeler_rs::common::spsc::GcItem;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -1029,6 +1035,7 @@ fn lost_wakeup_stress_invariant() {
         let mut parking_lot: [Option<GcItem>; 16] = Default::default();
         let parking_lot_dirty = AtomicBool::new(false);
         let rate_for_process = std::sync::atomic::AtomicU32::new(0);
+        let mut sync_state = RateSyncState::new(active.host_rate());
         let host_rates = [44100u32, 48000, 96000, 44100, 96000];
         let mut i = 0usize;
 
@@ -1039,7 +1046,13 @@ fn lost_wakeup_stress_invariant() {
             if rate != active.host_rate() {
                 rate_for_process.store(rate, Ordering::Release);
             }
-            sync_rate(&rate_for_process, &active, 48000, &flags_rt);
+            sync_rate(
+                &rate_for_process,
+                &active,
+                48000,
+                &flags_rt,
+                &mut sync_state,
+            );
 
             // Each loop iteration is one audio callback: the per-quantum
             // structural budget resets to zero.
@@ -1050,6 +1063,7 @@ fn lost_wakeup_stress_invariant() {
                 &mut active,
                 &mut active_stream,
                 &flags_rt,
+                None,
                 &mut gc_prod,
                 &mut parking_lot,
                 &parking_lot_dirty,

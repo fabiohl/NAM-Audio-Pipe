@@ -15,11 +15,19 @@ This document details the automated testing architecture, verification suites, r
 
 `NAM-Audio-Pipe` testing relies on feature flags defined in [`Cargo.toml`](../Cargo.toml):
 
-| Feature Flag     | Purpose                                                                | Operational Scope                                                  |
-|:---------------- |:---------------------------------------------------------------------- |:------------------------------------------------------------------ |
-| **`default`**    | Empty feature set for standalone production binaries.                  | Production builds and baseline compilation checks.                 |
-| **`testing`**    | Propagates `NeuralAmpModeler-rs/testing`, exposing mocks and fixtures. | Mandatory for executing unit, integration, and verification tests. |
-| **`heap-audit`** | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in the long suite's `heap-audit` phase and RT callback safety tests.    |
+| Feature Flag       | Purpose                                                                | Operational Scope                                                  |
+|:------------------ |:---------------------------------------------------------------------- |:------------------------------------------------------------------ |
+| **`default`**      | Enables `dual-mono` by default (`default = ["dual-mono"]`).            | Production builds and baseline compilation checks.                 |
+| **`dual-mono`**    | Propagates `NeuralAmpModeler-rs/dual-mono` for stereo L/R processing. | Default feature enabled across standard builds and audio pipelines. |
+| **`testing`**      | Propagates `NeuralAmpModeler-rs/testing`, `dual-mono`, `serde`, `sha2`.| Mandatory for executing unit, integration, and verification tests. |
+| **`heap-audit`**   | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in the long suite's `heap-audit` phase and RT callback safety tests. |
+| **`rt-hardening`** | Mirrors `NeuralAmpModeler-rs/rt-hardening` for matrix uniformity.      | Unconditionally active in `[dependencies]`; opt-in feature mirror. |
+
+### 1.1 Dependency Graph & Feature Unification Behavior
+
+- **Engine Feature Graph**: In [`Cargo.toml`](../Cargo.toml), `NeuralAmpModeler-rs` is declared with `default-features = false, features = ["rt-hardening"]`. This ensures the engine's `dual-mono` feature is not unconditionally forced by the dependency line.
+- **`--no-default-features` Behavior**: When compiled with `--lib --no-default-features` (as tested by `utils/lints.sh`), `dual-mono` is disabled, allowing the lean single-inference mono pipeline while retaining `rt-hardening`.
+- **Target Feature Requirements**: Testing binaries (e.g. `pgo_workload`, `pipe_long_receipt`, `ab_opt_bench`) declare `required-features = ["testing"]`. When checking or compiling targets with `--no-default-features`, Cargo skips targets whose required features are not satisfied unless `--features testing` or `--all-features` is supplied.
 
 ---
 
@@ -70,9 +78,13 @@ Each unit test verifies strict architectural invariants directly within the rele
 
 #### Real-Time Thread Setup & PM QoS
 
-- **Location**: [`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs)
-- **Contract**: Configures thread scheduling, CPU affinity, and power management constraints.
-- **Key Invariants**: Interacts with `/dev/cpu_dma_latency` to prevent CPU C-state entry latency spikes during audio streaming. Detects default hardware sinks via `pw-metadata` with a 500 ms watchdog timeout and filters out self-capture loopback nodes. Re-exports core affinity heuristics from the engine's verified `rt_hardening` module.
+- **Location**: [`src/standalone/rt_setup/rt_setup_test.rs`](../src/standalone/rt_setup/rt_setup_test.rs), [`src/standalone/rt_setup/pm_qos.rs`](../src/standalone/rt_setup/pm_qos.rs), [`src/standalone/rt_setup/thread.rs`](../src/standalone/rt_setup/thread.rs)
+- **Contract**: Configures thread scheduling, CPU affinity, activation precision mode, and power management constraints.
+- **Key Invariants**:
+  - Interacts with `/dev/cpu_dma_latency` to prevent CPU C-state entry latency spikes during audio streaming.
+  - Detects default hardware sinks via `pw-metadata` with a 500 ms watchdog timeout and filters out self-capture loopback nodes.
+  - Re-exports core affinity heuristics from the engine's verified `rt_hardening` module.
+  - Real-time thread setup explicitly sets thread-local `ActivationPrecision` (`Standard` universal default or `Fast` Padé) on the actual data thread prior to the first DSP quantum, overriding any pre-existing TLS on thread pools or across reconnect cycles.
 
 #### Telemetry & Status Polling
 
@@ -96,7 +108,7 @@ Each unit test verifies strict architectural invariants directly within the rele
 
 - **Location**: [`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)
 - **Contract**: Allocates shared memory for zero-copy lock-free ping-pong transfer between PipeWire capture and playback streams.
-- **Key Invariants**: Enforces 4096-byte page alignment, applies `madvise` memory hints, and verifies atomic generation counter progression in `allocate_dsp_bridge`.
+- **Key Invariants**: Enforces runtime system page size alignment (supporting 4, 16, and 64 KiB layouts) with full page padding, applies `madvise` memory hints (`MADV_DONTFORK`, `MADV_DONTDUMP`) with explicit diagnostic verification, and verifies atomic generation counter progression in `allocate_dsp_bridge`.
 
 #### PipeWire Capture Stream Setup
 
@@ -126,9 +138,13 @@ Each unit test verifies strict architectural invariants directly within the rele
 
 #### Lock-Free SPSC Resource Swaps & Rebuild Handlers
 
-- **Location**: [`src/standalone/pw_host/rt_callback/commands.rs`](../src/standalone/pw_host/rt_callback/commands.rs), [`cabsim_swap.rs`](../src/standalone/pw_host/rt_callback/cabsim_swap.rs), [`resampler_swap.rs`](../src/standalone/pw_host/rt_callback/resampler_swap.rs), [`handlers_test.rs`](../src/standalone/pw_host/handlers_test.rs)
+- **Location**: [`src/standalone/pw_host/rt_callback/commands.rs`](../src/standalone/pw_host/rt_callback/commands.rs), [`cabsim_swap.rs`](../src/standalone/pw_host/rt_callback/cabsim_swap.rs), [`rate_sync.rs`](../src/standalone/pw_host/rt_callback/rate_sync.rs), [`resampler_swap.rs`](../src/standalone/pw_host/rt_callback/resampler_swap.rs), [`handlers_test.rs`](../src/standalone/pw_host/handlers_test.rs)
 - **Contract**: Enables non-blocking, zero-allocation runtime swaps of neural models, cabinet IRs, sample rate converters, and oversampling engines.
-- **Key Invariants**: Command rings use bounded SPSC queues. The audio thread drains pending updates without blocking, while old resources are returned to an off-RT garbage collection (GC) queue for safe deallocation.
+- **Key Invariants**:
+  - Command rings use bounded SPSC queues. The audio thread drains pending updates without blocking, while old resources are returned to an off-RT garbage collection (GC) queue for safe deallocation.
+  - Resampler rebuild generation tracking is strictly idempotent across callbacks while a rebuild is in flight, preserving the target host rate even when atomic swap returns 0.
+  - Supports legitimate supersession and immediate unmuting on return to active rate ("retorno à taxa vigente"), invalidating in-flight envelopes.
+  - Failure handling is bounded: fail-open rollback un-mutes with the fallback resampler and latches failure state locally to prevent retry/alloc/log storms on unrecoverable rate tuples.
 
 #### Backend State Machine & Fail-Fast SLA
 
@@ -244,6 +260,16 @@ tests/
 - **Objective**: Verifies that the stereo DSP pipeline processes left and right channels with complete independence and bit-exact fidelity.
 - **Verifications**: Feeds complex test signals (uncorrelated noise, quadrature chirps, Karplus-Strong string synthesis) through both stereo and isolated mono pipelines. Asserts exact bitwise identity (`MSE == 0.0`, `SNR > 120 dB`).
 
+#### Latency Accounting & Oversampling Impulse Peak Alignment
+
+- **Files**: [`tests/oversampling_latency.rs`](../tests/oversampling_latency.rs), [`tests/cabsim_partition_latency.rs`](../tests/cabsim_partition_latency.rs)
+- **Objective**: Validates end-to-end DSP latency accounting across CabSim partitions, resampler ratios, and oversampling factors (`Off`, `X2`, `X4`).
+- **Verifications**:
+  - Offline unit impulse response through `RtSwapHarness` at 48 kHz, 96 kHz, and 44.1 kHz.
+  - Published latency from `StreamStatusFlags::read_applied_latencies` matches measured impulse peak index within $\pm 1$ sample tolerance.
+  - Zero heap allocation/deallocation on the RT callback thread (`feature = "heap-audit"`).
+  - CabSim partition policy strictly shapes output underrun prefix independent of host quantum.
+
 #### Concurrency & Swap Stress Harness
 
 - **File**: [`tests/swap_stress.rs`](../tests/swap_stress.rs)
@@ -304,19 +330,19 @@ Class B, operator-only. It records every phase result instead of aborting on the
 
 `--strict` promotes any `GAP` to `FAIL` and exports `NAM_RT_STRICT=1`; `NAM_PHASE_TIMEOUT_S` overrides the timeout used by every phase command. The phases are:
 
-| Receipt `phase_id` | Canonical phase | Harness & Invariant Evaluated                                                                                              | Output Log File                       |
-|:------------------ |:--------------- |:-------------------------------------------------------------------------------------------------------------------------- |:------------------------------------- |
-| **`phase0`**  | `catch-all`    | `cargo test --locked --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `--lib`). | `target/logs/long-catch-all.log`      |
-| **`phase1`**  | `soak`         | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                  | `target/logs/long-soak.log`           |
-| **`phase2`**  | `heap-audit`   | `cargo test --locked --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths. | `target/logs/long-heap-audit.log`     |
-| **`phase3`**  | `rt-deadline`  | `tests/rt_metrics.rs` (`deadline`, 10k quantums, DSP load < 85% of the quantum budget; `SCHED_FIFO` when available).      | `target/logs/long-rt-deadline.log`    |
-| **`phase4`**  | `rt-jitter`    | `tests/rt_metrics.rs` (`jitter`, 10k callbacks under contention; bounded inter-callback dispersion).                       | `target/logs/long-rt-jitter.log`      |
-| **`phase5`**  | `concurrency`  | `tests/rt_metrics.rs` (`concurrent`; 16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks). | `target/logs/long-concurrency.log`    |
-| **`phase6`**  | `endurance`    | `tests/endurance.rs` (real timeline at 48 kHz/64 frames, `NAM_ENDURANCE_SECONDS`; fail-closed validation windows and zero leaks). | `target/logs/long-endurance.log`      |
-| **`phase7`**  | `pw-resilience` | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling.                          | `target/logs/long-pw-resilience.log`  |
-| **`phase8`**  | `pw-live`      | Live daemon + `pw-play` + `io_uring` capability probe, then `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances). An absent capability is a typed GAP; the tests fail closed if executed without it. | `target/logs/long-pw-live.log`        |
-| **`phase9`**  | `recording`    | `io_uring_probe` and live PipeWire capability gates, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`); a probe tool/build failure is a phase failure, not a GAP. | `target/logs/long-recording.log`      |
-| **`phase10`** | `offline-parity` | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used.                      | `target/logs/long-offline-parity.log` |
+| Receipt `phase_id` | Canonical phase | Harness & Invariant Evaluated | Output Log File |
+| :------------------ | :--------------- | :-------------------------------------------------------------------------------------------------------------------------- | :------------------------------------- |
+| **`phase0`** | `catch-all` | `cargo test --locked --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `--lib`). | `target/logs/long-catch-all.log` |
+| **`phase1`** | `soak` | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS. | `target/logs/long-soak.log` |
+| **`phase2`** | `heap-audit` | `cargo test --locked --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths. | `target/logs/long-heap-audit.log` |
+| **`phase3`** | `rt-deadline` | `tests/rt_metrics.rs` (`deadline`, 10k quantums, DSP load < 85% of the quantum budget; `SCHED_FIFO` when available). | `target/logs/long-rt-deadline.log` |
+| **`phase4`** | `rt-jitter` | `tests/rt_metrics.rs` (`jitter`, 10k callbacks under contention; certified absolute wakeup delay, lost cycles, and dispatch dispersion; PASS strictly on isolated CPU). | `target/logs/long-rt-jitter.log` |
+| **`phase5`** | `concurrency` | `tests/rt_metrics.rs` (`concurrent`; 16 threads racing swap requests, stream transitions, and SPSC rings without deadlocks). | `target/logs/long-concurrency.log` |
+| **`phase6`** | `endurance` | `tests/endurance.rs` (real timeline at 48 kHz/64 frames, `NAM_ENDURANCE_SECONDS`; fail-closed validation windows and zero leaks). | `target/logs/long-endurance.log` |
+| **`phase7`** | `pw-resilience` | `tests/pw_integration.rs` against a private daemon; asserts reconnection and exhaustion handling. | `target/logs/long-pw-resilience.log` |
+| **`phase8`** | `pw-live` | Live daemon + `pw-play` + `io_uring` capability probe, then `tests/pw_integration.rs` and `tests/service_resilience.rs` (`SIGTERM`/double-signal acceptances). An absent capability is a typed GAP; the tests fail closed if executed without it. | `target/logs/long-pw-live.log` |
+| **`phase9`** | `recording` | `io_uring_probe` and live PipeWire capability gates, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`); a probe tool/build failure is a phase failure, not a GAP. | `target/logs/long-recording.log` |
+| **`phase10`** | `offline-parity` | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used. | `target/logs/long-offline-parity.log` |
 
 Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
 
@@ -325,16 +351,15 @@ Every phase writes `target/logs/long-<name>.log`. The human-readable text receip
 #### 3.3.1 Hosted CI and Manual Long Workflow (GitHub Actions)
 
 - **`ci.yml`:** lints and quick run as separate jobs per platform (`x86_64-linux-lints`, `x86_64-linux-quick`, `linux-arm64-lints`, `linux-arm64-quick`), so a lint failure cannot suppress the functional evidence, plus the `msrv` check. The x86_64 jobs are blocking; the ARM64 jobs are `continue-on-error` (experimental) until a native aarch64 execution is approved. Each job, including `msrv`, writes `target/logs/ci-provenance.log` and uploads `target/logs/**` (including the `*-status.tsv` carriers) with `if: always()`.
-- **Provenance:** each job writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine=…`). When `../NeuralAmpModeler-rs` is absent, the line records `engine=GAP engine_sibling_absent`.
-- **Engine source is a GAP:** `Cargo.toml` resolves `NeuralAmpModeler-rs` through `[patch.crates-io]` path `../NeuralAmpModeler-rs`. A hosted runner that checks out only this repository cannot resolve it, so remote lints and quick are not evidence until the product owner authorizes an engine source and SHA. The patch is intentional and is preserved.
+- **Provenance & Auxiliary Checkout:** each job writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine_type=… engine_version=… engine_checksum=… auxiliary_engine=…`). The compiled engine provenance is extracted deterministically from `Cargo.lock` (`NeuralAmpModeler-rs` version `2.0.0` from crates.io with its locked SHA-256 checksum), distinguishing it from the auxiliary sibling checkout (`../NeuralAmpModeler-rs`), which is maintained for parity oracles, reference fixtures, and fallback models. When `../NeuralAmpModeler-rs` is absent, the line records `auxiliary_engine=GAP:sibling_absent` while the compiled engine provenance remains valid and traceable.
 - **`long.yml`:** `workflow_dispatch` only, operator-triggered; `timeout-minutes: 300`. Hosted runs explicitly select all phases except `rt-deadline` and `rt-jitter`, because a hosted runner is not a comparable speed/RT gate. The workflow never certifies; the operator runs `build-release.sh --certify` on the isolated host.
 
 ### 3.4 Real-Time Criterion Bench
 
 The orphan `utils/tests-performance-regression.sh` wrapper was removed (D-03). [`benches/rt_gate.rs`](../benches/rt_gate.rs) remains available for operator-run Criterion measurements of the RT harness; it is not part of the quick or long disciplines.
 
-- **Coverage Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares the scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`).
-- **Baseline Storage**: Baselines, when an operator keeps them, live in `.performance-baselines/` (gitignored) and are never updated automatically.
+- **Diagnostic Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares the operator scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`); it is not consumed by an automated gate.
+- **Baseline Storage**: Baselines, when an operator keeps them, live in `.performance-baselines/` (gitignored) and are never updated automatically. Historical baselines prior to un-feedback `iter_batched_ref` input re-presentation are strictly incomparable.
 
 ---
 
@@ -398,7 +423,7 @@ The operator (or the external release ceremony) runs exactly three steps:
 2. `./utils/tests-long.sh --strict --artifact` — audits the canonical artifact and binds every receipt line to its SHA-256.
 3. `./utils/build-release.sh --certify` — hashes the artifact again, reconciles the build and long receipts, and writes `target/dist/release-receipt.json` with `CERTIFIED` or `REJECTED`. It never recompiles.
 
-> **Prerequisite for BOLT-capable hosts:** run `./utils/ab-opt-ceremony.sh` before the strict build. `build-release.sh --strict` refuses BOLT certification without `target/logs/ab-opt-ceremony-receipt.json` carrying a valid `PGO+BOLT` proof.
+> **Optimization pipeline:** Under `--strict` mode, `build-release.sh` enforces Profile-Guided Optimization (PGO) and, on BOLT-capable hosts (`llvm-bolt`, `perf2bolt`, and `kernel.perf_event_paranoid <= 1`), post-link machine code reordering to maximize real-time performance.
 
 ### 4.1 PGO Workload Coverage Matrix
 
@@ -418,15 +443,18 @@ The workload generates `target/logs/pgo-workload-receipt.json`, verifying that e
 
 ### 4.2 Static Assembly & Microarchitectural Gates (Phase 4.5)
 
-After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disassembled hot-path (`target/dsp_hotpath.asm`), enforcing strict static architectural rules:
+After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disassembled hot-path (`target/dsp_hotpath.asm`), enforcing strict static architectural rules with explicit status verification and target-by-target coverage ([`utils/codegen-profile.json`](../utils/codegen-profile.json)):
 
+- **Target-by-target coverage**: Tracks mandatory presence for `capture_dsp_pipeline`, `playback_dsp_cycle`, `process_dsp_buffer`, `process_block_internal`, `tanh_and_accumulate`, `cabsim_adapter`, `conv_engine`, and `resampler`, alongside explicitly documented optional/inlined routines (`gated`, `latency_histogram`).
+- **Fail-closed disassembly & status verification**: Captures `objdump` exit status explicitly, rejecting empty or partial disassembly before running filter gates.
 - **Zero AVX-512 `zmm` registers**: Enforces baseline `x86-64-v3` compatibility.
 - **Zero `libm` calls in RT paths**: Prohibits scalar standard library math calls in audio loops.
 - **Zero `alloc` / `__rust_alloc` symbols**: Prohibits heap allocation in DSP kernels.
+- **Atomic artifact delivery & fail-closed certification**: `deliver_artifact` validates each step (`cp`, `strip`, `chmod`, `--diagnose`) before publishing to `target/dist/`; `certify` evaluates both the verifier exit status (`PIPESTATUS[0]`) and log capture (`PIPESTATUS[1]`).
 
-### 4.3 A/B Optimization Ceremony ([`utils/ab-opt-ceremony.sh`](../utils/ab-opt-ceremony.sh))
+### 4.3 Automated Optimization Pipeline (PGO & Post-Link BOLT)
 
-Operator-only class D tool. It builds and measures three variants: `plain` → `PGO` → `PGO+BOLT`. Each measured run is pinned through the typed `pipe_perf_gate` (explicit `NAM_BENCH_CORE` → first online isolated CPU → first permitted CPU → unpinned `GAP`) and bounded by a per-variant timeout. `NAM_THERMAL_COOLDOWN_S` (default `0`, integer) inserts the optional settling time between variants. The comparison stage is the typed `pipe_ab_opt` binary, which writes `target/logs/ab-opt-ceremony-receipt.json`. If BOLT degrades the p99 tail latency against PGO, the verdict is the explicit **PGO-ONLY** fallback; a BOLT gain is never announced without measured proof.
+Production builds execute a multi-stage optimization pipeline combining Profile-Guided Optimization (PGO) and LLVM BOLT. Compilation begins by instrumenting DSP kernels with profiling counters; the synthetic workload exercises all canonical channel counts, sample rates, and quantum matrices. The resulting profile guides branch layout, function inlining, and loop vectorization in the second pass. On BOLT-capable hosts, post-link basic block reordering (`--reorder-blocks=ext-tsp`) and function placement (`--reorder-functions=hfsort`) are applied with `-hugify` and function splitting to minimize I-Cache and I-TLB miss penalties on critical DSP cycles.
 
 ---
 
@@ -442,7 +470,6 @@ All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repo
 | **`utils/tests-quick.sh`**     | Class A: `cargo test --features testing` in dev, skipping `#[ignore]`.                 | End of sprint                  |
 | **`utils/tests-long.sh`**      | Class B: 10-phase audit (soak, zero-alloc, RT, endurance, live PipeWire, io_uring, f64 parity). | Operator / Nightly / Release |
 | **`utils/build-release.sh`**   | Class C: builds the PGO/BOLT artifact and receipt; `--certify` reconciles without recompiling. | Production releases |
-| **`utils/ab-opt-ceremony.sh`** | Class D: operator A/B ceremony (`plain → PGO → PGO+BOLT`) with typed comparison.      | Release optimization validation |
 | **`utils/miri-audit.sh`**      | Class D: out-of-band formal aliasing and data-race audit for lock-free rings.          | Maintenance / Unsafe code audit |
 
 ### 5.2 Direct Command Cheat Sheet
@@ -490,6 +517,7 @@ cargo test --features testing --test distribution_qa
 ./utils/tests-long.sh --strict --artifact
 ./utils/build-release.sh --certify
 ```
+
 ```
 
 ---
@@ -537,11 +565,11 @@ All automation scripts in `utils/` follow a lean, predictable contract designed 
 ### 7.1 Script Classes & Error Handling
 
 | Class | Scripts | Error Handling | Rationale |
-|:----- |:------- |:-------------- |:--------- |
+| :----- | :------- | :-------------- | :--------- |
 | **Class A — Interactive** | `lints.sh`, `tests-quick.sh` | `set -euo pipefail`; aborts on the first failure; `ERR` trap emits `RESULT: FAIL` | Real-time developer loops; immediate failure conserves cycles. |
 | **Class B — Decoupled Audit** | `tests-long.sh` | `set -o pipefail` (no `-e`, no `-u`); every phase records its status; exit `1` at the end if any phase failed | Nightly/pre-release audits must collect all phase evidence without aborting. |
 | **Class C — Build** | `build-release.sh` | `set -euo pipefail`; aborts on the first failure | An intermediate build failure invalidates all downstream artifacts. |
-| **Class D — Manual Tool** | `ab-opt-ceremony.sh`, `miri-audit.sh`, `mod-update.sh` | `set -euo pipefail` | Operator-supervised, opt-in tools. |
+| **Class D — Manual Tool** | `miri-audit.sh`, `mod-update.sh` | `set -euo pipefail` | Operator-supervised, opt-in tools. |
 
 ### 7.2 Output Protocol & Exit Codes
 
@@ -572,13 +600,12 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long s
 ### 7.4 Canonical Command-Line Flags
 
 | Script | Supported Flags | Notes |
-|:------ |:--------------- |:----- |
+| :------ | :--------------- | :----- |
 | **All scripts** | `-h`, `--help` | Concise usage; exit 0. |
 | `lints.sh` | None | Zero-flag policy; formatting is applied locally and verified with `CI=true`. |
 | `tests-quick.sh` | None | No gap-allowance or simulation flags. |
 | `tests-long.sh` | `--strict`, `--artifact`, `--only <name>[,<name>]` | `--strict` turns any `GAP` into `FAIL`; `--artifact` binds the receipt to `target/dist/nam-audio-pipe`; `--only` selects canonical phases and yields a partial, non-certifiable receipt. |
 | `build-release.sh` | `--strict`, `--package`, `--install`, `--certify` | `--package` adds tarball/Flatpak; `--install` installs locally; `--certify` validates receipts without recompiling. |
-| `ab-opt-ceremony.sh` | `--runs`, `--blocks`, `--no-pgo`, `--no-bolt`, `--bench-extra` | Operator-only ceremony controls. |
 | `miri-audit.sh`, `mod-update.sh` | None | Manual tools. |
 
 ### 7.5 Canonical Environment Variables
@@ -586,9 +613,9 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long s
 #### Interface Variables (User & CI Control)
 
 | Variable | Default | Scope | Purpose & Semantics |
-|:-------- |:------- |:----- |:------------------- |
+| :-------- | :------- | :----- | :------------------- |
 | `CI` | Unset | CI runner | When `true`, `lints.sh` verifies formatting with `--check` instead of applying it. |
-| `NAM_THERMAL_COOLDOWN_S` | `0` | A/B ceremony | Non-negative integer seconds between measured variants. An invalid value exits `2`. |
+| `NAM_THERMAL_COOLDOWN_S` | `0` | Performance test | Non-negative integer seconds between benchmark runs. An invalid value exits `2`. |
 | `NAM_BENCH_CORE` | `auto` | A/B / RT | Bench-core precedence: explicit CPU → first online isolated CPU → first permitted CPU → unpinned `GAP`. |
 | `NAM_PHASE_TIMEOUT_S` | Per-command default | `tests-long.sh` | Overrides the timeout applied to each long-audit phase command. |
 | `NAM_ENDURANCE_SECONDS` | Harness default | `tests/endurance.rs` | Wall-clock endurance window. |
@@ -596,14 +623,14 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long s
 #### Harness Variables (Internal Script → Rust Communication)
 
 | Variable | Configured By | Read By | Purpose |
-|:-------- |:------------- |:------- |:------- |
+| :-------- | :------------- | :------- | :------- |
 | `NAM_RUN_ID` | `utils/_lib.sh` | Test harnesses | Unique run identifier for logs and receipt isolation. |
 | `NAM_RT_STRICT` | `tests-long.sh --strict` | `tests/rt_metrics.rs` | Promotes RT GAP conditions to hard failures. |
 
 ### 7.6 Measured Durations
 
 | Discipline / Script | Measured Duration | Budget Ceiling | Notes |
-|:------------------- |:----------------- |:-------------- |:----- |
+| :------------------- | :----------------- | :-------------- | :----- |
 | `utils/lints.sh` | ≈13 s (warm cache, 2026-10-27) a ≈20 s | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging. |
 | `utils/tests-quick.sh` | ≈41 s (warm cache, 2026-10-27) | ≤ 5 min | All non-ignored targets in the development profile. |
 | `utils/tests-long.sh` | Not measured (per-phase timeouts) | — | Operator-run; collects all failures. |

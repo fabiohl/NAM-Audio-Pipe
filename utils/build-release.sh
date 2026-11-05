@@ -39,6 +39,12 @@ fail_phase() {
     FAILS+=("$1")
     emit "PHASE: $1 FAIL rc=$2 log=$3"
 }
+# Every fatal path publishes exactly one RESULT: finish runs before exit, unless already done.
+die() {
+    echo "ERROR: $*" >&2
+    if [ "${FINISHED:-0}" != 1 ]; then finish || true; fi
+    exit 1
+}
 
 show_help() {
     cat <<'EOF'
@@ -104,15 +110,28 @@ if [ "$DO_CERTIFY" = 1 ]; then
     CERT_LOG="$LOG_DIR/build-release-certify.log"
     CERT_ARGS=(--artifact "$DIST_BIN" --build-receipt "$BUILD_RECEIPT" --long-receipt "$LONG_JSONL" --text-receipt "$LONG_TEXT" --out "$RELEASE_RECEIPT")
     if [ "$DO_STRICT" = 1 ]; then CERT_ARGS+=(--strict); fi
-    RC=0
     if CERT_BIN=$(find_receipt_bin); then
-        if ! "$CERT_BIN" certify "${CERT_ARGS[@]}" 2>&1 | tee "$CERT_LOG"; then RC=${PIPESTATUS[0]}; fi
+        set +e
+        "$CERT_BIN" certify "${CERT_ARGS[@]}" 2>&1 | tee "$CERT_LOG"
+        pipestatus=("${PIPESTATUS[@]}")
+        set -e
+        rc=${pipestatus[0]}
+        trc=${pipestatus[1]}
+        if [ "$rc" -ne 0 ]; then
+            fail_phase certify "$rc" "$CERT_LOG"
+            rm -f "$RELEASE_RECEIPT"
+        elif [ "$trc" -ne 0 ]; then
+            fail_phase certify "$trc" "$CERT_LOG (tee write failed)"
+            rm -f "$RELEASE_RECEIPT"
+        else
+            emit "PHASE: certify PASS log=$CERT_LOG"
+            ok "release certified: $RELEASE_RECEIPT"
+        fi
     else
         fail_phase certify 2 "$CERT_LOG (pipe_long_receipt unavailable; --certify never recompiles)"
         finish
         exit 1
     fi
-    if [ "$RC" -eq 0 ]; then ok "release certified: $RELEASE_RECEIPT"; else fail_phase certify "$RC" "$CERT_LOG"; fi
     finish
     exit $?
 fi
@@ -180,6 +199,9 @@ if [ -n "$LLVM_BOLT" ]; then
 fi
 if command -v perf >/dev/null 2>&1; then
     PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+    if [ "$PARANOID" -gt 1 ] && sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
+        PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+    fi
     if [ "$PARANOID" -le 1 ]; then HAS_PERF=true; fi
 fi
 if [ -z "$LLVM_BOLT" ] || [ -z "$PERF2BOLT" ] || [ "$HAS_PERF" != true ]; then
@@ -303,7 +325,15 @@ if [ -z "$BOLT_CAUSE" ]; then
 set -u
 bin="$1"; wav="$2"; shift 2
 node_ready() { pw-cli ls Node 2>/dev/null | grep -q 'node.name = "NAM-Audio-Pipe-input"'; }
-ticks() { awk '{print $14 + $15}' "/proc/$1/stat" 2>/dev/null || echo 0; }
+ticks() {
+    local p="$1" s
+    s=$(awk '{s+=$1} END {print (s+0)}' /proc/"$p"/task/*/schedstat 2>/dev/null)
+    if [ -n "$s" ] && [ "$s" -gt 0 ] 2>/dev/null; then
+        echo "$s"
+    else
+        awk '{print $14 + $15}' "/proc/$p/stat" 2>/dev/null || echo 0
+    fi
+}
 for model in "$@"; do
     "$bin" -m "$model" -b 64 --gate off & pid=$!
     ready=0
@@ -317,12 +347,15 @@ for model in "$@"; do
         kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1
     fi
     pw-play --target="NAM-Audio-Pipe-input" "$wav" >/dev/null 2>&1 & play=$!
-    sleep .5
-    t1=$(ticks "$pid"); sleep .5; t2=$(ticks "$pid")
+    sleep .3
+    t1=$(ticks "$pid"); sleep .8; t2=$(ticks "$pid")
+    if [ "$t2" -le "$t1" ]; then
+        sleep .5; t2=$(ticks "$pid")
+    fi
     kill "$play" "$pid" 2>/dev/null || true
     wait "$play" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
     if [ "$t2" -le "$t1" ]; then
-        echo "no sample consumption for $model" >&2
+        echo "no sample consumption for $model (t1=$t1, t2=$t2)" >&2
         exit 1
     fi
 done
@@ -436,22 +469,33 @@ if command -v llvm-objdump >/dev/null 2>&1; then OBJDUMP_TOOL=llvm-objdump; elif
 if [ -z "$OBJDUMP_TOOL" ] || [ ! -f "$ASM_BIN" ]; then
     gap codegen_objdump_unavailable
     CODEGEN_STATUS=unavailable
-elif {
-    LC_ALL=C "$OBJDUMP_TOOL" -d --demangle --no-show-raw-insn "$ASM_BIN" > "$ASM_FULL"
-    [ -s "$ASM_FULL" ] || exit 1
-    "$SCRIPT_DIR/dsp-hotpath-filter.py" --full "$ASM_FULL" --filtered "$ASM_TARGET" \
-        --summary "$ASM_SUMMARY" --profile "$SCRIPT_DIR/codegen-profile.json"
-} > "$CODEGEN_LOG" 2>&1; then
-    CODEGEN_STATUS=pass
-    ok "codegen static gates passed"
+    emit "PHASE: codegen_report GAP codegen_objdump_unavailable"
 else
     CODEGEN_STATUS=fail
-    if [ "$DO_STRICT" = 1 ]; then
-        fail_phase codegen_report 1 "$CODEGEN_LOG"
-        finish
-        exit 1
+    CODEGEN_ERR=0
+    if ! LC_ALL=C "$OBJDUMP_TOOL" -d --demangle --no-show-raw-insn "$ASM_BIN" > "$ASM_FULL" 2> "$CODEGEN_LOG"; then
+        CODEGEN_ERR=1
+    elif [ ! -s "$ASM_FULL" ]; then
+        echo "Disassembly output is empty" >> "$CODEGEN_LOG"
+        CODEGEN_ERR=1
+    elif ! "$SCRIPT_DIR/dsp-hotpath-filter.py" --full "$ASM_FULL" --filtered "$ASM_TARGET" \
+        --summary "$ASM_SUMMARY" --profile "$SCRIPT_DIR/codegen-profile.json" >> "$CODEGEN_LOG" 2>&1; then
+        CODEGEN_ERR=1
     fi
-    gap codegen_gate_fail
+
+    if [ "$CODEGEN_ERR" -eq 0 ]; then
+        CODEGEN_STATUS=pass
+        ok "codegen static gates passed"
+        emit "PHASE: codegen_report PASS log=$CODEGEN_LOG"
+    else
+        CODEGEN_STATUS=fail
+        if [ "$DO_STRICT" = 1 ]; then
+            fail_phase codegen_report 1 "$CODEGEN_LOG"
+            finish
+            exit 1
+        fi
+        gap codegen_gate_fail
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -465,21 +509,30 @@ if [ "$BOLT_APPLIED" = true ] && [ -f target/pgo-build/dist/nam-audio-pipe.bolt 
 fi
 STAGE_DIR=$(mktemp -d "$DIST_DIR/.nam-pipe-stage.XXXXXX")
 STAGE_BIN="$STAGE_DIR/nam-audio-pipe"
-if ! {
-    cp "$BUILD_BIN" "$STAGE_BIN"
-    strip --strip-all "$STAGE_BIN"
-    chmod +x "$STAGE_BIN"
-    "$STAGE_BIN" --diagnose > "$LOG_DIR/build-release-diagnose.out"
-} > "$DELIVER_LOG" 2>&1; then
+
+deliver_step_fail() {
+    local step_msg="$1" rc="${2:-1}"
+    echo "ERROR in deliver_artifact: $step_msg" >> "$DELIVER_LOG"
     rm -rf "$STAGE_DIR"
-    fail_phase deliver_artifact 1 "$DELIVER_LOG"
+    fail_phase deliver_artifact "$rc" "$DELIVER_LOG"
     finish
     exit 1
-fi
-mv -T "$STAGE_BIN" "$DIST_BIN"
-rmdir "$STAGE_DIR"
-DIST_SHA=$(sha256sum "$DIST_BIN" | awk '{print $1}')
+}
+
+# Explicit verified delivery pipeline (fail-closed atomic delivery)
+cp "$BUILD_BIN" "$STAGE_BIN" >> "$DELIVER_LOG" 2>&1 || deliver_step_fail "cp failed" $?
+strip --strip-all "$STAGE_BIN" >> "$DELIVER_LOG" 2>&1 || deliver_step_fail "strip failed" $?
+chmod 0755 "$STAGE_BIN" >> "$DELIVER_LOG" 2>&1 || deliver_step_fail "chmod failed" $?
+"$STAGE_BIN" --diagnose > "$LOG_DIR/build-release-diagnose.out" 2>> "$DELIVER_LOG" || deliver_step_fail "diagnose failed" $?
+[ -s "$STAGE_BIN" ] || deliver_step_fail "stage binary empty or missing" 1
+
+DIST_SHA=$(sha256sum "$STAGE_BIN" | awk '{print $1}')
+mv -T "$STAGE_BIN" "$DIST_BIN" || deliver_step_fail "mv to dist failed" $?
+rmdir "$STAGE_DIR" || true
+[ "$(sha256sum "$DIST_BIN" | awk '{print $1}')" = "$DIST_SHA" ] || deliver_step_fail "published SHA-256 differs from staged binary" 1
+echo "Delivered canonical binary: $DIST_BIN (sha256=$DIST_SHA)" >> "$DELIVER_LOG"
 ok "canonical artifact: $DIST_BIN (sha256=$DIST_SHA)"
+emit "PHASE: deliver_artifact PASS log=$DELIVER_LOG"
 
 INSTALLED_PATH=""
 if [ "$DO_INSTALL" = 1 ]; then
@@ -663,6 +716,7 @@ if [ -n "$INSTALLED_PATH" ]; then RCPT_ARGS+=(--installed-path "$INSTALLED_PATH"
 if [ ${#GAPS[@]} -gt 0 ]; then RCPT_ARGS+=(--gaps "$(IFS=,; echo "${GAPS[*]}")"); fi
 if [ "$DO_STRICT" = 1 ]; then RCPT_ARGS+=(--strict); fi
 if ! "$RECEIPT_BIN" build-receipt "${RCPT_ARGS[@]}" 2>&1 | tee "$RECEIPT_LOG"; then
+    rm -f "$BUILD_RECEIPT"
     fail_phase build_receipt "${PIPESTATUS[0]}" "$RECEIPT_LOG"
     finish
     exit 1

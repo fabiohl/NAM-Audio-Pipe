@@ -190,6 +190,3 @@ split-debuginfo = "unpacked"
 
 [lints.rust]
 raw_borrows_via_references = "warn"
-
-[patch.crates-io]
-NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }

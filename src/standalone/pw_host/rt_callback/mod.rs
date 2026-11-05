@@ -23,32 +23,35 @@ mod resampler_swap;
 #[cfg(feature = "testing")]
 pub mod harness;
 
-pub use cabsim_swap::{CabSimSwapDrain, cabsim_swap_drain, drain_cabsims};
+#[cfg(test)]
+pub use cabsim_swap::drain_cabsims;
+pub use cabsim_swap::{CabSimSwapDrain, cabsim_swap_drain, drain_cabsims_with_status};
 pub use commands::{
-    OsSwapDrain, STRUCTURAL_SWAPS_PER_CALLBACK, SlimmableSwapDrain, drain_os_engines,
+    OsSwapDrain, STRUCTURAL_SWAPS_PER_CALLBACK, SlimmableSwapDrain, drain_os_engines_with_status,
     drain_slimmable_models, os_swap_drain, receive_commands, slimmable_swap_drain,
     try_slimmable_rebuild,
 };
 #[cfg(not(feature = "testing"))]
 pub(crate) use process::handle_spa_pair_fail_closed;
-pub(crate) use process::silence_available_datas;
 pub use process::{PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
 #[cfg(feature = "testing")]
 pub use process::{
     handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,
 };
-pub use rate_sync::sync_rate;
-pub use resampler_swap::{ResamplerSwapDrain, drain_resamplers, resampler_swap_drain};
+pub(crate) use process::{silence_available_datas, stamp_chunk};
+pub use rate_sync::{RateSyncState, sync_rate};
+#[cfg(test)]
+pub use resampler_swap::drain_resamplers;
+pub use resampler_swap::{ResamplerSwapDrain, drain_resamplers_with_status, resampler_swap_drain};
 
 /// RT fatal flag raised when a panic is captured inside an RT callback closure.
 ///
-/// Bit 31 is **not** defined by `NeuralAmpModeler-rs`'s `RtStatusFlags` (bits
-/// `0..=30` are in use); this local constant aliases the free bit in the shared
-/// `status_bits` `AtomicU64`, keeping the RT→Main silent signaling on the same
-/// latch as every other RT status flag. The main control loop observes it
-/// (`status::observe_rt_panic`) and drives the ordered teardown — never an
-/// `abort` with a corrupted capture.
-pub(crate) const RT_STATUS_PANIC_CAPTURED: u64 = 1 << 31;
+/// Defined by `NeuralAmpModeler-rs`'s `common::spsc` as a public alias for
+/// `RT_STATUS_PROCESSOR_POISONED` (bit 31) in the shared `status_bits` `AtomicU64`,
+/// keeping the RT→Main silent signaling on the same latch as every other RT status flag.
+/// The main control loop observes it (`status::observe_rt_panic`) and drives the
+/// ordered teardown — never an `abort` with a corrupted capture.
+pub use neural_amp_modeler_rs::common::spsc::RT_STATUS_PANIC_CAPTURED;
 
 /// Executes the body of an RT callback closure under `catch_unwind`, containing
 /// any panic before it reaches the `pipewire` crate's `extern "C"` trampoline.

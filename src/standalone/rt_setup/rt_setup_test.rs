@@ -72,7 +72,11 @@ fn test_configure_realtime_thread_invalid_cpu() {
     // CPU_SETSIZE is typically 1024; 2048 is well out of bounds.
     // The function must not panic and must record the rejection atomically
     // (rt_affinity_err = -1 sentinel, rt_target_cpu preserved).
-    configure_realtime_thread(2048, rt_status.clone());
+    configure_realtime_thread(
+        2048,
+        rt_status.clone(),
+        neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+    );
     assert_eq!(
         rt_status
             .rt_affinity_err
@@ -112,7 +116,11 @@ fn test_configure_realtime_thread_cpu_zero_pins() {
     }
 
     let rt_status = std::sync::Arc::new(neural_amp_modeler_rs::common::spsc::RtStatusFlags::new());
-    configure_realtime_thread(0, rt_status.clone());
+    configure_realtime_thread(
+        0,
+        rt_status.clone(),
+        neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+    );
     assert_eq!(
         rt_status
             .rt_affinity_err
@@ -147,7 +155,11 @@ fn test_configure_realtime_thread_max_cpu_boundary() {
     // fewer than CPU_SETSIZE online CPUs the kernel rejects the mask with
     // EINVAL (or EPERM when the cpuset forbids it) — the function must record
     // the outcome without panicking or corrupting the mask.
-    configure_realtime_thread(max_cpu, rt_status.clone());
+    configure_realtime_thread(
+        max_cpu,
+        rt_status.clone(),
+        neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+    );
     let err = rt_status
         .rt_affinity_err
         .load(std::sync::atomic::Ordering::Relaxed);
@@ -166,10 +178,75 @@ fn test_configure_realtime_thread_arms_rt_callback_mark() {
     // off its context. Arming follows the scheduler step and is independent of
     // the policy outcome.
     rt_log_mark::rt_unmark_current_thread();
-    configure_realtime_thread(2, rt_status);
+    configure_realtime_thread(
+        2,
+        rt_status,
+        neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+    );
     assert!(rt_log_mark::rt_is_current_thread_marked());
 
     // Cleanup: leave no mark residue on the shared runner thread.
     rt_log_mark::rt_unmark_current_thread();
     assert!(!rt_log_mark::rt_is_current_thread_marked());
+}
+
+#[test]
+fn test_configure_realtime_thread_sets_activation_precision() {
+    use neural_amp_modeler_rs::math::activations::{
+        ActivationPrecision, activation_precision, clear_activation_tls,
+    };
+
+    let rt_status = std::sync::Arc::new(neural_amp_modeler_rs::common::spsc::RtStatusFlags::new());
+    clear_activation_tls();
+
+    // Verify Fast activation propagation
+    configure_realtime_thread(0, rt_status.clone(), ActivationPrecision::Fast);
+    assert_eq!(
+        activation_precision(),
+        ActivationPrecision::Fast,
+        "configure_realtime_thread must set Fast activation in thread-local storage"
+    );
+
+    // Verify Standard activation propagation and override of prior Fast TLS
+    configure_realtime_thread(0, rt_status, ActivationPrecision::Standard);
+    assert_eq!(
+        activation_precision(),
+        ActivationPrecision::Standard,
+        "configure_realtime_thread must explicitly override prior TLS with Standard"
+    );
+
+    clear_activation_tls();
+}
+
+#[test]
+fn test_configure_realtime_thread_in_spawned_thread_and_reconnect() {
+    use neural_amp_modeler_rs::math::activations::{ActivationPrecision, activation_precision};
+
+    // Simulate audio data thread lifecycle across reconnect:
+    // 1. Initial stream instance data thread configured with Fast.
+    let handle1 = std::thread::spawn(|| {
+        let rt_status =
+            std::sync::Arc::new(neural_amp_modeler_rs::common::spsc::RtStatusFlags::new());
+        configure_realtime_thread(0, rt_status, ActivationPrecision::Fast);
+        activation_precision()
+    });
+    assert_eq!(
+        handle1.join().expect("thread join"),
+        ActivationPrecision::Fast,
+        "initial data thread must have Fast activation"
+    );
+
+    // 2. Fresh data thread spawned after reconnect configured with Standard:
+    // must not inherit any prior TLS state.
+    let handle2 = std::thread::spawn(|| {
+        let rt_status =
+            std::sync::Arc::new(neural_amp_modeler_rs::common::spsc::RtStatusFlags::new());
+        configure_realtime_thread(0, rt_status, ActivationPrecision::Standard);
+        activation_precision()
+    });
+    assert_eq!(
+        handle2.join().expect("thread join"),
+        ActivationPrecision::Standard,
+        "reconnected data thread must have Standard activation"
+    );
 }

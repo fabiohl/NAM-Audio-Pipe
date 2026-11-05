@@ -7,6 +7,7 @@
 use super::super::rt_callback;
 use super::state::{CaptureState, RtHostChannels};
 use crate::recording::transport::RecordingSender;
+use crate::standalone::cli::BUFFER_SIZE_MIN;
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::SharedBackendStatus;
 use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
@@ -187,6 +188,7 @@ pub fn setup_capture_stream<'c>(
                         rt_setup::configure_realtime_thread(
                             target_cpu,
                             rt_status_for_process.clone(),
+                            state.activation,
                         );
                         state.thread_configured = true;
                     }
@@ -304,11 +306,17 @@ pub fn setup_capture_stream<'c>(
                     // renegotiation alone never forces a heavy FFT rebuild.
                     let last_n_samples =
                         rt_status_for_process.last_n_samples.load(Ordering::Relaxed) as usize;
+                    let partition_to_request = cabsim_partition_to_request(
+                        state.active_cabsim.as_deref(),
+                        state.cabsim_partition_policy,
+                    );
                     if cabsim_rebuild_needed(
                         state.active_cabsim.as_deref(),
                         state.ir_raw_samples.is_some(),
                         last_n_samples,
                         current_host_rate,
+                        partition_to_request,
+                        state.cabsim_failed_key,
                         rt_status_for_process.check_flag(
                             neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
                         ),
@@ -321,10 +329,6 @@ pub fn setup_capture_stream<'c>(
                         // (a real quantum proves the host rate was negotiated, which
                         // the rebuild needs). Rate-only rebuilds preserve the active
                         // partition.
-                        let partition_to_request = cabsim_partition_to_request(
-                            state.active_cabsim.as_deref(),
-                            state.cabsim_partition_policy,
-                        );
                         rt_status_for_process
                             .requested_cabsim_partition_size
                             .store(partition_to_request as u32, Ordering::Relaxed);
@@ -350,6 +354,7 @@ pub fn setup_capture_stream<'c>(
     let mut lat_storage = SpaPodStorage::new();
     let (init_samples, init_ns) = crate::standalone::pw_host::latency::compute_dsp_latency(
         initial_latency_samples,
+        0,
         0,
         48_000,
     );
@@ -422,6 +427,13 @@ fn cabsim_partition_to_request(
 /// to 256 samples at constant rate) keeps the existing pair active with zero
 /// audio interruption and zero FFT rebuild.
 ///
+/// `failed_key` suppresses endless retries of deterministically failing IR builds
+/// (D-06): when a build fails and delivers safe-bypass `None`, the requested
+/// `(host_rate, partition)` is latched in `CaptureState::cabsim_failed_key` and
+/// suppressed on subsequent callbacks. Since IR raw samples are immutable per process in
+/// NAM-Audio-Pipe, a renegotiated host rate or partition policy resets the latch,
+/// resuming rebuild requests for the fresh parameters (S08.4).
+///
 /// `already_pending` suppresses duplicate requests while a previous rebuild is
 /// in flight, for both the initial-install and the active-pair branches. Without
 /// it the active-pair branch would re-arm the request on every audio callback
@@ -434,21 +446,29 @@ fn cabsim_rebuild_needed(
     has_ir: bool,
     n_samples: usize,
     host_rate: u32,
+    partition: usize,
+    failed_key: Option<(u32, usize)>,
     already_pending: bool,
 ) -> bool {
     // The quantum only gates the first install (a real quantum proves the
-    // host rate was negotiated and lies inside the convolution partition
-    // domain [16, MAX_RESAMP_BUF]). An active pair never rebuilds on quantum
-    // drift — the block-size-agnostic driver chunks any host block
+    // host rate was negotiated and lies inside the valid buffer domain
+    // [BUFFER_SIZE_MIN, MAX_RESAMP_BUF]). An active pair never rebuilds on
+    // quantum drift — the block-size-agnostic driver chunks any host block
     // internally — so an anomalous quantum can never trigger successive
     // rebuilds of a healthy pair (the first-install branch keeps the domain
-    // defense-in-depth).
-    if !has_ir {
+    // defense-in-depth). Quanta below BUFFER_SIZE_MIN are rejected explicitly
+    // and reported by the off-RT quantum log.
+    if !has_ir || already_pending {
         return false;
     }
     match active {
-        None => !already_pending && (16..=MAX_RESAMP_BUF).contains(&n_samples),
-        Some(pair) => !already_pending && pair.sample_rate != host_rate,
+        None => {
+            if matches!(failed_key, Some((r, p)) if r == host_rate && p == partition) {
+                return false;
+            }
+            (BUFFER_SIZE_MIN as usize..=MAX_RESAMP_BUF).contains(&n_samples)
+        }
+        Some(pair) => pair.sample_rate != host_rate,
     }
 }
 

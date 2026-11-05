@@ -74,19 +74,43 @@ jobs:
           mkdir -p target/logs
           sha=$(git rev-parse HEAD)
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if engine_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
-            engine="sha=$engine_sha"
-          else
-            engine="GAP engine_sibling_absent"
+          eng_type="GAP:missing_lockfile"
+          eng_ver="unknown"
+          eng_chk="none"
+          if [ -f Cargo.lock ]; then
+            read -r eng_type eng_ver eng_chk < <(awk '
+              /^\[\[package\]\]/ { in_pkg=0 }
+              /^name = "NeuralAmpModeler-rs"/ { in_pkg=1 }
+              in_pkg && /^version = / { gsub(/"/, "", $3); ver=$3 }
+              in_pkg && /^source = / { gsub(/"/, "", $3); src=$3 }
+              in_pkg && /^checksum = / { gsub(/"/, "", $3); chk=$3 }
+              END {
+                if (!ver) {
+                  print "GAP:engine_not_found unknown none"
+                  exit 0
+                }
+                if (src ~ /^registry\+/) {
+                  type="registry"
+                } else if (src ~ /^git\+/) {
+                  type="git"
+                } else if (src) {
+                  type=src
+                } else {
+                  type="path"
+                }
+                printf "%s %s %s\n", type, ver, (chk ? chk : "none")
+              }
+            ' Cargo.lock)
           fi
-          printf 'PHASE: provenance sha=%s package_version=%s engine=%s\n' "$sha" "$version" "$engine" | tee target/logs/ci-provenance.log
+          if aux_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+            aux_engine="sha=$aux_sha"
+          else
+            aux_engine="GAP:sibling_absent"
+          fi
+          printf 'PHASE: provenance sha=%s package_version=%s engine_type=%s engine_version=%s engine_checksum=%s auxiliary_engine=%s\n' \
+            "$sha" "$version" "$eng_type" "$eng_ver" "$eng_chk" "$aux_engine" | tee target/logs/ci-provenance.log
       - name: Build canonical artifact
-        env:
-          STRICT_INPUT: ${{ inputs.strict }}
-        run: |
-          STRICT_FLAG=""
-          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
-          ./utils/build-release.sh $STRICT_FLAG
+        run: ./utils/build-release.sh
       - name: Long QA Suite (artifact)
         env:
           STRICT_INPUT: ${{ inputs.strict }}

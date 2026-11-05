@@ -45,13 +45,16 @@ fn main() {
         }
     }
 
-    /// §2.4 policy: explicit → first online isolated → first permitted → GAP.
+    /// Precedence policy (§9 item 33): explicit → first online isolated → first online permitted → GAP.
     fn resolve(explicit: Option<&str>) -> Option<u32> {
         if let Some(raw) = explicit
             .map(str::trim)
             .filter(|raw| !raw.is_empty() && *raw != "auto")
         {
-            return raw.parse::<u32>().ok();
+            return raw
+                .parse::<u32>()
+                .ok()
+                .filter(|&cpu| is_online(cpu as usize));
         }
         let isolated = fs::read_to_string("/sys/devices/system/cpu/isolated")
             .map(|list| parse_cpu_list(&list))
@@ -59,7 +62,10 @@ fn main() {
         if let Some(cpu) = isolated.into_iter().find(|&cpu| is_online(cpu)) {
             return Some(cpu as u32);
         }
-        get_allowed_cpus().into_iter().next().map(|cpu| cpu as u32)
+        get_allowed_cpus()
+            .into_iter()
+            .find(|&cpu| is_online(cpu))
+            .map(|cpu| cpu as u32)
     }
 
     fn explicit_core(args: &[String], stop: usize) -> Option<String> {

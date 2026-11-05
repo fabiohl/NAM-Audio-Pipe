@@ -315,12 +315,21 @@ To guarantee deterministic memory bounds, all components enforce strict maximum 
 |:---------------------- |:--------------------------------- |:--------------------------------------------------------------------------------- |
 | `MAX_BRIDGE_BUF`       | 8192 samples                      | `DspBridge` width; callbacks reject larger descriptors fail-closed.               |
 | `MAX_RESAMP_BUF`       | 8192 samples                      | Bounds maximum memory allocation for resamplers and oversampling engines.         |
-| CabSim Partition Size  | Clamped to `[16, MAX_RESAMP_BUF]` | Rebuild handlers clamp requested partitions before constructing UPOLS FFT plans.  |
+| CabSim Partition Size  | Clamped to `[1, MAX_RESAMP_BUF]`  | Initial setup and rebuild handlers support small quanta (`1..=MAX_RESAMP_BUF`) using chunked sub-blocks. |
 | `--buffer-size` Domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`  | Validated at CLI parsing; invalid values reject before PipeWire graph connection. |
 
 ### 6.2 Real-Time Watchdog & Dynamic Downgrade
 
 If DSP processing time exceeds 80% of the quantum deadline (`DEADLINE_EXCEEDED`), the engine transitions to a degraded state (`DEGRADE`), swapping to a lightweight A2 submodel via SPSC channels to prevent audible dropouts. When CPU contention subsides, full processing is automatically restored.
+
+### 6.3 Latency Publication, Oversampling Accounting & Seqlock Snapshot
+
+Latency compensation in the PipeWire graph requires accurate, lock-free publication of all algorithmic DSP delays (resampling, CabSim UPOLS priming, and oversampling filter stages):
+
+1. **Oversampling Conversion**: `OversampleEngine::latency_samples` returns native filter latency at model rate. `convert_os_latency_to_host(os_native, host_rate, model_rate)` converts this delay to host sample units.
+2. **Coherent Seqlock Snapshot**: `StreamStatusFlags` holds atomic counters for resampler, CabSim, and oversampling latencies, protected by `latency_sequence: AtomicU64`. The audio thread updates latencies without locks or allocation; non-RT watchers read consistent snapshots via `read_applied_latencies`.
+3. **Fail-Closed Metadata Stamp**: On starvation or descriptor validation errors, silence fallback routines (`deliver_playback_pair_fail_closed`, `deliver_silence_pair_fail_closed`) explicitly stamp chunk metadata (`offset = 0`, `size = 0`, `stride = 4`) to prevent downstream graph drivers from reading undefined memory regions.
+4. **SPA Semantics**: Detailed findings and recommendations regarding SPA `rate` vs `ns` parameters are documented in [docs/latency-spa-adr.md](latency-spa-adr.md).
 
 ---
 
@@ -389,7 +398,7 @@ nam-audio-pipe --diagnose-full
 | Code Range | Category              | Representative Identifiers                                                                    |
 |:---------- |:--------------------- |:--------------------------------------------------------------------------------------------- |
 | `E1xxx`    | Model Loading & I/O   | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1300` UNSUPPORTED_ARCHITECTURE        |
-| `E2xxx`    | Audio & Real-Time     | `E2001` DEADLINE_EXCEEDED, `E2111` PM_QOS_WRITE_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION |
+| `E2xxx`    | Audio & Real-Time     | `E2001` DEADLINE_EXCEEDED, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2120` PAGE_SIZE_QUERY_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION |
 | `E3xxx`    | SPSC / Lock-Free GC   | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                         |
 | `E4xxx`    | Runtime & CLI         | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                       |
 | `E5xxx`    | System Resources      | `E5000` OUT_OF_MEMORY                                                                         |

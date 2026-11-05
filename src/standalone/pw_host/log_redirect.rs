@@ -44,7 +44,10 @@ use super::rt_log_ring;
 
 unsafe extern "C" {
     fn vsnprintf(str: *mut c_char, size: usize, format: *const c_char, ap: VaList) -> c_int;
+}
 
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
     fn __vsnprintf(
         str: *mut c_char,
         size: usize,
@@ -265,6 +268,7 @@ unsafe fn format_and_dispatch_variadic(
 }
 
 /// Formats `va_list` tag pointer into a stack buffer and dispatches to logger.
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn format_and_dispatch_va_tag(
     level: spa_log_level,
@@ -332,6 +336,7 @@ pub unsafe extern "C" fn nam_pw_logt(
 
 /// # Safety
 /// Called by PipeWire SPA logging system for untopic'd `va_list` logging (v0).
+#[cfg(target_arch = "x86_64")]
 pub unsafe extern "C" fn nam_pw_logv(
     _object: *mut c_void,
     level: spa_log_level,
@@ -349,6 +354,7 @@ pub unsafe extern "C" fn nam_pw_logv(
 
 /// # Safety
 /// Called by PipeWire SPA logging system for topic'd `va_list` logging (v1+).
+#[cfg(target_arch = "x86_64")]
 pub unsafe extern "C" fn nam_pw_logtv(
     _object: *mut c_void,
     level: spa_log_level,
@@ -372,12 +378,23 @@ pub unsafe extern "C" fn nam_pw_topic_init(_object: *mut c_void, _topic: *mut sp
 }
 
 /// SPA method table containing our pure Rust function pointers.
+#[cfg(target_arch = "x86_64")]
 static SPA_LOG_METHODS: spa_log_methods = spa_log_methods {
     version: 1, // SPA_VERSION_LOG_METHODS
     log: Some(nam_pw_log),
     logv: Some(nam_pw_logv),
     logt: Some(nam_pw_logt),
     logtv: Some(nam_pw_logtv),
+    topic_init: Some(nam_pw_topic_init),
+};
+
+#[cfg(not(target_arch = "x86_64"))]
+static SPA_LOG_METHODS: spa_log_methods = spa_log_methods {
+    version: 1, // SPA_VERSION_LOG_METHODS
+    log: Some(nam_pw_log),
+    logv: None,
+    logt: Some(nam_pw_logt),
+    logtv: None,
     topic_init: Some(nam_pw_topic_init),
 };
 

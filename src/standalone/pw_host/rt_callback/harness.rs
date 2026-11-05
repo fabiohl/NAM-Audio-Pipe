@@ -283,6 +283,7 @@ pub struct SwapRtSide {
     pub parking_lot: [Option<GcItem>; 16],
     pub parking_lot_dirty: AtomicBool,
     pub rt_status: Arc<RtStatusFlags>,
+    pub stream_status: Arc<crate::standalone::pw_host::StreamStatusFlags>,
     pub bridge: Box<DspBridge>,
     pub lut: &'static GainLUT,
     /// Last host rate applied by `run_callback`.
@@ -657,6 +658,11 @@ impl SwapRtSide {
         Arc::clone(&self.rt_status)
     }
 
+    /// The stream status flags (latency snapshot).
+    pub fn stream_status(&self) -> &Arc<crate::standalone::pw_host::StreamStatusFlags> {
+        &self.stream_status
+    }
+
     /// Returns a playback-side reader for the harness's internal `DspBridge`.
     ///
     /// Allows soak/heap-audit tests to exercise the lock-free bridge read path
@@ -673,6 +679,11 @@ impl SwapRtSide {
     /// Changes the model's active NAM rate (drives `current_nam_rate`).
     pub fn set_nam_rate(&mut self, rate: u32) {
         self.state.current_nam_rate = rate;
+        if let Some(status) = &self.state.stream_status {
+            status
+                .applied_nam_rate
+                .store(rate, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Maximum working-buffer length for input slices (the pipeline clamps to
@@ -738,8 +749,26 @@ impl RtSwapHarness {
         let sys = SystemSnapshot::capture();
         let mut state = CaptureState::init(&sys, OversampleFactor::Off, gate_config);
         state.resampler = Box::new(NamResampler::new_simple(host_rate, nam_rate)?);
+        state.stream = Box::new(StreamingResampleBuffer::new(
+            host_rate,
+            nam_rate,
+            MAX_RESAMP_BUF,
+        )?);
         state.current_nam_rate = nam_rate;
         state.shared_target_rate = Arc::new(std::sync::atomic::AtomicU32::new(host_rate));
+
+        // Preallocate OS scratch buffers to MAX_OS_BUF so RT swaps to X2/X4 succeed without reallocation.
+        state.os_in_l = vec![0.0f32; MAX_OS_BUF].into_boxed_slice();
+        state.os_in_r = vec![0.0f32; MAX_OS_BUF].into_boxed_slice();
+        state.os_model_l = vec![0.0f32; MAX_OS_BUF].into_boxed_slice();
+        state.os_model_r = vec![0.0f32; MAX_OS_BUF].into_boxed_slice();
+
+        let stream_status = Arc::new(crate::standalone::pw_host::StreamStatusFlags::new());
+        stream_status.update_resampler_latency(state.stream.latency_samples());
+        stream_status
+            .applied_nam_rate
+            .store(nam_rate, std::sync::atomic::Ordering::Release);
+        state.stream_status = Some(Arc::clone(&stream_status));
 
         let spsc = setup_spsc(neural_amp_modeler_rs::common::spsc::SPSC_CAPACITY)?;
         // Dedicated swap channels live inside the engine `RtSwapDrain`s.
@@ -773,6 +802,7 @@ impl RtSwapHarness {
             parking_lot: Default::default(),
             parking_lot_dirty: AtomicBool::new(false),
             rt_status: spsc.rt_status,
+            stream_status: Arc::clone(&stream_status),
             bridge,
             lut: get_gain_lut(),
             current_host_rate: host_rate,
@@ -966,6 +996,11 @@ impl RtSwapHarness {
     /// The shared RT status flags (main-thread read face for gates).
     pub fn rt_status_arc(&self) -> Arc<RtStatusFlags> {
         self.rt.rt_status_arc()
+    }
+
+    /// The stream status flags (latency snapshot).
+    pub fn stream_status(&self) -> &Arc<crate::standalone::pw_host::StreamStatusFlags> {
+        self.rt.stream_status()
     }
 
     /// Returns a playback-side reader for the harness's internal `DspBridge`.

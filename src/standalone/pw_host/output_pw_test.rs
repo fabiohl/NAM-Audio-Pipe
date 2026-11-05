@@ -532,13 +532,11 @@ fn playback_bridge_starvation_rejects_asymmetric_extensions() {
     let mut r = [1.0f32; 16];
     fill_bytes(&mut l, 0x5A);
     fill_bytes(&mut r, 0xA5);
-    let mut chunk = chunk_of(0, 0);
+    let mut chunk = chunk_of(16, 128);
     let rt = RtStatusFlags::default();
     let stream_status = StreamStatusFlags::new();
 
-    // SAFETY: `l`/`r` are local aligned writable arrays and `chunk` is a
-    // local non-null struct; a silence window exceeding the smaller
-    // channel's capacity must be rejected fail-closed.
+    // SAFETY: `l`/`r` are local aligned writable arrays and `chunk` is a local non-null struct; a silence window exceeding the smaller channel's capacity must be rejected fail-closed.
     let frames = unsafe {
         deliver_silence_pair_fail_closed(
             l.as_ptr() as usize,
@@ -559,12 +557,56 @@ fn playback_bridge_starvation_rejects_asymmetric_extensions() {
         l.iter().all(|&s| s == 0.0) && r.iter().all(|&s| s == 0.0),
         "asymmetric extensions must silence both channels fail-closed"
     );
+    assert_eq!(chunk.offset, 0);
+    assert_eq!(chunk.size, 0);
+    assert_eq!(chunk.stride, 4);
     assert_eq!(
         stream_status
             .playback_bridge_starvation
             .load(Ordering::Relaxed),
         0
     );
+}
+
+#[test]
+fn playback_bridge_starvation_stamps_safe_zero_metadata_on_64kib_validation_failure() {
+    // 64 KiB buffer descriptor (16,384 samples) where silence_bytes exceeds MAX_BRIDGE_BUF * 4 (32 KiB).
+    // The FFI contract validation must reject this fail-closed, raise E2304,
+    // and stamp both chunk metadata descriptors with offset=0, size=0, stride=4
+    // so downstream consumers consume zero bytes.
+    let mut l = vec![0.75f32; 16384]; // 64 KiB
+    let mut r = vec![0.75f32; 16384]; // 64 KiB
+    fill_bytes(&mut l, 0x5A);
+    fill_bytes(&mut r, 0xA5);
+    let mut chunk_l = chunk_of(64, 65536);
+    let mut chunk_r = chunk_of(128, 65536);
+    let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
+    let silence_bytes = 65536; // 64 KiB exceeds MAX_BRIDGE_BUF * 4
+
+    // SAFETY: l and r are allocated 64 KiB vectors whose raw pointers and lengths remain valid for the call.
+    let frames = unsafe {
+        deliver_silence_pair_fail_closed(
+            l.as_ptr() as usize,
+            l.len() * 4,
+            &mut chunk_l,
+            r.as_ptr() as usize,
+            r.len() * 4,
+            &mut chunk_r,
+            silence_bytes,
+            &rt,
+            &stream_status,
+        )
+    };
+
+    assert_eq!(frames, None);
+    assert!(rt.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION));
+    assert_eq!(chunk_l.offset, 0);
+    assert_eq!(chunk_l.size, 0);
+    assert_eq!(chunk_l.stride, 4);
+    assert_eq!(chunk_r.offset, 0);
+    assert_eq!(chunk_r.size, 0);
+    assert_eq!(chunk_r.stride, 4);
 }
 
 #[test]
@@ -584,8 +626,7 @@ fn playback_bridge_starvation_with_huge_maxsize_bounds_to_max_bridge_buf() {
     let stream_status = StreamStatusFlags::new();
 
     let silence_bytes = MAX_BRIDGE_BUF * std::mem::size_of::<f32>();
-    // SAFETY: the left/right vectors and both chunks remain live and non-overlapping
-    // for the whole synchronous fail-closed deliver call.
+    // SAFETY: the left/right vectors and both chunks remain live and non-overlapping for synchronous call.
     let frames = unsafe {
         deliver_silence_pair_fail_closed(
             l.as_ptr() as usize,

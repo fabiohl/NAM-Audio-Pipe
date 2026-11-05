@@ -11,6 +11,19 @@
 use super::output_pw::SpaPodStorage;
 use pipewire as pw;
 
+/// Converts native oversampling latency samples (at `model_rate`) to equivalent host samples (at `host_rate`).
+///
+/// Uses integer ceiling conversion: `ceil(os_native * host_rate / model_rate)`.
+/// When either rate is zero or oversampling is off (`os_native == 0`), returns `os_native`.
+#[inline]
+pub fn convert_os_latency_to_host(os_native: u32, host_rate: u32, model_rate: u32) -> u32 {
+    if host_rate == 0 || model_rate == 0 || os_native == 0 {
+        os_native
+    } else {
+        ((os_native as u64 * host_rate as u64).div_ceil(model_rate as u64)) as u32
+    }
+}
+
 /// Computes total algorithmic DSP latency in samples and equivalent nanoseconds.
 ///
 /// Total algorithmic latency is composed of:
@@ -18,16 +31,21 @@ use pipewire as pw;
 ///    from `CabSimAdapter::latency_samples` when active, 0 when bypassed).
 /// 2. Resampler filter chain group delay (from
 ///    `StreamingResampleBuffer::latency_samples`, 0 when host rate matches model rate).
-/// 3. Intra-cycle bridge latency (0 samples in intra-cycle lockstep execution).
+/// 3. Oversampling half-band filter chain group delay (from
+///    `OversampleEngine::latency_samples`, converted to host samples via [`convert_os_latency_to_host`]).
+/// 4. Intra-cycle bridge latency (0 samples in intra-cycle lockstep execution).
 ///
 /// Returns `(total_samples, latency_ns)`.
 #[inline]
 pub fn compute_dsp_latency(
     cabsim_samples: u32,
     resampler_samples: u32,
+    oversample_samples: u32,
     host_rate: u32,
 ) -> (u32, i64) {
-    let total_samples = cabsim_samples.saturating_add(resampler_samples);
+    let total_samples = cabsim_samples
+        .saturating_add(resampler_samples)
+        .saturating_add(oversample_samples);
     let latency_ns = if host_rate > 0 {
         ((i64::from(total_samples)) * 1_000_000_000) / i64::from(host_rate)
     } else {
@@ -146,7 +164,7 @@ mod tests {
 
     #[test]
     fn compute_dsp_latency_zero_rate() {
-        let (samples, ns) = compute_dsp_latency(128, 16, 0);
+        let (samples, ns) = compute_dsp_latency(128, 16, 0, 0);
         assert_eq!(samples, 144);
         assert_eq!(ns, 0);
     }
@@ -154,22 +172,22 @@ mod tests {
     #[test]
     fn compute_dsp_latency_standard_partitions() {
         // 32 samples @ 48kHz: 32 * 1e9 / 48000 = 666_666 ns
-        let (samples, ns) = compute_dsp_latency(32, 0, 48_000);
+        let (samples, ns) = compute_dsp_latency(32, 0, 0, 48_000);
         assert_eq!(samples, 32);
         assert_eq!(ns, 666_666);
 
         // 64 samples @ 48kHz: 64 * 1e9 / 48000 = 1_333_333 ns
-        let (samples, ns) = compute_dsp_latency(64, 0, 48_000);
+        let (samples, ns) = compute_dsp_latency(64, 0, 0, 48_000);
         assert_eq!(samples, 64);
         assert_eq!(ns, 1_333_333);
 
         // 128 samples @ 48kHz: 128 * 1e9 / 48000 = 2_666_666 ns
-        let (samples, ns) = compute_dsp_latency(128, 0, 48_000);
+        let (samples, ns) = compute_dsp_latency(128, 0, 0, 48_000);
         assert_eq!(samples, 128);
         assert_eq!(ns, 2_666_666);
 
         // 256 samples @ 48kHz: 256 * 1e9 / 48000 = 5_333_333 ns
-        let (samples, ns) = compute_dsp_latency(256, 0, 48_000);
+        let (samples, ns) = compute_dsp_latency(256, 0, 0, 48_000);
         assert_eq!(samples, 256);
         assert_eq!(ns, 5_333_333);
     }
@@ -178,16 +196,52 @@ mod tests {
     fn compute_dsp_latency_combined_cabsim_and_resampler() {
         // 128 samples cabsim + 32 samples resampler @ 96kHz
         // 160 * 1e9 / 96000 = 1_666_666 ns
-        let (samples, ns) = compute_dsp_latency(128, 32, 96_000);
+        let (samples, ns) = compute_dsp_latency(128, 32, 0, 96_000);
         assert_eq!(samples, 160);
         assert_eq!(ns, 1_666_666);
+    }
+
+    #[test]
+    fn compute_dsp_latency_includes_oversampling() {
+        // 64 samples cabsim + 16 samples resampler + 12 samples oversampling (X2 @ 48kHz)
+        // 92 * 1e9 / 48000 = 1_916_666 ns
+        let (samples, ns) = compute_dsp_latency(64, 16, 12, 48_000);
+        assert_eq!(samples, 92);
+        assert_eq!(ns, 1_916_666);
+
+        // Converted oversampling latency (X4 @ 96kHz -> 36 host samples)
+        // 64 cabsim + 32 resampler + 36 oversampling = 132 samples @ 96kHz
+        let os_host = convert_os_latency_to_host(18, 96_000, 48_000);
+        assert_eq!(os_host, 36);
+        let (samples, ns) = compute_dsp_latency(64, 32, os_host, 96_000);
+        assert_eq!(samples, 132);
+        assert_eq!(ns, 1_375_000);
+    }
+
+    #[test]
+    fn convert_os_latency_to_host_ratios() {
+        assert_eq!(convert_os_latency_to_host(0, 48_000, 48_000), 0);
+        assert_eq!(convert_os_latency_to_host(12, 48_000, 48_000), 12);
+        assert_eq!(convert_os_latency_to_host(18, 48_000, 48_000), 18);
+
+        // 96kHz host (2x)
+        assert_eq!(convert_os_latency_to_host(12, 96_000, 48_000), 24);
+        assert_eq!(convert_os_latency_to_host(18, 96_000, 48_000), 36);
+
+        // 44.1kHz host: ceil(12 * 44100 / 48000) = ceil(11.025) = 12
+        assert_eq!(convert_os_latency_to_host(12, 44_100, 48_000), 12);
+        // ceil(18 * 44100 / 48000) = ceil(16.5375) = 17
+        assert_eq!(convert_os_latency_to_host(18, 44_100, 48_000), 17);
+
+        // Edge case: 0 rate
+        assert_eq!(convert_os_latency_to_host(12, 0, 48_000), 12);
     }
 
     #[test]
     fn build_process_latency_pod_creates_valid_pod() {
         pw::init();
         let mut storage = SpaPodStorage::new();
-        let (samples, ns) = compute_dsp_latency(128, 0, 48_000);
+        let (samples, ns) = compute_dsp_latency(128, 0, 0, 48_000);
         // SAFETY: `storage` is a live stack-local buffer kept alive and unmodified
         // for the lifetime of the returned pod.
         let pod = unsafe { build_process_latency_pod(samples, ns, &mut storage) }
@@ -211,7 +265,7 @@ mod tests {
     fn build_latency_pod_creates_valid_pod() {
         pw::init();
         let mut storage = SpaPodStorage::new();
-        let (samples, ns) = compute_dsp_latency(64, 16, 48_000);
+        let (samples, ns) = compute_dsp_latency(64, 16, 0, 48_000);
         // SAFETY: `storage` is a live stack-local buffer kept alive and unmodified
         // for the lifetime of the returned pod.
         let pod = unsafe {
