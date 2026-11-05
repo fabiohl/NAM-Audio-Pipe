@@ -12,8 +12,8 @@ use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::pw_host::capture::state::{CaptureState, RtHostChannels};
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_RESAMP_SWAP_PENDING, RtStatusFlags,
-    SwapBudget,
+    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_NEEDS_RESAMPLER_REBUILD,
+    RT_STATUS_RESAMP_SWAP_PENDING, RtStatusFlags, SwapBudget,
 };
 use neural_amp_modeler_rs::dsp::pipeline::{
     DspPipelineContext, MAX_BRIDGE_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
@@ -22,8 +22,9 @@ use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::math::dsp::gain_lut::GainLUT;
 
 use super::{
-    STRUCTURAL_SWAPS_PER_CALLBACK, drain_cabsims, drain_os_engines, drain_resamplers,
-    drain_slimmable_models, receive_commands, sync_rate, try_slimmable_rebuild,
+    STRUCTURAL_SWAPS_PER_CALLBACK, drain_cabsims_with_status, drain_os_engines_with_status,
+    drain_resamplers_with_status, drain_slimmable_models, receive_commands, sync_rate,
+    try_slimmable_rebuild,
 };
 
 use pipewire as pw;
@@ -168,7 +169,7 @@ fn try_zero_region(ptr: usize, bytes: usize) -> usize {
 /// ignored (there is no descriptor to stamp), matching the fail-closed
 /// contract of `read_chunk_meta`. Zero allocations, zero panics.
 #[inline(always)]
-fn stamp_chunk(chunk: *mut pw::spa::sys::spa_chunk, bytes: usize) {
+pub(crate) fn stamp_chunk(chunk: *mut pw::spa::sys::spa_chunk, bytes: usize) {
     if chunk.is_null()
         || !(chunk as usize).is_multiple_of(std::mem::align_of::<pw::spa::sys::spa_chunk>())
     {
@@ -234,14 +235,16 @@ pub(crate) fn silence_available_descriptors(
 /// `MAX_BRIDGE_BUF` frames (`MAX_BRIDGE_BUF * sizeof(f32)` bytes).
 /// Valid chunk metadata is stamped with `offset=0`, `size=silence_bytes` so the
 /// host consumes only the zeroed interval without replaying trailing stale data.
+/// When no region could be zeroed (null/misaligned data pointer or non-cardinal
+/// size) the chunk is still stamped to `size=0`, so stale metadata can never
+/// replay old audio; the chunk pointer is only dereferenced when `stamp_chunk`
+/// can prove it non-null and aligned.
 #[inline(always)]
 pub(crate) fn silence_available_datas(datas: &mut [pw::spa::buffer::Data]) {
     for data in datas.iter_mut() {
         let raw = data.as_raw();
         let zeroed = try_zero_region(raw.data as usize, raw.maxsize as usize);
-        if zeroed > 0 {
-            stamp_chunk(raw.chunk, zeroed);
-        }
+        stamp_chunk(raw.chunk, zeroed);
     }
 }
 
@@ -662,11 +665,15 @@ pub fn process_dsp_buffer(
     let Some((offset_l, size_l)) =
         resolve_capture_chunk_window(chunk_l, ptr_l, max_l, ptr_r, max_r, rt_status_for_process)
     else {
+        stamp_chunk(chunk_l, 0);
+        stamp_chunk(chunk_r, 0);
         return;
     };
     let Some((offset_r, size_r)) =
         resolve_capture_chunk_window(chunk_r, ptr_l, max_l, ptr_r, max_r, rt_status_for_process)
     else {
+        stamp_chunk(chunk_l, 0);
+        stamp_chunk(chunk_r, 0);
         return;
     };
 
@@ -687,6 +694,11 @@ pub fn process_dsp_buffer(
         size_r,
         rt_status_for_process,
     ) else {
+        // Both chunks are stamped even when no region could be zeroed: a valid
+        // descriptor gets `size = 0` (no stale data replayed), and an invalid
+        // descriptor is left untouched because its validity is not established.
+        stamp_chunk(chunk_l, 0);
+        stamp_chunk(chunk_r, 0);
         return;
     };
 
@@ -860,7 +872,7 @@ pub fn process_dsp_buffer(
     }
 }
 
-/// Verdict of running [`rt_quantum_prologue`].
+/// Verdict of running the real-time quantum prologue.
 ///
 /// Distinguishes whether the quantum should proceed with audio buffer dequeue and DSP processing,
 /// or whether DSP execution must be skipped (e.g. while an off-RT resampler swap is in flight,
@@ -986,12 +998,13 @@ pub fn rt_quantum_prologue(
             param_pops: 0,
         };
     };
-    drain_resamplers(
+    drain_resamplers_with_status(
         resampler_drain,
         &mut budget,
         &mut state.resampler,
         &mut state.stream,
         rt_status,
+        state.stream_status.as_deref(),
         &mut channels.gc_producer,
         parking_lot,
         parking_lot_dirty,
@@ -1007,10 +1020,12 @@ pub fn rt_quantum_prologue(
             param_pops: 0,
         };
     };
-    drain_cabsims(
+    drain_cabsims_with_status(
         cabsim_drain,
         &mut budget,
         &mut state.active_cabsim,
+        Some(&mut state.cabsim_failed_key),
+        state.stream_status.as_deref(),
         rt_status,
         &mut channels.gc_producer,
         parking_lot,
@@ -1055,11 +1070,12 @@ pub fn rt_quantum_prologue(
         &channels.gc_overflow,
     );
 
-    drain_os_engines(
+    drain_os_engines_with_status(
         &mut state.os_drain,
         &mut budget,
         &mut state.os_l,
         &mut state.os_r,
+        state.stream_status.as_deref(),
         rt_status,
         &mut channels.gc_producer,
         parking_lot,
@@ -1073,6 +1089,7 @@ pub fn rt_quantum_prologue(
         &state.resampler,
         state.current_nam_rate,
         rt_status,
+        &mut state.rate_sync,
     );
 
     // 5. Gain recomputation on parameter change.
@@ -1094,21 +1111,36 @@ pub fn rt_quantum_prologue(
             .load(Ordering::Acquire);
         let requested_gen = rt_status.requested_rate_generation.load(Ordering::Acquire);
 
-        if failed_gen != 0 && failed_gen == requested_gen {
-            // Fail-open rollback: the rebuild failed for requested_gen,
-            // so the callback resumes with the previous resampler in safe
-            // bypass/mute mode. Record the requested generation as
-            // resolved so the invariant
-            // `applied_rate_generation == requested_rate_generation`
-            // holds on unmute — the old resampler is the accepted
-            // fallback for this request, never a stale replacement.
-            rt_status
-                .applied_rate_generation
-                .store(requested_gen, Ordering::Release);
-            rt_status.clear_flag(RT_STATUS_RESAMP_SWAP_PENDING);
-            rt_status
-                .resampler_failed_generation
-                .store(0, Ordering::Release);
+        if failed_gen != 0 {
+            if failed_gen == requested_gen {
+                // Fail-open rollback: the rebuild failed for requested_gen,
+                // so the callback resumes with the previous resampler in safe
+                // bypass/mute mode. Record the requested generation as
+                // resolved so the invariant
+                // `applied_rate_generation == requested_rate_generation`
+                // holds on unmute — the old resampler is the accepted
+                // fallback for this request, never a stale replacement.
+                rt_status
+                    .applied_rate_generation
+                    .store(requested_gen, Ordering::Release);
+                rt_status.clear_flag(RT_STATUS_RESAMP_SWAP_PENDING);
+                rt_status.clear_flag(RT_STATUS_NEEDS_RESAMPLER_REBUILD);
+                rt_status
+                    .resampler_failed_generation
+                    .store(0, Ordering::Release);
+                state.rate_sync.record_failure();
+            } else if failed_gen < requested_gen {
+                // Stale failure from an obsolete request that was superseded:
+                // clear the stale marker and keep waiting for requested_gen.
+                rt_status
+                    .resampler_failed_generation
+                    .store(0, Ordering::Release);
+                return PrologueOutcome::Skip {
+                    current_host_rate,
+                    structural_applied: budget.used(),
+                    param_pops,
+                };
+            }
         } else {
             return PrologueOutcome::Skip {
                 current_host_rate,

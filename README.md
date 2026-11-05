@@ -328,27 +328,9 @@ The Flatpak bundle exports native desktop launchers and high-resolution icons to
 
 ---
 
-### Option B: Pre-Compiled Optimized Native Binary (`utils/build-release.sh`)
+### Option B: Simple Direct Cargo Build (Development & Testing)
 
-For maximum performance in mission-critical live setups, compile using the automated optimization pipeline:
-
-```bash
-# Build hyper-optimized PGO + LLVM BOLT binary:
-./utils/build-release.sh --install
-```
-
-This multi-stage builder executes:
-
-1. **Profile-Guided Optimization (PGO)**: Instruments DSP kernels across quantum matrices (32 to 1024 frames) and model families, generating profile traces to guide inlining and vectorization.
-2. **LLVM BOLT**: Rearranges basic blocks in machine code using Linux `perf` sample traces to minimize CPU Instruction Cache (I-Cache) and TLB misses.
-3. **Static Hotspot Gates**: Enforces zero `zmm` registers (AVX-512 opt-in policy), zero `libm` calls in RT paths, and zero heap allocations.
-4. **Installs directly** to `~/.local/bin/nam-audio-pipe`.
-
----
-
-### Option C: Direct Cargo Build
-
-For developers working directly on source code:
+For developers working on source code or rapid testing:
 
 ```bash
 # Direct development execution:
@@ -359,6 +341,49 @@ cargo build --release
 ```
 
 The compiled binary will be located at `target/release/nam-audio-pipe`.
+
+---
+
+### Option C: Hyper-Optimized Native Binary (`./utils/build-release.sh`)
+
+For maximum performance in mission-critical live setups and stage environments, compile using the automated multi-stage optimization pipeline combining **Profile-Guided Optimization (PGO)** and **LLVM BOLT**:
+
+```bash
+# Build hyper-optimized PGO + LLVM BOLT binary and install locally:
+./utils/build-release.sh --install
+```
+
+| Canonical Option | Purpose |
+|:---------------- |:------- |
+| `--package`      | Generates distribution tarball (`.tar.zst`) and Flatpak bundle (`.flatpak`) |
+| `--install`      | Installs the optimized binary directly to `~/.local/bin/nam-audio-pipe` |
+| `--strict`       | Enforces fail-closed mode: any optimization or verification gap aborts with error |
+| `--certify`      | Does not recompile; verifies and certifies canonical release receipts |
+| `-h, --help`     | Displays command-line help screen and exits |
+
+This automated builder executes:
+
+1. **Profile-Guided Optimization (PGO)**: Instruments DSP kernels across quantum matrices (32 to 1024 frames) and model families, generating profile traces to guide branch prediction and loop vectorization.
+2. **LLVM BOLT**: Rearranges basic blocks in machine code using Linux `perf` sample traces to minimize CPU Instruction Cache (I-Cache) and TLB misses.
+3. **Static Hotspot Gates**: Enforces zero `zmm` registers (AVX-512 opt-in policy), zero `libm` calls in RT paths, and zero heap allocations.
+4. **Installs directly** to `~/.local/bin/nam-audio-pipe`.
+
+---
+
+### Option D: Official Release & Certification Chain (Production)
+
+For distributors and release publishing, the official release pipeline enforces strict separation between compilation, stress testing, and cryptographic verification:
+
+```bash
+# 1. Build canonical optimized release artifact into target/dist/
+./utils/build-release.sh --strict --package --install
+
+# 2. Audit the canonical artifact under heavy soak, RT deadline, and zero-alloc stress
+./utils/tests-long.sh --strict --artifact
+
+# 3. Certify release compliance using the generated receipts without recompilation
+./utils/build-release.sh --certify
+```
 
 ---
 
@@ -436,11 +461,9 @@ NAM-Audio-Pipe maintains enterprise-grade reliability through an automated testi
 ./utils/tests-quick.sh
 
 # 3. Release chain (human operator only): build -> long audit -> certify.
-# On BOLT-capable hosts, run ./utils/ab-opt-ceremony.sh first to produce the
-# PGO+BOLT proof required by `build-release.sh --strict`.
 # The long suite covers accelerated soak, zero-alloc heap audit, RT deadline/jitter,
 # endurance, live PipeWire, io_uring and offline f64 parity.
-./utils/build-release.sh --strict --install
+./utils/build-release.sh --strict --package --install
 ./utils/tests-long.sh --strict --artifact
 ./utils/build-release.sh --certify
 ```

@@ -47,6 +47,7 @@ fn empty_consumer_no_change() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -82,6 +83,7 @@ fn single_swap_updates_active_and_clears_flag() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -129,6 +131,7 @@ fn multiple_swaps_keep_last() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -177,6 +180,7 @@ fn swap_cascades_old_resampler_to_gc() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -232,6 +236,7 @@ fn stale_generation_is_gc_discarded_without_unmute() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -260,6 +265,7 @@ fn stale_generation_is_gc_discarded_without_unmute() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -305,6 +311,7 @@ fn unversioned_payload_never_applied_when_request_exists() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -353,6 +360,7 @@ fn budget_applies_one_and_coalesces_backlog() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -412,6 +420,7 @@ fn budget_exhausted_parks_envelope_resolved_next_callback() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -436,6 +445,7 @@ fn budget_exhausted_parks_envelope_resolved_next_callback() {
         &mut active,
         &mut active_stream,
         &flags,
+        None,
         &mut gc_p,
         &mut parking_lot,
         &parking_lot_dirty,
@@ -445,4 +455,71 @@ fn budget_exhausted_parks_envelope_resolved_next_callback() {
     assert!(!drain.has_deferred());
     assert!(drain.is_empty());
     assert!(!flags.check_flag(RT_STATUS_RESAMP_SWAP_PENDING));
+}
+
+#[test]
+fn applied_latency_updated_on_install_and_preserved_on_discard() {
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = resampler_swap_drain(cons);
+    let mut active = make_rs(48000, 48000);
+    let mut active_stream = make_stream(48000, 48000);
+    let (mut gc_p, _gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
+    let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let applied_latency = AtomicU32::new(0);
+
+    // Request 96k host rate with generation 1
+    flags.requested_rate_generation.store(1, Ordering::Release);
+    prod.push(make_payload(1, 96000, 48000)).unwrap();
+
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    drain_resamplers(
+        &mut drain,
+        &mut budget,
+        &mut active,
+        &mut active_stream,
+        &flags,
+        Some(&applied_latency),
+        &mut gc_p,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+    );
+
+    let expected_lat = active_stream.latency_samples();
+    assert!(
+        expected_lat > 0,
+        "resampler 96k to 48k must have non-zero filter latency"
+    );
+    assert_eq!(
+        applied_latency.load(Ordering::Acquire),
+        expected_lat,
+        "applied latency must be published upon install (D-08)"
+    );
+
+    // Now push a superseded envelope with generation 2 while requested is 3
+    flags.requested_rate_generation.store(3, Ordering::Release);
+    prod.push(make_payload(2, 44100, 48000)).unwrap();
+
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    drain_resamplers(
+        &mut drain,
+        &mut budget,
+        &mut active,
+        &mut active_stream,
+        &flags,
+        Some(&applied_latency),
+        &mut gc_p,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+    );
+
+    assert_eq!(
+        applied_latency.load(Ordering::Acquire),
+        expected_lat,
+        "discarded envelope must not modify applied latency"
+    );
 }

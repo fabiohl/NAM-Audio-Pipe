@@ -18,6 +18,7 @@
 //! / parked in the drain's deferred slot for the next callback. Tuning
 //! preserved: [`STRUCTURAL_POPS_PER_CALLBACK`] pops per callback.
 
+use crate::standalone::pw_host::StreamStatusFlags;
 use neural_amp_modeler_rs::common::spsc::{
     CabSimSwapPayload, GcItem, GcOverflowBuffer, GcSink, RtStatusFlags, RtSwapDrain, RtSwapHandler,
     SwapBudget,
@@ -25,7 +26,7 @@ use neural_amp_modeler_rs::common::spsc::{
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 
 use rtrb::Consumer;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Dedicated cab-sim swap ring drained by [`RtSwapDrain`].
 pub type CabSimSwapRing = Consumer<Box<CabSimSwapPayload>>;
@@ -41,6 +42,10 @@ pub type CabSimSwapDrain = RtSwapDrain<CabSimSwapRing>;
 /// `active_cabsim` or `applied_cabsim_generation`.
 pub(crate) struct CabSimSwapHandler<'a> {
     active_cabsim: &'a mut Option<Box<CabSimPair>>,
+    failed_key: Option<&'a mut Option<(u32, usize)>>,
+    applied_latency: Option<&'a AtomicU32>,
+    applied_latency_pair: Option<&'a AtomicU64>,
+    stream_status: Option<&'a StreamStatusFlags>,
     rt_status: &'a RtStatusFlags,
 }
 
@@ -73,7 +78,32 @@ impl RtSwapHandler for CabSimSwapHandler<'_> {
 
     #[cold]
     fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
-        install_cabsim(payload, self.active_cabsim, gc, self.rt_status);
+        if payload.pair.is_some() {
+            if let Some(failed) = self.failed_key.as_deref_mut() {
+                *failed = None;
+            }
+        } else {
+            let rate = self
+                .rt_status
+                .requested_cabsim_host_rate
+                .load(Ordering::Relaxed);
+            let part = self
+                .rt_status
+                .requested_cabsim_partition_size
+                .load(Ordering::Relaxed) as usize;
+            if let Some(failed) = self.failed_key.as_deref_mut() {
+                *failed = Some((rate, part));
+            }
+        }
+        install_cabsim(
+            payload,
+            self.active_cabsim,
+            gc,
+            self.rt_status,
+            self.applied_latency,
+            self.applied_latency_pair,
+            self.stream_status,
+        );
     }
 
     #[cold]
@@ -82,17 +112,20 @@ impl RtSwapHandler for CabSimSwapHandler<'_> {
     }
 }
 
-/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically
-/// (engine canonical 3-phase protocol).
+/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically with coherent pair support.
 #[inline(always)]
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
-pub fn drain_cabsims(
+pub fn drain_cabsims_with_pair(
     drain: &mut CabSimSwapDrain,
     budget: &mut SwapBudget,
     active_cabsim: &mut Option<Box<CabSimPair>>,
+    failed_key: Option<&mut Option<(u32, usize)>>,
+    applied_latency: Option<&AtomicU32>,
+    applied_latency_pair: Option<&AtomicU64>,
     rt_status_for_process: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
@@ -108,9 +141,84 @@ pub fn drain_cabsims(
     };
     let mut handler = CabSimSwapHandler {
         active_cabsim,
+        failed_key,
+        applied_latency,
+        applied_latency_pair,
+        stream_status: None,
         rt_status: rt_status_for_process,
     };
     drain.drain(&mut handler, budget, &mut gc);
+}
+
+/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically with complete `StreamStatusFlags` seqlock snapshot support.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+)]
+pub fn drain_cabsims_with_status(
+    drain: &mut CabSimSwapDrain,
+    budget: &mut SwapBudget,
+    active_cabsim: &mut Option<Box<CabSimPair>>,
+    failed_key: Option<&mut Option<(u32, usize)>>,
+    stream_status: Option<&StreamStatusFlags>,
+    rt_status_for_process: &RtStatusFlags,
+    gc_producer: &mut rtrb::Producer<GcItem>,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    gc_overflow_for_process: &GcOverflowBuffer,
+) {
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow_for_process,
+        rt_status: rt_status_for_process,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = CabSimSwapHandler {
+        active_cabsim,
+        failed_key,
+        applied_latency: stream_status.map(|s| &s.applied_cabsim_latency),
+        applied_latency_pair: stream_status.map(|s| &s.applied_latency_pair),
+        stream_status,
+        rt_status: rt_status_for_process,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
+
+/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically
+/// (engine canonical 3-phase protocol).
+#[inline(always)]
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+)]
+pub fn drain_cabsims(
+    drain: &mut CabSimSwapDrain,
+    budget: &mut SwapBudget,
+    active_cabsim: &mut Option<Box<CabSimPair>>,
+    failed_key: Option<&mut Option<(u32, usize)>>,
+    applied_latency: Option<&AtomicU32>,
+    rt_status_for_process: &RtStatusFlags,
+    gc_producer: &mut rtrb::Producer<GcItem>,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    gc_overflow_for_process: &GcOverflowBuffer,
+) {
+    drain_cabsims_with_pair(
+        drain,
+        budget,
+        active_cabsim,
+        failed_key,
+        applied_latency,
+        None,
+        rt_status_for_process,
+        gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        gc_overflow_for_process,
+    );
 }
 
 /// Builds the drain for a fresh (re)connection, preserving the historical
@@ -128,8 +236,34 @@ fn install_cabsim(
     active_cabsim: &mut Option<Box<CabSimPair>>,
     gc: &mut GcSink<'_>,
     rt_status_for_process: &RtStatusFlags,
+    applied_latency: Option<&AtomicU32>,
+    applied_latency_pair: Option<&AtomicU64>,
+    stream_status: Option<&StreamStatusFlags>,
 ) {
     std::mem::swap(&mut payload.pair, active_cabsim);
+    let lat = active_cabsim
+        .as_ref()
+        .map(|p| p.l.latency_samples() as u32)
+        .unwrap_or(0);
+    if let Some(status) = stream_status {
+        status.update_cabsim_latency(lat);
+    } else {
+        if let Some(applied) = applied_latency {
+            applied.store(lat, Ordering::Release);
+        }
+        if let Some(pair) = applied_latency_pair {
+            let mut cur = pair.load(Ordering::Relaxed);
+            loop {
+                let (res, _) = StreamStatusFlags::unpack_latency_pair(cur);
+                let next = StreamStatusFlags::pack_latency_pair(res, lat);
+                match pair.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+    }
+
     rt_status_for_process
         .applied_cabsim_generation
         .store(payload.generation, Ordering::Release);

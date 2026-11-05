@@ -7,8 +7,7 @@
 //! reducing the inline closure size while preserving the same capture semantics.
 
 use crate::standalone::pw_host::output_pw::{
-    check_negotiated_rate_mismatch, mark_format_contract_ok, reject_negotiated_format_violation,
-    validate_audio_raw_format,
+    check_negotiated_rate_mismatch, reject_negotiated_format_violation, validate_audio_raw_format,
 };
 use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
@@ -68,7 +67,7 @@ pub fn param_changed_handler(
                 .stream_status()
                 .capture_negotiated_rate
                 .store(rate, Ordering::Release);
-            mark_format_contract_ok(backend.stream_status(), "capture");
+            backend.mark_format_ok("capture");
             check_negotiated_rate_mismatch(backend.stream_status());
             backend.notify_wakeup();
         }

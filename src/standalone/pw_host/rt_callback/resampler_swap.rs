@@ -27,8 +27,9 @@ use neural_amp_modeler_rs::common::spsc::{
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 
+use crate::standalone::pw_host::StreamStatusFlags;
 use rtrb::Consumer;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Dedicated resampler swap ring drained by [`RtSwapDrain`].
 pub type ResamplerSwapRing = Consumer<Box<ResamplerSwapPayload>>;
@@ -48,6 +49,9 @@ pub(crate) struct ResamplerSwapHandler<'a> {
     resampler: &'a mut Box<NamResampler>,
     stream: &'a mut Box<StreamingResampleBuffer>,
     rt_status: &'a RtStatusFlags,
+    applied_latency: Option<&'a AtomicU32>,
+    applied_latency_pair: Option<&'a AtomicU64>,
+    stream_status: Option<&'a StreamStatusFlags>,
 }
 
 impl RtSwapHandler for ResamplerSwapHandler<'_> {
@@ -79,7 +83,16 @@ impl RtSwapHandler for ResamplerSwapHandler<'_> {
 
     #[cold]
     fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
-        install_resampler(payload, self.resampler, self.stream, gc, self.rt_status);
+        install_resampler(
+            payload,
+            self.resampler,
+            self.stream,
+            gc,
+            self.rt_status,
+            self.applied_latency,
+            self.applied_latency_pair,
+            self.stream_status,
+        );
     }
 
     #[cold]
@@ -88,18 +101,21 @@ impl RtSwapHandler for ResamplerSwapHandler<'_> {
     }
 }
 
-/// Runs one callback drain of the resampler swap ring (engine protocol).
+/// Runs one callback drain of the resampler swap ring with coherent pair latency support.
 #[inline(always)]
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
-pub fn drain_resamplers(
+pub fn drain_resamplers_with_pair(
     drain: &mut ResamplerSwapDrain,
     budget: &mut neural_amp_modeler_rs::common::spsc::SwapBudget,
     resampler: &mut Box<NamResampler>,
     stream: &mut Box<StreamingResampleBuffer>,
     rt_status_for_process: &RtStatusFlags,
+    applied_latency: Option<&AtomicU32>,
+    applied_latency_pair: Option<&AtomicU64>,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
     parking_lot_dirty: &AtomicBool,
@@ -116,8 +132,81 @@ pub fn drain_resamplers(
         resampler,
         stream,
         rt_status: rt_status_for_process,
+        applied_latency,
+        applied_latency_pair,
+        stream_status: None,
     };
     drain.drain(&mut handler, budget, &mut gc);
+}
+
+/// Runs one callback drain of the resampler swap ring with complete `StreamStatusFlags` seqlock snapshot support.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+)]
+pub fn drain_resamplers_with_status(
+    drain: &mut ResamplerSwapDrain,
+    budget: &mut neural_amp_modeler_rs::common::spsc::SwapBudget,
+    resampler: &mut Box<NamResampler>,
+    stream: &mut Box<StreamingResampleBuffer>,
+    rt_status_for_process: &RtStatusFlags,
+    stream_status: Option<&StreamStatusFlags>,
+    gc_producer: &mut rtrb::Producer<GcItem>,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    gc_overflow_for_process: &GcOverflowBuffer,
+) {
+    let mut gc = GcSink {
+        producer: gc_producer,
+        parking_lot,
+        overflow: gc_overflow_for_process,
+        rt_status: rt_status_for_process,
+        parking_lot_dirty: Some(parking_lot_dirty),
+    };
+    let mut handler = ResamplerSwapHandler {
+        resampler,
+        stream,
+        rt_status: rt_status_for_process,
+        applied_latency: stream_status.map(|s| &s.applied_resampler_latency),
+        applied_latency_pair: stream_status.map(|s| &s.applied_latency_pair),
+        stream_status,
+    };
+    drain.drain(&mut handler, budget, &mut gc);
+}
+
+/// Runs one callback drain of the resampler swap ring (engine protocol).
+#[inline(always)]
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+)]
+pub fn drain_resamplers(
+    drain: &mut ResamplerSwapDrain,
+    budget: &mut neural_amp_modeler_rs::common::spsc::SwapBudget,
+    resampler: &mut Box<NamResampler>,
+    stream: &mut Box<StreamingResampleBuffer>,
+    rt_status_for_process: &RtStatusFlags,
+    applied_latency: Option<&AtomicU32>,
+    gc_producer: &mut rtrb::Producer<GcItem>,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    gc_overflow_for_process: &GcOverflowBuffer,
+) {
+    drain_resamplers_with_pair(
+        drain,
+        budget,
+        resampler,
+        stream,
+        rt_status_for_process,
+        applied_latency,
+        None,
+        gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        gc_overflow_for_process,
+    );
 }
 
 /// Builds the drain for a fresh (re)connection, preserving the historical
@@ -131,15 +220,45 @@ pub fn resampler_swap_drain(ring: ResamplerSwapRing) -> ResamplerSwapDrain {
 /// unmutes (clears `RT_STATUS_RESAMP_SWAP_PENDING`) and cascades the retired
 /// resampler envelope to GC.
 #[cold]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain install signature takes individual engine/status components"
+)]
 fn install_resampler(
     mut payload: Box<ResamplerSwapPayload>,
     resampler: &mut Box<NamResampler>,
     stream: &mut Box<StreamingResampleBuffer>,
     gc: &mut GcSink<'_>,
     rt_status_for_process: &RtStatusFlags,
+    applied_latency: Option<&AtomicU32>,
+    applied_latency_pair: Option<&AtomicU64>,
+    stream_status: Option<&StreamStatusFlags>,
 ) {
     std::mem::swap(&mut payload.resampler, resampler);
     std::mem::swap(&mut payload.stream, stream);
+
+    let lat = stream.latency_samples();
+    if let Some(status) = stream_status {
+        status.update_resampler_latency(lat);
+        status
+            .applied_nam_rate
+            .store(resampler.nam_rate(), Ordering::Release);
+    } else {
+        if let Some(applied) = applied_latency {
+            applied.store(lat, Ordering::Release);
+        }
+        if let Some(pair) = applied_latency_pair {
+            let mut cur = pair.load(Ordering::Relaxed);
+            loop {
+                let (_, cab) = StreamStatusFlags::unpack_latency_pair(cur);
+                let next = StreamStatusFlags::pack_latency_pair(lat, cab);
+                match pair.compare_exchange_weak(cur, next, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(actual) => cur = actual,
+                }
+            }
+        }
+    }
 
     rt_status_for_process
         .applied_rate_generation

@@ -52,17 +52,93 @@ fn make_pair(
 #[test]
 fn rebuild_not_requested_without_ir_or_samples() {
     let pair = make_pair(64, 48000);
-    assert!(!cabsim_rebuild_needed(Some(&pair), false, 64, 48000, false));
-    assert!(!cabsim_rebuild_needed(None, false, 64, 48000, false));
-    assert!(!cabsim_rebuild_needed(None, true, 0, 48000, false));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        false,
+        64,
+        48000,
+        64,
+        None,
+        false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        None, false, 64, 48000, 64, None, false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        None, true, 0, 48000, 64, None, false
+    ));
 }
 
 #[test]
 fn rebuild_requested_when_no_pair_active_and_not_pending() {
-    // First install (or recovery after a failed rebuild pushed None).
-    assert!(cabsim_rebuild_needed(None, true, 64, 48000, false));
+    // First install: no pair active and no latch.
+    assert!(cabsim_rebuild_needed(
+        None, true, 64, 48000, 64, None, false
+    ));
     // A request already in flight must not be re-requested.
-    assert!(!cabsim_rebuild_needed(None, true, 64, 48000, true));
+    assert!(!cabsim_rebuild_needed(
+        None, true, 64, 48000, 64, None, true
+    ));
+}
+
+#[test]
+fn rebuild_suppressed_when_failed_key_matches() {
+    // S08.4 / D-06: Recovery after a failed rebuild pushed None.
+    // In NAM-Audio-Pipe, IR is configured at startup and is immutable per process.
+    // The latch keys strictly on (host_rate, partition), suppressing retries across
+    // all subsequent callbacks until a renegotiated rate or partition policy changes the key.
+    assert!(!cabsim_rebuild_needed(
+        None,
+        true,
+        64,
+        48000,
+        64,
+        Some((48000, 64)),
+        false
+    ));
+    // Even if n_samples changes within domain, the same (rate, partition) stays latched.
+    assert!(!cabsim_rebuild_needed(
+        None,
+        true,
+        128,
+        48000,
+        64,
+        Some((48000, 64)),
+        false
+    ));
+}
+
+#[test]
+fn rebuild_resumed_when_host_rate_or_partition_differs_from_failed_key() {
+    // Legitimate new rate: PipeWire renegotiates rate from 48000 to 44100 or 96000.
+    assert!(cabsim_rebuild_needed(
+        None,
+        true,
+        64,
+        44100,
+        64,
+        Some((48000, 64)),
+        false
+    ));
+    assert!(cabsim_rebuild_needed(
+        None,
+        true,
+        64,
+        96000,
+        64,
+        Some((48000, 64)),
+        false
+    ));
+    // Legitimate new partition policy:
+    assert!(cabsim_rebuild_needed(
+        None,
+        true,
+        64,
+        48000,
+        128,
+        Some((48000, 64)),
+        false
+    ));
 }
 
 #[test]
@@ -72,18 +148,66 @@ fn rebuild_not_requested_on_partition_mismatch_quantum_decoupled() {
     // partição fixa. Uma renegociação de quantum (ex.: 64 → 128 amostras a
     // taxa constante) mantém o par ativo sem interrupção nem FFT pesada.
     let pair = make_pair(64, 48000);
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 48000, false));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 256, 48000, false));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 48000, false));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        128,
+        48000,
+        64,
+        None,
+        false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        256,
+        48000,
+        64,
+        None,
+        false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        48000,
+        64,
+        None,
+        false
+    ));
 }
 
 #[test]
 fn rebuild_requested_on_rate_mismatch() {
     let pair = make_pair(64, 48000);
     // IR calibrated for 48k while the host output runs at another rate.
-    assert!(cabsim_rebuild_needed(Some(&pair), true, 64, 44100, false));
-    assert!(cabsim_rebuild_needed(Some(&pair), true, 64, 96000, false));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 48000, false));
+    assert!(cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        44100,
+        64,
+        None,
+        false
+    ));
+    assert!(cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        96000,
+        64,
+        None,
+        false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        48000,
+        64,
+        None,
+        false
+    ));
 }
 
 #[test]
@@ -97,45 +221,127 @@ fn rebuild_suppressed_while_pending_with_active_pair() {
     let pair = make_pair(64, 48000);
 
     // Quantum divergente sozinho nunca rebuilda — com ou sem pendência.
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 48000, false));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 48000, true));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        128,
+        48000,
+        64,
+        None,
+        false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        128,
+        48000,
+        64,
+        None,
+        true
+    ));
     // Taxa divergente isolada.
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 44100, true));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 96000, true));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        44100,
+        64,
+        None,
+        true
+    ));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        96000,
+        64,
+        None,
+        true
+    ));
     // Ambos divergentes (quantum + taxa).
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 44100, true));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        128,
+        44100,
+        64,
+        None,
+        true
+    ));
     // Par correspondente com pendência segue no-op.
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 64, 48000, true));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        48000,
+        64,
+        None,
+        true
+    ));
 
     // Sem pendência, só a divergência de taxa requisita.
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 128, 48000, false));
-    assert!(cabsim_rebuild_needed(Some(&pair), true, 64, 44100, false));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        128,
+        48000,
+        64,
+        None,
+        false
+    ));
+    assert!(cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        64,
+        44100,
+        64,
+        None,
+        false
+    ));
 }
 
 #[test]
 fn rebuild_first_install_gated_by_partition_domain() {
     // O quantum só condiciona a primeira instalação (um quantum real prova que
-    // a taxa do host foi negociada) — fora do domínio [16, MAX_RESAMP_BUF] o
-    // par ausente nunca requisita. A partição em si vem da política
-    // `--cabsim-partition`, nunca do quantum. Um par ativo saudável nunca
-    // rebuilda por quantum, mesmo anômalo: o driver agnóstico de bloco
-    // processa qualquer tamanho.
+    // a taxa do host foi negociada) — fora do domínio
+    // [BUFFER_SIZE_MIN, MAX_RESAMP_BUF] o par ausente nunca requisita. A
+    // partição em si vem da política `--cabsim-partition`, nunca do quantum.
+    // Um par ativo saudável nunca rebuilda por quantum, mesmo anômalo: o
+    // driver agnóstico de bloco processa qualquer tamanho.
     assert!(!cabsim_rebuild_needed(
         None,
         true,
         MAX_RESAMP_BUF + 1,
         48000,
+        64,
+        None,
         false
     ));
-    assert!(!cabsim_rebuild_needed(None, true, 8, 48000, false));
-    assert!(!cabsim_rebuild_needed(None, true, 0, 48000, false));
-    // Bordas do domínio ainda instalam quando falta o par.
-    assert!(cabsim_rebuild_needed(None, true, 16, 48000, false));
+    // Quantum zero não é bloco de áudio válido.
+    assert!(!cabsim_rebuild_needed(
+        None, true, 0, 48000, 64, None, false
+    ));
+    // Quanta de 1 a 15 são explicitamente rejeitados pelo gate de instalação.
+    assert!(!cabsim_rebuild_needed(
+        None, true, 1, 48000, 64, None, false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        None, true, 8, 48000, 64, None, false
+    ));
+    assert!(!cabsim_rebuild_needed(
+        None, true, 15, 48000, 64, None, false
+    ));
+    // Bordas e valores típicos do domínio ainda instalam quando falta o par.
+    assert!(cabsim_rebuild_needed(
+        None, true, 16, 48000, 64, None, false
+    ));
     assert!(cabsim_rebuild_needed(
         None,
         true,
         MAX_RESAMP_BUF,
         48000,
+        64,
+        None,
         false
     ));
     let pair = make_pair(16, 48000);
@@ -145,6 +351,8 @@ fn rebuild_first_install_gated_by_partition_domain() {
         true,
         MAX_RESAMP_BUF,
         48000,
+        16,
+        None,
         false
     ));
     assert!(!cabsim_rebuild_needed(
@@ -152,9 +360,19 @@ fn rebuild_first_install_gated_by_partition_domain() {
         true,
         MAX_RESAMP_BUF + 1,
         48000,
+        16,
+        None,
         false
     ));
-    assert!(!cabsim_rebuild_needed(Some(&pair), true, 8, 48000, false));
+    assert!(!cabsim_rebuild_needed(
+        Some(&pair),
+        true,
+        8,
+        48000,
+        16,
+        None,
+        false
+    ));
 }
 
 /// Renegociação simulada de quantum: 128 → 256 amostras a taxa constante
@@ -166,7 +384,7 @@ fn quantum_renegotiation_at_constant_rate_never_rebuilds() {
         let pair = make_pair(partition, 48000);
         for quantum in [16usize, 32, 64, 128, 256, 512, 1024] {
             assert!(
-                !cabsim_rebuild_needed(Some(&pair), true, quantum, 48000, false),
+                !cabsim_rebuild_needed(Some(&pair), true, quantum, 48000, partition, None, false),
                 "quantum {quantum} a 48 kHz com partição {partition} não deve rebuildar"
             );
         }

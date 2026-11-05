@@ -582,6 +582,7 @@ pub type OsSwapDrain = RtSwapDrain<OsSwapRing>;
 pub(crate) struct OsSwapHandler<'a> {
     os_l: &'a mut Box<OversampleEngine>,
     os_r: &'a mut Box<OversampleEngine>,
+    stream_status: Option<&'a crate::standalone::pw_host::StreamStatusFlags>,
     rt_status: &'a RtStatusFlags,
 }
 
@@ -614,7 +615,14 @@ impl RtSwapHandler for OsSwapHandler<'_> {
 
     #[cold]
     fn install(&mut self, payload: Box<Self::Payload>, gc: &mut GcSink<'_>) {
-        install_os_pair(payload, self.os_l, self.os_r, gc, self.rt_status);
+        install_os_pair(
+            payload,
+            self.os_l,
+            self.os_r,
+            self.stream_status,
+            gc,
+            self.rt_status,
+        );
     }
 
     #[cold]
@@ -631,11 +639,12 @@ impl RtSwapHandler for OsSwapHandler<'_> {
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
 )]
-pub fn drain_os_engines(
+pub fn drain_os_engines_with_status(
     drain: &mut Option<OsSwapDrain>,
     budget: &mut SwapBudget,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
+    stream_status: Option<&crate::standalone::pw_host::StreamStatusFlags>,
     rt_status: &RtStatusFlags,
     gc_producer: &mut rtrb::Producer<GcItem>,
     parking_lot: &mut [Option<GcItem>; 16],
@@ -655,9 +664,42 @@ pub fn drain_os_engines(
     let mut handler = OsSwapHandler {
         os_l,
         os_r,
+        stream_status,
         rt_status,
     };
     drain.drain(&mut handler, budget, &mut gc);
+}
+
+/// Simple test-convenience wrapper for [`drain_os_engines_with_status`] without stream status flags.
+#[cfg(test)]
+#[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+)]
+pub fn drain_os_engines(
+    drain: &mut Option<OsSwapDrain>,
+    budget: &mut SwapBudget,
+    os_l: &mut Box<OversampleEngine>,
+    os_r: &mut Box<OversampleEngine>,
+    rt_status: &RtStatusFlags,
+    gc_producer: &mut rtrb::Producer<GcItem>,
+    parking_lot: &mut [Option<GcItem>; 16],
+    parking_lot_dirty: &AtomicBool,
+    gc_overflow: &GcOverflowBuffer,
+) {
+    drain_os_engines_with_status(
+        drain,
+        budget,
+        os_l,
+        os_r,
+        None,
+        rt_status,
+        gc_producer,
+        parking_lot,
+        parking_lot_dirty,
+        gc_overflow,
+    );
 }
 
 /// Builds the drain for a fresh (re)connection, preserving the historical
@@ -672,6 +714,7 @@ fn install_os_pair(
     mut pair: Box<OsEnginePair>,
     os_l: &mut Box<OversampleEngine>,
     os_r: &mut Box<OversampleEngine>,
+    stream_status: Option<&crate::standalone::pw_host::StreamStatusFlags>,
     gc: &mut GcSink<'_>,
     rt_status: &RtStatusFlags,
 ) {
@@ -682,6 +725,10 @@ fn install_os_pair(
         .store(pair.generation, Ordering::Release);
     std::mem::swap(&mut pair.l, os_l);
     std::mem::swap(&mut pair.r, os_r);
+    let os_lat = os_l.latency_samples() as u32;
+    if let Some(status) = stream_status {
+        status.update_oversample_latency(os_lat);
+    }
     gc.retire(GcItem::OsEnginePair(pair));
 }
 

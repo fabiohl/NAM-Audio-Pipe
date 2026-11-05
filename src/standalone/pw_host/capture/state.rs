@@ -10,6 +10,7 @@
 
 use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use crate::standalone::cli::GateConfig;
+use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::pw_host::rt_callback::{
     CabSimSwapDrain, OsSwapDrain, ResamplerSwapDrain, SlimmableSwapDrain,
 };
@@ -97,6 +98,10 @@ pub struct CaptureState {
     pub recording_meta_rate: u32,
     pub recording_block: AlignedBlock<MAX_BLOCK_SIZE>,
     pub thread_configured: bool,
+    /// Activation precision mode for the audio data thread.
+    pub activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
+    /// Rate synchronization state across callbacks (desired rate tracking, idempotency, retry bounds).
+    pub rate_sync: crate::standalone::pw_host::rt_callback::RateSyncState,
     pub ir_raw_samples: Option<Vec<f32>>,
     /// Sample rate of `ir_raw_samples` (the IR file's native rate). The
     /// main-thread rebuild resamples the preserved original IR specifically
@@ -129,6 +134,14 @@ pub struct CaptureState {
     pub deferred_model: Option<ParamPayload>,
     pub slimmable_drain: Option<SlimmableSwapDrain>,
     pub os_drain: Option<OsSwapDrain>,
+    /// Cab-sim rebuild failure latch: stores the `(host_rate, partition_size)` of the last
+    /// build attempt that failed and installed safe-bypass (`None`).
+    /// Prevents RT callback from repeatedly requesting rebuilds for the same failing key (D-06).
+    /// Cleared upon successful pair installation. Since IR is immutable per process in NAM-Audio-Pipe,
+    /// recovery from a failed latch occurs when host rate or partition policy changes (S08.4).
+    pub cabsim_failed_key: Option<(u32, usize)>,
+    /// Optional reference to the host stream status flags for publishing applied latency (D-08).
+    pub stream_status: Option<Arc<StreamStatusFlags>>,
 }
 
 impl CaptureState {
@@ -291,6 +304,8 @@ impl CaptureState {
             recording_meta_rate: 0,
             recording_block: AlignedBlock::new(),
             thread_configured: false,
+            activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+            rate_sync: crate::standalone::pw_host::rt_callback::RateSyncState::new(48_000),
             ir_raw_samples: None,
             ir_source_rate: 0,
             cabsim_partition_policy: crate::standalone::cli::CABSIM_PARTITION_DEFAULT as usize,
@@ -299,6 +314,8 @@ impl CaptureState {
             deferred_model: None,
             slimmable_drain: None,
             os_drain: None,
+            cabsim_failed_key: None,
+            stream_status: None,
         }
     }
 }

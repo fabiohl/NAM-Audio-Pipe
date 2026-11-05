@@ -6,6 +6,7 @@
 //! Handles resampler, buffer quantum logging, CabSim IR rebuild,
 //! slimmable WaveNet slicing, and oversampling engine reconfiguration.
 
+use crate::standalone::cli::BUFFER_SIZE_MIN;
 use crate::standalone::colors::Colorize;
 use neural_amp_modeler_rs::common::diagnostics::{NamErrorCode, SystemSnapshot};
 use neural_amp_modeler_rs::common::spsc::{
@@ -447,6 +448,13 @@ pub(super) fn handle_quantum_log(
     let effective_quantum = rt_status.requested_buffer_frames.load(Ordering::Relaxed);
     let old_quantum = rt_status.previous_buffer_frames.load(Ordering::Relaxed);
     if effective_quantum != 0 && effective_quantum != old_quantum {
+        if effective_quantum < BUFFER_SIZE_MIN {
+            log::warn!(
+                "PipeWire quantum {} samples is below the supported minimum {}; CabSim installation is rejected and the dry path keeps running.",
+                effective_quantum,
+                BUFFER_SIZE_MIN
+            );
+        }
         let rate = if host_rate > 0 { host_rate } else { 48_000 };
         let eff_ms = effective_quantum as f64 * 1000.0 / rate as f64;
         let req_str = if requested_quantum > 0 {
@@ -490,8 +498,9 @@ pub(super) fn handle_quantum_log(
 ///
 /// Rollback: on build failure the handler delivers `None` — safe cab-sim
 /// bypass — instead of letting the RT run an IR calibrated for a divergent
-/// rate. The RT re-requests while `active == None`, so transient failures
-/// recover automatically.
+/// rate. The RT latches the failed (rate, partition) key so it does not endlessly
+/// re-request rebuilds for the same failing parameters (D-06); a new rate or IR
+/// resets the latch and allows recovery.
 pub(super) fn handle_cabsim_rebuild(
     rt_status: &RtStatusFlags,
     ir_raw_samples: Option<&[f32]>,

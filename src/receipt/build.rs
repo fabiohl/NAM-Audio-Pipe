@@ -133,24 +133,118 @@ pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String, std::io::Error> {
 
 /// Parse `ab-opt-ceremony-receipt.json` into `(proof_id, samples, fdata_sha)`.
 ///
-/// A proof requires the `PGO+BOLT` verdict and at least three measured runs.
-/// The ceremony itself derives that verdict from the p99 non-regression
-/// contract, so the build receipt must not re-encode a different gain rule.
+/// A proof requires the `PGO+BOLT` verdict, at least three measured runs, the
+/// complete and unique topology × run ledger (no defaults, no dropped entries),
+/// and a strict non-tie p99/max win on every run. The 5 % margin is recorded as
+/// pending PO approval and never used to promote BOLT; incomplete or invalid
+/// evidence yields `None` (GAP), never a silent pass.
 pub fn parse_ab_opt_ceremony_receipt<P: AsRef<Path>>(
     path: P,
 ) -> Option<(String, Option<String>, Option<String>)> {
     let content = fs::read_to_string(path).ok()?;
     let doc: serde_json::Value = serde_json::from_str(&content).ok()?;
+    if doc.get("schema_version").and_then(|v| v.as_u64()) != Some(2) {
+        return None;
+    }
+    if doc.get("tool").and_then(|v| v.as_str()) != Some("ab-opt-ceremony") {
+        return None;
+    }
     if doc.get("verdict").and_then(|v| v.as_str()) != Some("PGO+BOLT") {
+        return None;
+    }
+    if doc.get("bolt_applied").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    if doc
+        .get("bolt_gain_threshold_status")
+        .and_then(|v| v.as_str())
+        != Some("pending_po_approval")
+        || doc
+            .get("bolt_gain_threshold_used_for_promotion")
+            .and_then(|v| v.as_bool())
+            != Some(false)
+        || doc.get("bolt_gain_threshold_pct").and_then(|v| v.as_f64())
+            != Some(BOLT_GAIN_THRESHOLD_PCT_PENDING_PO)
+    {
         return None;
     }
     let runs = doc
         .get("runs")
         .and_then(|r| r.as_u64().or_else(|| r.as_str()?.parse().ok()))
         .unwrap_or(0);
-    if runs < 3 {
+    if runs < MIN_CEREMONY_RUNS {
         return None;
     }
+
+    // Fail-closed validation of per-run ledger and margin fields (§9 item 34)
+    if doc.get("bolt_reproducible_gain").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    if doc
+        .get("effective_reproducible_gain")
+        .and_then(|v| v.as_bool())
+        != Some(true)
+    {
+        return None;
+    }
+    let ledger = doc.get("ledger").and_then(|v| v.as_array())?;
+    let expected = TOPOLOGIES.len() * runs as usize;
+    if ledger.len() != expected {
+        return None;
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut min_p99 = f64::INFINITY;
+    let mut min_max = f64::INFINITY;
+    for entry in ledger {
+        let topology = entry.get("topology").and_then(|v| v.as_str())?;
+        if !TOPOLOGIES.contains(&topology) {
+            return None;
+        }
+        let run = entry.get("run").and_then(|v| v.as_u64())?;
+        if run < 1 || run > runs {
+            return None;
+        }
+        if !seen.insert((topology.to_string(), run)) {
+            return None;
+        }
+        let samples = entry.get("samples").and_then(|v| v.as_u64()).unwrap_or(0);
+        if samples == 0 {
+            return None;
+        }
+        let bolt_promoted = entry
+            .get("bolt_promoted_this_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let p99_gain = entry.get("bolt_gain_pct").and_then(|v| v.as_f64())?;
+        let max_gain = entry.get("bolt_max_gain_pct").and_then(|v| v.as_f64())?;
+        if !bolt_promoted
+            || !p99_gain.is_finite()
+            || !max_gain.is_finite()
+            || p99_gain <= 0.0
+            || max_gain <= 0.0
+        {
+            return None;
+        }
+        min_p99 = min_p99.min(p99_gain);
+        min_max = min_max.min(max_gain);
+    }
+    for topology in TOPOLOGIES {
+        for run in 1..=runs {
+            if !seen.contains(&(topology.to_string(), run)) {
+                return None;
+            }
+        }
+    }
+
+    let declared_min_p99 = doc.get("min_bolt_gain_pct").and_then(|v| v.as_f64())?;
+    let declared_min_max = doc.get("min_bolt_max_gain_pct").and_then(|v| v.as_f64())?;
+    let reconciled =
+        |declared: f64, computed: f64| declared.is_finite() && (declared - computed).abs() <= 1e-9;
+    if !reconciled(declared_min_p99, min_p99) || !reconciled(declared_min_max, min_max) {
+        return None;
+    }
+
     let lbr = doc.get("bolt_lbr");
     let samples = lbr
         .and_then(|l| l.get("samples"))
@@ -197,6 +291,9 @@ pub fn parse_pgo_workload_receipt<P: AsRef<Path>>(path: P) -> Option<PgoWorkload
 
 const MIN_TOTAL_BLOCKS: u64 = 1000;
 const MIN_CELL_BLOCKS: u64 = 4;
+const MIN_CEREMONY_RUNS: u64 = 3;
+/// Pending PO approval: recorded in the receipt, never used to promote BOLT.
+const BOLT_GAIN_THRESHOLD_PCT_PENDING_PO: f64 = 5.0;
 const TOPOLOGIES: [&str; 3] = ["wavenet_a1", "wavenet_a2", "lstm"];
 const DSP_GROUPS: [&str; 6] = [
     "resampler",

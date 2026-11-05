@@ -113,6 +113,33 @@ pub struct StreamStatusFlags {
     /// was negotiated on either stream.
     pub format_contract_ok: AtomicU32,
 
+    /// Algorithmic latency in samples of the resampler stage currently applied on the RT audio thread (D-08).
+    /// Updated with `Ordering::Release` in `install_resampler` upon committing a swap.
+    pub applied_resampler_latency: AtomicU32,
+
+    /// Algorithmic latency in samples of the cab-sim stage currently applied on the RT audio thread (D-08)
+    /// (`0` when bypassed / no pair active). Updated with `Ordering::Release` in `install_cabsim`.
+    pub applied_cabsim_latency: AtomicU32,
+
+    /// Algorithmic latency in native model samples of the oversampling stage currently applied on the RT audio thread (F-PIPE-01)
+    /// (`0` when bypassed / Off, `12` for X2, `18` for X4). Updated with `Ordering::Release` in `install_os_pair`.
+    pub applied_oversample_latency: AtomicU32,
+
+    /// Sample rate of the model actually installed behind the applied resampler
+    /// (`0` = not published yet). Updated off-/RT with `Ordering::Release` when
+    /// the resampler is installed, so latency conversion never assumes 48 kHz.
+    pub applied_nam_rate: AtomicU32,
+
+    /// Sequence lock counter for the coherent multi-component latency snapshot (resampler, cabsim, oversample) (F-PIPE-01).
+    /// Odd = write in progress; Even = clean snapshot.
+    pub latency_sequence: AtomicU64,
+
+    /// Coherent 64-bit atomic latency snapshot (D-08 / S08.4).
+    /// High 32 bits: resampler latency in samples.
+    /// Low 32 bits: cabsim latency in samples.
+    /// Eliminates transient latency tearing when reading aggregate DSP latency off-RT.
+    pub applied_latency_pair: AtomicU64,
+
     /// Host clock `time.now` from the last capture stream time() call (nanoseconds).
     pub capture_host_now: AtomicI64,
     /// Host clock `time.ticks` from the last capture stream time() call.
@@ -159,12 +186,112 @@ impl StreamStatusFlags {
             capture_active: AtomicU32::new(1),
             playback_active: AtomicU32::new(1),
             format_contract_ok: AtomicU32::new(1),
+            applied_resampler_latency: AtomicU32::new(0),
+            applied_cabsim_latency: AtomicU32::new(0),
+            applied_oversample_latency: AtomicU32::new(0),
+            applied_nam_rate: AtomicU32::new(0),
+            latency_sequence: AtomicU64::new(0),
+            applied_latency_pair: AtomicU64::new(0),
             capture_host_now: AtomicI64::new(0),
             capture_host_ticks: AtomicU64::new(0),
             capture_host_delay: AtomicI64::new(0),
             playback_host_now: AtomicI64::new(0),
             playback_host_ticks: AtomicU64::new(0),
             playback_host_delay: AtomicI64::new(0),
+        }
+    }
+
+    /// Packs resampler and cabsim latencies into a single 64-bit snapshot.
+    #[inline(always)]
+    pub fn pack_latency_pair(resampler: u32, cabsim: u32) -> u64 {
+        ((resampler as u64) << 32) | (cabsim as u64)
+    }
+
+    /// Unpacks a 64-bit snapshot into (resampler_latency, cabsim_latency).
+    #[inline(always)]
+    pub fn unpack_latency_pair(packed: u64) -> (u32, u32) {
+        ((packed >> 32) as u32, packed as u32)
+    }
+
+    /// Atomically reads the coherent (resampler, cabsim) latency snapshot.
+    #[inline(always)]
+    pub fn read_applied_latency_pair(&self) -> (u32, u32) {
+        Self::unpack_latency_pair(self.applied_latency_pair.load(Ordering::Acquire))
+    }
+
+    /// Atomically reads the coherent (resampler, cabsim, oversample_native) latency snapshot via seqlock (F-PIPE-01).
+    ///
+    /// Single writer (the RT audio thread); writers bump the sequence before and
+    /// after the stores. The `Acquire` fence before the closing sequence load
+    /// orders the field loads before the validation, so a concurrent writer can
+    /// never expose a torn snapshot.
+    #[inline]
+    pub fn read_applied_latencies(&self) -> (u32, u32, u32) {
+        loop {
+            let s0 = self.latency_sequence.load(Ordering::Acquire);
+            if s0 & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let res = self.applied_resampler_latency.load(Ordering::Relaxed);
+            let cab = self.applied_cabsim_latency.load(Ordering::Relaxed);
+            let os = self.applied_oversample_latency.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            let s1 = self.latency_sequence.load(Ordering::Relaxed);
+            if s0 == s1 {
+                return (res, cab, os);
+            }
+        }
+    }
+
+    /// Atomically updates resampler latency and the coherent latency snapshots.
+    #[inline]
+    pub fn update_resampler_latency(&self, resampler: u32) {
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+        self.applied_resampler_latency
+            .store(resampler, Ordering::Release);
+        self.update_latency_pair_compat(
+            resampler,
+            self.applied_cabsim_latency.load(Ordering::Relaxed),
+        );
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+    }
+
+    /// Atomically updates cabsim latency and the coherent latency snapshots.
+    #[inline]
+    pub fn update_cabsim_latency(&self, cabsim: u32) {
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+        self.applied_cabsim_latency.store(cabsim, Ordering::Release);
+        self.update_latency_pair_compat(
+            self.applied_resampler_latency.load(Ordering::Relaxed),
+            cabsim,
+        );
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+    }
+
+    /// Atomically updates oversample latency (native model samples) and the coherent latency snapshot.
+    #[inline]
+    pub fn update_oversample_latency(&self, oversample: u32) {
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+        self.applied_oversample_latency
+            .store(oversample, Ordering::Release);
+        self.latency_sequence.fetch_add(1, Ordering::Release);
+    }
+
+    #[inline]
+    fn update_latency_pair_compat(&self, resampler: u32, cabsim: u32) {
+        let mut cur = self.applied_latency_pair.load(Ordering::Relaxed);
+        loop {
+            let next = Self::pack_latency_pair(resampler, cabsim);
+            match self.applied_latency_pair.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
         }
     }
 
@@ -207,5 +334,52 @@ mod tests {
         assert_eq!(status.e2e_exact.len(), 1);
         status.e2e_exact.reset();
         assert_eq!(status.e2e_exact.len(), 0);
+    }
+
+    #[test]
+    fn applied_latency_pair_coherent_snapshot() {
+        let status = StreamStatusFlags::new();
+        assert_eq!(status.read_applied_latency_pair(), (0, 0));
+
+        status.update_resampler_latency(32);
+        assert_eq!(status.read_applied_latency_pair(), (32, 0));
+        assert_eq!(status.applied_resampler_latency.load(Ordering::Acquire), 32);
+
+        status.update_cabsim_latency(128);
+        assert_eq!(status.read_applied_latency_pair(), (32, 128));
+        assert_eq!(status.applied_cabsim_latency.load(Ordering::Acquire), 128);
+
+        status.update_resampler_latency(0);
+        assert_eq!(status.read_applied_latency_pair(), (0, 128));
+
+        status.update_cabsim_latency(0);
+        assert_eq!(status.read_applied_latency_pair(), (0, 0));
+    }
+
+    #[test]
+    fn applied_latencies_coherent_seqlock_snapshot() {
+        let status = StreamStatusFlags::new();
+        assert_eq!(status.read_applied_latencies(), (0, 0, 0));
+
+        status.update_resampler_latency(32);
+        assert_eq!(status.read_applied_latencies(), (32, 0, 0));
+
+        status.update_cabsim_latency(128);
+        assert_eq!(status.read_applied_latencies(), (32, 128, 0));
+
+        status.update_oversample_latency(12);
+        assert_eq!(status.read_applied_latencies(), (32, 128, 12));
+
+        status.update_oversample_latency(18);
+        assert_eq!(status.read_applied_latencies(), (32, 128, 18));
+
+        status.update_resampler_latency(0);
+        assert_eq!(status.read_applied_latencies(), (0, 128, 18));
+
+        status.update_oversample_latency(0);
+        assert_eq!(status.read_applied_latencies(), (0, 128, 0));
+
+        status.update_cabsim_latency(0);
+        assert_eq!(status.read_applied_latencies(), (0, 0, 0));
     }
 }

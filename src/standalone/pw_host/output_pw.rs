@@ -11,7 +11,7 @@ use pipewire as pw;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas};
+use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas, stamp_chunk};
 use super::stream_status::StreamStatusFlags;
 use crate::standalone::cli::GateConfig;
 use crate::standalone::rt_setup;
@@ -104,6 +104,8 @@ pub struct PipewireHostConfig {
     /// Static banner facts resolved by `main` (F-UX-13). The control loop emits
     /// one consolidated status banner once the first RT confirmations arrive.
     pub banner: crate::standalone::banner::BannerRequest,
+    /// Explicit activation precision mode (`Standard` exact-grade or `Fast` Padé).
+    pub activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).
@@ -273,9 +275,16 @@ pub unsafe fn deliver_playback_pair_fail_closed(
     n_bytes: usize,
     rt_status: &RtStatusFlags,
 ) -> Option<usize> {
-    let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
+    let (_n_bytes, n_out) = match handle_spa_pair_fail_closed(
         ptr_l, max_l, chunk_l, 0, n_bytes, ptr_r, max_r, chunk_r, 0, n_bytes, rt_status,
-    )?;
+    ) {
+        Some(v) => v,
+        None => {
+            stamp_chunk(chunk_l, 0);
+            stamp_chunk(chunk_r, 0);
+            return None;
+        }
+    };
 
     // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
     // symmetry and strict pointer disjunction, so `out_l` is well-formed.
@@ -363,7 +372,7 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     rt_status: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
 ) -> Option<usize> {
-    let (_n_bytes, n_out) = handle_spa_pair_fail_closed(
+    let (_n_bytes, n_out) = match handle_spa_pair_fail_closed(
         ptr_l,
         max_l,
         chunk_l,
@@ -375,7 +384,14 @@ pub unsafe fn deliver_silence_pair_fail_closed(
         0,
         silence_bytes,
         rt_status,
-    )?;
+    ) {
+        Some(v) => v,
+        None => {
+            stamp_chunk(chunk_l, 0);
+            stamp_chunk(chunk_r, 0);
+            return None;
+        }
+    };
 
     // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
     // symmetry and strict pointer disjunction, so `out_l` is well-formed.

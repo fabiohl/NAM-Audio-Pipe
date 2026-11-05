@@ -106,6 +106,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
                 stream_status: Some(stream_status_clone),
                 recording_status: None,
                 banner: Default::default(),
+                activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
             },
             gc_cons,
             sl_cons,

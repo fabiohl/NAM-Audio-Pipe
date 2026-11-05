@@ -5,13 +5,13 @@
 //! CPU affinity locking, main control loop, bounded backend reconnection
 //! and graceful shutdown.
 
-use super::SharedBackendStatus;
 use super::capture::state::{CaptureState, RtHostChannels};
 use super::handlers;
 use super::observe_rt_panic;
 use super::output_pw::AppState;
 use super::reconnect::{ReconnectCycle, ReconnectPolicy, STABLE_RESET, StabilityEvent};
 use super::wakeup::ControlPlaneWakeup;
+use super::{SharedBackendStatus, StreamStatusFlags};
 use crate::recording::alert::RecordingAlert;
 use crate::recording::guard::{RecordingWorkerGuard, RecordingWorkerOutcome};
 use crate::recording::transport::RecordingSender;
@@ -121,6 +121,7 @@ pub fn run_pipewire_host(
         stream_status,
         recording_status,
         banner,
+        activation,
     } = config;
 
     // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
@@ -167,6 +168,7 @@ pub fn run_pipewire_host(
     unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
 
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
+    rt_state.activation = activation;
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
     // The cab-sim partition policy (--cabsim-partition) sizes every pair
@@ -241,6 +243,11 @@ pub fn run_pipewire_host(
     // =========================================================
     // 3. PROTECTED CONFIGURATION SCOPE (RAII)
     // =========================================================
+    // PM QoS lock: disable deep CPU C-States for the entire duration of the
+    // audio host session, including reconnect backoff windows, so power transition
+    // latency does not induce jitter upon reconnection (D-09).
+    let _cpu_dma_lock = rt_setup::lock_cpu_c_states();
+
     // Shared backend state machine: the capture and playback stream state
     // listeners mark it `Failed` on a fatal connectivity loss and the main
     // control loop below polls it every iteration — the process never survives
@@ -257,6 +264,7 @@ pub fn run_pipewire_host(
         SharedBackendStatus::with_rt_and_stream_status(rt_status.clone(), stream_status);
     backend_init.bind_wakeup(wakeup.clone());
     let backend_status = Arc::new(backend_init);
+    rt_state.stream_status = Some(Arc::clone(backend_status.stream_status()));
     let backend_for_capture = backend_status.clone();
     let backend_for_playback = backend_status.clone();
     // The RT-observable failure flag lives in the worker guard; clone it here
@@ -367,14 +375,48 @@ pub fn run_pipewire_host(
             // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
             let latency_str = format!("{}/48000", buffer_size);
 
-            let initial_latency_samples = if ir_raw_samples.is_some() {
-                cabsim_partition.clamp(
-                    16,
-                    neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF as u32,
-                )
-            } else {
-                0
+            // Compute actual initial DSP latency from the currently installed state in `state_ptr`:
+            // - At initial startup: cabsim is None (latency = 0), resampler is initialized (usually 0 if host matches nam).
+            // - After reconnect: models, IR, resampler, and cabsim in `state_ptr` survived!
+            //   We reflect the exact latency of the installed resampler and cabsim (or 0 if bypassed/uninstalled),
+            //   avoiding both underestimating the resampler and overestimating an uninstalled cab-sim (D-08).
+            // SAFETY: The PipeWire main loop is stopped at this point (either pre-run
+            // or between reconnect attempts after the previous loop exited). No RT thread or
+            // audio callback is accessing `state_ptr` concurrently.
+            let (initial_resamp_lat, initial_cab_lat, initial_os_native, initial_nam_rate) = unsafe {
+                let state = &*state_ptr;
+                let resamp = state.stream.latency_samples();
+                let cab = state
+                    .active_cabsim
+                    .as_ref()
+                    .map(|pair| pair.l.latency_samples() as u32)
+                    .unwrap_or(0);
+                let os = state.os_l.latency_samples() as u32;
+                (resamp, cab, os, state.current_nam_rate)
             };
+            let initial_os_lat =
+                latency::convert_os_latency_to_host(initial_os_native, 48_000, initial_nam_rate);
+            let initial_latency_samples = initial_resamp_lat + initial_cab_lat + initial_os_lat;
+            backend_status
+                .stream_status()
+                .applied_nam_rate
+                .store(initial_nam_rate, Ordering::Release);
+            backend_status
+                .stream_status()
+                .applied_resampler_latency
+                .store(initial_resamp_lat, Ordering::Release);
+            backend_status
+                .stream_status()
+                .applied_cabsim_latency
+                .store(initial_cab_lat, Ordering::Release);
+            backend_status
+                .stream_status()
+                .applied_oversample_latency
+                .store(initial_os_native, Ordering::Release);
+            backend_status.stream_status().applied_latency_pair.store(
+                StreamStatusFlags::pack_latency_pair(initial_resamp_lat, initial_cab_lat),
+                Ordering::Release,
+            );
 
             let (cs, cl) = capture::setup_capture_stream(
                 &core,
@@ -460,8 +502,6 @@ pub fn run_pipewire_host(
         // We can safely release the teardown guard from any previous iteration.
         drop(teardown_guard.take());
 
-        let _cpu_dma_lock = rt_setup::lock_cpu_c_states();
-
         sys.emit_irq_advisory(target_cpu);
 
         // 4.2 RT THREAD START (Background)
@@ -485,8 +525,6 @@ pub fn run_pipewire_host(
         // =========================================================
         // 5. MAIN CONTROL LOOP (Main Thread, Non-RT)
         // =========================================================
-        let mut active_cabsim_latency = initial_latency_samples;
-        let mut active_resampler_latency = 0u32;
         let mut last_published_dsp_latency = initial_latency_samples;
         let mut last_published_rate = 48_000u32;
 
@@ -579,23 +617,36 @@ pub fn run_pipewire_host(
                 if p_rate != 0 { p_rate } else { 48_000 }
             };
 
-            if let Some(resamp_lat) =
-                handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer)
-            {
-                active_resampler_latency = resamp_lat;
-            }
-
-            if let Some(cab_lat) = handlers::handle_cabsim_rebuild(
+            let _ = handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer);
+            let _ = handlers::handle_cabsim_rebuild(
                 &rt_status,
                 ir_raw_samples.as_deref(),
                 ir_source_rate,
                 &sys,
                 &mut cabsim_producer,
-            ) {
-                active_cabsim_latency = cab_lat;
-            }
+            );
 
-            let current_dsp_latency = active_cabsim_latency + active_resampler_latency;
+            // Read the coherent DSP latency snapshot effectively applied on the audio thread (D-08 / S08.4 / F-PIPE-01).
+            // A coherent seqlock read ensures resampler, cabsim, and oversampling latencies form a consistent snapshot.
+            let (active_resampler_latency, active_cabsim_latency, active_os_native_latency) =
+                backend_status.stream_status().read_applied_latencies();
+            let applied_nam_rate = backend_status
+                .stream_status()
+                .applied_nam_rate
+                .load(Ordering::Relaxed);
+            let model_rate = if applied_nam_rate != 0 {
+                applied_nam_rate
+            } else {
+                48_000
+            };
+            let active_os_latency = latency::convert_os_latency_to_host(
+                active_os_native_latency,
+                host_rate,
+                model_rate,
+            );
+
+            let current_dsp_latency =
+                active_cabsim_latency + active_resampler_latency + active_os_latency;
             handlers::handle_quantum_log(&rt_status, buffer_size, current_dsp_latency, host_rate);
 
             if current_dsp_latency != last_published_dsp_latency
@@ -605,6 +656,7 @@ pub fn run_pipewire_host(
                 let (_, lat_ns) = latency::compute_dsp_latency(
                     active_cabsim_latency,
                     active_resampler_latency,
+                    active_os_latency,
                     host_rate,
                 );
                 let _ = latency::update_stream_latency(
@@ -620,11 +672,14 @@ pub fn run_pipewire_host(
                     lat_ns,
                 );
                 log::info!(
-                    "{} Published updated DSP processing latency to PipeWire graph: {} samples ({:.2} ms @{}Hz)",
+                    "{} Published updated DSP processing latency to PipeWire graph: {} samples ({:.2} ms @{}Hz) [cabsim={}, resampler={}, oversample={}]",
                     "⏱️".cyan(),
                     current_dsp_latency,
                     lat_ns as f64 / 1_000_000.0,
                     host_rate,
+                    active_cabsim_latency,
+                    active_resampler_latency,
+                    active_os_latency,
                 );
                 last_published_dsp_latency = current_dsp_latency;
                 if active != 0 {

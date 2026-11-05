@@ -27,14 +27,13 @@
 //! - `rt_jitter_gate_10k_callbacks` (filter `jitter`, Phase 4): 10 000
 //!   callback dispatches at the nominal period while background I/O, cache
 //!   thrash and syscall-storm threads perturb the shared CPU. Measures the
-//!   inter-callback interval dispersion (max / p99 / p99.9 / p99.99 /
-//!   std-dev), counts `tail_events_gt_200us`, and captures the RT thread's
-//!   `getrusage` (`nvcsw`/`nivcsw`/`minflt`) plus PMU `ipc` deltas. On a
-//!   certified host the 99.99th percentile must stay within the tail limit
-//!   (0.75·T default, overridable via `NAM_RT_JITTER_TAIL_LIMIT_US`). Emits
-//!   `TEST_RESULT[rt_jitter]=PASS max_jitter_us=... p99_jitter_us=...`.
-//!   Without exclusive CPU affinity the gate skips as
-//!   `=GAP:cpu_not_isolated` (task rollback — no false positives).
+//!   absolute wakeup delay (`late_ns = t_k - next`), lost cycles, and inter-callback
+//!   dispatch dispersion (secondary metric). On a certified host (single pinned
+//!   isolated CPU + SCHED_FIFO), the deadline must hold (`max_late <= T`,
+//!   `p99.99 <= 0.75·T`, `lost_cycles == 0`). Emits
+//!   `TEST_RESULT[rt_jitter]=PASS max_late_us=... p99_late_us=...`.
+//!   Without an isolated CPU the gate reports `=GAP:cpu_not_isolated` (in strict
+//!   and non-strict — no false positives).
 //! - `concurrent_state_interleaving_stress_16_threads` (filter `concurrent`,
 //!   Phase 5): 16-thread stress over swap requests, stream-state transitions
 //!   (`observe_stream_state`), simulated reconnect cycles, sample-rate
@@ -818,8 +817,16 @@ fn rt_deadline_full() {
 /// I/O/cache/syscall stress. Measures the inter-callback interval dispersion
 /// (max / p99 / std-dev) and emits the typed PASS marker; without exclusive
 /// CPU affinity the gate reports `GAP:cpu_not_isolated` (task rollback).
+/// RT jitter and deadline gate: measures absolute wakeup delay (`late_ns = t_k - next`),
+/// detects lost cycles when delay exceeds the nominal quantum period, and records
+/// inter-callback dispatch dispersion as a secondary metric under heavy background contention.
+///
+/// On a calibrated RT environment (single pinned isolated CPU + SCHED_FIFO), certifies deadline
+/// adherence (`max_late <= T`, `p99.99 <= 0.75·T`, `lost_cycles == 0`).
+/// On non-isolated environments (e.g. first permitted core on standard host), executes under
+/// contention but emits `=GAP:cpu_not_isolated` (in strict and non-strict) rather than a false PASS.
 #[test]
-#[ignore = "RT jitter gate: inter-callback dispatch dispersion under contention — long suite only (tests-long.sh Phase 4)"]
+#[ignore = "RT jitter gate: absolute delay and dispatch dispersion under contention — long suite only (tests-long.sh Phase 4)"]
 fn rt_jitter_gate_10k_callbacks() {
     if cfg!(debug_assertions) {
         eprintln!("TEST_RESULT[rt_jitter]=GAP:debug_build_measurement_invalid");
@@ -828,16 +835,10 @@ fn rt_jitter_gate_10k_callbacks() {
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.pinned_single_cpu {
-        if env.strict {
-            panic!("RT jitter gate: NAM_RT_STRICT=1 and the process is not pinned to a single CPU");
-        }
         eprintln!("TEST_RESULT[rt_jitter]=GAP:cpu_not_isolated");
         return;
     }
     if !env.sched_fifo {
-        if env.strict {
-            panic!("RT jitter gate: NAM_RT_STRICT=1 and SCHED_FIFO is unavailable");
-        }
         eprintln!("TEST_RESULT[rt_jitter]=GAP:sched_fifo_unavailable");
         return;
     }
@@ -880,14 +881,26 @@ fn rt_jitter_gate_10k_callbacks() {
     let pmu = PmuCounters::open();
     pmu.start();
 
-    let mut deltas = Vec::with_capacity(JITTER_CALLBACKS - 1);
+    let mut dispatch_dispersions = Vec::with_capacity(JITTER_CALLBACKS - 1);
+    let mut late_samples = Vec::with_capacity(JITTER_CALLBACKS);
+    let mut lost_cycles: u64 = 0;
     let mut next = now_ns() + nominal_ns;
     let mut prev = now_ns();
+
     for block in 0..JITTER_CALLBACKS {
         sleep_until_monotonic_raw(next);
         let t_k = now_ns();
+
+        let late_ns = t_k.saturating_sub(next);
+        if late_ns > nominal_ns {
+            lost_cycles += 1;
+            next = t_k;
+        }
+        late_samples.push(late_ns);
+        next += nominal_ns;
+
         if block > 0 {
-            deltas.push(t_k.abs_diff(prev).abs_diff(nominal_ns));
+            dispatch_dispersions.push(t_k.abs_diff(prev).abs_diff(nominal_ns));
         }
         prev = t_k;
 
@@ -896,8 +909,6 @@ fn rt_jitter_gate_10k_callbacks() {
         in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
         in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
-
-        next += nominal_ns;
     }
     stop.store(true, Ordering::Release);
     for th in stressers {
@@ -906,100 +917,97 @@ fn rt_jitter_gate_10k_callbacks() {
     pmu.stop();
     let rusage_after = read_thread_rusage().ok();
 
-    let max_jitter_ns = *deltas.iter().max().expect("non-empty jitter series");
-    let p99_ns = percentile_ns(deltas.clone(), 0.99);
-    let p999_ns = percentile_ns(deltas.clone(), 0.999);
-    let p9999_ns = percentile_ns(deltas.clone(), 0.9999);
-    let tail_events_gt_200us = deltas.iter().filter(|&&d| d > 200_000).count();
-    let std_dev = std_dev_ns(&deltas);
+    let max_late_ns = *late_samples.iter().max().expect("non-empty late series");
+    let p99_late_ns = percentile_ns(late_samples.clone(), 0.99);
+    let p999_late_ns = percentile_ns(late_samples.clone(), 0.999);
+    let p9999_late_ns = percentile_ns(late_samples.clone(), 0.9999);
+
+    let max_dispatch_dispersion_ns = dispatch_dispersions.iter().copied().max().unwrap_or(0);
+    let p99_dispatch_dispersion_ns = percentile_ns(dispatch_dispersions.clone(), 0.99);
+    let p999_dispatch_dispersion_ns = percentile_ns(dispatch_dispersions.clone(), 0.999);
+    let p9999_dispatch_dispersion_ns = percentile_ns(dispatch_dispersions.clone(), 0.9999);
+    let tail_events_gt_200us = late_samples.iter().filter(|&&d| d > 200_000).count();
+    let std_dev_dispersion = std_dev_ns(&dispatch_dispersions);
+
     let rusage = rusage_delta(rusage_before, rusage_after);
     let rusage_str = format_rusage(rusage.as_ref());
     let ipc_str = format_ipc(&pmu);
 
     let budget_max_ns = nominal_ns;
     let budget_p99_ns = (nominal_ns as f64 * 0.5) as u64;
-    // Certified tail gate: the 99.99th percentile must stay within 0.75·T (monotonic with
-    // p99 <= 0.5·T, overridable via NAM_RT_JITTER_TAIL_LIMIT_US for host-specific calibration).
-    //
-    // Measured (isolated core 8 + SCHED_FIFO 80, governor performance, 3 runs):
-    // p99.99 = 546/798/810 µs, max_jitter = 549/802/815 µs, p99 = 40/227/230 µs.
-    // The former 0.25·T = 333 µs tail limit sits below the host's real p99.99
-    // dispersion and fails on a certified host; 0.75·T = 1000 µs holds a >=15 %
-    // margin over the worst observed tail while staying monotonic with p99 <=
-    // 0.5·T.
     let tail_limit_ns = std::env::var("NAM_RT_JITTER_TAIL_LIMIT_US")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(|us| us * 1_000)
         .unwrap_or(nominal_ns * 3 / 4);
 
-    let max_jitter_us = max_jitter_ns as f64 / 1e3;
-    let p99_jitter_us = p99_ns as f64 / 1e3;
-    let p999_jitter_us = p999_ns as f64 / 1e3;
-    let p9999_jitter_us = p9999_ns as f64 / 1e3;
+    let max_late_us = max_late_ns as f64 / 1e3;
+    let p99_late_us = p99_late_ns as f64 / 1e3;
+    let p999_late_us = p999_late_ns as f64 / 1e3;
+    let p9999_late_us = p9999_late_ns as f64 / 1e3;
+    let max_dispatch_dispersion_us = max_dispatch_dispersion_ns as f64 / 1e3;
+    let p99_dispatch_dispersion_us = p99_dispatch_dispersion_ns as f64 / 1e3;
+    let p999_dispatch_dispersion_us = p999_dispatch_dispersion_ns as f64 / 1e3;
+    let p9999_dispatch_dispersion_us = p9999_dispatch_dispersion_ns as f64 / 1e3;
     let budget_max_us = budget_max_ns as f64 / 1e3;
     let budget_p99_us = budget_p99_ns as f64 / 1e3;
     let tail_limit_us = tail_limit_ns as f64 / 1e3;
 
     eprintln!(
-        "RT_METRICS rt_jitter profile=release+testing quantums={JITTER_CALLBACKS} max_jitter_us={max_jitter_us:.1} \
-         p99_jitter_us={p99_jitter_us:.1} p999_jitter_us={p999_jitter_us:.1} p9999_jitter_us={p9999_jitter_us:.1} \
-         tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1} tail_limit_us={tail_limit_us:.1} \
+        "RT_METRICS rt_jitter profile=release+testing quantums={JITTER_CALLBACKS} max_late_us={max_late_us:.1} \
+         p99_late_us={p99_late_us:.1} p999_late_us={p999_late_us:.1} p9999_late_us={p9999_late_us:.1} \
+         lost_cycles={lost_cycles} max_dispatch_dispersion_us={max_dispatch_dispersion_us:.1} \
+         p99_dispatch_dispersion_us={p99_dispatch_dispersion_us:.1} \
+         p999_dispatch_dispersion_us={p999_dispatch_dispersion_us:.1} \
+         p9999_dispatch_dispersion_us={p9999_dispatch_dispersion_us:.1} \
+         tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1} \
+         budget_p99_us={budget_p99_us:.1} tail_limit_us={tail_limit_us:.1} \
          std_dev_us={:.1} nominal_us={:.1} {rusage_str} {ipc_str}",
-        std_dev / 1e3,
+        std_dev_dispersion / 1e3,
         nominal_ns as f64 / 1e3,
     );
 
-    if max_jitter_ns <= budget_max_ns && p99_ns <= budget_p99_ns {
-        // Under NAM_RT_STRICT=1 a PASS is only certifiable on a
-        // calibrated RT environment — dispersion numbers within budget on an
-        // uncalibrated host must fail, never emit a silent pass.
-        if env.strict && !env.calibrated() {
-            panic!(
-                "RT jitter gate FAILED: NAM_RT_STRICT=1 requires a calibrated realtime \
-                 environment (single pinned isolated CPU + SCHED_FIFO) to certify a PASS; the \
-                 current environment is not calibrated — refusing a silent pass on an \
-                 uncalibrated host"
-            );
-        }
-        // Certified-only tail gate: on a calibrated host the 99.99th percentile
-        // must stay within the tail limit (monotonic tail watch, F-PR-09 p.3).
-        if env.calibrated() {
-            assert!(
-                p9999_ns <= tail_limit_ns,
-                "RT jitter gate FAILED: p99.99 {p9999_jitter_us:.1} us exceeds tail limit \
-                 ({tail_limit_us:.1} us) on a calibrated RT environment"
-            );
-        }
+    // T-03.3: Without cpu_isolated, the verdict is GAP:cpu_not_isolated in strict and in non-strict.
+    // Execution on "first permitted" core is valid for diagnostic measurement but can never certify PASS.
+    if !env.cpu_isolated {
         let env_str = env.format_env();
         eprintln!(
-            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_jitter_us={max_jitter_us:.1} \
-             p99_jitter_us={p99_jitter_us:.1} p999_jitter_us={p999_jitter_us:.1} \
-             p9999_jitter_us={p9999_jitter_us:.1} tail_events_gt_200us={tail_events_gt_200us} \
-             budget_max_us={budget_max_us:.1} std_dev_us={:.1} {env_str}",
-            std_dev / 1e3,
+            "TEST_RESULT[rt_jitter]=GAP:cpu_not_isolated profile=release+testing \
+             max_late_us={max_late_us:.1} p99_late_us={p99_late_us:.1} p9999_late_us={p9999_late_us:.1} \
+             lost_cycles={lost_cycles} max_dispatch_dispersion_us={max_dispatch_dispersion_us:.1} \
+             tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1} \
+             tail_limit_us={tail_limit_us:.1} std_dev_us={:.1} {env_str}",
+            std_dev_dispersion / 1e3,
         );
         return;
     }
 
-    if env.calibrated() {
-        panic!(
-            "RT jitter gate FAILED: max jitter {max_jitter_us:.1} us exceeds budget {budget_max_us:.1} us \
-             (p99 {p99_jitter_us:.1} us vs {budget_p99_us:.1} us) on a calibrated RT environment"
+    // T-03.2: Deadline certification verdict on isolated calibrated RT environment.
+    let deadline_ok = max_late_ns <= budget_max_ns
+        && p9999_late_ns <= tail_limit_ns
+        && p99_late_ns <= budget_p99_ns
+        && lost_cycles == 0;
+
+    if deadline_ok {
+        let env_str = env.format_env();
+        eprintln!(
+            "TEST_RESULT[rt_jitter]=PASS profile=release+testing max_late_us={max_late_us:.1} \
+             p99_late_us={p99_late_us:.1} p999_late_us={p999_late_us:.1} \
+             p9999_late_us={p9999_late_us:.1} lost_cycles={lost_cycles} \
+             max_dispatch_dispersion_us={max_dispatch_dispersion_us:.1} \
+             tail_events_gt_200us={tail_events_gt_200us} \
+             budget_max_us={budget_max_us:.1} tail_limit_us={tail_limit_us:.1} \
+             std_dev_us={:.1} {env_str}",
+            std_dev_dispersion / 1e3,
         );
-    } else if env.strict {
-        panic!(
-            "RT jitter gate FAILED: max jitter {max_jitter_us:.1} us exceeds budget {budget_max_us:.1} us \
-             (p99 {p99_jitter_us:.1} us vs {budget_p99_us:.1} us) — NAM_RT_STRICT=1 promoted this GAP to a \
-             hard failure (environment is not calibrated: CPU not isolated/pinned or no SCHED_FIFO); \
-             re-run on the calibrated RT host"
-        );
+        return;
     }
-    eprintln!(
-        "TEST_RESULT[rt_jitter]=GAP:uncalibrated_environment profile=release+testing \
-         max_jitter_us={max_jitter_us:.1} p99_jitter_us={p99_jitter_us:.1} \
-         p999_jitter_us={p999_jitter_us:.1} p9999_jitter_us={p9999_jitter_us:.1} \
-         tail_events_gt_200us={tail_events_gt_200us} budget_max_us={budget_max_us:.1}"
+
+    panic!(
+        "RT jitter gate FAILED: deadline violation on calibrated RT environment \
+         (max_late {max_late_us:.1} us vs budget {budget_max_us:.1} us, \
+          p99.99 {p9999_late_us:.1} us vs tail limit {tail_limit_us:.1} us, \
+          lost_cycles: {lost_cycles})"
     );
 }
 

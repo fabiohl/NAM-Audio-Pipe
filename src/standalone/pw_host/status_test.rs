@@ -1084,3 +1084,103 @@ fn observe_error_during_teardown_still_marks_failed() {
         Some(("capture", "fatal hardware failure".to_string()))
     );
 }
+
+#[test]
+fn format_restoration_transitions_degraded_to_running_when_both_active_and_valid() {
+    let backend = SharedBackendStatus::new();
+    backend.set_stream_active("capture", true);
+    backend.set_stream_active("playback", true);
+    assert_eq!(backend.state(), BackendState::Running);
+    assert!(backend.is_running());
+
+    // Format violation on capture stream degrades backend and mutes audio
+    crate::standalone::pw_host::output_pw::reject_negotiated_format_violation(
+        &RtStatusFlags::default(),
+        backend.stream_status(),
+        "capture",
+        crate::standalone::pw_host::output_pw::ContractViolation::NotStereo(1),
+    );
+    backend.mark_degraded("SPA format contract violated on capture stream");
+    assert!(matches!(backend.state(), BackendState::Degraded { .. }));
+    assert!(!backend.is_running());
+
+    // Valid format renegotiation on capture recovers the backend to Running
+    backend.mark_format_ok("capture");
+    assert_eq!(backend.state(), BackendState::Running);
+    assert!(backend.is_running());
+}
+
+#[test]
+fn format_restoration_transitions_degraded_to_starting_when_streams_not_both_active() {
+    let backend = SharedBackendStatus::new();
+    backend.set_stream_active("capture", true);
+    backend.set_stream_active("playback", false);
+    assert_eq!(backend.state(), BackendState::Starting);
+
+    // Format violation while starting
+    crate::standalone::pw_host::output_pw::reject_negotiated_format_violation(
+        &RtStatusFlags::default(),
+        backend.stream_status(),
+        "capture",
+        crate::standalone::pw_host::output_pw::ContractViolation::NotStereo(1),
+    );
+    backend.mark_degraded("format violation");
+    assert!(matches!(backend.state(), BackendState::Degraded { .. }));
+
+    // Format recovered, but playback is not streaming yet -> transitions to Starting, not Running
+    backend.mark_format_ok("capture");
+    assert_eq!(backend.state(), BackendState::Starting);
+    assert!(!backend.is_running());
+
+    // When playback connects, now transitions to Running
+    backend.set_stream_active("playback", true);
+    assert_eq!(backend.state(), BackendState::Running);
+    assert!(backend.is_running());
+}
+
+#[test]
+fn single_stream_format_ok_remains_degraded_if_other_format_invalid() {
+    let backend = SharedBackendStatus::new();
+    backend.set_stream_active("capture", true);
+    backend.set_stream_active("playback", true);
+
+    // Both streams suffer format violations
+    crate::standalone::pw_host::output_pw::reject_negotiated_format_violation(
+        &RtStatusFlags::default(),
+        backend.stream_status(),
+        "capture",
+        crate::standalone::pw_host::output_pw::ContractViolation::NotStereo(1),
+    );
+    crate::standalone::pw_host::output_pw::reject_negotiated_format_violation(
+        &RtStatusFlags::default(),
+        backend.stream_status(),
+        "playback",
+        crate::standalone::pw_host::output_pw::ContractViolation::NotAudioRaw,
+    );
+    backend.mark_degraded("both streams violated");
+    assert!(matches!(backend.state(), BackendState::Degraded { .. }));
+
+    // Capture recovers first, but playback is still invalid -> remains Degraded
+    backend.mark_format_ok("capture");
+    assert!(matches!(backend.state(), BackendState::Degraded { .. }));
+    assert!(!backend.is_running());
+
+    // Playback recovers -> both valid and active -> transitions to Running
+    backend.mark_format_ok("playback");
+    assert_eq!(backend.state(), BackendState::Running);
+    assert!(backend.is_running());
+}
+
+#[test]
+fn failed_state_is_sticky_and_ignores_format_ok() {
+    let backend = SharedBackendStatus::new();
+    backend.mark_failed("capture", "daemon disconnected");
+    assert!(backend.is_failed());
+
+    // Neither format recovery nor stream active can overwrite terminal Failed
+    backend.mark_format_ok("capture");
+    backend.set_stream_active("capture", true);
+    backend.set_stream_active("playback", true);
+    assert!(backend.is_failed());
+    assert!(matches!(backend.state(), BackendState::Failed { .. }));
+}

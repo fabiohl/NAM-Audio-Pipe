@@ -125,7 +125,8 @@ pub const MAX_BRINGUP_SUPPRESSED_POLLS: u32 = 32;
 pub use rt_callback::harness::RtSwapHarness;
 #[cfg(feature = "testing")]
 pub use rt_callback::{
-    handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,
+    PrologueOutcome, RateSyncState, handle_spa_pair_fail_closed, resolve_capture_chunk_window,
+    send_recording_audio,
 };
 
 // Re-exports for test module compatibility (pw_host_test.rs).

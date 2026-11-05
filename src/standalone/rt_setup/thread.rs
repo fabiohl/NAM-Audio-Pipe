@@ -103,6 +103,7 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     target_cpu: usize,
     rt_status: &RtStatusFlags,
     cfg: &C,
+    activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
 ) {
     cfg.set_daz_ftz();
     set_dsp_thread_name();
@@ -119,12 +120,26 @@ pub fn configure_realtime_thread_with<C: ThreadConfigurator>(
     // data thread re-arms in its own first quantum. One TLS store, once, on the
     // cold setup path: no cost on the steady-state hot path.
     let _ = crate::standalone::rt_setup::rt_log_mark::rt_mark_current_thread();
+
+    // Propagate thread-local activation precision (Fast or Standard).
+    // Explicitly sets TLS, overriding any previously lingering value on reused threads,
+    // and establishing the exact precision before the first DSP quantum runs.
+    neural_amp_modeler_rs::math::activations::set_activation_tls(activation);
 }
 
 /// Configures the current DSP thread for real-time operation using the default
 /// engine `SystemThreadConfigurator`.
 #[cold]
 #[inline(never)]
-pub fn configure_realtime_thread(target_cpu: usize, rt_status: Arc<RtStatusFlags>) {
-    configure_realtime_thread_with(target_cpu, &rt_status, &SystemThreadConfigurator);
+pub fn configure_realtime_thread(
+    target_cpu: usize,
+    rt_status: Arc<RtStatusFlags>,
+    activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
+) {
+    configure_realtime_thread_with(
+        target_cpu,
+        &rt_status,
+        &SystemThreadConfigurator,
+        activation,
+    );
 }

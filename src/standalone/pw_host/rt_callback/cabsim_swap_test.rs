@@ -30,6 +30,8 @@ fn empty_consumer_no_change_and_clean_lot() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -67,6 +69,8 @@ fn swap_clears_active_and_sets_dirty() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -110,6 +114,8 @@ fn swap_replaces_active_and_gcs_retired_pair() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -164,6 +170,8 @@ fn stale_generation_is_discarded_to_gc_without_applying() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -224,6 +232,8 @@ fn budget_applies_one_and_coalesces_backlog_latest_wins() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -278,6 +288,8 @@ fn budget_exhausted_parks_command_resolved_next_callback() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -301,6 +313,8 @@ fn budget_exhausted_parks_command_resolved_next_callback() {
         &mut drain,
         &mut budget,
         &mut active,
+        None,
+        None,
         &flags,
         &mut gc_p,
         &mut parking_lot,
@@ -311,6 +325,110 @@ fn budget_exhausted_parks_command_resolved_next_callback() {
     assert_eq!(active.as_ref().unwrap().sample_rate, 96000);
     assert!(!drain.has_deferred());
     assert!(drain.is_empty());
+}
+
+#[test]
+fn applied_latency_and_failed_key_latching() {
+    let ir = [1.0f32, 0.5, 0.25, 0.125];
+    let (mut prod, cons) = rtrb::RingBuffer::new(4);
+    let mut drain = cabsim_swap_drain(cons);
+    let mut active: Option<Box<CabSimPair>> = None;
+    let (mut gc_p, _gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
+    let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let applied_latency = AtomicU32::new(0);
+    let mut failed_key: Option<(u32, usize)> = None;
+
+    // 1. Install a pair: updates applied latency and clears failed_key
+    flags
+        .requested_cabsim_generation
+        .store(1, Ordering::Release);
+    flags
+        .requested_cabsim_host_rate
+        .store(48000, Ordering::Relaxed);
+    flags
+        .requested_cabsim_partition_size
+        .store(64, Ordering::Relaxed);
+    prod.push(Box::new(CabSimSwapPayload {
+        generation: 1,
+        pair: Some(Box::new(make_pair(&ir, 64, 48000))),
+    }))
+    .unwrap();
+
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    drain_cabsims(
+        &mut drain,
+        &mut budget,
+        &mut active,
+        Some(&mut failed_key),
+        Some(&applied_latency),
+        &flags,
+        &mut gc_p,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+    );
+
+    assert_eq!(applied_latency.load(Ordering::Acquire), 64);
+    assert_eq!(failed_key, None);
+
+    // 2. Install None (simulating build failure bypass):
+    // Applied latency drops to 0 and failed_key latches (48000, 64)
+    flags
+        .requested_cabsim_generation
+        .store(2, Ordering::Release);
+    prod.push(Box::new(CabSimSwapPayload {
+        generation: 2,
+        pair: None,
+    }))
+    .unwrap();
+
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    drain_cabsims(
+        &mut drain,
+        &mut budget,
+        &mut active,
+        Some(&mut failed_key),
+        Some(&applied_latency),
+        &flags,
+        &mut gc_p,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+    );
+
+    assert!(active.is_none());
+    assert_eq!(applied_latency.load(Ordering::Acquire), 0);
+    assert_eq!(failed_key, Some((48000, 64)));
+
+    // 3. Obsolete envelope: discarded without modifying latency or latch
+    flags
+        .requested_cabsim_generation
+        .store(4, Ordering::Release);
+    prod.push(Box::new(CabSimSwapPayload {
+        generation: 3,
+        pair: Some(Box::new(make_pair(&ir, 128, 96000))),
+    }))
+    .unwrap();
+
+    let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
+    drain_cabsims(
+        &mut drain,
+        &mut budget,
+        &mut active,
+        Some(&mut failed_key),
+        Some(&applied_latency),
+        &flags,
+        &mut gc_p,
+        &mut parking_lot,
+        &parking_lot_dirty,
+        &gc_overflow,
+    );
+
+    assert_eq!(applied_latency.load(Ordering::Acquire), 0);
+    assert_eq!(failed_key, Some((48000, 64)));
 }
 
 #[cfg(all(test, feature = "heap-audit"))]
@@ -387,6 +505,8 @@ mod heap_audit_tests {
                     &mut self.drain,
                     &mut budget,
                     &mut self.active,
+                    None,
+                    None,
                     &self.flags,
                     &mut self.gc_p,
                     &mut self.parking_lot,

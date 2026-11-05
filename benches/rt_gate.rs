@@ -15,7 +15,7 @@
 
 #![cfg(feature = "testing")]
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
 use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
@@ -75,28 +75,81 @@ fn harness(
     h.push_input_gain(1.0);
     h.push_output_gain(1.0);
     for _ in 0..8 {
-        let mut l = [0f32; BLOCK];
-        let mut r = [0f32; BLOCK];
+        let mut l = [0.1f32; BLOCK];
+        let mut r = [0.2f32; BLOCK];
         h.run_callback(&mut l, &mut r, BLOCK);
     }
     h.consume_gc();
     h
 }
 
-/// Benchmarks one warmed harness callback, cycling a preallocated signal so the
-/// silence gate stays open and no allocation happens inside the timed loop.
-fn bench_callback(c: &mut Criterion, group: &str, id: &str, mut h: RtSwapHarness) {
-    let mut l = [0.1f32; BLOCK];
-    let mut r = [0.2f32; BLOCK];
+/// Benchmarks one warmed harness callback, re-presenting fresh input blocks via
+/// `iter_batched_ref` outside the timed region so the signal is non-feedback and
+/// constant across iterations, with zero allocations inside the timed loop.
+fn bench_callback(
+    c: &mut Criterion,
+    group: &str,
+    id: &str,
+    mut h: RtSwapHarness,
+    has_effect: bool,
+) {
+    // 1. Preflight check: verify run_callback processes BLOCK frames and produces valid output
+    let mut pre_l = [0.1f32; BLOCK];
+    let mut pre_r = [0.2f32; BLOCK];
+    let n_pw = h.run_callback(&mut pre_l, &mut pre_r, BLOCK);
+    assert_eq!(
+        n_pw, BLOCK,
+        "scenario {id}: run_callback did not process full block (got {n_pw})"
+    );
+    assert!(
+        h.out_l().iter().all(|s| s.is_finite()),
+        "scenario {id}: out_l contains non-finite samples"
+    );
+    assert!(
+        h.out_r().iter().all(|s| s.is_finite()),
+        "scenario {id}: out_r contains non-finite samples"
+    );
+    if has_effect {
+        let energy_l: f32 = h.out_l().iter().map(|s| s * s).sum();
+        let energy_r: f32 = h.out_r().iter().map(|s| s * s).sum();
+        assert!(
+            energy_l > 1e-9 && energy_r > 1e-9,
+            "scenario {id}: expected non-silent output with effect"
+        );
+    }
+
     let mut g = c.benchmark_group(group);
     g.bench_function(id, |b| {
-        b.iter(|| {
-            h.run_callback(&mut l, &mut r, BLOCK);
-            std::hint::black_box(&l);
-            std::hint::black_box(&r);
-        });
+        b.iter_batched_ref(
+            || ([0.1f32; BLOCK], [0.2f32; BLOCK]),
+            |(l, r)| {
+                let n_pw = h.run_callback(l, r, BLOCK);
+                assert_eq!(n_pw, BLOCK);
+                std::hint::black_box(h.out_l());
+                std::hint::black_box(h.out_r());
+            },
+            BatchSize::SmallInput,
+        );
     });
     g.finish();
+
+    // 2. Post-bench validation: verify output is still finite and non-silent
+    assert!(
+        h.out_l().iter().all(|s| s.is_finite()),
+        "scenario {id}: post-bench out_l contains non-finite samples"
+    );
+    assert!(
+        h.out_r().iter().all(|s| s.is_finite()),
+        "scenario {id}: post-bench out_r contains non-finite samples"
+    );
+    if has_effect {
+        let energy_l: f32 = h.out_l().iter().map(|s| s * s).sum();
+        let energy_r: f32 = h.out_r().iter().map(|s| s * s).sum();
+        assert!(
+            energy_l > 1e-9 && energy_r > 1e-9,
+            "scenario {id}: post-bench expected non-silent output with effect"
+        );
+    }
 }
 
 fn bench_host_scenarios(c: &mut Criterion) {
@@ -109,18 +162,21 @@ fn bench_host_scenarios(c: &mut Criterion) {
             Some(model(WAVENET_A2_JSON)),
             true,
         ),
+        true,
     );
     bench_callback(
         c,
         "PIPE_Host",
         "LSTM_64_samp",
         harness(Some(model(LSTM_JSON)), Some(model(LSTM_JSON)), false),
+        true,
     );
     bench_callback(
         c,
         "PIPE_Host",
         "Passthrough_64_samp",
         harness(None, None, false),
+        false,
     );
 
     // Per-topology anchors mirroring the ab_opt_bench scenarios,
@@ -134,6 +190,7 @@ fn bench_host_scenarios(c: &mut Criterion) {
             Some(model(WAVENET_A1_JSON)),
             false,
         ),
+        true,
     );
     bench_callback(
         c,
@@ -144,12 +201,14 @@ fn bench_host_scenarios(c: &mut Criterion) {
             Some(model(WAVENET_A2_JSON)),
             false,
         ),
+        true,
     );
     bench_callback(
         c,
         "PIPE_AbOpt",
         "LSTM_48k_64_samp",
         harness(Some(model(LSTM_JSON)), Some(model(LSTM_JSON)), false),
+        true,
     );
 }
 

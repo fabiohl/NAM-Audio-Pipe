@@ -524,12 +524,16 @@ struct CellCfg {
 ///
 /// Only the block loop is timed; the one-time machinery construction is
 /// outside the measured window (it would pollute the tail-latency envelope).
+/// Warmup and measurement run on the SAME instance: `warmup` blocks are run first
+/// without recording latency samples, and when `warmup` finishes, PMU counters are
+/// reset/enabled and the remaining `blocks` are measured directly on the warmed instance.
 fn run_measured(
     path: &Path,
     cfg: &CellCfg,
     warmup: u64,
     blocks: u64,
     ir_path: &Path,
+    mut pmcs: Option<&mut PmcSet>,
 ) -> (Vec<u64>, u64) {
     let rate = cfg.rate;
     let quantum = cfg.quantum;
@@ -684,6 +688,13 @@ fn run_measured(
             crossfade_scratch_r: &mut xfd_r,
         };
 
+        if i == warmup
+            && let Some(p) = pmcs.as_mut()
+        {
+            p.reset();
+            p.enable();
+        }
+
         let t0 = rdtsc_cycles();
         let n_pw = capture_dsp_pipeline_streaming(
             &mut samples_l,
@@ -697,10 +708,14 @@ fn run_measured(
         let t1 = rdtsc_cycles();
         black_box(&samples_l);
         black_box(&samples_r);
-        total_frames += n_pw as u64;
         if i >= warmup {
+            total_frames += n_pw as u64;
             cycle_samples.push(t1 - t0);
         }
+    }
+
+    if let Some(p) = pmcs.as_mut() {
+        p.disable();
     }
 
     black_box(&bridge);
@@ -974,7 +989,7 @@ fn main() -> ExitCode {
         eprintln!("  cpu = {c}");
     }
 
-    let pmcs = PmcSet::open();
+    let mut pmcs = PmcSet::open();
     let mut jsonl_lines: Vec<JsonValue> = Vec::new();
     let mut txt = String::new();
     txt.push_str(&format!(
@@ -1000,12 +1015,17 @@ fn main() -> ExitCode {
     for (path, topo) in &scope {
         for run in 0..cfg.runs {
             pmcs.reset();
-            // Warmup runs outside the PMU window; the measured block loop is
-            // bracketed by enable/disable so the counters attribute only to it.
-            let _warm = run_measured(path, &cell_cfg, cfg.warmup, 0, &ir_path);
-            pmcs.enable();
-            let (cycles, total_frames) = run_measured(path, &cell_cfg, 0, cfg.blocks, &ir_path);
-            pmcs.disable();
+            // Single-instance warmup and measurement: warmup runs on the same instance
+            // without latency recording or PMU counting. When warmup completes, PMU counters
+            // are enabled and measured blocks are recorded on the primed pipeline.
+            let (cycles, total_frames) = run_measured(
+                path,
+                &cell_cfg,
+                cfg.warmup,
+                cfg.blocks,
+                &ir_path,
+                Some(&mut pmcs),
+            );
             let counts = pmcs.counts();
             let st = Stats::of(cycles);
             let to_ns = |c: u64| c * 1000 / freq;
