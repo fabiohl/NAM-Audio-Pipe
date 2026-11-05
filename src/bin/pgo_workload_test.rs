@@ -509,3 +509,67 @@ fn parse_cli_rejects_non_finite_seconds() {
     assert!(parse_cli_from(vec!["--seconds".to_string(), "NaN".to_string()]).is_err());
     assert!(parse_cli_from(vec!["--seconds".to_string(), "inf".to_string()]).is_err());
 }
+
+#[test]
+fn gate_thresholds_are_finite_squared_and_ordered() {
+    let (open_sq, close_sq) = gate_thresholds_sq(-70.0, -80.0);
+
+    assert!(
+        open_sq.is_finite() && close_sq.is_finite(),
+        "gate thresholds must be finite, got ({open_sq}, {close_sq})"
+    );
+    assert!(close_sq > 0.0, "the close threshold must be positive");
+    assert!(
+        open_sq > close_sq,
+        "the open threshold must dominate the close threshold"
+    );
+
+    let expected_open = 10.0_f32.powf(-70.0 / 10.0);
+    assert!(
+        (open_sq - expected_open).abs() < 1e-12,
+        "open threshold must be the squared linear amplitude: {open_sq} vs {expected_open}"
+    );
+}
+
+#[test]
+fn resampled_oversampled_cells_advance_all_frames() {
+    let model_path = Path::new("tests/fixtures/models/wavenet_a1_standard.nam");
+    let json = std::fs::read_to_string(model_path)
+        .expect("the WaveNet A1 fixture must be committed in tests/fixtures/models");
+    let data = parse_nam_json(&json).expect("the WaveNet A1 fixture must parse");
+    let model_sr = data.sample_rate.unwrap_or(48_000.0) as u32;
+
+    let mut model_l = Some(build_model(&data).expect("left model must build"));
+    let mut model_r = Some(build_model(&data).expect("right model must build"));
+    let stress_signal = generate_stress_signal_v2_default(model_sr);
+
+    for os_mode in [MODE_2X, MODE_4X] {
+        let cfg = CellConfig {
+            rate: 44_100,
+            quantum: 32,
+            os_mode,
+            cabsim_ir: false,
+            recording: false,
+            gate: true,
+            blocks: 8,
+        };
+        let progress = run_cell(
+            &mut model_l,
+            &mut model_r,
+            model_sr,
+            &stress_signal,
+            0,
+            &cfg,
+            Path::new(FIXTURE_IR),
+        );
+
+        let expected = cfg.blocks * cfg.quantum as u64;
+        assert!(
+            progress.frames >= expected,
+            "cell 44100/{}/32/{os_mode}/gate=on must advance every frame: got {} of {expected}",
+            model_sr,
+            progress.frames
+        );
+        assert_eq!(progress.blocks, cfg.blocks);
+    }
+}

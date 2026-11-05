@@ -30,14 +30,16 @@
 //! and belongs to the long suite, not the fast CI path. Run it with
 //! `cargo test --features testing -- --ignored`.
 //!
-//! The oracle is compiled into the engine `testing` module, so there is no
-//! sibling-repository or external NAMCore binary dependency: the fixture graph
-//! stays self-contained (see `tests/fixtures/.manifest.sha256`).
+//! The f64 oracle is compiled into the engine `testing` module, so the fixture
+//! graph stays self-contained (see `tests/fixtures/.manifest.sha256`). When a
+//! NAMCore C++ render binary is provisioned (`NAM_CORE_RENDER_BIN`, exported by
+//! the hosted workflow), the same case is additionally compared against the C++
+//! oracle. `NAM_REQUIRE_CPP_ORACLE=1` (strict mode) makes its absence fatal.
 //!
 //! Receipt provenance: each case prints `FIXTURE_SHA256[<label>]` (the model
 //! fixture digest, for `pipe_long_receipt append --fixture-sha256`). The
 //! in-process f64 oracle has no external artifact, so `ORACLE_SHA256` is
-//! deliberately not emitted.
+//! emitted only for the provisioned C++ render binary.
 
 use nam_audio_pipe::standalone::cli::GateConfig;
 use nam_audio_pipe::standalone::pw_host::RtSwapHarness;
@@ -93,6 +95,13 @@ const FIXTURES: [(&str, &str, f64); 3] = [
 /// **resampled-path smoke gate** that only catches gross breakage (silence,
 /// gain collapse, NaN) — it is deliberately *not* claimed as oracle parity.
 const RATES: [(u32, u32, f64, f64); 2] = [(48_000, 48_000, 0.0, 0.0), (44_100, 48_000, 0.25, 0.0)];
+
+// Measured (2026-11-05, release, NAMCore C++ oracle): the C++ rows sit on the
+// same floor as f64 at both host rates and reuse the per-fixture native gates:
+//   A1   48 kHz: f64 1.418e-13 / C++ 1.854e-13
+//   A2   48 kHz: f64 6.095e-14 / C++ 1.526e-13
+//   LSTM 48 kHz: f64 1.119e-11 / C++ 1.064e-11
+//   44.1 kHz rows: ESR ≤ 9.9e-12 and SNR ≥ 110 dB for both oracles.
 
 fn fixture_model(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -196,6 +205,132 @@ fn oracle_model_data(path: &Path) -> NamModelData {
     }
 }
 
+/// Resolves the NAMCore C++ render binary.
+///
+/// `NAM_CORE_RENDER_BIN` is authoritative (exported by the hosted workflow).
+/// When it is absent, the engine's fixture helper resolves the render build of
+/// the linked engine checkout. `NAM_REQUIRE_CPP_ORACLE=1` turns absence into a
+/// hard failure instead of a silent skip.
+fn cpp_oracle_bin() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("NAM_CORE_RENDER_BIN") {
+        let p = PathBuf::from(val);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let fallback = neural_amp_modeler_rs::testing::fixtures::render_bin_path();
+    fallback.is_file().then_some(fallback)
+}
+
+fn oracle_required() -> bool {
+    std::env::var("NAM_REQUIRE_CPP_ORACLE").as_deref() == Ok("1")
+}
+
+/// Renders the same model-rate input through the C++ NAMCore oracle and returns
+/// the host-rate expected curve (calibrated and resampled like the f64 path).
+fn cpp_expected(
+    bin: &Path,
+    model_path: &Path,
+    oracle_input: &[f32],
+    input_mult_adj: f32,
+    output_mult_adj: f32,
+    host_rate: u32,
+    tmp_dir: &Path,
+) -> Vec<f32> {
+    let scaled: Vec<f32> = oracle_input.iter().map(|&s| s * input_mult_adj).collect();
+    let stem = model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("model");
+    let wav_in = tmp_dir.join(format!("cpp_in_{stem}_{host_rate}.wav"));
+    let wav_out = tmp_dir.join(format!("cpp_out_{stem}_{host_rate}.wav"));
+    neural_amp_modeler_rs::testing::wav::write_wav_f32(&wav_in, &scaled, MODEL_RATE)
+        .expect("write C++ oracle input WAV");
+    let output = std::process::Command::new(bin)
+        .arg(model_path)
+        .arg(&wav_in)
+        .arg(&wav_out)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to execute NAMCore render {bin:?}: {e}"));
+    assert!(
+        output.status.success(),
+        "{host_rate}: NAMCore render failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let (raw, _rate) = neural_amp_modeler_rs::testing::wav::read_wav_f32(&wav_out)
+        .expect("read C++ oracle output WAV");
+    let calibrated: Vec<f32> = raw.iter().map(|&s| s * output_mult_adj).collect();
+    reference_resample(&calibrated, MODEL_RATE, host_rate)
+}
+
+/// Aligns `produced` against `expected`, measures the steady-state tail, prints
+/// the `// Measured:` evidence and enforces the contract gates.
+fn compare_curves(
+    label: &str,
+    host_rate: u32,
+    produced: &[f32],
+    expected: &[f32],
+    latency: usize,
+    gates: (f64, f64),
+    oracle: &str,
+) {
+    let (esr_gate, snr_gate) = gates;
+    let overlap_end = produced.len().min(expected.len());
+    let mut best = (0isize, f64::INFINITY, f64::NEG_INFINITY, 0usize);
+    for sh in -(latency as isize) - 16..=(latency as isize) + 16 {
+        let (a, b) = shift_pair(&produced[..overlap_end], &expected[..overlap_end], sh);
+        let end = a.len().saturating_sub(EDGE_GUARD);
+        let start = end.saturating_sub(MEASURE);
+        if end <= start + 1024 {
+            continue;
+        }
+        let e = compute_esr(&b[start..end], &a[start..end]);
+        if e < best.1 {
+            best = (
+                sh,
+                e,
+                compute_snr_db(&b[start..end], &a[start..end]),
+                end - start,
+            );
+        }
+    }
+    let (align, esr, snr_db, win_len) = best;
+    assert!(
+        win_len > 1024,
+        "{label}@{host_rate}[{oracle}]: insufficient overlap (produced={}, expected={})",
+        produced.len(),
+        expected.len()
+    );
+
+    let effective_snr = if snr_gate > 0.0 {
+        snr_gate
+    } else {
+        f64::NEG_INFINITY
+    };
+
+    println!(
+        "// Measured: {label}@{host_rate}Hz [{oracle}]  ESR={esr:.3e} (gate {:.2e})  SNR={snr_db:.2} dB (gate {effective_snr:.1} dB)  align={align:+}  lat={latency}  n={win_len}",
+        if esr_gate > 0.0 { esr_gate } else { f64::NAN },
+    );
+
+    if esr_gate > 0.0 {
+        assert!(
+            esr < esr_gate,
+            "{label}@{host_rate}[{oracle}]: ESR {esr:.3e} exceeds gate {esr_gate:.2e}"
+        );
+    }
+    if snr_gate > 0.0 {
+        assert!(
+            snr_db > effective_snr,
+            "{label}@{host_rate}[{oracle}]: SNR {snr_db:.2} dB below gate {effective_snr:.1} dB"
+        );
+    }
+
+    println!(
+        "TEST_RESULT[offline_parity_{label}_{host_rate}_{oracle}]=PASS esr={esr:.3e} snr_db={snr_db:.2}"
+    );
+}
+
 /// Runs one `(fixture, host_rate)` fidelity comparison.
 fn run_case(
     label: &str,
@@ -262,68 +397,55 @@ fn run_case(
         .collect();
     let expected = reference_resample(&oracle_scaled, MODEL_RATE, host_rate);
 
-    // 5. Align and compare the measured tail past the warmup. The resampler
-    //    phase can differ by a few host samples between the streaming
-    //    production path and the one-shot reference, so a small integer
-    //    alignment search is applied before measuring.
+    // 5. Compare against both oracles: the in-process f64 reference (mandatory)
+    //    and, when provisioned, the C++ NAMCore render binary. The hosted
+    //    workflow exports NAM_CORE_RENDER_BIN; `NAM_REQUIRE_CPP_ORACLE=1`
+    //    (strict mode) makes an absent oracle a hard failure.
     let latency = resampler_latency_samples(host_rate, nam_rate);
-    let overlap_end = produced.len().min(expected.len());
-    let mut best = (0isize, f64::INFINITY, f64::NEG_INFINITY, 0usize);
-    for sh in -(latency as isize) - 16..=(latency as isize) + 16 {
-        let (a, b) = shift_pair(&produced[..overlap_end], &expected[..overlap_end], sh);
-        let end = a.len().saturating_sub(EDGE_GUARD);
-        let start = end.saturating_sub(MEASURE);
-        if end <= start + 1024 {
-            continue;
-        }
-        let e = compute_esr(&b[start..end], &a[start..end]);
-        if e < best.1 {
-            best = (
-                sh,
-                e,
-                compute_snr_db(&b[start..end], &a[start..end]),
-                end - start,
-            );
-        }
+    let cpp_bin = cpp_oracle_bin();
+    if cpp_bin.is_none() && oracle_required() {
+        panic!(
+            "{label}@{host_rate}: NAM_REQUIRE_CPP_ORACLE=1 but no NAMCore render binary was found"
+        );
     }
-    let (align, esr, snr_db, win_len) = best;
-    assert!(
-        win_len > 1024,
-        "{label}@{host_rate}: insufficient overlap (produced={}, expected={})",
-        produced.len(),
-        expected.len()
-    );
-
-    let effective_snr = if snr_gate > 0.0 {
-        snr_gate
-    } else {
-        f64::NEG_INFINITY
-    };
-
-    println!(
-        "// Measured: {label}@{host_rate}Hz  ESR={esr:.3e} (gate {:.2e})  SNR={snr_db:.2} dB (gate {effective_snr:.1} dB)  align={align:+}  lat={latency}  n={win_len}",
-        if esr_gate > 0.0 { esr_gate } else { f64::NAN },
-    );
-    println!("TEST_RESULT[offline_parity_{label}_{host_rate}] esr={esr:.3e} snr_db={snr_db:.2}");
     println!("FIXTURE_SHA256[{label}]={}", sha256_file(&model_path));
-
-    if esr_gate > 0.0 {
-        assert!(
-            esr < esr_gate,
-            "{label}@{host_rate}: ESR {esr:.3e} exceeds gate {esr_gate:.2e}"
+    compare_curves(
+        label,
+        host_rate,
+        &produced,
+        &expected,
+        latency,
+        (esr_gate, snr_gate),
+        "f64",
+    );
+    if let Some(bin) = cpp_bin {
+        let tmp_dir = std::env::temp_dir().join("nam_pipe_offline_parity");
+        std::fs::create_dir_all(&tmp_dir).ok();
+        let cpp = cpp_expected(
+            &bin,
+            &model_path,
+            &oracle_input,
+            pair.input_mult_adj,
+            pair.output_mult_adj,
+            host_rate,
+            &tmp_dir,
         );
-    }
-    if snr_gate > 0.0 {
-        assert!(
-            snr_db > effective_snr,
-            "{label}@{host_rate}: SNR {snr_db:.2} dB below gate {effective_snr:.1} dB"
+        compare_curves(
+            label,
+            host_rate,
+            &produced,
+            &cpp,
+            latency,
+            (esr_gate, snr_gate),
+            "cpp",
         );
+        println!("ORACLE_SHA256[cpp]={}", sha256_file(&bin));
     }
 }
 
 /// Full offline chain parity across every fixture and both host rates.
 #[test]
-#[ignore = "renders the f64 oracle over full signals — long suite, run with --ignored"]
+#[ignore = "renders the f64 and NAMCore C++ oracles over full signals — long suite, run with --ignored"]
 fn pipe_offline_full_chain_parity() {
     for (host_rate, nam_rate, esr_gate, snr_gate) in RATES {
         for (label, fixture, native_esr) in FIXTURES {

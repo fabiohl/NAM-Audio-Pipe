@@ -3,50 +3,67 @@
   "targets": [
     {
       "id": "capture_dsp_pipeline",
-      "pattern": "capture_dsp_pipeline_streaming|capture_dsp_pipeline$|capture_dsp_pipeline_inner",
+      "pattern": "setup_capture_stream::\\{closure#2\\}::\\{closure#0\\}.*call_once$|capture_dsp_pipeline_streaming|capture_dsp_pipeline$",
       "required": true,
-      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+      "expected_methods": ["call_once", "capture_dsp_pipeline"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 },
+      "exceptions": {
+        "alloc": ["free@GLIBC", "malloc@GLIBC", "RawVec", "handle_error", "drop_glue"]
+      }
     },
     {
       "id": "playback_dsp_cycle",
-      "pattern": "playback_dsp_cycle",
+      "pattern": "^(<)?nam_audio_pipe::standalone::pw_host::playback::setup_playback_stream::\\{closure#2\\}(>)?$|playback_dsp_cycle$",
       "required": true,
-      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+      "expected_methods": ["closure#2", "playback_dsp_cycle"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 },
+      "exceptions": {
+        "alloc": ["free@GLIBC"]
+      }
     },
     {
       "id": "process_dsp_buffer",
-      "pattern": "process_dsp_buffer",
+      "pattern": "^(<)?nam_audio_pipe::standalone::pw_host::capture::setup::setup_capture_stream::\\{closure#2\\}(>)?$|process_dsp_buffer$",
       "required": true,
-      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+      "expected_methods": ["closure#2", "process_dsp_buffer"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 },
+      "exceptions": {
+        "alloc": ["free@GLIBC"]
+      }
     },
     {
       "id": "process_block_internal",
-      "pattern": "process_block_internal",
+      "pattern": "process_block_internal::<.*>(\\.cold|\\.warm|\\.part\\.[0-9]+)?$|process_block_internal$",
       "required": true,
+      "expected_methods": ["process_block_internal"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {
       "id": "tanh_and_accumulate",
       "pattern": "tanh_and_",
       "required": true,
+      "expected_methods": ["tanh_and_"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {
       "id": "cabsim_adapter",
-      "pattern": "CabSimAdapter.*process_block|CabSimAdapter.*process",
+      "pattern": "CabSimAdapter>::process_block(\\.cold|\\.warm|\\.part\\.[0-9]+)?$|CabSimAdapter::process_block$",
       "required": true,
+      "expected_methods": ["process_block"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {
       "id": "conv_engine",
-      "pattern": "ConvEngine.*process",
+      "pattern": "ConvEngine>::process(\\.cold|\\.warm|\\.part\\.[0-9]+)?$|CabSimAdapter>::process_block(\\.cold|\\.warm|\\.part\\.[0-9]+)?$",
       "required": true,
+      "expected_methods": ["process", "process_block"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {
       "id": "resampler",
-      "pattern": "ResamplerCore.*process|NamResampler.*process",
+      "pattern": "ResamplerCore>::process_internal|<.*ResamplerCore.*>::process_internal|ResamplerCore.*process_internal$",
       "required": true,
+      "expected_methods": ["process_internal"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {

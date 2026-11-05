@@ -2,13 +2,13 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # utils/_lib.sh — execução, logs e carrier tipado de NAM-Audio-Pipe (fases, gates, RESULT). Classe D (biblioteca). Sem cor, sem cópia pinada.
 # Uso: chamar lib_init após o parsing de help; concluir com trap_fail + finish.
-# Orçamento: 120
+# Orçamento: 135
 LOG_DIR=target/logs
 NAM_RUN_ID="${NAM_RUN_ID:-}"
 PROJECT_DIR="$PWD"
 SCRIPT_NAME="$(basename "${0%.sh}")"
 STATUS_NAME="$SCRIPT_NAME"
-T0=$SECONDS; FAILS=(); GAPS=(); STRICT=0; EMIT_RC=0
+T0=$SECONDS; FAILS=(); GAPS=(); STRICT=0; EMIT_RC=0; SCOPE="${SCOPE:-full}"
 
 warn()  { echo "WARN: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
@@ -20,8 +20,17 @@ emit()  {
         printf '%s\n' "$line" >> "$LOG_DIR/summary.txt" 2>/dev/null || { echo "ERROR: cannot append summary.txt" >&2; EMIT_RC=1; }
     fi
 }
-phase() { emit "PHASE: $1"; }
-gap()   { GAPS+=("$1"); emit "PHASE: ${PHASE_NAME:-$1} GAP $1"; }
+phase() { PHASE_NAME="$1"; emit "PHASE: $1"; }
+gap() {
+    local p="${PHASE_NAME:-$1}" g="$1"
+    if [ $# -ge 2 ]; then p="$1"; g="$2"; fi
+    local known
+    for known in ${GAPS[@]+"${GAPS[@]}"}; do
+        if [ "$known" = "$g" ]; then return 0; fi
+    done
+    GAPS+=("$g")
+    emit "PHASE: $p GAP $g"
+}
 
 # lib_init — ÚNICO ponto que cria target/logs e trunca summary.txt. Depois do help.
 # lib_quiet (filho dentro de fase do pai) só inibe summary/marker: o carrier obsoleto do
@@ -58,6 +67,8 @@ run_step() {
 }
 
 # ran_tests <log>: every cargo test binary ran and none reported failures.
+# Exceção formal documentada (D3/GOV-1): valida resumo de teste via grep sobre log
+# higienizado contra ANSI como gate fail-closed (§9.38), até contagem estruturada estável.
 ran_tests() {
     local log="$1" clean n_run n_start n_res n_fail n_pass
     clean=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" 2>/dev/null || true)
@@ -72,8 +83,9 @@ ran_tests() {
 
 # assert_ran_tests <log> [min]: fail-closed gate against empty selections.
 assert_ran_tests() {
-    local log="$1" min="${2:-1}" total
-    total=$(grep -oE '[0-9]+ (passed|measured)' "$log" 2>/dev/null | awk '{s += $1} END {print s + 0}' || true)
+    local log="$1" min="${2:-1}" clean total
+    clean=$(sed -E 's/\x1b\[[0-9;]*[a-zA-Z]//g' "$log" 2>/dev/null || true)
+    total=$(grep -oE '[0-9]+ (passed|measured)' <<<"$clean" | awk '{s += $1} END {print s + 0}' || true)
     if [ "${total:-0}" -lt "$min" ] || ! ran_tests "$log"; then
         echo "GATE FAIL: $log executed ${total:-0} test(s) < $min." >&2
         return 1
@@ -89,27 +101,29 @@ trap_fail() {
     finish || true
 }
 
-# carrier_write <veredito> — uma linha, quatro colunas TAB. Falha de escrita é FAIL.
+# carrier_write <veredito> — uma linha, cinco colunas TAB. Falha de escrita é FAIL.
 carrier_write() {
     local sf="$LOG_DIR/${STATUS_NAME}-status.tsv"
-    printf '%s\t%s\t%s\t%s\n' "$STATUS_NAME" "$1" \
-        "$(IFS=,; printf '%s' "${GAPS[*]:-none}")" "$(IFS=,; printf '%s' "${FAILS[*]:-none}")" > "$sf" 2>/dev/null && return 0
+    printf '%s\t%s\t%s\t%s\t%s\n' "$STATUS_NAME" "$1" \
+        "$(IFS=,; printf '%s' "${GAPS[*]:-none}")" "$(IFS=,; printf '%s' "${FAILS[*]:-none}")" "scope=${SCOPE:-full}" > "$sf" 2>/dev/null && return 0
     echo "ERROR: cannot write status carrier $sf" >&2
     FAILS+=("carrier"); return 1
 }
 
 finish() {
-    local s=PASS e=0 line; FINISHED=1
+    local s=PASS e=0 line f_csv g_csv; FINISHED=1
     [ ${#GAPS[@]} -gt 0 ] && s=PASS_WITH_GAPS
     { [ ${#FAILS[@]} -gt 0 ] || { [ "$STRICT" = 1 ] && [ ${#GAPS[@]} -gt 0 ]; }; } && s=FAIL
     [ "$EMIT_RC" -ne 0 ] && { FAILS+=("emit"); s=FAIL; }
     carrier_write "$s" || s=FAIL
-    line="RESULT: $s ($((SECONDS - T0))s) fails=${FAILS[*]:-none} gaps=${GAPS[*]:-none}"
+    f_csv=$(IFS=,; printf '%s' "${FAILS[*]:-none}"); g_csv=$(IFS=,; printf '%s' "${GAPS[*]:-none}")
+    line="RESULT: $s ($((SECONDS - T0))s) fails=$f_csv gaps=$g_csv scope=${SCOPE:-full}"
     if [ "${lib_quiet:-}" != "1" ] && ! printf '%s\n' "$line" >> "$LOG_DIR/summary.txt" 2>/dev/null; then
         e=1; echo "ERROR: cannot append summary.txt" >&2
         if [ "$s" != FAIL ]; then
             FAILS+=("emit"); s=FAIL; carrier_write "$s" || true
-            line="RESULT: $s ($((SECONDS - T0))s) fails=${FAILS[*]:-none} gaps=${GAPS[*]:-none}"
+            f_csv=$(IFS=,; printf '%s' "${FAILS[*]:-none}")
+            line="RESULT: $s ($((SECONDS - T0))s) fails=$f_csv gaps=$g_csv scope=${SCOPE:-full}"
         fi
     fi
     printf '%s\n' "$line"

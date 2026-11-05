@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
+
 //! A/B optimization benchmark — measures the DSP hot-path envelope of the
 //! **current binary** so `plain → PGO → PGO+BOLT` builds can be compared.
 //!
@@ -443,6 +445,7 @@ impl Stats {
 
 // ── TSC helpers ─────────────────────────────────────────────────────────────
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc_cycles() -> u64 {
     // SAFETY: `_mm_lfence` + `_rdtsc` are available on all x86-64 CPUs; they
@@ -451,6 +454,12 @@ fn rdtsc_cycles() -> u64 {
         core::arch::x86_64::_mm_lfence();
         core::arch::x86_64::_rdtsc()
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rdtsc_cycles() -> u64 {
+    0
 }
 
 fn measure_freq_ghz_x1000() -> u64 {
@@ -948,6 +957,7 @@ fn parse_args() -> Cfg {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+#[cfg(target_arch = "x86_64")]
 fn main() -> ExitCode {
     neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE
         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1170,6 +1180,15 @@ fn main() -> ExitCode {
     eprintln!("receipt: {}", cfg.receipt_json.display());
     eprintln!("verdict retained for the ceremony comparison (plain → PGO → PGO+BOLT)");
     ExitCode::SUCCESS
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() -> ExitCode {
+    eprintln!(
+        "GAP: ab_opt_bench is supported only on x86_64 (TSC and PMU counters unavailable on this architecture)"
+    );
+    println!("GAP ab_opt_bench_unsupported_arch");
+    ExitCode::from(10u8)
 }
 
 #[cfg(test)]

@@ -28,12 +28,16 @@ DO_CERTIFY=0
 
 # gap deduplicado: uma lacuna repetida é um registro único no carrier.
 gap() {
+    local p="${PHASE_NAME:-$1}" g="$1"
+    if [ $# -ge 2 ]; then p="$1"; g="$2"; fi
     local known
     for known in ${GAPS[@]+"${GAPS[@]}"}; do
-        if [ "$known" = "$1" ]; then return 0; fi
+        if [ "$known" = "$g" ]; then return 0; fi
     done
-    GAPS+=("$1")
-    emit "PHASE: ${PHASE_NAME:-$1} GAP $1"
+    GAPS+=("$g")
+    if [ "$p" != "env_verify" ]; then
+        emit "PHASE: $p GAP $g"
+    fi
 }
 fail_phase() {
     FAILS+=("$1")
@@ -108,6 +112,11 @@ if [ "$DO_CERTIFY" = 1 ]; then
     rm -f "$RELEASE_RECEIPT"
     phase certify
     CERT_LOG="$LOG_DIR/build-release-certify.log"
+    if [ -f "$LOG_DIR/tests-long-status.tsv" ] && grep -q 'scope=partial' "$LOG_DIR/tests-long-status.tsv"; then
+        fail_phase certify 1 "$CERT_LOG (tests-long ran with partial scope)"
+        finish || true
+        exit 1
+    fi
     CERT_ARGS=(--artifact "$DIST_BIN" --build-receipt "$BUILD_RECEIPT" --long-receipt "$LONG_JSONL" --text-receipt "$LONG_TEXT" --out "$RELEASE_RECEIPT")
     if [ "$DO_STRICT" = 1 ]; then CERT_ARGS+=(--strict); fi
     if CERT_BIN=$(find_receipt_bin); then
@@ -144,6 +153,7 @@ rm -f "$BUILD_RECEIPT" "$RELEASE_RECEIPT"
 # Phase 1: environment, toolchain and canonical paths.
 # ---------------------------------------------------------------------------
 phase env_verify
+ENV_GAPS=${#GAPS[@]}
 ENV_LOG="$LOG_DIR/build-release-env_verify.log"
 if ! {
     for cmd in rustc cargo; do
@@ -175,7 +185,7 @@ LLVM_PROFDATA="$RUST_SYSROOT/lib/rustlib/$RUST_HOST/bin/llvm-profdata"
 if [ ! -x "$LLVM_PROFDATA" ]; then LLVM_PROFDATA=$(command -v llvm-profdata 2>/dev/null || true); fi
 if [ -n "$LLVM_PROFDATA" ] && [ ! -x "$LLVM_PROFDATA" ]; then LLVM_PROFDATA=""; fi
 if [ -z "$LLVM_PROFDATA" ]; then
-    gap pgo_profdata_unavailable
+    gap env_verify pgo_profdata_unavailable
     if [ "$DO_STRICT" = 1 ]; then
         finish || true
         die "llvm-profdata is mandatory under --strict (rustup component add llvm-tools-preview)"
@@ -183,7 +193,7 @@ if [ -z "$LLVM_PROFDATA" ]; then
 fi
 
 LLVM_BOLT=""
-for candidate in llvm-bolt llvm-bolt-19 llvm-bolt-18; do
+for candidate in llvm-bolt llvm-bolt-22 llvm-bolt-21 llvm-bolt-20 llvm-bolt-19 llvm-bolt-18; do
     if command -v "$candidate" >/dev/null 2>&1; then LLVM_BOLT="$candidate"; break; fi
 done
 if [ -z "$LLVM_BOLT" ]; then
@@ -195,7 +205,16 @@ PERF2BOLT=""
 HAS_PERF=false
 if [ -n "$LLVM_BOLT" ]; then
     PERF2BOLT="$(dirname "$LLVM_BOLT")/perf2bolt"
-    if [ ! -x "$PERF2BOLT" ]; then PERF2BOLT=$(command -v perf2bolt 2>/dev/null || true); fi
+    if [ ! -x "$PERF2BOLT" ]; then
+        for candidate in perf2bolt perf2bolt-22 perf2bolt-21 perf2bolt-20 perf2bolt-19 perf2bolt-18; do
+            if command -v "$candidate" >/dev/null 2>&1; then PERF2BOLT=$(command -v "$candidate"); break; fi
+        done
+    fi
+    if [ ! -x "$PERF2BOLT" ]; then
+        for candidate in /usr/lib/llvm-*/bin/perf2bolt; do
+            if [ -x "$candidate" ]; then PERF2BOLT="$candidate"; break; fi
+        done
+    fi
 fi
 if command -v perf >/dev/null 2>&1; then
     PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
@@ -204,8 +223,10 @@ if command -v perf >/dev/null 2>&1; then
     fi
     if [ "$PARANOID" -le 1 ]; then HAS_PERF=true; fi
 fi
-if [ -z "$LLVM_BOLT" ] || [ -z "$PERF2BOLT" ] || [ "$HAS_PERF" != true ]; then
-    gap bolt_tools_unavailable
+BOLT_AVAILABLE=false
+if [ -n "$LLVM_BOLT" ] && [ -n "$PERF2BOLT" ] && [ "$HAS_PERF" = true ]; then BOLT_AVAILABLE=true; fi
+if [ "$BOLT_AVAILABLE" != true ]; then
+    gap env_verify bolt_tools_unavailable
     if [ "$DO_STRICT" = 1 ]; then
         finish || true
         die "BOLT (llvm-bolt + perf2bolt + perf with kernel.perf_event_paranoid<=1) is mandatory under --strict"
@@ -219,6 +240,11 @@ if ! cargo build --locked --features testing --bin pipe_long_receipt >/dev/null 
 fi
 RECEIPT_BIN=target/debug/pipe_long_receipt
 ok "environment ready (rustflags: $CONFIG_RUSTFLAGS)"
+if [ ${#GAPS[@]} -eq "$ENV_GAPS" ]; then
+    emit "PHASE: env_verify PASS log=$ENV_LOG"
+else
+    emit "PHASE: env_verify PASS_WITH_GAPS log=$ENV_LOG"
+fi
 
 # ---------------------------------------------------------------------------
 # Phase 2: PGO workload and profile merge.
@@ -237,19 +263,21 @@ if [ -n "$LLVM_PROFDATA" ]; then
     if {
         RUSTFLAGS="$PGO_GEN_RUSTFLAGS" LLVM_PROFILE_FILE="$PROFRAW_DIR/default_%m_%p.profraw" \
             cargo run --locked --profile dist --features testing --target-dir target/pgo-build \
-            --bin pgo_workload -- --receipt "$PGO_RECEIPT"
-        "$RECEIPT_BIN" pgo-check --receipt "$PGO_RECEIPT"
-        PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' | wc -l)
-        [ "$PROFRAW_COUNT" -gt 0 ] || { echo "no .profraw profiles generated"; exit 1; }
-        "$LLVM_PROFDATA" merge -sparse -o "$MERGED_PROFILE" "$PROFRAW_DIR"/*.profraw
+            --bin pgo_workload -- --receipt "$PGO_RECEIPT" &&
+        "$RECEIPT_BIN" pgo-check --receipt "$PGO_RECEIPT" &&
+        PROFRAW_COUNT=$(find "$PROFRAW_DIR" -name '*.profraw' | wc -l) &&
+        [ "$PROFRAW_COUNT" -gt 0 ] &&
+        "$LLVM_PROFDATA" merge -sparse -o "$MERGED_PROFILE" "$PROFRAW_DIR"/*.profraw &&
         [ -s "$MERGED_PROFILE" ]
     } 2>&1 | tee "$PGO_LOG"; then
         PGO_APPLIED=true
         ok "PGO profile merged: $MERGED_PROFILE"
+        emit "PHASE: pgo_profile PASS log=$PGO_LOG"
     else
-        fail_phase pgo_profile "${PIPESTATUS[0]}" "$PGO_LOG"
-        if [ "$DO_STRICT" = 1 ]; then finish; exit 1; fi
-        gap pgo_not_applied
+        rm -rf "$PGO_DIR"
+        fail_phase pgo_profile "${PIPESTATUS[0]:-1}" "$PGO_LOG"
+        finish
+        exit 1
     fi
     rm -rf "$PROFRAW_DIR"
 else
@@ -278,6 +306,7 @@ fi
 PGO_BIN=target/pgo-build/dist/nam-audio-pipe
 [ -f "$PGO_BIN" ] || { fail_phase compile_binary 1 "$COMPILE_LOG"; finish; exit 1; }
 ok "optimized binary: $PGO_BIN"
+emit "PHASE: compile_binary PASS log=$COMPILE_LOG"
 
 # ---------------------------------------------------------------------------
 # Phase 4: BOLT post-link optimization (live PipeWire profiling).
@@ -425,6 +454,7 @@ if [ -z "$BOLT_CAUSE" ]; then
 fi
 
 if [ -z "$BOLT_CAUSE" ] && [ "$BOLT_APPLIED" != true ]; then BOLT_CAUSE="BOLT was not applied"; fi
+BOLT_PHASE_OK=false
 if [ -n "$BOLT_CAUSE" ]; then
     echo "BOLT unavailable: $BOLT_CAUSE" | tee -a "$BOLT_LOG"
     if [ "$DO_STRICT" = 1 ]; then
@@ -432,15 +462,17 @@ if [ -n "$BOLT_CAUSE" ]; then
         finish
         exit 1
     fi
-    gap bolt_not_applied
+    if [ "$BOLT_AVAILABLE" = true ]; then gap bolt_not_applied; fi
 else
     ok "BOLT applied: ${PERF_SAMPLES} perf samples, build-id confirmed"
+    BOLT_PHASE_OK=true
 fi
 
 if [ "$BOLT_APPLIED" = true ]; then
     if "$RECEIPT_BIN" bolt-proof --receipt "$CEREMONY_RECEIPT" >/dev/null 2>&1; then
         ok "BOLT win proof verified: $CEREMONY_RECEIPT"
     else
+        BOLT_PHASE_OK=false
         gap bolt_proof_unverified
         if [ "$DO_STRICT" = 1 ]; then
             echo "BOLT applied but no valid ab-opt ceremony proof at $CEREMONY_RECEIPT" | tee -a "$BOLT_LOG"
@@ -450,15 +482,17 @@ if [ "$BOLT_APPLIED" = true ]; then
         fi
     fi
 fi
+if [ "$BOLT_PHASE_OK" = true ]; then emit "PHASE: bolt_optimize PASS log=$BOLT_LOG"; fi
 
 # ---------------------------------------------------------------------------
 # Phase 5: static DSP codegen gates on the selected binary.
 # ---------------------------------------------------------------------------
 phase codegen_report
 CODEGEN_LOG="$LOG_DIR/build-release-codegen_report.log"
-ASM_FULL=target/dsp_hotpath.full.asm
-ASM_TARGET=target/dsp_hotpath.asm
-ASM_SUMMARY=target/dsp_hotpath_summary.txt
+CODEGEN_DIR="$LOG_DIR/codegen"; mkdir -p "$CODEGEN_DIR"
+ASM_FULL="$CODEGEN_DIR/dsp_hotpath.full.asm"
+ASM_TARGET="$CODEGEN_DIR/dsp_hotpath.asm"
+ASM_SUMMARY="$CODEGEN_DIR/dsp_hotpath_summary.txt"
 CODEGEN_STATUS=unavailable
 ASM_BIN="$PGO_BIN"
 if [ "$BOLT_APPLIED" = true ] && [ -f target/pgo-build/dist/nam-audio-pipe.bolt ]; then
@@ -466,10 +500,15 @@ if [ "$BOLT_APPLIED" = true ] && [ -f target/pgo-build/dist/nam-audio-pipe.bolt 
 fi
 OBJDUMP_TOOL=""
 if command -v llvm-objdump >/dev/null 2>&1; then OBJDUMP_TOOL=llvm-objdump; elif command -v objdump >/dev/null 2>&1; then OBJDUMP_TOOL=objdump; fi
-if [ -z "$OBJDUMP_TOOL" ] || [ ! -f "$ASM_BIN" ]; then
-    gap codegen_objdump_unavailable
+if [ -z "$OBJDUMP_TOOL" ]; then
     CODEGEN_STATUS=unavailable
-    emit "PHASE: codegen_report GAP codegen_objdump_unavailable"
+    gap codegen_objdump_unavailable
+elif [ ! -f "$ASM_BIN" ]; then
+    CODEGEN_STATUS=fail
+    echo "selected binary missing: $ASM_BIN" >> "$CODEGEN_LOG"
+    fail_phase codegen_report 1 "$CODEGEN_LOG"
+    finish
+    exit 1
 else
     CODEGEN_STATUS=fail
     CODEGEN_ERR=0
@@ -479,22 +518,19 @@ else
         echo "Disassembly output is empty" >> "$CODEGEN_LOG"
         CODEGEN_ERR=1
     elif ! "$SCRIPT_DIR/dsp-hotpath-filter.py" --full "$ASM_FULL" --filtered "$ASM_TARGET" \
-        --summary "$ASM_SUMMARY" --profile "$SCRIPT_DIR/codegen-profile.json" >> "$CODEGEN_LOG" 2>&1; then
+        --summary "$ASM_SUMMARY" --profile "$SCRIPT_DIR/codegen-profile.json" 2>&1 | tee -a "$CODEGEN_LOG"; then
         CODEGEN_ERR=1
     fi
 
     if [ "$CODEGEN_ERR" -eq 0 ]; then
         CODEGEN_STATUS=pass
+        cp -p "$ASM_TARGET" target/ 2>/dev/null || true; cp -p "$ASM_SUMMARY" target/ 2>/dev/null || true
         ok "codegen static gates passed"
         emit "PHASE: codegen_report PASS log=$CODEGEN_LOG"
     else
-        CODEGEN_STATUS=fail
-        if [ "$DO_STRICT" = 1 ]; then
-            fail_phase codegen_report 1 "$CODEGEN_LOG"
-            finish
-            exit 1
-        fi
-        gap codegen_gate_fail
+        fail_phase codegen_report "$CODEGEN_ERR" "$CODEGEN_LOG"
+        finish
+        exit 1
     fi
 fi
 
@@ -552,6 +588,7 @@ if [ "$DO_INSTALL" = 1 ]; then
     fi
     INSTALLED_PATH="$HOME/.local/bin/nam-audio-pipe"
     ok "installed: $INSTALLED_PATH"
+    emit "PHASE: install PASS log=$INSTALL_LOG"
 fi
 
 # ---------------------------------------------------------------------------
@@ -690,6 +727,7 @@ EOF
         flatpak install --user --reinstall -y "$FLATPAK_BUNDLE" >> "$PKG_LOG" 2>&1
     fi
     ok "flatpak bundle: $FLATPAK_BUNDLE"
+    emit "PHASE: packaging PASS log=$PKG_LOG"
 fi
 
 # ---------------------------------------------------------------------------
@@ -725,5 +763,6 @@ ok "build receipt: $BUILD_RECEIPT"
 # The long audit reuses this id so build and long receipts reconcile even when
 # the three commands run as independent processes.
 printf '%s\n' "$NAM_RUN_ID" > "$LOG_DIR/build-run-id"
+emit "PHASE: build_receipt PASS log=$RECEIPT_LOG"
 
 finish

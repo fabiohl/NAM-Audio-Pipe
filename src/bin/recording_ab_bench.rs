@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code, unused_imports))]
+
 //! Recording transport A/B benchmark: inline SPSC ring vs preallocated
 //! pool + small-descriptor SPSC transport for the recording path.
 //!
@@ -118,6 +120,7 @@ impl Default for Cfg {
 // ── TSC helpers ─────────────────────────────────────────────────────────────
 
 /// Serialized `RDTSC` (LFENCE + RDTSC) raw cycle count.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc_cycles() -> u64 {
     // SAFETY: `_mm_lfence` + `_rdtsc` are available on all x86-64 CPUs; they
@@ -126,6 +129,12 @@ fn rdtsc_cycles() -> u64 {
         core::arch::x86_64::_mm_lfence();
         core::arch::x86_64::_rdtsc()
     }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rdtsc_cycles() -> u64 {
+    0
 }
 
 /// Measures the current TSC rate as fixed-point GHz × 1000 (cycles per ns ×
@@ -482,10 +491,15 @@ fn measure_cache_proxy(frames: usize) -> CacheProxy {
     let mut cold = Vec::with_capacity(2000);
     for _ in 0..2000 {
         for chunk in dst.as_chunks_mut::<16>().0 {
+            #[cfg(target_arch = "x86_64")]
             // SAFETY: every element of `dst` is in-bounds, mutable memory;
             // `_mm_clflush` has no side effects beyond invalidating the cache
             // line containing the address.
-            unsafe { core::arch::x86_64::_mm_clflush(chunk.as_mut_ptr() as *const u8) };
+            unsafe {
+                core::arch::x86_64::_mm_clflush(chunk.as_mut_ptr() as *const u8)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = chunk;
         }
         let t0 = rdtsc_cycles();
         dst.copy_from_slice(&src);
@@ -637,6 +651,7 @@ fn host_context(freq_ghz_x1000: u64) -> Vec<(String, JsonValue)> {
     ctx
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() -> ExitCode {
     let cfg = parse_args();
     if let Err(e) = pin_thread(cfg.producer_cpu) {
@@ -812,6 +827,15 @@ fn main() -> ExitCode {
     eprintln!("VERDICT: {verdict}");
     eprintln!("PROMOTE={promote}");
     ExitCode::SUCCESS
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() -> ExitCode {
+    eprintln!(
+        "GAP: recording_ab_bench is supported only on x86_64 (TSC and cache line flushing unavailable on this architecture)"
+    );
+    println!("GAP recording_ab_bench_unsupported_arch");
+    ExitCode::from(10u8)
 }
 
 fn emit_size_report(

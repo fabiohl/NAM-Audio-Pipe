@@ -526,8 +526,10 @@ impl<const N: usize> InFlightBlock<'_, N> {
     /// audio block; check [`is_barrier`](Self::is_barrier) first.
     #[inline]
     pub fn block(&self) -> &AlignedBlock<MAX_BLOCK_SIZE> {
-        self.block
-            .expect("a control barrier carries no audio block")
+        match self.block {
+            Some(block) => block,
+            None => panic!("a control barrier carries no audio block"),
+        }
     }
 
     /// The descriptor that carried this block (slot index + valid length), or

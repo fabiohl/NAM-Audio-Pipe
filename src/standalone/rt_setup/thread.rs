@@ -41,6 +41,10 @@ pub fn mlockall_ok() -> bool {
 ///    back to classic `PR_SET_THP_DISABLE` on older kernels.
 /// 2. **mlockall** — Locks current and future memory in physical RAM, preventing
 ///    page faults in the DSP thread.
+/// 3. **Heap trimming disabled** — `mallopt(M_TRIM_THRESHOLD, -1)` and
+///    `mallopt(M_MMAP_MAX, 0)` keep freed arenas resident instead of returning
+///    them to the kernel, removing the demand-zero minor faults that survive a
+///    successful `mlockall`.
 ///
 /// These operations were originally executed in the cold-path of the first DSP
 /// frame, but were moved here to reduce jitter at the critical moment of the
@@ -59,6 +63,21 @@ pub fn configure_process_wide() {
             let errno = err.raw_os_error().unwrap_or(-1);
             log::warn!("mlockall: failed({errno})");
         }
+    }
+
+    // Even when `mlockall` succeeds, glibc may return freed SPSC/GC arenas to
+    // the kernel (`MADV_DONTNEED`/`munmap`), and the DSP thread would then pay
+    // a demand-zero minor page fault on the next allocation. Disabling heap
+    // trimming and mmap-backed allocations keeps every freed chunk resident in
+    // the process heap for reuse, so the RT thread never re-faults a page that
+    // the allocator handed back to the kernel.
+    #[cfg(target_os = "linux")]
+    // SAFETY: `mallopt` takes integer parameters (`c_int`); the constants come
+    // from glibc and are valid for the running allocator. Failures are
+    // non-fatal: a rejected parameter simply leaves the default policy.
+    unsafe {
+        let _ = libc::mallopt(libc::M_TRIM_THRESHOLD, -1);
+        let _ = libc::mallopt(libc::M_MMAP_MAX, 0);
     }
 }
 

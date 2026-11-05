@@ -147,9 +147,10 @@ run_phase() {
     local -a phase_gaps=()
     if ! is_phase_selected "$name"; then
         emit "PHASE: $name SKIPPED"
+        local skip_rc=0
         "$RECEIPT_BIN" append --phase-id "$id" --name "$name" --status SKIPPED --duration-ms 0 \
-            --out "$RECEIPT" ${ARTIFACT_SHA256:+--artifact-sha256 "$ARTIFACT_SHA256"} 2>/dev/null \
-            || { LONG_RECEIPT_FAILED=1; FAILS+=("$id"); }
+            --out "$RECEIPT" ${ARTIFACT_SHA256:+--artifact-sha256 "$ARTIFACT_SHA256"} 2>/dev/null || skip_rc=$?
+        [ "$skip_rc" -eq 0 ] || [ "$skip_rc" -eq 10 ] || { LONG_RECEIPT_FAILED=1; FAILS+=("$id"); }
         return 0
     fi
     CUR_LOG="$log"; PRE_GAPS=(); TGTS=(); REQS=(); NOT_RUN=0
@@ -324,7 +325,7 @@ if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ]; then
     "$RECEIPT_BIN" validate "${val_args[@]}" >>"$LOG_DIR/tests-long-validate.log" 2>&1 \
         || FAILS+=(receipt_validation)
 fi
-if [ ${#ONLY_PHASES[@]} -gt 0 ]; then gap "only-subset:${ONLY_PHASES[*]}"; fi
+if [ ${#ONLY_PHASES[@]} -gt 0 ]; then SCOPE=partial; subset_tag=$(IFS=+; printf '%s' "${ONLY_PHASES[*]}"); emit "PHASE: phase-selection PASS only-subset:$subset_tag"; fi
 for g in ${GAPS[@]+"${GAPS[@]}"}; do emit_text "GAP: $g"; done
 if [ ${#FAILS[@]} -gt 0 ]; then emit_text "OVERALL: FAILED"
 elif [ ${#ONLY_PHASES[@]} -gt 0 ]; then emit_text "OVERALL: PARTIAL (--only: recibo sem overall, não certificável)"

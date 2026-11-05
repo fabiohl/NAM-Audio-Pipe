@@ -5,8 +5,9 @@ name: Long QA Suite
 
 # Release chain, decoupled: build-release.sh -> tests-long.sh --artifact -> build-release.sh --certify.
 # This hosted workflow never certifies and never runs rt-deadline/rt-jitter.
-# Hosted runners lack an isolated CPU, BOLT, SCHED_FIFO privileges and a session manager: those
-# surface as typed GAPs. With `strict: true` any GAP fails the run.
+# Hosted runners lack an isolated CPU and SCHED_FIFO privileges: those
+# surface as typed GAPs. BOLT, perf and the C++ parity oracle are provisioned below.
+# With `strict: true` any GAP fails the run.
 on:
   workflow_dispatch:
     inputs:
@@ -34,11 +35,20 @@ jobs:
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -46,7 +56,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config clang libclang-dev \
             libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
-            appstream desktop-file-utils binutils
+            wireplumber dbus appstream desktop-file-utils binutils \
+            llvm-bolt linux-tools-common linux-tools-generic
+          sudo apt-get install -y linux-tools-$(uname -r) || true
+          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+      - name: Provision C++ parity oracle
+        run: |
+          cd "$GITHUB_WORKSPACE/NeuralAmpModeler-rs"
+          utils/setup-third-party.sh
+          oracle=$(utils/ensure_namcore_render.sh)
+          test -x "$oracle"
+          echo "NAM_CORE_RENDER_BIN=$oracle" >> "$GITHUB_ENV"
+          echo "NAM_REQUIRE_CPP_ORACLE=1" >> "$GITHUB_ENV"
       # Runner images can ship an older preinstalled stable; the crate needs rust-version 1.99.
       - name: Update Rust toolchain
         run: |
@@ -56,19 +77,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
-      # The live PipeWire (PHASE8) and PGO workload need a reachable daemon. A bare daemon (no
-      # session manager) is enough for the application's own capture/playback nodes.
-      - name: Start PipeWire daemon
+      # The live PipeWire (PHASE8/PHASE9) and PGO workload need a reachable,
+      # fully scheduled graph: a bare daemon has no session manager and no
+      # driver node, so capture streams may never receive process() callbacks.
+      - name: Start headless PipeWire graph (daemon, session manager, virtual nodes)
         run: |
-          XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/xdg"
           mkdir -p -m 700 "$XDG_RUNTIME_DIR"
           echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
-          XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" setsid nohup pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
+          # wireplumber requires a session bus; the daemon and the session
+          # manager share this private one, and later steps inherit it.
+          dbus-daemon --session --fork --print-address=1 > "$RUNNER_TEMP/dbus-address"
+          dbus_address=$(sed -n '1p' "$RUNNER_TEMP/dbus-address")
+          export DBUS_SESSION_BUS_ADDRESS="$dbus_address"
+          echo "DBUS_SESSION_BUS_ADDRESS=$dbus_address" >> "$GITHUB_ENV"
+          setsid nohup pipewire > "$RUNNER_TEMP/pipewire.log" 2>&1 &
           for _ in $(seq 1 50); do
             [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && break
             sleep 0.2
           done
           [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || { echo "PipeWire socket did not appear"; cat "$RUNNER_TEMP/pipewire.log"; exit 1; }
+          setsid nohup wireplumber > "$RUNNER_TEMP/wireplumber.log" 2>&1 &
+          wireplumber_pid=$!
+          # Fail closed if the session manager dies or never connects: the
+          # create-node calls below succeed without it, so verifying the
+          # WirePlumber client in the graph is what proves streams will link.
+          for _ in $(seq 1 100); do
+            if ! kill -0 "$wireplumber_pid" 2>/dev/null; then
+              echo "wireplumber exited during startup"
+              cat "$RUNNER_TEMP/wireplumber.log"
+              exit 1
+            fi
+            pw-cli ls Client 2>/dev/null | grep -qi 'application.name = "WirePlumber"' && break
+            sleep 0.1
+          done
+          pw-cli ls Client | tee "$RUNNER_TEMP/pipewire-clients.log"
+          grep -qi 'application.name = "WirePlumber"' "$RUNNER_TEMP/pipewire-clients.log"
+          # Persistent virtual drivers: a sink (graph scheduling clock) and a
+          # source, so hosted runners without hardware audio still schedule the
+          # host's capture/playback nodes.
+          pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=ci-null-sink media.class=Audio/Sink object.linger=true audio.position=[FL FR] }'
+          pw-cli create-node adapter '{ factory.name=support.null-audio-sink node.name=ci-null-source media.class=Audio/Source/Virtual object.linger=true audio.position=[FL FR] }'
+          pw-cli ls Node | tee "$RUNNER_TEMP/pipewire-nodes.log"
+          grep -q ci-null-sink "$RUNNER_TEMP/pipewire-nodes.log"
+          grep -q ci-null-source "$RUNNER_TEMP/pipewire-nodes.log"
       - name: Record provenance
         run: |
           mkdir -p target/logs
@@ -110,7 +162,12 @@ jobs:
           printf 'PHASE: provenance sha=%s package_version=%s engine_type=%s engine_version=%s engine_checksum=%s auxiliary_engine=%s\n' \
             "$sha" "$version" "$eng_type" "$eng_ver" "$eng_chk" "$aux_engine" | tee target/logs/ci-provenance.log
       - name: Build canonical artifact
-        run: ./utils/build-release.sh
+        env:
+          STRICT_INPUT: ${{ inputs.strict }}
+        run: |
+          STRICT_FLAG=""
+          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
+          ./utils/build-release.sh $STRICT_FLAG
       - name: Long QA Suite (artifact)
         env:
           STRICT_INPUT: ${{ inputs.strict }}
@@ -135,4 +192,5 @@ jobs:
             target/logs/**
             target/dist/build-receipt.json
             target/dist/release-receipt.json
+          if-no-files-found: error
           retention-days: 14

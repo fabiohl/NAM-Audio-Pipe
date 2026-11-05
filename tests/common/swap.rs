@@ -140,11 +140,25 @@ pub fn cabsim_pair() -> Box<CabSimPair> {
         CabSimAdapter::new(Box::new(ConvEngine::new(ir, PARTITION).expect("conv")))
             .expect("adapter")
     };
-    Box::new(CabSimPair {
+    let mut pair = Box::new(CabSimPair {
         l: Box::new(mk(&ir_l)),
         r: Box::new(mk(&ir_r)),
         sample_rate: SAMPLE_RATE,
-    })
+    });
+
+    // Pre-touch every convolution page (IR partitions, FDL and FFT scratch) on
+    // the producer thread, where demand paging is harmless. A single
+    // partition-sized block is enough to exercise the full frequency-domain
+    // MAC over all partitions; `reset()` then restores the exact
+    // post-construction state (zero-alloc, IR/plan preserved) so the RT side
+    // sees an engine bit-identical to a freshly built one.
+    let partition = pair.partition_size();
+    let mut scratch_l = vec![0.0f32; partition];
+    let mut scratch_r = vec![0.0f32; partition];
+    pair.process_block_stereo(&mut scratch_l, &mut scratch_r, None);
+    pair.l.reset();
+    pair.r.reset();
+    pair
 }
 
 /// Deterministic stereo test signal (L != R so the mono detector stays open).
@@ -219,6 +233,33 @@ pub const VALIDATION_EXPECTED_R_GAIN: f32 = -0.1596;
 #[cfg(feature = "testing")]
 pub const SWAP_INTERVAL: usize = 20;
 
+/// Pre-touches an oversampling engine's half-band delay lines and X4
+/// inter-stage buffer on the producer thread, then resets it to the exact
+/// post-construction state.
+///
+/// The engine is about to be published to the RT side; without this warm-up
+/// the first real upsample/downsample after the swap would fault in those
+/// pages on the audio thread. `reset()` is zero-alloc and bit-identical to a
+/// freshly constructed engine, so the pre-touch has no observable effect on
+/// the processed stream.
+#[cfg(feature = "testing")]
+fn prewarm_oversample(engine: &mut OversampleEngine) {
+    let input = [0.0f32; BLOCK];
+    let mut upsampled = [0.0f32; BLOCK * 4];
+    let n_up = engine.upsample(
+        &input,
+        &mut upsampled[..BLOCK * engine.factor().multiplier()],
+        None,
+    );
+    if n_up == 0 {
+        engine.reset();
+        return;
+    }
+    let mut output = [0.0f32; BLOCK];
+    let _ = engine.downsample(&upsampled[..n_up], &mut output, None);
+    engine.reset();
+}
+
 /// Applies a mixed swap batch: model, CabSim, oversampling and gain.
 ///
 /// Shared cadence between the accelerated soak and the real endurance:
@@ -256,10 +297,12 @@ pub fn apply_swap_batch(h: &mut RtSwapHarness, block: usize) {
         _ => OversampleFactor::X4,
     };
     let os_max = BLOCK * 4;
-    if let (Ok(l), Ok(r)) = (
+    if let (Ok(mut l), Ok(mut r)) = (
         OversampleEngine::new(os_factor, os_max),
         OversampleEngine::new(os_factor, os_max),
     ) {
+        prewarm_oversample(&mut l);
+        prewarm_oversample(&mut r);
         h.push_os_pair(l, r);
     }
 

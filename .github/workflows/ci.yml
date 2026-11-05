@@ -5,8 +5,8 @@ name: CI
 
 # Fast disciplines only: utils/lints.sh (fmt check, check/clippy matrix, rustdoc, SPDX, policies,
 # AppStream/desktop packaging) and utils/tests-quick.sh (cargo test --features testing, dev profile,
-# private PipeWire daemon). Lints and quick run as separate jobs so one cannot hide the other.
-# Heavy/RT/certification work lives in long.yml (manual dispatch).
+# non-daemon unit and offline integration tests). Lints and quick run as separate jobs so one cannot hide the other.
+# Heavy/RT/daemon/io_uring certification work lives in long.yml (manual dispatch).
 # Linux only: the product is a PipeWire host (x86_64 reference + aarch64).
 on:
   push:
@@ -36,11 +36,20 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -116,11 +125,20 @@ jobs:
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -189,21 +207,27 @@ jobs:
           path: target/logs/**
           retention-days: 14
 
-  # linux-arm64 (NEON engine backend) is experimental. While NeuralAmpModeler-rs v2.0.0
-  # supports aarch64, physical real-time execution, PipeWire audio graph integration,
-  # SCHED_FIFO scheduling, and latency gates have not been certified natively on local ARM hardware
-  # (internal quality contract). Non-blocking (`continue-on-error: true`) until native hardware certification.
+  # linux-arm64 compilation is blocking; tests remain non-blocking (`continue-on-error: true`)
+  # until native ARM test execution stabilizes (D1).
   linux-arm64-lints:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 40
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -264,7 +288,7 @@ jobs:
         uses: ./.github/actions/qa-summary
         with:
           title: linux-arm64-lints
-          note: "ARM64 experimental: non-blocking (continue-on-error) until a native aarch64 execution is approved."
+          note: "ARM64 compilation: blocking CI gate (D1)."
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -279,11 +303,20 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -344,7 +377,7 @@ jobs:
         uses: ./.github/actions/qa-summary
         with:
           title: linux-arm64-quick
-          note: "ARM64 experimental: non-blocking (continue-on-error) until a native aarch64 execution is approved."
+          note: "ARM64 experimental: non-blocking test execution until stabilization (D1)."
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -364,11 +397,20 @@ jobs:
       RUSTUP_TOOLCHAIN: 1.99.0
     steps:
       - uses: actions/checkout@v7
+      - name: Load environment variables
+        run: |
+          while IFS='=' read -r key val; do
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [ -z "$key" ] && continue
+            val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+            echo "$key=$val" >> "$GITHUB_ENV"
+          done < variables.env
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
         uses: actions/checkout@v7
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
+          ref: ${{ env.ENGINE_COMMIT }}
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -428,7 +470,7 @@ jobs:
           echo "PHASE: msrv" | tee -a target/logs/summary.txt
           rc=0
           t_start=$(date +%s)
-          cargo check --locked --all-targets --features testing 2>&1 | tee target/logs/msrv-check.log || rc=$?
+          cargo check --locked --all-targets --all-features 2>&1 | tee target/logs/msrv-check.log || rc=$?
           elapsed=$(( $(date +%s) - t_start ))
           if [ "$rc" -eq 0 ]; then
             echo "PHASE: msrv PASS log=target/logs/msrv-check.log" | tee -a target/logs/summary.txt

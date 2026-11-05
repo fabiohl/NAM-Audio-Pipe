@@ -144,6 +144,14 @@ const DEFAULT_TOTAL_SECONDS: f64 = 10.0;
 /// this many blocks so its hot-path instructions are provably in the profile.
 const DEFAULT_MIN_BLOCKS_PER_CELL: u64 = 4;
 
+/// Maximum oversampled buffer size: `MAX_RESAMP_BUF × 4` (for X4 oversampling).
+const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
+
+/// Total working storage for the four oversampled slices plus the two
+/// crossfade scratch slices (`MAX_RESAMP_BUF` each, matching the engine's
+/// R-16 guard).
+const OS_BUF_LEN: usize = MAX_OS_BUF * 4 + MAX_RESAMP_BUF * 2;
+
 /// DSP topology family classification used by the receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Topology {
@@ -337,6 +345,15 @@ fn build_cabsim_pair(ir_path: &Path, target_rate: u32, block_size: usize) -> Cab
     }
 }
 
+/// Converts a dBFS threshold to the squared linear amplitude expected by
+/// [`DspPipelineContext`], whose gate thresholds are compared against the
+/// block mean-square energy.
+fn gate_thresholds_sq(open_db: f32, close_db: f32) -> (f32, f32) {
+    let open = 10.0_f32.powf(open_db / 20.0);
+    let close = 10.0_f32.powf(close_db / 20.0);
+    (open * open, close * close)
+}
+
 /// Runs one matrix cell: `cfg.blocks` blocks through the full DSP pipeline at
 /// the cell's host rate / quantum / oversampling / CabSim / recording
 /// configuration. Fail-closed: any construction failure aborts the process.
@@ -391,7 +408,10 @@ fn run_cell(
     let mut model_out_r = vec![0.0; MAX_RESAMP_BUF];
 
     let (threshold_open_sq, threshold_close_sq) = if cfg.gate {
-        ((-70.0f32).powf(10.0 / 20.0), (-80.0f32).powf(10.0 / 20.0))
+        gate_thresholds_sq(
+            gate_params.threshold_open_db,
+            gate_params.threshold_close_db,
+        )
     } else {
         (0.0f32, 0.0f32)
     };
@@ -420,7 +440,7 @@ fn run_cell(
         }
     };
 
-    let mut os_buf: [f32; MAX_RESAMP_BUF * 6] = [0.0f32; MAX_RESAMP_BUF * 6];
+    let mut os_buf = vec![0.0f32; OS_BUF_LEN];
     let mut samples_l = vec![0.0f32; quantum];
     let mut samples_r = vec![0.0f32; quantum];
 
@@ -462,10 +482,11 @@ fn run_cell(
             conv_pair: conv.as_mut(),
         };
 
-        let (os_in_l_slice, rest) = os_buf.split_at_mut(MAX_RESAMP_BUF);
-        let (os_in_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let (os_model_l_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
-        let (os_model_r_slice, rest) = rest.split_at_mut(MAX_RESAMP_BUF);
+        let os_buf = os_buf.as_mut_slice();
+        let (os_in_l_slice, rest) = os_buf.split_at_mut(MAX_OS_BUF);
+        let (os_in_r_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
+        let (os_model_l_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
+        let (os_model_r_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
         let (xfd_scratch_l_slice, xfd_scratch_r_slice) = rest.split_at_mut(MAX_RESAMP_BUF);
 
         let bufs = DspBuffers {

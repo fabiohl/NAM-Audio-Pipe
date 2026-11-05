@@ -126,7 +126,15 @@ pub fn derive(
             MarkerState::Pass => {}
         }
     }
-    let tests_executed = count_tests_executed_from_log(log);
+    // Matrix tests may execute several subcases inside a single Cargo
+    // invocation. They emit one `TEST_RESULT[...]` line per subcase, so prefer
+    // that explicit cardinality over the per-binary `test result:` count.
+    let subcases = lines.iter().filter(|l| l.contains("TEST_RESULT[")).count() as u64;
+    let tests_executed = if subcases > 0 {
+        subcases
+    } else {
+        count_tests_executed_from_log(log)
+    };
     if tests_executed == 0 {
         failures.push("zero_tests_executed".to_string());
     }

@@ -31,6 +31,54 @@ use common::{
     DirGuard, ShutdownGuard, TEST_MUTEX, recording_init_for, spawn_ready_worker, temp_dir,
 };
 
+/// Silent `pw-play` stream attached to the NAM capture sink while the E2E
+/// recording session runs.
+///
+/// The headless CI graph has no hardware `Audio/Source`, so the host capture
+/// node is never scheduled without an active producer and `process()` never
+/// runs. Feeding the capture sink a silent WAV keeps the graph driving the
+/// node (real quantums, `last_n_samples` advances) without opening the DSP
+/// path (the noise gate stays closed). Dropping the guard kills and reaps the
+/// child, including on a panicking assertion.
+struct SilentCaptureProducer {
+    child: Option<std::process::Child>,
+}
+
+impl SilentCaptureProducer {
+    /// Spawns `pw-play` on an already-generated silent WAV. The caller
+    /// generates the file once, outside the polling loop, so a failed spawn
+    /// never triggers repeated multi-megabyte writes.
+    fn attach(wav: &std::path::Path) -> Option<Self> {
+        let child = std::process::Command::new("pw-play")
+            .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
+            .arg(wav)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        Some(Self { child: Some(child) })
+    }
+
+    /// Whether the `pw-play` child already exited (or was reaped), so the
+    /// caller can re-attach a live producer instead of waiting for a stream
+    /// that will never produce callbacks.
+    fn has_exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+            None => true,
+        }
+    }
+}
+
+impl Drop for SilentCaptureProducer {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// RAII guard that changes CWD for the duration of a test.
 struct CwdGuard(PathBuf);
 
@@ -362,9 +410,29 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
 
     // Wait (bounded) for the RT callback to process ≥1 quantum. That proves
     // the capture stream ran AND the recording ring received Metadata+Audio.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // Once the host registers its capture sink, attach a silent producer so
+    // the graph schedules the node even on a headless CI runner with no
+    // hardware source. The tone lives in its own directory (never the capture
+    // scan directory) and is generated once, outside the polling loop.
+    let tone_dir = temp_dir();
+    let _tone_guard = DirGuard::new(tone_dir.clone());
+    let tone_wav = tone_dir.join("silence.wav");
+    common::generate_silent_wav(&tone_wav, 30);
+
+    let mut producer: Option<SilentCaptureProducer> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut next_sink_probe = std::time::Instant::now();
     let mut last_n_samples = 0u32;
     while std::time::Instant::now() < deadline {
+        if producer.as_mut().is_some_and(|p| p.has_exited()) {
+            producer = None;
+        }
+        if producer.is_none() && std::time::Instant::now() >= next_sink_probe {
+            next_sink_probe = std::time::Instant::now() + Duration::from_millis(250);
+            if common::graph_has_nam_sink_matching(None) {
+                producer = SilentCaptureProducer::attach(&tone_wav);
+            }
+        }
         last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
         if last_n_samples > 0 {
             break;
