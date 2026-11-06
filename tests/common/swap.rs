@@ -346,6 +346,17 @@ pub fn validate_linear_window(h: &mut RtSwapHarness) -> bool {
     // stream does, and both chains stay certified independently.
     let dc_l = VALIDATION_DC_L; // 0.3: L oracle `1.875·dc + 0.1 = 0.6625`
     let dc_r = VALIDATION_DC_R; // 0.21: R oracle `-0.1596·dc = -0.0335160`
+
+    // Drain any in-flight ambient commands before pushing validation payloads
+    // so they enter an empty ring buffer without contention or SPSC drops.
+    let mut pre_drained = 0usize;
+    while h.commands_pending() && pre_drained < VALIDATION_DRAIN_BUDGET {
+        let mut l = [dc_l; BLOCK];
+        let mut r = [dc_r; BLOCK];
+        h.run_callback(&mut l, &mut r, BLOCK);
+        pre_drained += 1;
+    }
+
     h.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
     h.push_cabsim(None);
     h.push_os_pair(

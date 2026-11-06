@@ -383,6 +383,12 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         rt_handle.join().expect("join RT thread");
     {
         let mut h = harness.lock().expect("harness lock");
+        // Canonical baseline reset: restore harness to the exact quiescent baseline
+        // topology (Linear A/B, CabSim None, Oversample Off) that produced the
+        // initial telemetry baseline. This ensures the first→last delta measures true
+        // leak drift instead of comparing a light Linear working set with an active
+        // heavy model (WaveNet/LSTM) left running when the timer elapsed.
+        validate_linear_window(&mut h);
         h.consume_gc();
     }
     // Record post-stop, post-GC steady-state sample
