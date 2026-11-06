@@ -12,6 +12,7 @@ cd "$(dirname "$0")/.."
 SCRIPT_NAME=build-release
 SCRIPT_DIR="$PWD/utils"
 LOG_DIR=target/logs
+SCOPE=build
 DIST_DIR=target/dist
 DIST_BIN="$DIST_DIR/nam-audio-pipe"
 BUILD_RECEIPT="$DIST_DIR/build-receipt.json"
@@ -43,9 +44,26 @@ fail_phase() {
     FAILS+=("$1")
     emit "PHASE: $1 FAIL rc=$2 log=$3"
 }
+PARANOID_ORIG=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+restore_paranoid() {
+    local cur
+    cur=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+    if [ -n "${PARANOID_ORIG:-}" ] && [ "$cur" != "$PARANOID_ORIG" ]; then
+        if ! sudo -n sysctl -q -w kernel.perf_event_paranoid="$PARANOID_ORIG" 2>/dev/null; then
+            if [ "${FINISHED:-0}" = 1 ]; then
+                echo "WARN: perf_event_paranoid not restored after RESULT" >&2
+            else
+                gap bolt_optimize perf_paranoid_not_restored
+            fi
+        fi
+    fi
+}
+trap restore_paranoid EXIT
+
 # Every fatal path publishes exactly one RESULT: finish runs before exit, unless already done.
 die() {
     echo "ERROR: $*" >&2
+    restore_paranoid
     if [ "${FINISHED:-0}" != 1 ]; then finish || true; fi
     exit 1
 }
@@ -58,10 +76,10 @@ Usage:
   utils/build-release.sh [flags]
 
 Canonical flags:
-  --strict     Fail-closed: PGO and a proven BOLT are mandatory; any gap aborts.
+  --strict     Fail-closed: PGO is mandatory; BOLT requires ceremony proof; any unproven gap aborts.
   --package    Also produce the .tar.zst and Flatpak bundle in target/dist/.
-  --install    Install the canonical binary into ~/.local/bin (and the bundle, if packaged).
   --certify    Do not build: reconcile the artifact, build receipt and long audit.
+  --install    Only with --certify: install the certified binary (and the bundle, if declared).
   -h, --help   Show this help.
 EOF
 }
@@ -76,6 +94,9 @@ while [ $# -gt 0 ]; do
         *) usage_fail "build-release.sh: flag desconhecida '$1'" ;;
     esac
 done
+if [ "$DO_INSTALL" = 1 ] && [ "$DO_CERTIFY" != 1 ]; then
+    usage_fail "build-release.sh: --install exige --certify"
+fi
 
 lib_init
 trap 'trap_fail $?' ERR
@@ -92,6 +113,35 @@ GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY=false
 if [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then GIT_DIRTY=true; fi
+
+# install_certified <receipt-bin> — instala somente após verify-release (CERTIFIED, SHA e pacotes).
+install_certified() {
+    local bin=$1 log="$LOG_DIR/build-release-install_artifact.log" sha stage frc=0 fpath dest="$HOME/.local/bin/nam-audio-pipe"
+    phase install_artifact
+    if ! sha=$("$bin" verify-release --release-receipt "$RELEASE_RECEIPT" --artifact "$DIST_BIN" 2>"$log"); then
+        fail_phase install_artifact 1 "$log"; finish || true; exit 1
+    fi
+    mkdir -p "$HOME/.local/bin"
+    stage=$(mktemp "$HOME/.local/bin/.nam-audio-pipe.XXXXXX")
+    if ! { cp "$DIST_BIN" "$stage" && chmod 755 "$stage" && mv -T "$stage" "$dest"; } >> "$log" 2>&1; then
+        rm -f "$stage"; fail_phase install_artifact 1 "$log"; finish || true; exit 1
+    fi
+    if [ "$(sha256sum "$dest" | awk '{print $1}')" != "$sha" ]; then
+        fail_phase install_artifact 1 "$log"; finish || true; exit 1
+    fi
+    echo "installed: $dest sha256=$sha" >> "$log"
+    fpath=$("$bin" flatpak-path --release-receipt "$RELEASE_RECEIPT" 2>>"$log") || frc=$?
+    if [ "$frc" -eq 0 ]; then
+        if ! flatpak install --user --reinstall -y "$fpath" >> "$log" 2>&1; then
+            fail_phase install_artifact 1 "$log"; finish || true; exit 1
+        fi
+        echo "flatpak installed: $fpath" >> "$log"
+    elif [ "$frc" -ne 3 ]; then
+        fail_phase install_artifact "$frc" "$log"; finish || true; exit 1
+    fi
+    ok "installed: $dest (sha256=$sha)"
+    emit "PHASE: install_artifact PASS log=$log"
+}
 
 find_receipt_bin() {
     local candidate
@@ -135,6 +185,7 @@ if [ "$DO_CERTIFY" = 1 ]; then
         else
             emit "PHASE: certify PASS log=$CERT_LOG"
             ok "release certified: $RELEASE_RECEIPT"
+            if [ "$DO_INSTALL" = 1 ]; then install_certified "$CERT_BIN"; fi
         fi
     else
         fail_phase certify 2 "$CERT_LOG (pipe_long_receipt unavailable; --certify never recompiles)"
@@ -216,6 +267,20 @@ if [ -n "$LLVM_BOLT" ]; then
         done
     fi
 fi
+MERGE_FDATA=""
+if [ -n "$LLVM_BOLT" ]; then
+    MERGE_FDATA="$(dirname "$LLVM_BOLT")/merge-fdata"
+    if [ ! -x "$MERGE_FDATA" ]; then
+        for candidate in merge-fdata merge-fdata-22 merge-fdata-21 merge-fdata-20 merge-fdata-19 merge-fdata-18; do
+            if command -v "$candidate" >/dev/null 2>&1; then MERGE_FDATA=$(command -v "$candidate"); break; fi
+        done
+    fi
+    if [ ! -x "$MERGE_FDATA" ]; then
+        for candidate in /usr/lib/llvm-*/bin/merge-fdata; do
+            if [ -x "$candidate" ]; then MERGE_FDATA="$candidate"; break; fi
+        done
+    fi
+fi
 if command -v perf >/dev/null 2>&1; then
     PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
     if [ "$PARANOID" -gt 1 ] && sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
@@ -224,13 +289,9 @@ if command -v perf >/dev/null 2>&1; then
     if [ "$PARANOID" -le 1 ]; then HAS_PERF=true; fi
 fi
 BOLT_AVAILABLE=false
-if [ -n "$LLVM_BOLT" ] && [ -n "$PERF2BOLT" ] && [ "$HAS_PERF" = true ]; then BOLT_AVAILABLE=true; fi
+if [ -n "$LLVM_BOLT" ] && { [ -n "$MERGE_FDATA" ] || { [ -n "$PERF2BOLT" ] && [ "$HAS_PERF" = true ]; }; }; then BOLT_AVAILABLE=true; fi
 if [ "$BOLT_AVAILABLE" != true ]; then
     gap env_verify bolt_tools_unavailable
-    if [ "$DO_STRICT" = 1 ]; then
-        finish || true
-        die "BOLT (llvm-bolt + perf2bolt + perf with kernel.perf_event_paranoid<=1) is mandatory under --strict"
-    fi
 fi
 
 if ! cargo build --locked --features testing --bin pipe_long_receipt >/dev/null 2>&1; then
@@ -239,6 +300,33 @@ if ! cargo build --locked --features testing --bin pipe_long_receipt >/dev/null 
     die "cannot build the typed receipt tool (pipe_long_receipt)"
 fi
 RECEIPT_BIN=target/debug/pipe_long_receipt
+# --strict is the operator release path: the A/B ceremony receipt is an input,
+# not something this script can synthesize. Fail during env_verify instead of
+# after the PGO/BOLT work when the proof is absent or invalid (F9).
+if [ "$DO_STRICT" = 1 ]; then
+    CEREMONY_PREFLIGHT_LOG="$LOG_DIR/build-release-ceremony_preflight.log"
+    if [ ! -f "$CEREMONY_RECEIPT" ]; then
+        echo "ERROR: --strict requires $CEREMONY_RECEIPT (operator A/B ceremony); run utils/ab-opt-ceremony.sh on the isolated host or omit --strict for a QA build" | tee "$CEREMONY_PREFLIGHT_LOG" >&2
+        fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
+        finish || true
+        exit 1
+    fi
+    if ! CEREMONY_PREFLIGHT_VERDICT=$("$RECEIPT_BIN" ceremony-proof --receipt "$CEREMONY_RECEIPT" --git-sha "$GIT_COMMIT" 2>"$CEREMONY_PREFLIGHT_LOG"); then
+        echo "ERROR: --strict rejected the A/B ceremony receipt (see $CEREMONY_PREFLIGHT_LOG)" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
+        fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
+        finish || true
+        exit 1
+    fi
+    case "$CEREMONY_PREFLIGHT_VERDICT" in
+        PGO+BOLT|PGO-ONLY) ;;
+        *)
+            echo "ERROR: --strict requires a PGO+BOLT or PGO-ONLY ceremony verdict, got '$CEREMONY_PREFLIGHT_VERDICT'" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
+            fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
+            finish || true
+            exit 1
+            ;;
+    esac
+fi
 ok "environment ready (rustflags: $CONFIG_RUSTFLAGS)"
 if [ ${#GAPS[@]} -eq "$ENV_GAPS" ]; then
     emit "PHASE: env_verify PASS log=$ENV_LOG"
@@ -316,12 +404,44 @@ BOLT_LOG="$LOG_DIR/build-release-bolt_optimize.log"
 BOLT_DIR=target/bolt-profile
 BOLT_APPLIED=false
 BOLT_CAUSE=""
+BOLT_MODE=""
+LBR_USED=false
 BOLT_VERSION=""
 BOLT_PROFILE=""
-rm -rf "$BOLT_DIR"
-mkdir -p "$BOLT_DIR"
+BOLT_STATUS=not_applied
+BOLT_PROOF=none
 
-if [ "$HAS_PERF" != true ] || [ -z "$LLVM_BOLT" ] || [ -z "$PERF2BOLT" ]; then
+CEREMONY_VERDICT=""
+CEREMONY_REJECTION="no ceremony receipt"
+if [ -f "$CEREMONY_RECEIPT" ]; then
+    CEREMONY_VERDICT=$("$RECEIPT_BIN" ceremony-proof --receipt "$CEREMONY_RECEIPT" --git-sha "$GIT_COMMIT" 2>"$LOG_DIR/build-release-ceremony_proof.err" || true)
+    CEREMONY_REJECTION=$(cat "$LOG_DIR/build-release-ceremony_proof.err")
+    cat "$LOG_DIR/build-release-ceremony_proof.err" >> "$BOLT_LOG"
+fi
+
+if [ "$CEREMONY_VERDICT" != "PGO+BOLT" ]; then
+    if [ "$CEREMONY_VERDICT" = "PGO-ONLY" ]; then
+        echo "A/B ceremony proved PGO-ONLY (BOLT applied, margin not met); fallback_pgo_only per promotion policy" | tee -a "$BOLT_LOG"
+        BOLT_STATUS=not_proven
+        BOLT_PROOF=fallback_pgo_only
+        emit "PHASE: bolt_optimize PASS log=$BOLT_LOG"
+    else
+        echo "No valid PGO+BOLT ceremony proof at $CEREMONY_RECEIPT (${CEREMONY_REJECTION:-rejected})" | tee -a "$BOLT_LOG"
+        if [ "$DO_STRICT" = 1 ]; then
+            fail_phase bolt_optimize 1 "$BOLT_LOG"
+            restore_paranoid
+            finish || true
+            exit 1
+        fi
+        gap bolt_not_proven
+        BOLT_STATUS=not_proven
+        BOLT_PROOF=none
+    fi
+else
+    rm -rf "$BOLT_DIR"
+    mkdir -p "$BOLT_DIR"
+
+if [ -z "$LLVM_BOLT" ] || { [ -z "$MERGE_FDATA" ] && { [ "$HAS_PERF" != true ] || [ -z "$PERF2BOLT" ]; }; }; then
     BOLT_CAUSE="BOLT tools or unprivileged perf unavailable"
 elif ! command -v pw-cli >/dev/null 2>&1 || ! { pw-cli info 0 >/dev/null 2>&1 || pgrep -x pipewire >/dev/null 2>&1; }; then
     BOLT_CAUSE="PipeWire daemon is not running"
@@ -391,18 +511,58 @@ done
 EOF
     chmod +x "$PROFILE_DRIVER"
     PERF_ARGS=(-F 4000 -e cycles:u)
-    if perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
+    if [ "$HAS_PERF" = true ] && [ -n "$PERF2BOLT" ] && perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
+        LBR_USED=true
         PERF_ARGS=(-F 99 -e cycles:u -j any,u)
     fi
-    printf 'BOLT profiling %s model(s)\n' "${#MODEL_FILES[@]}" >> "$BOLT_LOG"
-    if ! perf record "${PERF_ARGS[@]}" -o "$BOLT_DIR/perf.data" -- \
-        "$PROFILE_DRIVER" "$PGO_BIN" "$TEST_WAV" "${MODEL_FILES[@]}" >> "$BOLT_LOG" 2>&1; then
-        BOLT_CAUSE="perf record failed"
+    LBR_SAMPLES=0
+    if [ "$LBR_USED" = true ]; then
+        printf 'BOLT perf profiling %s model(s)\n' "${#MODEL_FILES[@]}" >> "$BOLT_LOG"
+        if ! perf record "${PERF_ARGS[@]}" -o "$BOLT_DIR/perf.data" -- \
+            "$PROFILE_DRIVER" "$PGO_BIN" "$TEST_WAV" "${MODEL_FILES[@]}" >> "$BOLT_LOG" 2>&1; then
+            BOLT_CAUSE="perf record failed"
+        else
+            # The -j probe can succeed on hosts that still record zero branch
+            # stacks (cloud VMs). Trust only real LBR entries in the profile.
+            LBR_SAMPLES=$(perf script -i "$BOLT_DIR/perf.data" -F brstack 2>/dev/null | grep -cE '0x[0-9a-fA-F]+/0x[0-9a-fA-F]+' || true)
+            if [ "$LBR_SAMPLES" -eq 0 ]; then LBR_USED=false; fi
+        fi
+    fi
+    if [ -z "$BOLT_CAUSE" ] && [ "$LBR_USED" != true ] && [ -n "$MERGE_FDATA" ]; then
+        # No usable LBR: BOLT instrumentation collects function/edge counters
+        # without PMU facilities and is preferred over timer-only samples.
+        BOLT_MODE=instrumented
+        INSTRUMENTED_BIN="$BOLT_DIR/nam-audio-pipe.instrumented"
+        rm -f "$BOLT_DIR"/bolt.fdata.*
+        printf 'BOLT instrumentation profiling %s model(s)\n' "${#MODEL_FILES[@]}" >> "$BOLT_LOG"
+        if ! "$LLVM_BOLT" "$PGO_BIN" -instrument -o "$INSTRUMENTED_BIN" \
+            --instrumentation-file="$BOLT_DIR/bolt.fdata" --instrumentation-file-append-pid >> "$BOLT_LOG" 2>&1; then
+            BOLT_CAUSE="llvm-bolt instrumentation failed"
+        elif ! "$PROFILE_DRIVER" "$INSTRUMENTED_BIN" "$TEST_WAV" "${MODEL_FILES[@]}" >> "$BOLT_LOG" 2>&1; then
+            BOLT_CAUSE="instrumented workload failed"
+        else
+            FDATA_FILES=()
+            while IFS= read -r -d '' f; do if [ -s "$f" ]; then FDATA_FILES+=("$f"); fi; done < <(find "$BOLT_DIR" -maxdepth 1 -name 'bolt.fdata.*' -print0 2>/dev/null || true)
+            if [ ${#FDATA_FILES[@]} -eq 0 ] || ! "$MERGE_FDATA" "${FDATA_FILES[@]}" > "$BOLT_DIR/perf.fdata" 2>>"$BOLT_LOG"; then
+                BOLT_CAUSE="merge-fdata produced no representative profile"
+            fi
+        fi
+    elif [ -z "$BOLT_CAUSE" ]; then
+        # LBR profile already recorded; otherwise perf2bolt receives a
+        # timer-sampled profile in no-LBR mode (-nl).
+        BOLT_MODE=perf2bolt
+        if [ ! -f "$BOLT_DIR/perf.data" ]; then
+            printf 'BOLT no-LBR profiling %s model(s)\n' "${#MODEL_FILES[@]}" >> "$BOLT_LOG"
+            if ! perf record "${PERF_ARGS[@]}" -o "$BOLT_DIR/perf.data" -- \
+                "$PROFILE_DRIVER" "$PGO_BIN" "$TEST_WAV" "${MODEL_FILES[@]}" >> "$BOLT_LOG" 2>&1; then
+                BOLT_CAUSE="perf record failed"
+            fi
+        fi
     fi
 fi
 
 PERF_SAMPLES=0
-if [ -z "$BOLT_CAUSE" ]; then
+if [ -z "$BOLT_CAUSE" ] && [ -f "$BOLT_DIR/perf.data" ]; then
     PERF_SIZE=$(stat -c%s "$BOLT_DIR/perf.data" 2>/dev/null || echo 0)
     PERF_SAMPLES=$(perf script -i "$BOLT_DIR/perf.data" 2>/dev/null | wc -l || echo 0)
     if [ "$PERF_SIZE" -lt 8192 ] || [ "$PERF_SAMPLES" -lt 500 ]; then
@@ -410,7 +570,7 @@ if [ -z "$BOLT_CAUSE" ]; then
     fi
 fi
 
-if [ -z "$BOLT_CAUSE" ]; then
+if [ -z "$BOLT_CAUSE" ] && [ -f "$BOLT_DIR/perf.data" ]; then
     ELF_BID=$(LC_ALL=C readelf -n "$PGO_BIN" 2>/dev/null | grep -oP 'Build ID:\s+\K[0-9a-fA-F]+' | head -n1 | tr 'A-F' 'a-f' || true)
     PERF_BID=$(LC_ALL=C perf buildid-list -i "$BOLT_DIR/perf.data" 2>/dev/null | grep -F "$PGO_BIN" | head -n1 | sed -E 's/.*=//' | awk '{print $1}' || true)
     if [ -z "$ELF_BID" ] || [ "$PERF_BID" != "$ELF_BID" ]; then
@@ -418,11 +578,9 @@ if [ -z "$BOLT_CAUSE" ]; then
     fi
 fi
 
-if [ -z "$BOLT_CAUSE" ]; then
+if [ -z "$BOLT_CAUSE" ] && [ "$BOLT_MODE" = perf2bolt ]; then
     PERF2BOLT_FLAGS=()
-    if [ "$PERF_SAMPLES" -gt 0 ] && ! perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
-        if "$PERF2BOLT" --help 2>&1 | grep -- '--basic-events' >/dev/null; then PERF2BOLT_FLAGS+=("--basic-events"); fi
-    fi
+    if [ "$LBR_USED" != true ]; then PERF2BOLT_FLAGS+=("-nl"); fi
     if ! "$PERF2BOLT" "${PERF2BOLT_FLAGS[@]}" -p "$BOLT_DIR/perf.data" "$PGO_BIN" -o "$BOLT_DIR/perf.fdata" >> "$BOLT_LOG" 2>&1; then
         BOLT_CAUSE="perf2bolt conversion failed"
     fi
@@ -432,7 +590,7 @@ if [ -z "$BOLT_CAUSE" ]; then
     FDATA_SIZE=$(stat -c%s "$BOLT_DIR/perf.fdata" 2>/dev/null || echo 0)
     FDATA_LINES=$(awk '$1 ~ /^[0-9]+$/ {n++} END {print n+0}' "$BOLT_DIR/perf.fdata")
     DSP_HITS=0
-    for sym in capture_dsp_pipeline wavenet lstm cabsim; do
+    for sym in setup_capture_stream capture_dsp_pipeline wavenet lstm cabsim; do
         if grep -qi "$sym" "$BOLT_DIR/perf.fdata"; then DSP_HITS=$((DSP_HITS + 1)); fi
     done
     if [ "$FDATA_SIZE" -lt 1024 ] || [ "$FDATA_LINES" -lt 20 ] || [ "$DSP_HITS" -eq 0 ]; then
@@ -453,36 +611,23 @@ if [ -z "$BOLT_CAUSE" ]; then
     fi
 fi
 
-if [ -z "$BOLT_CAUSE" ] && [ "$BOLT_APPLIED" != true ]; then BOLT_CAUSE="BOLT was not applied"; fi
-BOLT_PHASE_OK=false
-if [ -n "$BOLT_CAUSE" ]; then
-    echo "BOLT unavailable: $BOLT_CAUSE" | tee -a "$BOLT_LOG"
-    if [ "$DO_STRICT" = 1 ]; then
-        fail_phase bolt_optimize 1 "$BOLT_LOG"
-        finish
-        exit 1
-    fi
-    if [ "$BOLT_AVAILABLE" = true ]; then gap bolt_not_applied; fi
-else
-    ok "BOLT applied: ${PERF_SAMPLES} perf samples, build-id confirmed"
-    BOLT_PHASE_OK=true
-fi
-
-if [ "$BOLT_APPLIED" = true ]; then
-    if "$RECEIPT_BIN" bolt-proof --receipt "$CEREMONY_RECEIPT" >/dev/null 2>&1; then
-        ok "BOLT win proof verified: $CEREMONY_RECEIPT"
-    else
-        BOLT_PHASE_OK=false
-        gap bolt_proof_unverified
+    if [ -z "$BOLT_CAUSE" ] && [ "$BOLT_APPLIED" != true ]; then BOLT_CAUSE="BOLT was not applied"; fi
+    if [ -n "$BOLT_CAUSE" ]; then
+        echo "BOLT unavailable: $BOLT_CAUSE" | tee -a "$BOLT_LOG"
         if [ "$DO_STRICT" = 1 ]; then
-            echo "BOLT applied but no valid ab-opt ceremony proof at $CEREMONY_RECEIPT" | tee -a "$BOLT_LOG"
             fail_phase bolt_optimize 1 "$BOLT_LOG"
-            finish || true
+            restore_paranoid
+            finish
             exit 1
         fi
+        gap bolt_not_applied
+    else
+        ok "BOLT applied (${BOLT_MODE})"
+        BOLT_STATUS=applied
+        emit "PHASE: bolt_optimize PASS log=$BOLT_LOG"
     fi
 fi
-if [ "$BOLT_PHASE_OK" = true ]; then emit "PHASE: bolt_optimize PASS log=$BOLT_LOG"; fi
+restore_paranoid
 
 # ---------------------------------------------------------------------------
 # Phase 5: static DSP codegen gates on the selected binary.
@@ -570,27 +715,6 @@ echo "Delivered canonical binary: $DIST_BIN (sha256=$DIST_SHA)" >> "$DELIVER_LOG
 ok "canonical artifact: $DIST_BIN (sha256=$DIST_SHA)"
 emit "PHASE: deliver_artifact PASS log=$DELIVER_LOG"
 
-INSTALLED_PATH=""
-if [ "$DO_INSTALL" = 1 ]; then
-    phase install
-    INSTALL_LOG="$LOG_DIR/build-release-install.log"
-    mkdir -p "$HOME/.local/bin"
-    INSTALL_STAGE=$(mktemp "$HOME/.local/bin/.nam-audio-pipe.XXXXXX")
-    if ! {
-        cp "$DIST_BIN" "$INSTALL_STAGE"
-        chmod 755 "$INSTALL_STAGE"
-        mv -T "$INSTALL_STAGE" "$HOME/.local/bin/nam-audio-pipe"
-    } > "$INSTALL_LOG" 2>&1; then
-        rm -f "$INSTALL_STAGE"
-        fail_phase install 1 "$INSTALL_LOG"
-        finish
-        exit 1
-    fi
-    INSTALLED_PATH="$HOME/.local/bin/nam-audio-pipe"
-    ok "installed: $INSTALLED_PATH"
-    emit "PHASE: install PASS log=$INSTALL_LOG"
-fi
-
 # ---------------------------------------------------------------------------
 # Phase 7: optional distribution packages (tarball + Flatpak).
 # ---------------------------------------------------------------------------
@@ -604,7 +728,8 @@ if [ "$DO_PACKAGE" = 1 ]; then
     FLATPAK_BUILD_DIR=$(mktemp -d -t nam-pipe-flatpak-build.XXXXXX)
     FLATPAK_REPO_DIR=$(mktemp -d -t nam-pipe-flatpak-repo.XXXXXX)
     FLATPAK_SMOKE_DIR=$(mktemp -d -t nam-pipe-flatpak-smoke.XXXXXX)
-    trap 'rm -rf "$PKG_DIR" "$VERIFY_DIR" "$FLATPAK_BUILD_DIR" "$FLATPAK_REPO_DIR" "$FLATPAK_SMOKE_DIR"' EXIT
+    cleanup_packaging() { rm -rf "$PKG_DIR" "$VERIFY_DIR" "$FLATPAK_BUILD_DIR" "$FLATPAK_REPO_DIR" "$FLATPAK_SMOKE_DIR"; restore_paranoid; }
+    trap cleanup_packaging EXIT
     SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct 2>/dev/null || date +%s)
     mkdir -p "$PKG_DIR/$ARCHIVE_NAME"
     cp "$DIST_BIN" "$PKG_DIR/$ARCHIVE_NAME/nam-audio-pipe"
@@ -637,6 +762,12 @@ EOF
     METAINFO_SRC=packaging/flatpak/io.github.fabiohl.NAMAudioPipe.metainfo.xml
     ICONS_SRC=packaging/flatpak/icons/hicolor
     APP_ID=io.github.fabiohl.NAMAudioPipe
+    SDK_NAME=org.freedesktop.Sdk
+    if ! flatpak info org.freedesktop.Sdk//25.08 >/dev/null 2>&1; then SDK_NAME=org.freedesktop.Platform; fi
+    if ! flatpak build-init "$FLATPAK_BUILD_DIR" "$APP_ID" "$SDK_NAME" org.freedesktop.Platform 25.08 >> "$PKG_LOG" 2>&1; then
+        fail_phase packaging 1 "$PKG_LOG"
+        die "flatpak build-init failed"
+    fi
     mkdir -p "$FLATPAK_BUILD_DIR/files/bin" "$FLATPAK_BUILD_DIR/files/share/applications" \
         "$FLATPAK_BUILD_DIR/files/share/metainfo" "$FLATPAK_BUILD_DIR/files/share/licenses/$APP_ID"
     cp "$DIST_BIN" "$FLATPAK_BUILD_DIR/files/bin/nam-audio-pipe"
@@ -688,9 +819,6 @@ EOF
         fail_phase packaging 1 "$PKG_LOG"
         die "AppStream release version/date is out of sync with Cargo.toml ($VERSION)"
     fi
-    SDK_NAME=org.freedesktop.Sdk
-    if ! flatpak info org.freedesktop.Sdk//25.08 >/dev/null 2>&1; then SDK_NAME=org.freedesktop.Platform; fi
-    flatpak build-init "$FLATPAK_BUILD_DIR" "$APP_ID" "$SDK_NAME" org.freedesktop.Platform 25.08
     flatpak build-finish "$FLATPAK_BUILD_DIR" --command=nam-audio-pipe --socket=pulseaudio \
         --filesystem=xdg-run/pipewire-0 --share=ipc --device=all --filesystem=home:ro \
         --filesystem=xdg-music --socket=fallback-x11 --socket=wayland
@@ -723,9 +851,6 @@ EOF
         fail_phase packaging 1 "$PKG_LOG"
         die "in-sandbox Flatpak smoke test failed"
     fi
-    if [ "$DO_INSTALL" = 1 ]; then
-        flatpak install --user --reinstall -y "$FLATPAK_BUNDLE" >> "$PKG_LOG" 2>&1
-    fi
     ok "flatpak bundle: $FLATPAK_BUNDLE"
     emit "PHASE: packaging PASS log=$PKG_LOG"
 fi
@@ -733,10 +858,11 @@ fi
 # ---------------------------------------------------------------------------
 # Phase 8: typed build receipt (failure to write it is a failure).
 # ---------------------------------------------------------------------------
+restore_paranoid
 phase build_receipt
 RECEIPT_LOG="$LOG_DIR/build-release-build_receipt.log"
 PGO_STATUS=skipped
-BOLT_STATUS=skipped
+BOLT_STATUS="${BOLT_STATUS:-skipped}"
 if [ "$PGO_APPLIED" = true ]; then PGO_STATUS=applied; fi
 if [ "$BOLT_APPLIED" = true ]; then BOLT_STATUS=applied; fi
 RCPT_ARGS=(--out "$BUILD_RECEIPT" --artifact "$DIST_BIN" --package-name nam-audio-pipe
@@ -744,13 +870,13 @@ RCPT_ARGS=(--out "$BUILD_RECEIPT" --artifact "$DIST_BIN" --package-name nam-audi
     --git-dirty "$GIT_DIRTY" --cargo-lock Cargo.lock --rustc-version "$(rustc --version)"
     --rustflags "$RELEASE_RUSTFLAGS" --pgo-status "$PGO_STATUS" --bolt-status "$BOLT_STATUS"
     --codegen-status "$CODEGEN_STATUS")
+if [ -n "$BOLT_PROOF" ] && [ "$BOLT_PROOF" != "none" ]; then RCPT_ARGS+=(--bolt-proof "$BOLT_PROOF"); fi
 if [ "$PGO_APPLIED" = true ] && [ -f "$PGO_RECEIPT" ]; then RCPT_ARGS+=(--pgo-workload-receipt "$PGO_RECEIPT"); fi
 if [ -n "$BOLT_VERSION" ]; then RCPT_ARGS+=(--bolt-version "$BOLT_VERSION"); fi
 if [ -n "$BOLT_PROFILE" ] && [ -f "$BOLT_PROFILE" ]; then RCPT_ARGS+=(--bolt-profile "$BOLT_PROFILE"); fi
 if [ -f "$CEREMONY_RECEIPT" ]; then RCPT_ARGS+=(--ceremony-receipt "$CEREMONY_RECEIPT"); fi
 if [ -n "$TARBALL_PATH" ]; then RCPT_ARGS+=(--tarball-path "$TARBALL_PATH"); fi
 if [ -n "$FLATPAK_PATH" ]; then RCPT_ARGS+=(--flatpak-path "$FLATPAK_PATH"); fi
-if [ -n "$INSTALLED_PATH" ]; then RCPT_ARGS+=(--installed-path "$INSTALLED_PATH"); fi
 if [ ${#GAPS[@]} -gt 0 ]; then RCPT_ARGS+=(--gaps "$(IFS=,; echo "${GAPS[*]}")"); fi
 if [ "$DO_STRICT" = 1 ]; then RCPT_ARGS+=(--strict); fi
 if ! "$RECEIPT_BIN" build-receipt "${RCPT_ARGS[@]}" 2>&1 | tee "$RECEIPT_LOG"; then
@@ -764,5 +890,4 @@ ok "build receipt: $BUILD_RECEIPT"
 # the three commands run as independent processes.
 printf '%s\n' "$NAM_RUN_ID" > "$LOG_DIR/build-run-id"
 emit "PHASE: build_receipt PASS log=$RECEIPT_LOG"
-
 finish

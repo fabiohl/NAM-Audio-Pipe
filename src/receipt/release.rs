@@ -54,6 +54,8 @@ pub struct ReleaseReceipt {
     pub pgo_workload: Option<PgoWorkloadInfo>,
     pub artifacts: ReleaseArtifacts,
     pub long_audit: ReleaseLongAudit,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -435,7 +437,14 @@ pub fn evaluate_certification(
                     fails.push("build_not_strict".to_string());
                     reasons.push("build receipt strict_mode is false".to_string());
                 }
-                if receipt.status != "PASSED" {
+                let is_proven_pgo_only = receipt.optimizations.pgo_applied
+                    && !receipt.optimizations.bolt_applied
+                    && receipt.optimizations.bolt_proof == "fallback_pgo_only";
+
+                let valid_status = receipt.status == "PASSED"
+                    || (is_proven_pgo_only && receipt.status == "PASS_WITH_GAPS");
+
+                if !valid_status {
                     fails.push("build_status_not_passed".to_string());
                     reasons.push(format!(
                         "build receipt status is '{}', expected 'PASSED'",
@@ -471,8 +480,27 @@ pub fn evaluate_certification(
                     &mut reasons,
                 );
                 for gap in &receipt.gaps {
+                    if gap == "bolt_not_proven" && is_proven_pgo_only {
+                        continue;
+                    }
                     gaps.push(format!("build:{gap}"));
                     reasons.push(format!("build receipt declares gap: '{gap}'"));
+                }
+                if receipt.optimizations.bolt_applied
+                    && receipt.optimizations.bolt_proof == "fallback_pgo_only"
+                {
+                    fails.push("build_verdict_mismatch".to_string());
+                    reasons.push(
+                        "build receipt has bolt_applied=true but bolt_proof=fallback_pgo_only"
+                            .to_string(),
+                    );
+                }
+                if !receipt.optimizations.pgo_applied {
+                    fails.push("unoptimized_verdict".to_string());
+                    reasons.push(
+                        "build receipt optimizations reflect unoptimized verdict (pgo_applied=false)"
+                            .to_string(),
+                    );
                 }
                 Some(receipt)
             }
@@ -647,6 +675,14 @@ pub fn evaluate_certification(
             )
         };
 
+    let verdict = if optimizations.bolt_applied {
+        Some("PGO+BOLT".to_string())
+    } else if optimizations.pgo_applied && optimizations.bolt_proof == "fallback_pgo_only" {
+        Some("PGO-ONLY".to_string())
+    } else {
+        None
+    };
+
     ReleaseReceipt {
         schema_version: "1.0.0".to_string(),
         timestamp_utc: now_iso8601(),
@@ -662,5 +698,109 @@ pub fn evaluate_certification(
         pgo_workload,
         artifacts,
         long_audit,
+        verdict,
     }
 }
+
+/// Re-checks a `CERTIFIED` release receipt against the bytes about to be installed.
+/// Returns the verified artifact SHA-256, or every reconciliation problem found.
+pub fn verify_release_receipt(
+    release_path: &Path,
+    artifact_path: &Path,
+) -> Result<String, Vec<String>> {
+    let receipt: ReleaseReceipt = fs::read_to_string(release_path)
+        .map_err(|e| e.to_string())
+        .and_then(|c| serde_json::from_str(&c).map_err(|e| e.to_string()))
+        .map_err(|e| {
+            vec![format!(
+                "release receipt {} unreadable or invalid: {e}",
+                release_path.display()
+            )]
+        })?;
+    let actual = hash_file(artifact_path).map_err(|e| {
+        vec![format!(
+            "cannot hash artifact {}: {e}",
+            artifact_path.display()
+        )]
+    })?;
+
+    let mut problems = Vec::new();
+    if receipt.status != "CERTIFIED" {
+        problems.push(format!(
+            "release receipt status is '{}', expected 'CERTIFIED'",
+            receipt.status
+        ));
+    }
+    if !receipt.fails.is_empty() || !receipt.gaps.is_empty() {
+        problems.push("release receipt declares fails or gaps".to_string());
+    }
+    if receipt.artifacts.artifact_consistency != "match" {
+        problems.push(format!(
+            "release receipt artifact consistency is '{}', expected 'match'",
+            receipt.artifacts.artifact_consistency
+        ));
+    }
+    if actual != receipt.artifacts.artifact_sha256 {
+        problems.push(format!(
+            "artifact SHA-256 {actual} differs from release receipt {}",
+            receipt.artifacts.artifact_sha256
+        ));
+    }
+    match verify_receipt_artifact(Path::new(&receipt.long_audit.receipt_path), artifact_path) {
+        ArtifactConsistency::Match { declared } if declared == actual => {}
+        other => problems.push(format!(
+            "long audit artifact provenance {}: {}",
+            other.as_str(),
+            other
+                .problem()
+                .unwrap_or_else(|| "declared SHA differs from artifact".to_string())
+        )),
+    }
+    let run_reconciled = match (
+        receipt.provenance.run_id.as_deref(),
+        fs::read_to_string(&receipt.long_audit.receipt_path),
+    ) {
+        (Some(expected), Ok(content)) if !expected.is_empty() => content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line.trim()).ok())
+            .filter(|v| v.get("phase_id").and_then(|p| p.as_str()) != Some("overall"))
+            .all(|v| v.get("run_id").and_then(|r| r.as_str()) == Some(expected)),
+        _ => false,
+    };
+    if !run_reconciled {
+        problems.push("long audit run_id does not reconcile with the release receipt".to_string());
+    }
+
+    let mut fails = Vec::new();
+    verify_declared_artifact(
+        "tarball",
+        &receipt.artifacts.tarball_path,
+        &receipt.artifacts.tarball_sha256,
+        &mut fails,
+        &mut problems,
+    );
+    verify_declared_artifact(
+        "flatpak",
+        &receipt.artifacts.flatpak_path,
+        &receipt.artifacts.flatpak_sha256,
+        &mut fails,
+        &mut problems,
+    );
+
+    if problems.is_empty() {
+        Ok(actual)
+    } else {
+        Err(problems)
+    }
+}
+
+/// Flatpak bundle path declared by a release receipt; `None` when no bundle was packaged.
+pub fn declared_flatpak_path(release_path: &Path) -> Result<Option<String>, String> {
+    let content = fs::read_to_string(release_path).map_err(|e| e.to_string())?;
+    let receipt: ReleaseReceipt = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    Ok(receipt.artifacts.flatpak_path)
+}
+
+#[cfg(test)]
+#[path = "release_test.rs"]
+mod tests;

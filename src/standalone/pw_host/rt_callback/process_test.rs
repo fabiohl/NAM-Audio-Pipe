@@ -1757,7 +1757,7 @@ fn gate_custom_threshold_config_runs_without_panic_or_regression() {
 }
 
 #[test]
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "dual-mono"))]
 fn gate_off_does_not_affect_mono_detection() {
     use crate::standalone::pw_host::RtSwapHarness;
     let mut h = RtSwapHarness::new_with_gate(48000, 48000, false).expect("harness with gate off");

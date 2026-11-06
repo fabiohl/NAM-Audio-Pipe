@@ -14,6 +14,7 @@
 //! - [`build`]/[`release`] — typed build provenance and fail-closed release
 //!   certification (`target/dist/{build,release}-receipt.json`).
 
+pub mod ab_opt;
 pub mod long;
 
 #[cfg(feature = "testing")]

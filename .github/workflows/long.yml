@@ -3,18 +3,14 @@
 
 name: Long QA Suite
 
-# Release chain, decoupled: build-release.sh -> tests-long.sh --artifact -> build-release.sh --certify.
-# This hosted workflow never certifies and never runs rt-deadline/rt-jitter.
-# Hosted runners lack an isolated CPU and SCHED_FIFO privileges: those
-# surface as typed GAPs. BOLT, perf and the C++ parity oracle are provisioned below.
-# With `strict: true` any GAP fails the run.
+# Hosted QA workflow with a single, recommended configuration. It is
+# intentionally zero-input: the GitHub "Run workflow" button must not ask
+# questions. The hosted build is never strict (the operator A/B ceremony
+# receipt is unavailable here), the QA runs the hosted-safe phase list without
+# rt-deadline/rt-jitter, and certification remains operator-only. BOLT, perf
+# and the C++ parity oracle are provisioned below.
 on:
   workflow_dispatch:
-    inputs:
-      strict:
-        description: 'Strict mode (treat gaps as failures)'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -34,7 +30,9 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Load environment variables
         run: |
           while IFS='=' read -r key val; do
@@ -43,12 +41,15 @@ jobs:
             val=$(echo "$val" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
             echo "$key=$val" >> "$GITHUB_ENV"
           done < variables.env
+          . ./variables.env
+          [ -n "${ENGINE_COMMIT:-}" ] || { echo "ERROR: ENGINE_COMMIT missing in variables.env" >&2; exit 1; }
       - name: Checkout NeuralAmpModeler-rs (engine sibling)
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fabiohl/NeuralAmpModeler-rs
           path: NeuralAmpModeler-rs
           ref: ${{ env.ENGINE_COMMIT }}
+          persist-credentials: false
       - name: Set up engine sibling symlink
         run: ln -sfn "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" "$RUNNER_WORKSPACE/NeuralAmpModeler-rs"
       - name: Install system dependencies
@@ -58,7 +59,7 @@ jobs:
             libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
             wireplumber dbus appstream desktop-file-utils binutils \
             llvm-bolt linux-tools-common linux-tools-generic
-          sudo apt-get install -y linux-tools-$(uname -r) || true
+          sudo apt-get install -y "linux-tools-$(uname -r)" || true
           sudo sysctl -w kernel.perf_event_paranoid=1 || true
       - name: Provision C++ parity oracle
         run: |
@@ -74,7 +75,7 @@ jobs:
           rustup update --no-self-update stable
           rustup component add llvm-tools-preview
           rustc --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/dev') }}
       # The live PipeWire (PHASE8/PHASE9) and PGO workload need a reachable,
@@ -154,30 +155,63 @@ jobs:
               }
             ' Cargo.lock)
           fi
-          if aux_sha=$(git -C ../NeuralAmpModeler-rs rev-parse HEAD 2>/dev/null); then
+          if aux_sha=$(git -C "$GITHUB_WORKSPACE/NeuralAmpModeler-rs" rev-parse HEAD 2>/dev/null); then
             aux_engine="sha=$aux_sha"
           else
             aux_engine="GAP:sibling_absent"
           fi
-          printf 'PHASE: provenance sha=%s package_version=%s engine_type=%s engine_version=%s engine_checksum=%s auxiliary_engine=%s\n' \
-            "$sha" "$version" "$eng_type" "$eng_ver" "$eng_chk" "$aux_engine" | tee target/logs/ci-provenance.log
+          rustc_v=$(rustc --version)
+          cargo_v=$(cargo --version)
+          printf 'PHASE: provenance sha=%s package_version=%s engine_type=%s engine_version=%s engine_checksum=%s auxiliary_engine=%s rustc=%s cargo=%s\n' \
+            "$sha" "$version" "$eng_type" "$eng_ver" "$eng_chk" "$aux_engine" "$rustc_v" "$cargo_v" | tee target/logs/ci-provenance.log
+      - name: Record capability matrix
+        run: |
+          mkdir -p target/logs
+          cargo build --locked --quiet --bin io_uring_probe
+          set +e
+          target/debug/io_uring_probe
+          io_rc=$?
+          set -e
+          case "$io_rc" in
+            0) io=ok ;;
+            1) io=GAP:io_uring_unsupported ;;
+            *) io="FAIL:io_uring_probe_rc$io_rc" ;;
+          esac
+          pw=GAP:pw_cli_unavailable
+          if command -v pw-cli >/dev/null 2>&1 && timeout 5 pw-cli info 0 >/dev/null 2>&1; then pw=ok; fi
+          play=GAP:pw_play_unavailable
+          if command -v pw-play >/dev/null 2>&1 && pw-play --version >/dev/null 2>&1; then play=ok; fi
+          oracle=GAP:cpp_oracle_unavailable
+          if [ -n "${NAM_CORE_RENDER_BIN:-}" ] && [ -x "$NAM_CORE_RENDER_BIN" ]; then oracle=ok; fi
+          printf 'PHASE: capabilities io_uring=%s pipewire=%s pw_play=%s cpp_oracle=%s\n' \
+            "$io" "$pw" "$play" "$oracle" | tee target/logs/ci-capabilities.log | tee -a target/logs/summary.txt
+          printf '%s\n' "$NAM_RUN_ID" > target/logs/.summary-run
+          [ "$io_rc" -le 1 ] || exit 1
       - name: Build canonical artifact
-        env:
-          STRICT_INPUT: ${{ inputs.strict }}
-        run: |
-          STRICT_FLAG=""
-          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
-          ./utils/build-release.sh $STRICT_FLAG
+        # Hosted QA builds are never strict: --strict requires the operator's
+        # A/B ceremony receipt, which this runner cannot produce. The workflow
+        # never uses --strict; the operator release chain owns it.
+        run: ./utils/build-release.sh
       - name: Long QA Suite (artifact)
-        env:
-          STRICT_INPUT: ${{ inputs.strict }}
+        # Recommended hosted-safe configuration, fixed by design. rt-deadline
+        # and rt-jitter are reserved for the operator's isolated host; the
+        # build above is non-strict. No dispatch inputs are required.
+        run: >-
+          ./utils/tests-long.sh --artifact --only
+          'catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity'
+      - name: Write evidence manifest
+        if: always()
         run: |
-          STRICT_FLAG=""
-          if [ "$STRICT_INPUT" = "true" ]; then STRICT_FLAG="--strict"; fi
-          # Hosted runners are not a comparable speed/RT gate: rt-deadline and
-          # rt-jitter are reserved for the operator's isolated host.
-          ./utils/tests-long.sh $STRICT_FLAG --artifact \
-            --only "catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity"
+          mkdir -p target/logs
+          build=false; if [ -f target/dist/build-receipt.json ]; then build=true; fi
+          long_scope=none
+          if [ -f target/logs/long-audit-receipt.jsonl ]; then long_scope=full
+          elif [ -f target/logs/long-audit-receipt.partial.jsonl ]; then long_scope=partial
+          fi
+          certify=false
+          if [ -f target/dist/release-receipt.json ]; then certify=true; fi
+          printf '{"run_id":"%s","build_receipt":%s,"long_receipt_scope":"%s","certification_receipt":%s}\n' \
+            "$NAM_RUN_ID" "$build" "$long_scope" "$certify" > target/logs/evidence-manifest.json
       - name: Publish step summary
         if: always()
         uses: ./.github/actions/qa-summary
@@ -185,7 +219,7 @@ jobs:
           title: Long QA Suite
       - name: Upload logs and receipts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: long-logs-receipts
           path: |

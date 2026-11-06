@@ -1,8 +1,7 @@
 # ADR: PipeWire SPA Latency Semantics (`rate` vs `ns`) and Oversampling Delay Accounting
 
-- **Status:** Proposed (Under Product Owner Review)
+- **Status:** Proposed
 - **Scope:** `NAM-Audio-Pipe` (`src/standalone/pw_host/latency.rs`, `stream_status.rs`, `run.rs`)
-- **Related Findings:** F-PIPE-01 (oversampling in published latency snapshot), F-PIPE-05 (SPA `rate` vs `ns` semantics spike)
 - **References:**
   - PipeWire 1.6.2 source: `src/pipewire/stream.c` (`pw_stream_get_time_n`)
   - SPA headers: `/usr/include/spa-0.2/spa/param/latency.h`, `/usr/include/spa-0.2/spa/param/latency-utils.h`
@@ -14,6 +13,7 @@
 
 `NAM-Audio-Pipe` publishes latency parameters to the PipeWire graph using the SPA POD API (`SPA_PARAM_Latency`).
 In `src/standalone/pw_host/latency.rs`:
+
 ```rust
 builder.add_property(SPA_LATENCY_min_rate, latency_samples);
 builder.add_property(SPA_LATENCY_max_rate, latency_samples);
@@ -22,8 +22,9 @@ builder.add_property(SPA_LATENCY_max_ns, latency_ns);
 ```
 
 Two questions required empirical and architectural investigation:
-1. **F-PIPE-05 (Spike SPA):** Do PipeWire graph calculations treat `rate` (samples) and `ns` (nanoseconds) as mutually exclusive alternatives, or do they sum them additively?
-2. **F-PIPE-01:** How should native oversampling filter delay (`OversampleEngine::latency_samples`: 0 for Off, 12 for X2, 18 for X4 at model rate) be converted to host units and exposed atomically alongside resampler and CabSim latencies?
+
+1. **SPA `rate` vs `ns` Semantics:** Do PipeWire graph calculations treat `rate` (samples) and `ns` (nanoseconds) as mutually exclusive alternatives, or do they sum them additively?
+2. **Oversampling Latency Publication:** How should native oversampling filter delay (`OversampleEngine::latency_samples`: 0 for Off, 12 for X2, 18 for X4 at model rate) be converted to host units and exposed atomically alongside resampler and CabSim latencies?
 
 ---
 
@@ -39,6 +40,7 @@ time->delay += ((latency.min_ns + latency.max_ns) / 2) * (int64_t)time->rate.den
 ```
 
 ### Analysis
+
 1. **Additive Behavior:** PipeWire does **not** treat `rate` and `ns` as fallback alternatives; it evaluates both terms and adds them to `time->delay`.
 2. **Double Compensation Risk:** When `latency_samples` is written to `min_rate`/`max_rate` and the exact same duration is converted to nanoseconds and written to `min_ns`/`max_ns`, PipeWire sums the two, doubling the reported delay in graph time calculations.
 3. **Canonical PipeWire Recommendation:** The official PipeWire documentation (<https://docs.pipewire.org/page_latency.html>) specifies:
@@ -49,21 +51,23 @@ time->delay += ((latency.min_ns + latency.max_ns) / 2) * (int64_t)time->rate.den
 
 ## 3. Decision and Constraints
 
-### 3.1 Sprint SP-08 Boundary (Fail-Closed Governance)
-In accordance with the sprint restrictions of SP-08 (T-08.0):
-> *"Até a decisão do PO, `latency.rs` não muda os campos `rate` e `ns`."*
+### 3.1 Current Contract Preservation (Fail-Closed)
 
-Therefore, `latency.rs` retains its existing field emission pending formal PO sign-off.
+To preserve existing compatibility contracts until an explicit breaking change to SPA parameter emission is scheduled, `latency.rs` retains its existing dual-field (`rate` and `ns`) emission.
 
-### 3.2 Recommendation for PO Approval
-Upon PO review, change `update_stream_latency` in `latency.rs` to publish:
+### 3.2 Recommended Target Emission
+
+When updating `update_stream_latency` in `latency.rs` to align strictly with PipeWire's additive `pw_stream_get_time_n` semantics, publish:
+
 - `min_rate = latency_samples`
 - `max_rate = latency_samples`
 - `min_ns = 0`
 - `max_ns = 0`
 
-### 3.3 Oversampling Latency Accounting (F-PIPE-01)
+### 3.3 Oversampling Latency Accounting
+
 To account for oversampling delay accurately without RT locking:
+
 1. **Unit Conversion:** `OversampleEngine::latency_samples()` reports delay in native model samples (at the installed model rate, not an assumed 48 kHz). The function `convert_os_latency_to_host(os_native, host_rate, model_rate)` scales this delay to host samples with integer ceiling:
    $$\text{os\_host} = \left\lceil \frac{\text{os\_native} \times \text{host\_rate}}{\text{model\_rate}} \right\rceil$$
    The implementation is `div_ceil` (`latency.rs`); the previous round-to-nearest text did not match the code. `model_rate` is the rate of the model actually installed (captured during setup/reconnection and on every resampler install), never a hardcoded 48 kHz.
@@ -76,7 +80,7 @@ To account for oversampling delay accurately without RT locking:
 
 ## 4. Operator Verification Protocol (Physical PipeWire Graph)
 
-For human operator validation (T-08.6) on a live PipeWire system:
+For live verification on a physical PipeWire system:
 
 1. **Test Matrix:**
    - Quanta: `16`, `64`, `256` frames (`pw-metadata -n settings 0 clock.force-quantum <Q>`). Quanta below `16` are rejected by the installation gate (the CLI minimum is also `16`).
@@ -84,6 +88,7 @@ For human operator validation (T-08.6) on a live PipeWire system:
    - Oversampling: `--oversample off`, `--oversample 2x`, `--oversample 4x`
    - CabSim: Partition `32`, `64`, `128` (the partition is independent of the quantum; allowed values are `{32, 64, 128, 256}`)
 2. **Commands:**
+
    ```bash
    # Inspect node latency published to PipeWire:
    pw-dump | jq '.[] | select(.info.props["node.name"] == "NAM-Audio-Pipe-playback") | .info.params.Latency'
@@ -91,6 +96,7 @@ For human operator validation (T-08.6) on a live PipeWire system:
    # Verify graph delay calculation:
    pw-top
    ```
+
 3. **Validation Criteria:**
    - At quantum 16, CabSim installs without underrun or contract violation flags (`RT_STATUS_CABSIM_CONTRACT_VIOLATION == 0`).
    - Dynamic oversample switching (via CLI/param) updates published latency without audio dropouts or graph errors.
@@ -100,4 +106,3 @@ For human operator validation (T-08.6) on a live PipeWire system:
 Bridge starvation (the capture side produced no new block for this quantum: paused input, pending rebuild, clock drift or quantum miss) is a **success path**: the playback callback still dequeues the buffer, validates the SPA descriptors, and delivers coherent analytical silence with `offset = 0`, `size = silence_bytes`, `stride = 4` on both chunks. It must not be reported as an SPA contract violation.
 
 A malformed SPA descriptor (null/misaligned data or chunk, non-cardinal size, out-of-bounds window, asymmetric frames or overlapping channels) is a **validation failure**: it raises `RT_STATUS_HOST_CONTRACT_VIOLATION` (`E2304`), zeroes the regions it can prove writable, and stamps `size = 0` where the chunk descriptor itself is valid. It never writes through a pointer whose validity cannot be established and never leaves stale chunk metadata that could replay old audio.
-

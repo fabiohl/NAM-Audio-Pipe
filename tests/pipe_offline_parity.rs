@@ -73,7 +73,7 @@ const SWEEP_AMPLITUDE: f64 = 0.3;
 ///
 /// Gates derive from the engine quality contract's *safety* envelope
 /// (`max(baseline × 10, 1e-12)`) applied to the production-vs-f64 baseline
-/// (`esr_f64`) recorded in `docs/quality-contract.json`:
+/// (`esr_f64`) recorded in `NeuralAmpModeler-rs/docs/quality-contract.json`:
 ///   wavenet-a1-standard 1.05e-13, slim-a2-example 1.82e-14, lstm-official 2.71e-12.
 const FIXTURES: [(&str, &str, f64); 3] = [
     ("A1", "wavenet_a1_standard.nam", 1.05e-12),

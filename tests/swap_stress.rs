@@ -40,6 +40,7 @@ use neural_amp_modeler_rs::dsp::pipeline::{DspBridgeReader, MAX_BRIDGE_BUF};
 
 use common::swap::*;
 
+#[cfg(feature = "dual-mono")]
 use std::sync::{Arc, Mutex};
 
 // ── 1. Concurrent soak: atomicity, no inversion, no starvation ──────────────
@@ -49,6 +50,7 @@ use std::sync::{Arc, Mutex};
 /// runs continuous audio. Asserts after every callback: L/R channel counts
 /// never desync (atomic pairing), the audio frame counter advances (no
 /// starvation), and the burst is eventually absorbed.
+#[cfg(feature = "dual-mono")]
 fn run_concurrent_soak(total_swaps: usize, callbacks: usize) {
     let mut harness = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
     harness.push_load_model(Some(linear_a()), Some(linear_b()), 1.0, 1.0, SAMPLE_RATE);
@@ -191,6 +193,7 @@ fn run_concurrent_soak(total_swaps: usize, callbacks: usize) {
 }
 
 /// Fast concurrent soak: the default quick-suite pass.
+#[cfg(feature = "dual-mono")]
 #[test]
 fn swap_soak_concurrent_atomicity_and_no_starvation() {
     run_concurrent_soak(4_000, 12_000);
@@ -198,6 +201,7 @@ fn swap_soak_concurrent_atomicity_and_no_starvation() {
 
 /// Extended concurrent soak: 10× swap traffic and 10× callback volume for the
 /// long suite (Phase 1 of `tests-long.sh`). Long-running — `#[ignore]`d.
+#[cfg(feature = "dual-mono")]
 #[test]
 #[ignore]
 fn swap_soak_extended_concurrent_stress() {
@@ -209,6 +213,7 @@ fn swap_soak_extended_concurrent_stress() {
 /// Final-state proof: after a pair (A on L, B on R) is installed and settles,
 /// the L output tracks A's steady-state gain (+1.875·x) and the R output tracks
 /// B's (−0.16·x). If the channels were inverted, L would track B instead.
+#[cfg(feature = "dual-mono")]
 #[test]
 fn swap_no_channel_inversion_with_linear_tags() {
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
@@ -259,6 +264,7 @@ fn swap_no_channel_inversion_with_linear_tags() {
 
 /// Pushes an output gain and verifies BOTH channels scale by exactly the same
 /// factor relative to the unity-gain baseline — no L/R gain imbalance.
+#[cfg(feature = "dual-mono")]
 #[test]
 fn swap_gain_balance_symmetric() {
     let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");

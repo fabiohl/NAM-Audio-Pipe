@@ -1,0 +1,16 @@
+{
+  "git_sha": "5f743cb000000000000000000000000000000000",
+  "git_dirty": false,
+  "cargo_lock_sha256": "4e724b172a15f019688461bfa2a74c43f11e9f2df486be77fb238385d03e5c77",
+  "rustc_vv_sha256": "b0d62a0429f52f4a47ef034293f7734193b22cf3ffcf18d2d9ec76f9260d8a56",
+  "engine_commit": "633614d000000000000000000000000000000000",
+  "run_id": "fixture-run-001",
+  "proof_subject": "ab_opt_bench",
+  "ts": "2026-11-06T00:00:00Z",
+  "cpu_bench": "8",
+  "isolated": "8-11",
+  "governor": "performance",
+  "perf_event_paranoid_before": 2,
+  "perf_event_paranoid_after": 2
+}
+

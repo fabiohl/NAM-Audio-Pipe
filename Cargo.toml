@@ -117,7 +117,11 @@ default = ["dual-mono"]
 # L/R pipeline processes each channel independently instead of folding R as a
 # mono copy of L (mono detection becomes dynamic per-block).
 dual-mono = ["NeuralAmpModeler-rs/dual-mono"]
-testing = ["NeuralAmpModeler-rs/testing", "dual-mono", "dep:serde", "dep:sha2"]
+# Test-only utilities and receipt tooling. Intentionally independent from
+# `dual-mono`: `cargo test --features testing` still enables the default
+# feature, while `--no-default-features --features testing` exercises the
+# lean single-inference runtime path.
+testing = ["NeuralAmpModeler-rs/testing", "dep:serde", "dep:sha2"]
 # Enables the RT heap-audit allocator (CountingAllocator) and the swap
 # zero-allocation gates.
 heap-audit = ["NeuralAmpModeler-rs/heap-audit"]

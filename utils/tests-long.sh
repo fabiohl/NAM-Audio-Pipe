@@ -85,23 +85,13 @@ is_phase_selected() {
     done
     return 1
 }
-if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; export NAM_REQUIRE_CPP_ORACLE=1; fi
+if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; fi
 # A partial run must never destroy the previous full receipt: it writes to a
 # sibling set of paths that cannot be mistaken for a certifiable audit.
-if [ ${#ONLY_PHASES[@]} -gt 0 ]; then
-    TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"
-    RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"
-    FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"
-fi
+if [ ${#ONLY_PHASES[@]} -gt 0 ]; then TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"; RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"; FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"; fi
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_TARGET_DIR" = "target/long" ]; then rm -rf target/long; fi
 rm -f "$RECEIPT" "$FAIL_REASONS" "$TEXT_RECEIPT"
-if [ "$USE_ARTIFACT" = 1 ]; then
-    if [ ! -f "$ARTIFACT_PATH" ]; then
-        echo "ERRO: --artifact especificado mas $ARTIFACT_PATH não existe." >&2
-        exit 2
-    fi
-    ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}')
-fi
+if [ "$USE_ARTIFACT" = 1 ]; then [ -f "$ARTIFACT_PATH" ] || { echo "ERRO: --artifact especificado mas $ARTIFACT_PATH não existe." >&2; exit 2; }; ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}'); fi
 HAS_CHRT_FIFO=0
 if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then HAS_CHRT_FIFO=1; fi
 ensure_receipt_bin() {
@@ -182,7 +172,10 @@ run_phase() {
     done <<<"$gaps_out"
     case "$st" in
         PASS) emit "PHASE: $name PASS log=$log" ;;
-        GAP) emit "PHASE: $name GAP $(IFS=,; printf '%s' "${phase_gaps[*]}")" ;;
+        GAP)
+            emit "PHASE: $name GAP $(IFS=,; printf '%s' "${phase_gaps[*]}")"
+            [ "$name" = "offline-parity" ] && echo 'export NAM_CORE_RENDER_BIN="$(cd <engine> && utils/ensure_namcore_render.sh | tail -n1)"'
+            ;;
         FAIL) FAILS+=("$id"); emit "PHASE: $name FAIL rc=$rc log=$log"; tail -n 40 "$log" >&2 ;;
     esac
     if [ "$st" != ERROR ]; then
@@ -250,7 +243,13 @@ body_pw_resilience() {
     REQS+=("daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon")
 }
 body_pw_live() {
-    local to="$1"
+    local to="$1" launcher=run_cmd
+    # The release certificate requires a calibrated host (pinned isolated CPU +
+    # SCHED_FIFO) for the E2E tight gate to certify instead of declaring a GAP.
+    # Only the strict release run changes the launcher; hosted/non-strict runs
+    # keep the natural host affinity so they never pin the whole live graph to
+    # a shared CPU.
+    [ "$STRICT" = 1 ] && launcher=run_rt_cmd
     if ! command -v pw-cli >/dev/null 2>&1 || ! timeout 5 pw-cli info 0 >/dev/null 2>&1; then
         NOT_RUN=1; pre_gap pw_integration_daemon_unavailable; return 0
     fi
@@ -260,7 +259,7 @@ body_pw_live() {
     probe_io_uring_capability "$to"; local probe_rc=$?
     if [ "$probe_rc" -eq 1 ]; then NOT_RUN=1; pre_gap io_uring_kernel_unsupported; return 0; fi
     [ "$probe_rc" -eq 0 ] || return 1
-    run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
+    "$launcher" "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pw_integration --test service_resilience -- --ignored --test-threads=1 --nocapture || return 1
     TGTS+=(tests/pw_integration.rs tests/service_resilience.rs)
     REQS+=("sigterm_acceptance:2" double_signal)
@@ -283,6 +282,10 @@ body_recording() {
 }
 body_offline_parity() {
     local to="$1"
+    if [ -z "${NAM_CORE_RENDER_BIN:-}" ] || [ ! -x "${NAM_CORE_RENDER_BIN:-}" ]; then
+        NOT_RUN=1; pre_gap offline_parity:missing_cpp_oracle; return 0
+    fi
+    [ "$STRICT" = 1 ] && export NAM_REQUIRE_CPP_ORACLE=1
     run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pipe_offline_parity -- --ignored --nocapture --test-threads=1 || return 1
     TGTS+=(tests/pipe_offline_parity.rs)

@@ -46,14 +46,22 @@ unsafe extern "C" {
     fn vsnprintf(str: *mut c_char, size: usize, format: *const c_char, ap: VaList) -> c_int;
 }
 
+// `spa_log_methods.logv`/`logtv` receive the platform `va_list` by value on
+// AAPCS64 (aarch64) but as a pointer to the SysV register-save area on x86_64.
+// The bindgen-generated type follows the target ABI, so mirror it exactly.
 #[cfg(target_arch = "x86_64")]
+type SpaVaList = *mut pipewire::spa::sys::__va_list_tag;
+#[cfg(target_arch = "aarch64")]
+type SpaVaList = pipewire::spa::sys::va_list;
+
+// The same libc `vsnprintf` symbol is declared with two ABI-identical views:
+// the C-variadic entry point above receives Rust's `VaList`, while SPA hands us
+// the bindgen-generated platform `va_list`. Keep both for zero-copy dispatch.
+#[expect(clashing_extern_declarations)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe extern "C" {
-    fn __vsnprintf(
-        str: *mut c_char,
-        size: usize,
-        format: *const c_char,
-        ap: *mut pipewire::spa::sys::__va_list_tag,
-    ) -> c_int;
+    #[link_name = "vsnprintf"]
+    fn vsnprintf_va(str: *mut c_char, size: usize, format: *const c_char, ap: SpaVaList) -> c_int;
 }
 
 /// Dispatches formatted PipeWire log message to the unified `log::*` facade.
@@ -267,8 +275,8 @@ unsafe fn format_and_dispatch_variadic(
     dispatch_pipewire_log(level, topic, file, line, func, msg);
 }
 
-/// Formats `va_list` tag pointer into a stack buffer and dispatches to logger.
-#[cfg(target_arch = "x86_64")]
+/// Formats a `va_list` into a stack buffer and dispatches to logger.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[inline]
 unsafe fn format_and_dispatch_va_tag(
     level: spa_log_level,
@@ -277,14 +285,21 @@ unsafe fn format_and_dispatch_va_tag(
     line: c_int,
     func: *const c_char,
     fmt: *const c_char,
-    args: *mut pipewire::spa::sys::__va_list_tag,
+    args: SpaVaList,
 ) {
-    if fmt.is_null() || args.is_null() {
+    if fmt.is_null() {
+        return;
+    }
+    // On x86_64 the SysV `va_list` arrives as a pointer that may be null;
+    // on aarch64 AAPCS64 passes the state struct by value.
+    #[cfg(target_arch = "x86_64")]
+    if args.is_null() {
         return;
     }
     let mut buf = [0u8; 1024];
-    // SAFETY: __vsnprintf writes at most buf.len() bytes into buf.
-    let written = unsafe { __vsnprintf(buf.as_mut_ptr() as *mut c_char, buf.len(), fmt, args) };
+    // SAFETY: `vsnprintf_va` writes at most `buf.len()` bytes; `fmt` and `args`
+    // are the valid C variadic state supplied by PipeWire's SPA log dispatch.
+    let written = unsafe { vsnprintf_va(buf.as_mut_ptr() as *mut c_char, buf.len(), fmt, args) };
     if written < 0 {
         return;
     }
@@ -336,7 +351,7 @@ pub unsafe extern "C" fn nam_pw_logt(
 
 /// # Safety
 /// Called by PipeWire SPA logging system for untopic'd `va_list` logging (v0).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe extern "C" fn nam_pw_logv(
     _object: *mut c_void,
     level: spa_log_level,
@@ -344,9 +359,9 @@ pub unsafe extern "C" fn nam_pw_logv(
     line: c_int,
     func: *const c_char,
     fmt: *const c_char,
-    args: *mut pipewire::spa::sys::__va_list_tag,
+    args: SpaVaList,
 ) {
-    // SAFETY: Caller provides valid format string and va_list pointer.
+    // SAFETY: Caller provides valid format string and va_list state.
     unsafe {
         format_and_dispatch_va_tag(level, std::ptr::null(), file, line, func, fmt, args);
     }
@@ -354,7 +369,7 @@ pub unsafe extern "C" fn nam_pw_logv(
 
 /// # Safety
 /// Called by PipeWire SPA logging system for topic'd `va_list` logging (v1+).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe extern "C" fn nam_pw_logtv(
     _object: *mut c_void,
     level: spa_log_level,
@@ -363,9 +378,9 @@ pub unsafe extern "C" fn nam_pw_logtv(
     line: c_int,
     func: *const c_char,
     fmt: *const c_char,
-    args: *mut pipewire::spa::sys::__va_list_tag,
+    args: SpaVaList,
 ) {
-    // SAFETY: Caller provides valid format string and va_list pointer.
+    // SAFETY: Caller provides valid format string and va_list state.
     unsafe {
         format_and_dispatch_va_tag(level, topic, file, line, func, fmt, args);
     }
@@ -378,7 +393,7 @@ pub unsafe extern "C" fn nam_pw_topic_init(_object: *mut c_void, _topic: *mut sp
 }
 
 /// SPA method table containing our pure Rust function pointers.
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static SPA_LOG_METHODS: spa_log_methods = spa_log_methods {
     version: 1, // SPA_VERSION_LOG_METHODS
     log: Some(nam_pw_log),
@@ -388,7 +403,7 @@ static SPA_LOG_METHODS: spa_log_methods = spa_log_methods {
     topic_init: Some(nam_pw_topic_init),
 };
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 static SPA_LOG_METHODS: spa_log_methods = spa_log_methods {
     version: 1, // SPA_VERSION_LOG_METHODS
     log: Some(nam_pw_log),

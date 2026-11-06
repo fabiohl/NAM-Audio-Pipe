@@ -13,8 +13,10 @@
 //! receipt with the strict long audit and writes `release-receipt.json`.
 //!
 //! Subcommands: `append`, `summary`, `validate [--strict]`, `pgo-check`,
-//! `bolt-proof`, `build-receipt`, `certify`.
-//! Exit codes: 0 success; 1 I/O or verification error; 2 usage error.
+//! `bolt-proof`, `build-receipt`, `certify`, `verify-artifact`, `verify-release`,
+//! `flatpak-path`.
+//! Exit codes: 0 success; 1 I/O or verification error; 2 usage error;
+//! 3 `flatpak-path` when the release declares no bundle.
 
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -26,13 +28,15 @@ use std::str::FromStr;
 use nam_audio_pipe::receipt::LONG_ROSTER;
 use nam_audio_pipe::receipt::build::{
     BuildArtifacts, BuildOptimizations, BuildProvenance, BuildReceipt, PackageInfo,
-    extract_engine_provenance, hash_file, parse_ab_opt_ceremony_receipt,
-    parse_pgo_workload_receipt, validate_pgo_matrix,
+    extract_engine_provenance, hash_file, parse_pgo_workload_receipt,
+    validate_ab_opt_ceremony_receipt, validate_pgo_matrix,
 };
 use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
 use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict};
 use nam_audio_pipe::receipt::phase_log::{self, Requirement, Verdict};
-use nam_audio_pipe::receipt::release::{evaluate_certification, verify_receipt_artifact};
+use nam_audio_pipe::receipt::release::{
+    declared_flatpak_path, evaluate_certification, verify_receipt_artifact, verify_release_receipt,
+};
 use neural_amp_modeler_rs::testing::receipt::{
     LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, LongReason, count_tests_executed_from_log,
     detect_gap_markers, now_iso8601,
@@ -51,10 +55,13 @@ fn main() {
         "summary" => cmd_summary(&args[1..]),
         "validate" => cmd_validate(&args[1..]),
         "pgo-check" => cmd_pgo_check(&args[1..]),
-        "bolt-proof" => cmd_bolt_proof(&args[1..]),
+        "ceremony-proof" => cmd_ceremony_proof(&args[1..]),
+        "bolt-proof" => cmd_ceremony_proof(&args[1..]),
         "build-receipt" => cmd_build_receipt(&args[1..]),
         "certify" => cmd_certify(&args[1..]),
         "verify-artifact" => cmd_verify_artifact(&args[1..]),
+        "verify-release" => cmd_verify_release(&args[1..]),
+        "flatpak-path" => cmd_flatpak_path(&args[1..]),
         "-h" | "--help" => {
             print_help();
             exit(0);
@@ -82,7 +89,7 @@ fn print_help() {
     println!("  pipe_long_receipt summary [--out <file>]");
     println!("  pipe_long_receipt validate [--out <file>] [--strict]");
     println!("  pipe_long_receipt pgo-check --receipt <file>");
-    println!("  pipe_long_receipt bolt-proof --receipt <file>");
+    println!("  pipe_long_receipt ceremony-proof --receipt <file> [--git-sha <sha>]");
     println!(
         "  pipe_long_receipt build-receipt --artifact <path> [--out <file>] [--strict] [options...]"
     );
@@ -90,6 +97,12 @@ fn print_help() {
         "  pipe_long_receipt certify [--artifact <path>] [--build-receipt <path>] [--long-receipt <path>] [--text-receipt <path>] [--out <file>] [--strict]"
     );
     println!("  pipe_long_receipt verify-artifact --out <file> --artifact <path>");
+    println!(
+        "  pipe_long_receipt verify-release [--release-receipt <path>] [--artifact <path>]   (prints artifact SHA-256)"
+    );
+    println!(
+        "  pipe_long_receipt flatpak-path [--release-receipt <path>]   (exit 3 when no bundle)"
+    );
     println!();
     println!(
         "Status values: PASSED, FAILED, SKIPPED, INCONCLUSIVE, SKIP_CAPABILITY, NOT_RUN, SIMULATED"
@@ -452,22 +465,24 @@ fn cmd_pgo_check(args: &[String]) {
     }
 }
 
-fn cmd_bolt_proof(args: &[String]) {
+fn cmd_ceremony_proof(args: &[String]) {
     let flags = match parse_flags(args) {
         Ok(f) => f,
-        Err(e) => die_usage("bolt-proof", &e),
+        Err(e) => die_usage("ceremony-proof", &e),
     };
     let receipt = match required(&flags, "receipt") {
         Ok(v) => v.clone(),
-        Err(e) => die_usage("bolt-proof", &e),
+        Err(e) => die_usage("ceremony-proof", &e),
     };
-    match parse_ab_opt_ceremony_receipt(&receipt) {
-        Some((proof_id, _, _)) => {
-            println!("BOLT_PROOF: {proof_id}");
+    let git_sha = flags.get("git-sha").map(|s| s.as_str());
+
+    match validate_ab_opt_ceremony_receipt(&receipt, git_sha, None) {
+        Ok((_proof_id, _samples, _fdata_sha, verdict)) => {
+            println!("{verdict}");
             exit(0);
         }
-        None => {
-            println!("BOLT_PROOF: MISSING");
+        Err(rejection) => {
+            eprintln!("CEREMONY_PROOF_REJECTED: {}", rejection.reason_code());
             exit(1);
         }
     }
@@ -577,16 +592,27 @@ fn cmd_build_receipt(args: &[String]) {
         .as_ref()
         .and_then(|p| hash_file(Path::new(p)).ok());
 
-    let bolt_proof = if let Some(path) = ceremony_receipt.as_deref() {
-        match parse_ab_opt_ceremony_receipt(path) {
-            Some((proof_id, _, _)) => proof_id,
-            None => {
+    let bolt_proof_flag = flags.get("bolt-proof").cloned();
+    let bolt_proof = if let Some(flag_proof) = bolt_proof_flag {
+        flag_proof
+    } else if let Some(path) = ceremony_receipt.as_deref() {
+        match validate_ab_opt_ceremony_receipt(path, Some(&git_commit), Some(&cargo_lock_sha256)) {
+            Ok((proof_id, _, _, verdict)) => {
+                if verdict == "PGO-ONLY" || bolt_status == "not_proven" {
+                    "fallback_pgo_only".to_string()
+                } else {
+                    proof_id
+                }
+            }
+            Err(e) => {
                 if bolt_status == "applied" {
                     gaps.push("bolt_proof_unverified".to_string());
                 }
-                "unverified".to_string()
+                format!("unverified:{}", e.reason_code())
             }
         }
+    } else if bolt_status == "not_proven" {
+        "fallback_pgo_only".to_string()
     } else {
         if bolt_status == "applied" {
             gaps.push("bolt_proof_unverified".to_string());
@@ -606,7 +632,9 @@ fn cmd_build_receipt(args: &[String]) {
     if !pgo_applied {
         gaps.push("pgo_not_applied".to_string());
     }
-    if !bolt_applied {
+    if bolt_status == "not_proven" {
+        gaps.push("bolt_not_proven".to_string());
+    } else if !bolt_applied {
         gaps.push("bolt_not_applied".to_string());
     }
     if codegen_status != "pass" {
@@ -615,7 +643,12 @@ fn cmd_build_receipt(args: &[String]) {
     gaps.sort();
     gaps.dedup();
 
-    let status = if !gaps.is_empty() && strict {
+    let fatal_strict_gaps: Vec<&String> = gaps
+        .iter()
+        .filter(|g| g.as_str() != "bolt_not_proven")
+        .collect();
+
+    let status = if !fatal_strict_gaps.is_empty() && strict {
         "FAILED"
     } else if !gaps.is_empty() {
         "PASS_WITH_GAPS"
@@ -708,6 +741,56 @@ fn cmd_verify_artifact(args: &[String]) {
         eprintln!("verify-artifact: {reason}");
     }
     exit(verdict.exit_code() as i32);
+}
+
+fn cmd_verify_release(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("verify-release", &e),
+    };
+    let release = flags
+        .get("release-receipt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_RELEASE_RECEIPT.to_string());
+    let artifact = flags
+        .get("artifact")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_ARTIFACT.to_string());
+    match verify_release_receipt(Path::new(&release), Path::new(&artifact)) {
+        Ok(sha) => {
+            println!("{sha}");
+            exit(0);
+        }
+        Err(problems) => {
+            for problem in &problems {
+                eprintln!("verify-release: {problem}");
+            }
+            eprintln!("RELEASE_VERIFY: FAIL reasons={}", problems.len());
+            exit(1);
+        }
+    }
+}
+
+fn cmd_flatpak_path(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("flatpak-path", &e),
+    };
+    let release = flags
+        .get("release-receipt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_RELEASE_RECEIPT.to_string());
+    match declared_flatpak_path(Path::new(&release)) {
+        Ok(Some(path)) => {
+            println!("{path}");
+            exit(0);
+        }
+        Ok(None) => exit(3),
+        Err(e) => {
+            eprintln!("flatpak-path: cannot read {release}: {e}");
+            exit(1);
+        }
+    }
 }
 
 fn cmd_certify(args: &[String]) {

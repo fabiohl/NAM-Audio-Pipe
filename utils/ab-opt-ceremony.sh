@@ -59,6 +59,17 @@ need() { command -v "$1" >/dev/null 2>&1 || { echo "ERRO: '$1' não encontrado n
 need rustc; need cargo; need timeout
 lib_init
 mkdir -p "$AB_DIR"
+PARANOID_BEFORE=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+restore_paranoid() {
+    local cur
+    cur=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+    if [ -n "${PARANOID_BEFORE:-}" ] && [ "$cur" != "$PARANOID_BEFORE" ]; then
+        if ! sudo -n sysctl -q -w kernel.perf_event_paranoid="$PARANOID_BEFORE" 2>/dev/null; then
+            gap perf_paranoid_not_restored
+        fi
+    fi
+}
+trap restore_paranoid EXIT
 rm -f "$AB_DIR"/ab-opt-plain.json "$AB_DIR"/ab-opt-pgo.json "$AB_DIR"/ab-opt-pgo+bolt.json
 rm -f "$AB_DIR"/ab-opt-pgo-gen.json "$AB_DIR"/ab-opt-bolt-probe.json "$AB_DIR"/ab-opt-ceremony-receipt.json
 rm -rf "$AB_BUILD_DIR"
@@ -236,6 +247,51 @@ if [ "$USE_PGO" = 1 ]; then
     fi
 fi
 
+restore_paranoid
+PARANOID_AFTER=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+GIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_DIRTY=false
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then GIT_DIRTY=true; fi
+CARGO_LOCK_SHA=$(sha256sum Cargo.lock 2>/dev/null | awk '{print $1}' || echo "unknown")
+RUSTC_VV_SHA=$(rustc -vV 2>/dev/null | sha256sum | awk '{print $1}' || echo "unknown")
+ENGINE_COMMIT="${ENGINE_COMMIT:-unknown}"
+ISOLATED=$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)
+GOVERNOR=$(cat "/sys/devices/system/cpu/cpu${bench_core:-0}/cpufreq/scaling_governor" 2>/dev/null || echo "unknown")
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+cat > "$AB_DIR/ab-opt-provenance.json" <<EOF
+{
+  "git_sha": "$GIT_SHA",
+  "git_dirty": $GIT_DIRTY,
+  "cargo_lock_sha256": "$CARGO_LOCK_SHA",
+  "rustc_vv_sha256": "$RUSTC_VV_SHA",
+  "engine_commit": "$ENGINE_COMMIT",
+  "run_id": "${NAM_RUN_ID:-none}",
+  "proof_subject": "ab_opt_bench",
+  "ts": "$TS",
+  "cpu_bench": "${bench_core:-none}",
+  "isolated": "$ISOLATED",
+  "governor": "$GOVERNOR",
+  "perf_event_paranoid_before": $PARANOID_BEFORE,
+  "perf_event_paranoid_after": $PARANOID_AFTER
+}
+EOF
+
+if [ "$BOLT_APPLIED" = 1 ]; then
+    FDATA_SHA=$(sha256sum "$PGO_DIR/perf.fdata" 2>/dev/null | awk '{print $1}' || echo "unknown")
+    LBR_SAMPLES=$(perf script -i "$PGO_DIR/perf.data" -F brstack 2>/dev/null | grep -cE '0x[0-9a-fA-F]+/0x[0-9a-fA-F]+' || true)
+    [ -n "$LBR_SAMPLES" ] || LBR_SAMPLES=0
+    LBR_MODE="basic"
+    if [ "$LBR" = 1 ]; then LBR_MODE="lbr"; fi
+    cat > "$AB_DIR/ab-opt-bolt-lbr.json" <<EOF
+{
+  "samples": $LBR_SAMPLES,
+  "fdata_sha256": "$FDATA_SHA",
+  "mode": "$LBR_MODE"
+}
+EOF
+fi
+
 if [ "$USE_PGO" = 1 ]; then
     CAUSE=()
     [ "$BOLT_APPLIED" = 1 ] || CAUSE=(--bolt-cause "${BOLT_CAUSE:-BOLT not requested}")
@@ -243,9 +299,11 @@ if [ "$USE_PGO" = 1 ]; then
     run_timed 120 "$COMPARE_BIN" compare --dir "$AB_DIR" --out "$RECEIPT" --runs "$RUNS" \
         --bolt-applied "$BOLT_APPLIED" ${CAUSE[@]+"${CAUSE[@]}"} || RC=$?
     [ "$RC" -eq 0 ] || FAILS+=(verdict)
+    restore_paranoid
     finish || exit 1
     [ "$RC" -eq 0 ] || exit 1
 else
     echo "PLAIN-only diagnostic run; no PGO/BOLT verdict."
+    restore_paranoid
     finish
 fi
