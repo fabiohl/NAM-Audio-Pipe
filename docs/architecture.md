@@ -247,6 +247,22 @@ ulimit -r 95                                                         # Grant RT 
 ulimit -l unlimited                                                  # Grant physical memory locking
 ```
 
+### 4.4 Target Architectures & Platform Support (x86_64 & Linux on ARM)
+
+NAM-Audio-Pipe is engineered natively for the Linux multimedia ecosystem, with explicit architectural handling across CPU architectures:
+
+| Platform / Architecture      | Status                            | Continuous Integration Gate                                                          | Real-Time & Hardware Certification                                                                                                                              |
+|:---------------------------- |:--------------------------------- |:------------------------------------------------------------------------------------ |:--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux `x86_64`**           | Reference Platform (Tier 1)       | Blocking (`x86_64-linux-lints`, `x86_64-linux-quick`, `msrv`)                        | Full hardware certification, soak tests, RT deadline/jitter auditing, and PGO + LLVM BOLT optimization.                                                         |
+| **Linux on ARM (`aarch64`)** | Theoretically Compatible (Tier 2) | Blocking (`linux-arm64-lints` on `ubuntu-26.04-arm`), advisory (`linux-arm64-quick`) | Compiles cleanly and is architecturally compatible. Formal bare-metal RT deadline/jitter certification and audio interface testing have not yet been performed. |
+
+#### Architectural Provisions for Linux on ARM
+
+1. **Target-Scoped Compiler Flags**: In [`.cargo/config.toml`](../.cargo/config.toml), architecture-specific flags (such as `-Ctarget-cpu=x86-64-v3`) are strictly gated under `[target.'cfg(target_arch = "x86_64")']`. Linker hardening flags (`-Wl,-z,now`, `-Wl,--gc-sections`, `-Wl,--as-needed`) apply uniformly to all Linux targets, preventing undefined CPU flags during ARM compilation.
+2. **C-ABI Variadic Log Interception (AAPCS64)**: PipeWire's SPA logging functions use C variadics. Under AAPCS64 (`aarch64`), `va_list` arguments are passed by value, whereas SysV (`x86_64`) passes them via register-save area pointers. Pure-Rust logging in [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs) conditionally binds `SpaVaList` to `pipewire::spa::sys::va_list` on `aarch64` and handles direct `vsnprintf` formatting without external C bridges.
+3. **Continuous Integration on Native ARM Runners**: GitHub Actions executes `linux-arm64-lints` on native `ubuntu-26.04-arm` runners as a blocking gate (validating `cargo check`, `cargo clippy`, and code formatting), alongside advisory `linux-arm64-quick` test suites.
+4. **Formal Testing Scope**: While the codebase is architecturally sound, compiles cleanly, and is theoretically compatible on Linux ARM64 platforms, formal real-time hardware validation (such as `tests-long.sh` RT-jitter and deadline phases on bare-metal ARM audio interfaces) has not yet been formally conducted.
+
 ---
 
 ## 5. Lock-Free SPSC Channels & 3-Tier GC Cascade
@@ -517,6 +533,15 @@ To prevent this:
 - Log events on the marked thread are written to a preallocated SPSC ring queue (~344 KiB).
 - An off-RT drainer thread consumes the queue and replays records through standard logger channels.
 - If the ring queue overflows, dropped messages are recorded in `pw_log_dropped` without blocking the audio thread.
+
+#### Platform ABI Variadics (`x86_64` vs `aarch64`)
+
+PipeWire's `spa_log_methods.logv` and `logtv` dispatch platform-specific `va_list` types. In [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs), the type alias `SpaVaList` is conditioned per target:
+
+- On `x86_64` (System V ABI): Passed as a pointer (`*mut pipewire::spa::sys::__va_list_tag`).
+- On `aarch64` (AAPCS64 ABI): Passed by value (`pipewire::spa::sys::va_list`).
+
+This enables identical zero-overhead variadic formatting into the fixed 1024-byte stack buffer across both CPU architectures without external C wrappers.
 
 ---
 

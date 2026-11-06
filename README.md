@@ -5,7 +5,7 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 # NAM-Audio-Pipe
 
-![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg) ![Rust](https://img.shields.io/badge/Rust-1.99%2B-orange.svg) ![PipeWire](https://img.shields.io/badge/PipeWire-%E2%89%A5%200.3-brightgreen.svg) ![Latency](https://img.shields.io/badge/Latency-Sub--ms-red.svg) ![RT-Safe](https://img.shields.io/badge/RT--Safe-Zero--Alloc-brightgreen.svg) ![SIMD](https://img.shields.io/badge/SIMD-AVX2%20x86--64--v3-blueviolet.svg) ![Parity](https://img.shields.io/badge/Parity-Dual--Oracle%20%3E136dB%20SNR-success.svg) ![Recording](https://img.shields.io/badge/Recording-io__uring%2032bit%20WAV-yellow.svg)
+![License](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg) ![Rust](https://img.shields.io/badge/Rust-1.99%2B-orange.svg) ![PipeWire](https://img.shields.io/badge/PipeWire-%E2%89%A5%200.3-brightgreen.svg) ![Arch](https://img.shields.io/badge/Arch-x86--64%20%7C%20ARM64-blue.svg) ![Latency](https://img.shields.io/badge/Latency-Sub--ms-red.svg) ![RT-Safe](https://img.shields.io/badge/RT--Safe-Zero--Alloc-brightgreen.svg) ![SIMD](https://img.shields.io/badge/SIMD-AVX2%20x86--64--v3-blueviolet.svg) ![Parity](https://img.shields.io/badge/Parity-Dual--Oracle%20%3E136dB%20SNR-success.svg) ![Recording](https://img.shields.io/badge/Recording-io__uring%2032bit%20WAV-yellow.svg)
 
 **NAM-Audio-Pipe** is an ultra-low latency, real-time standalone PipeWire host application for [Neural Amp Modeler (NAM)](https://www.neuralampmodeler.com/) simulation on Linux.
 
@@ -299,6 +299,18 @@ nam-audio-pipe --gate off
 
 ---
 
+## 🖥️ Supported Platforms & Architectures
+
+| Architecture                 | Platform Tier           | Continuous Integration                                                            | Real-Time Hardware Certification           | Notes                                                                                                                                                             |
+|:---------------------------- |:----------------------- |:--------------------------------------------------------------------------------- |:------------------------------------------ |:----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux `x86_64`**           | **Tier 1 (Reference)**  | Blocking (`lints`, `quick`, `msrv`, `long`)                                       | Fully verified & certified                 | Requires `x86-64-v3` baseline (AVX2, FMA, BMI2). Supports full PGO + LLVM BOLT optimization pipeline.                                                             |
+| **Linux on ARM (`aarch64`)** | **Tier 2 (Compatible)** | Blocking compile/lint (`linux-arm64-lints`), advisory quick (`linux-arm64-quick`) | Not formally tested on bare-metal hardware | Compiles cleanly on native ARM64 runners (`ubuntu-26.04-arm`). Architecture flags are scoped in `.cargo/config.toml`, and pure-Rust SPA logging supports AAPCS64. |
+
+> [!NOTE]
+> **Linux on ARM Status**: While NAM-Audio-Pipe continuously compiles, passes static analysis, and is architecturally compatible on Linux on ARM (`aarch64`), formal validation on physical ARM audio workstations (such as real-time audio deadline certification, bare-metal ALSA/PipeWire driver testing, and hardware latency profiling) has not yet been formally conducted.
+
+---
+
 ## 📦 Installation & Packaging Options
 
 NAM-Audio-Pipe can be run directly via Cargo, compiled into a standalone hyper-optimized binary, or installed as a sandboxed Flatpak application.
@@ -332,7 +344,7 @@ The Flatpak bundle exports native desktop launchers and high-resolution icons to
 
 ### Option B: Simple Direct Cargo Build (Development & Testing)
 
-For developers working on source code or rapid testing:
+For developers working on source code or rapid testing on `x86_64` or Linux on ARM:
 
 ```bash
 # Direct development execution:
@@ -343,6 +355,8 @@ cargo build --release --bin nam-audio-pipe
 ```
 
 The compiled binary will be located at `target/release/nam-audio-pipe`.
+
+> **Building on Linux on ARM (ARM64)**: Standard Cargo compilation works out-of-the-box (`cargo build --release --bin nam-audio-pipe`). Microarchitecture flags (`x86-64-v3`) in `.cargo/config.toml` are automatically scoped to `x86_64` targets, generating clean, native AArch64 code on ARM systems.
 
 ---
 

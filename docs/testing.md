@@ -258,8 +258,8 @@ Every phase writes `target/logs/long-<name>.log`. The human-readable text receip
 - **`ci.yml`:** Static analysis and fast test disciplines execute across isolated matrix jobs:
   - `x86_64-linux-lints`: Runs `utils/lints.sh` with strict Clippy, AppStream, and doc gates (blocking).
   - `x86_64-linux-quick`: Runs `utils/tests-quick.sh` across both `dual-mono` and lean mono profiles (blocking).
-  - `linux-arm64-lints`: Validates compilation and lints on ARM64 architecture (blocking).
-  - `linux-arm64-quick`: Runs quick tests on ARM64 (`continue-on-error` advisory).
+  - `linux-arm64-lints`: Validates compilation and lints on ARM64 architecture (blocking gate).
+  - `linux-arm64-quick`: Runs quick tests on ARM64 (`continue-on-error` advisory; bare-metal hardware and RT-deadline certification remain unperformed on ARM).
   - `msrv`: Enforces minimum supported Rust version (`1.99.0`) using `--locked --all-targets --all-features`.
   - **Deterministic Provenance**: Each job sources [`variables.env`](../variables.env) (`ENGINE_COMMIT`), writes `target/logs/ci-provenance.log`, and uploads `target/logs/**` (including `*-status.tsv` carriers).
 - **`long.yml`:** Operator-triggered manual workflow (`workflow_dispatch`, zero inputs, `timeout-minutes: 300`). Provisions BOLT, perf counters, the C++ parity oracle (`NAM_CORE_RENDER_BIN`), a private D-Bus session, and persistent PipeWire sink/source nodes (`ci-null-sink`, `ci-null-source`). Executes hosted-safe phases (`catch-all`, `soak`, `heap-audit`, `concurrency`, `endurance`, `pw-resilience`, `pw-live`, `recording`, `offline-parity`), leaving isolated hardware phases (`rt-deadline`, `rt-jitter`) for bare-metal operator execution.

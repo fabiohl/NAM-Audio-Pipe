@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-11-01
+## [1.1.0] - 2026-11-06
 
 ### Added [1.1.0]
 
+- **Linux on ARM (ARM64 / aarch64) Platform Documentation:** Documented native Linux on ARM platform status across `README.md` and `docs/architecture.md`. Clarified that the project maintains continuous integration on native ARM64 runners (`ubuntu-26.04-arm`) with blocking compilation and lint gates (`linux-arm64-lints`) and theoretical software compatibility, while formal bare-metal real-time audio testing and latency certification remain pending.
 - **PipeWire Latency Reporting:** Stream properties and latency reporting driven by the real PipeWire graph.
 - **Rust QA Receipts:** Long-phase receipt tooling in Rust with `run_id` support (flags or `NAM_RUN_ID`), unified phase logging and script-budget validation.
 - **CI Provenance:** Independent lint and quick jobs, engine provenance logging and an adjusted long-workflow timeout.
