@@ -9,7 +9,7 @@ This document serves as the technical architecture reference and system specific
 
 NAM-Audio-Pipe embeds [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) as its core DSP engine, providing complete model execution (WaveNet, LSTM, ConvNet, Linear), cabinet impulse response (IR) convolution, polyphase sample rate conversion, and anti-aliasing oversampling.
 
-> **Core Philosophy**: Source code is the primordial source of truth. This document defines the high-level system topology, threading model, memory layout, real-time safety contracts, and external system integrations that cannot be expressed within code comments alone.
+> **Core Philosophy**: Source code is the primordial source of truth. This document defines the high-level system topology, threading model, memory layout, real-time safety contracts, SPA latency accounting, and external system integrations that cannot be expressed within code comments alone.
 
 ---
 
@@ -26,19 +26,20 @@ In PipeWire's multimedia graph, an audio capture sink (`Audio/Sink`) processes i
 ┌──────────────────────────────┐              ┌───────────────────────────────┐
 │     Capture Stream / Node    │              │    Playback Stream / Node     │
 │   (NAM-Audio-Pipe-input)     │              │   (NAM-Audio-Pipe-playback)   │
-│   - Node: "Audio/Sink"       │              │   - Node: "Stream/Output"     │
-│   - Group: "nam-audio-pipe"  │              │   - Group: "nam-audio-pipe"   │
+│   - Node: "Audio/Sink"       │              │   - Node: "Stream/Output/Audio"│
+│   - Group:                   │              │   - Group:                    │
+│     "nam-audio-pipe-dsp"     │              │     "nam-audio-pipe-dsp"      │
 │   - Runs DSP on Audio Thread │              │   - Reads from DspBridge      │
 └──────────────┬───────────────┘              └───────────────▲───────────────┘
                │                                              │
-               │ (process_dsp)                                │ (on_process)
+               │ (capture_dsp_pipeline_streaming)             │ (on_process)
                ▼                                              │
        ┌──────────────────────────────────────────────────────────────┐
        │                   DspBridge (Shared Memory)                  │
        │  - Double-Buffered Scratch Arrays (buf_l, buf_r)             │
        │  - Lock-Free Atomic Read/Write Generation Synchronization    │
        │  - madvise(MADV_DONTFORK | MADV_DONTDUMP)                    │
-       │  - #[repr(align(128))] Cache-Line Isolation                  │
+       │  - #[repr(C, align(128))] Cache-Line Isolation               │
        └──────────────────────────────┬───────────────────────────────┘
                                       │
                                       │ (If --record active)
@@ -68,7 +69,7 @@ All PipeWire node names, stream descriptions, and thread loop identifiers are de
 | **Playback Node**   | `NAM-Audio-Pipe-playback` | `NAM-Audio-Pipe Processed Output` | `Stream/Output/Audio` (Audio playback source) | `PW_PLAYBACK_NODE_NAME` / `PW_PLAYBACK_NODE_DESC` |
 | **Playback Stream** | `NAM-Audio-Pipe-Output`   | Processed audio output stream     | Emits processed audio to hardware/patchbay    | `PW_PLAYBACK_STREAM_NAME`                         |
 
-### 1.2 Graph Scheduling Synchronization
+### 1.2 Graph Scheduling Synchronization & Control Plane Wakeup
 
 To eliminate inter-thread synchronization jitter, both streams are bound to identical scheduling groups:
 
@@ -77,34 +78,41 @@ To eliminate inter-thread synchronization jitter, both streams are bound to iden
 
 This configuration instructs the PipeWire graph scheduler to execute both capture and playback callbacks synchronously on the same real-time driver loop thread (`nam-audio-pipe-loop`, `PW_THREAD_LOOP_NAME`).
 
+Furthermore, coordination between the PipeWire `ThreadLoop` and the main process loop is managed by [`ControlPlaneWakeup`](../src/standalone/pw_host/wakeup.rs). Rather than relying on unconditional sleep intervals, state changes, format renegotiations, and shutdown events trigger instant condition variable notifications with a bounded fallback timeout ($\le 100\text{ ms}$), achieving near-zero latency control plane responsiveness without system call overhead on the audio thread.
+
 ---
 
 ## 2. Memory Architecture & Lock-Free Bridge (`DspBridge`)
 
-The shared memory bridge ([`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs)) coordinates zero-copy, lock-free audio transfer between the capture callback (which executes neural inference) and the playback callback (which copies processed buffers to hardware output).
+The shared memory bridge ([`src/standalone/pw_host/bridge.rs`](../src/standalone/pw_host/bridge.rs) and `neural_amp_modeler_rs::dsp::pipeline::DspBridge`) coordinates zero-copy, lock-free audio transfer between the capture callback (which executes neural inference) and the playback callback (which delivers processed buffers to hardware output).
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          DspBridge Memory Layout                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  #[repr(align(128))] buffers: [BridgeBuffer; 2]                             │
-│    - BridgeBuffer 0: buf_l: [f32; 8192], buf_r: [f32; 8192], n_samples: u32 │
-│    - BridgeBuffer 1: buf_l: [f32; 8192], buf_r: [f32; 8192], n_samples: u32 │
+│  #[repr(C, align(128))] buffers: [UnsafeCell<BridgeBuffer>; 2]              │
+│    - BridgeBuffer 0: buf_l: [f32; 8192], buf_r: [f32; 8192], n_samples, gen │
+│    - BridgeBuffer 1: buf_l: [f32; 8192], buf_r: [f32; 8192], n_samples, gen │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│  active_read_idx: AtomicUsize                                               │
-│  generation:      AtomicU64                                                 │
-│  consumed_gen:    AtomicU64                                                 │
-│  dropped_frames:  AtomicU32                                                 │
+│  Writer-Owned Line (128 bytes):                                             │
+│    - active_read_idx: AtomicUsize                                           │
+│    - generation:      AtomicU64                                             │
+│    - dropped_frames:  AtomicU32                                             │
+│    - _pad_writer:     [u8; 108]                                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Reader-Owned Line (128 bytes):                                             │
+│    - consumed_gen:    AtomicU64                                             │
+│    - _pad_reader:     [u8; 120]                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.1 Double Buffering & Cache Isolation
 
-- **Zero-Copy Double Buffering**: `DspBridge` contains two independent `BridgeBuffer` slots (`MAX_BRIDGE_BUF = 8192` samples). The capture stream writes to `buffers[1 - active_idx]` and flips `active_read_idx` using `Ordering::Release`. The playback stream loads `active_read_idx` using `Ordering::Acquire` and reads without mutex locks.
-- **Cache-Line Isolation (`#[repr(align(128))]`)**: The structure is aligned to 128 bytes to isolate cache lines and prevent CPU cache-line bouncing (false sharing) between threads.
-- **Page Alignment & Kernel Advisories**: Allocated dynamically with a 4096-byte page-aligned layout and wrapped in `BridgeRef`. Applies Linux memory flags:
+- **Zero-Copy Double Buffering**: `DspBridge` contains two independent `BridgeBuffer` slots (`MAX_BRIDGE_BUF = 8192` samples). Each slot is wrapped in `UnsafeCell` to provide interior mutability without creating aliasing `&mut DspBridge` references on the real-time hot path, ensuring full compliance with Stacked Borrows and Tree Borrows pointer provenance rules.
+- **Cache-Line Isolation (`#[repr(C, align(128))]`)**: Writer and reader atomic control fields are segregated into distinct 128-byte cache lines with explicit byte padding (`_pad_writer: [u8; 108]`, `_pad_reader: [u8; 120]`). This completely eliminates false sharing and cache-line bouncing between CPU cores, including 128-byte line architectures such as Apple Silicon and modern x86 server microarchitectures.
+- **Dynamic Page Alignment & Kernel Advisories**: Bridge memory is allocated via `calculate_bridge_layout`, dynamically querying the runtime system page size (`sysconf(_SC_PAGESIZE)`, accommodating 4, 16, and 64 KiB pages). Both base address and allocation length are padded to exact multiples of the page size, ensuring that Linux kernel memory advisories operate cleanly on dedicated memory pages:
   - `madvise(MADV_DONTFORK)`: Eliminates Copy-on-Write duplication overhead if child processes are spawned.
-  - `madvise(MADV_DONTDUMP)`: Excludes large scratch buffers from core dumps to conserve disk space during debugging.
+  - `madvise(MADV_DONTDUMP)`: Excludes large scratch buffers from core dumps to conserve disk space and speed crash analysis.
 
 ---
 
@@ -119,7 +127,7 @@ NAM-Audio-Pipe enforces strict thread segregation across three isolated executio
 │  - PipeWire Initialization & Shutdown Lifecycle                             │
 │  - Off-RT Resampler / CabSim Dynamic Rebuilds                               │
 │  - Housekeeping & SPSC Garbage Collection Drain (drain_gc_channels)         │
-│  - Telemetry Polling (poll_rt_status @ 10 Hz)                               │
+│  - Telemetry Polling & Control Plane Coordination (ControlPlaneWakeup)      │
 └──────┬──────────────────────────────┬───────────────────────────────┬───────┘
        │                              │                               │
        │ SPSC Command Channels        │ Atomic Telemetry              │ SPSC Audio Ring
@@ -136,10 +144,10 @@ NAM-Audio-Pipe enforces strict thread segregation across three isolated executio
 
 The audio processing callback executes under strict real-time determinism:
 
-1. **Zero Heap Allocations**: All scratch buffers, resamplers, layer weights, and convolution engines are pre-allocated during startup or swapped via SPSC pointers.
+1. **Zero Heap Allocations**: All scratch buffers, resamplers, layer weights, and convolution engines are pre-allocated during startup or swapped via single-producer single-consumer (SPSC) pointers.
 2. **Zero Mutex Locks**: Inter-thread coordination uses wait-free SPSC channels (`rtrb`) and atomic memory primitives.
 3. **Zero Blocking I/O**: Filesystem access, standard output printing, and direct logging macros (`log::*`) are prohibited in the audio callback.
-4. **Panic Containment**: Callback bodies are wrapped in `catch_unwind(AssertUnwindSafe)`. Unhandled panics latch the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` and mute output, allowing the main control loop to initiate a graceful shutdown instead of aborting the process.
+4. **Panic Containment**: Callback bodies are wrapped in `catch_unwind(AssertUnwindSafe)`. Unhandled panics latch the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` (bit 31) and mute output, allowing the main control loop to initiate a graceful shutdown and flush pending WAV files instead of aborting the process.
 
 ---
 
@@ -152,23 +160,24 @@ stateDiagram-v2
     [*] --> Starting
     Starting --> Running: Streams Active
     Starting --> Failed: Connection Error (Exit 5)
-    Running --> Degraded: Non-Fatal Anomaly
+    Running --> Degraded: Non-Fatal Anomaly (Format Mismatch)
     Degraded --> Running: Recovered
     Running --> Reconnecting: Daemon Loss / Stream Error
     Degraded --> Reconnecting: Daemon Loss
     Reconnecting --> Running: Reconnected (Within Budget)
     Reconnecting --> Failed: Budget Exhausted (Fail-Fast)
     Failed --> Terminated: Ordered Teardown (WAV Finalized)
-    Running --> Terminated: SIGINT / SIGTERM
+    Running --> Terminated: SIGINT / SIGTERM / SIGHUP
 ```
 
 #### Key Lifecycle Invariants
 
-- **Sticky Failure**: Once marked `Failed`, the state cannot revert to `Running` except through a formal reconnection handshake (`begin_reconnect`). The main control loop polls this status via an atomic fast-path, initiating teardown within 200 ms (fail-fast SLA < 500 ms).
+- **State Representation**: The FSM defines explicit variants: `Starting`, `Running`, `Degraded { reason: String }`, `Reconnecting { attempt: u32, total_attempts: u32, next_backoff: Duration }`, `Failed { stream: &'static str, reason: String }`, and `Terminated`.
+- **Sticky Failure**: Once marked `Failed`, the state cannot revert to `Running` except through a formal reconnection handshake (`begin_reconnect`). The main control loop polls this status via an atomic fast-path and `ControlPlaneWakeup`, initiating teardown immediately (fail-fast SLA $< 200\text{ ms}$, with $\le 100\text{ ms}$ fallback timeout).
 - **DSP State Preservation**: `CaptureState` (neural models, resamplers, cabinet IRs, gains) and RT-side SPSC channels reside in heap `Box` allocations reached via raw pointers outside stream closures. Re-instantiating PipeWire streams after a daemon restart preserves all internal processing state.
-- **Bounded Reconnect Budget**:
-  - Production default: 6 attempts with progressive exponential backoff (250 → 500 → 1000 → 2000 → 4000 → 4000 ms), capped at an 11.75-second ceiling per episode.
-  - When `--fail-fast` is passed, reconnection is disabled entirely.
+- **Bounded Reconnect Budget** ([`src/standalone/pw_host/reconnect.rs`](../src/standalone/pw_host/reconnect.rs)):
+  - Production default: 6 attempts (`PRODUCTION_MAX_ATTEMPTS`) with progressive exponential backoff (250 → 500 → 1000 → 2000 → 4000 → 4000 ms), capped at an 11.75-second ceiling per recovery episode.
+  - When `--fail-fast` is passed, reconnection is disabled entirely (`max_attempts = 0`).
   - `--reconnect-timeout <s>` allows operators to tune the total budget.
 - **Stability Window Reset (60 s)**: After 60 seconds (`STABLE_RESET`) of uninterrupted healthy streaming, the attempt budget is fully replenished. Transient drops over prolonged sessions never accumulate to trigger an unintended process exit.
 
@@ -181,8 +190,8 @@ Process termination is unified in [`src/standalone/signals.rs`](../src/standalon
 - **Signal Interception**: Installs an async-signal-safe handler for `SIGINT` (Ctrl+C), `SIGTERM` (systemd/containers), `SIGHUP` (terminal window closure), and `SIGQUIT`.
 - **Atomic Grace Window**:
   - The first signal sets the process-global `SHUTDOWN` atomic flag and initiates cooperative teardown.
-  - Normal grace window is 500 ms; when recording is active, `main()` extends this window to 5,000 ms (`RECORDING_GRACE_WINDOW_MS`) to allow in-flight WAV headers to rewrite and flush cleanly (`fsync`).
-  - Signals arriving within the grace window are ignored to avoid interrupting cleanup. Signals arriving *after* the window expires escalate to `_exit(1)`.
+  - Normal grace window is 500 ms (`DEFAULT_GRACE_WINDOW_MS`); when recording is active, `main()` extends this window to 5,000 ms (`RECORDING_GRACE_WINDOW_MS`) to allow in-flight WAV headers to rewrite and flush cleanly (`fsync`).
+  - Signals arriving within the grace window are ignored to avoid interrupting cleanup. Signals arriving *after* the window expires escalate immediately to `_exit(1)`.
 - **Broken Pipe Handling**: CLI outputs (`--help`, `--diagnose`) use `cli::write_stdout`, which tolerates `EPIPE` when piped to pagination utilities (`head -n 1`) without panicking.
 - **Color Discipline**: ANSI escape sequences are automatically disabled when standard output is redirected to files or pipes, respecting `NO_COLOR` and `CLICOLOR_FORCE`.
 
@@ -192,15 +201,15 @@ Process termination is unified in [`src/standalone/signals.rs`](../src/standalon
 
 Failures are categorized into distinct exit codes ([`src/standalone/exit.rs`](../src/standalone/exit.rs)) to facilitate script automation:
 
-| Exit Code | Classification   | Trigger Conditions                                              | User Remediation Hint                                |
-|:---------:|:---------------- |:--------------------------------------------------------------- |:---------------------------------------------------- |
-|   **0**   | Clean Success    | Normal process termination via signal or `--help`/`--diagnose`. | None (operation completed successfully).             |
-|   **1**   | Generic / Forced | Uncategorized failure or hard signal escalation after timeout.  | Inspect application error logs.                      |
-|   **2**   | Argument Error   | Malformed CLI flags, invalid buffer size, or missing files.     | Run with `-h` or `--help` to review syntax.          |
-|   **3**   | Model Load Error | Corrupt, missing, or unsupported `.nam`/`.namb` file format.    | Verify model file path and architecture support.     |
-|   **4**   | Cabinet IR Error | Unreadable or malformed cabinet impulse response `.wav` file.   | Check IR file format or pass `--cab-optional`.       |
-|   **5**   | Backend Error    | Unreachable PipeWire daemon or stream negotiation failure.      | Verify PipeWire daemon status (`systemctl --user`).  |
-|   **6**   | Recording Error  | Unwritable directory, `io_uring` failure, or buffer overruns.   | Check disk permissions and space availability.       |
+| Exit Code | Classification   | `ExitKind` Variant    | Trigger Conditions                                                         | User Remediation Hint                               |
+|:---------:|:---------------- |:--------------------- |:-------------------------------------------------------------------------- |:--------------------------------------------------- |
+| **0**     | Clean Success    | —                     | Normal process termination via signal or `--help`/`--diagnose`.            | None (operation completed successfully).            |
+| **1**     | Generic / Forced | `EXIT_GENERIC`        | Uncategorized failure or hard signal escalation after timeout.             | Inspect application error logs.                     |
+| **2**     | Argument Error   | `ExitKind::Usage`     | Malformed CLI flags, invalid buffer size, or missing files.                | Run with `-h` or `--help` to review syntax.         |
+| **3**     | Model Load Error | `ExitKind::Model`     | Corrupt, missing, or unsupported `.nam`/`.namb` file format.               | Verify model file path and architecture support.    |
+| **4**     | Cabinet IR Error | `ExitKind::CabIr`     | Unreadable or malformed cabinet impulse response `.wav` file.              | Check IR file format or pass `--cab-optional`.      |
+| **5**     | Backend Error    | `ExitKind::Backend`   | Unreachable PipeWire daemon or stream negotiation failure.                 | Verify PipeWire daemon status (`systemctl --user`). |
+| **6**     | Recording Error  | `ExitKind::Recording` | Unwritable directory, `io_uring` failure, or overruns (`SuccessWithLoss`). | Check disk permissions and space availability.      |
 
 ---
 
@@ -218,7 +227,7 @@ To guarantee glitch-free audio processing at quantum sizes down to 64 samples (1
 
 - **PM QoS (`/dev/cpu_dma_latency`)**: Pins CPU DMA latency to 0 µs, preventing power management from transitioning execution cores into deep sleep states (C-states: C1, C6, C8).
 - **Memory Paging Lock (`mlockall`)**: Locks the application's virtual address space into physical RAM (`MCL_CURRENT | MCL_FUTURE`), preventing page faults and swap disk I/O.
-- **Transparent Huge Pages (THP) Disablement**: Disables THP via `prctl(PR_SET_THP_DISABLE, ...)` to prevent kernel compaction daemon (`khugepaged`) latency spikes.
+- **Transparent Huge Pages (THP) Disablement**: Disables THP via `prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)` to prevent kernel compaction daemon (`khugepaged`) latency spikes.
 - **Hardware Sink Auto-Detection**: Queries `pw-metadata` with a 500 ms watchdog timeout to locate the default audio output sink, filtering out loopback nodes to prevent routing feedback.
 
 ### 4.3 Host Calibration Guidelines (Kernel Command Line)
@@ -249,9 +258,9 @@ Communication between the non-RT main thread and the real-time audio thread is c
 │                           SPSC Channel Topology                             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  param_channel:     Consumer<ParamPayload>       (Gains, Bypass, Modes)     │
-│  resampler_channel: Consumer<Box<NamResampler>>  (Off-RT Rebuilt Resamplers)│
-│  cabsim_channel:    Consumer<Option<Box<CabSimPair>>> (Off-RT Rebuilt IRs)  │
-│  slimmable_channel: Consumer<Option<Box<StaticModel>>> (A2 Submodels)       │
+│  resampler_channel: Consumer<ResamplerSwapPayload> (Off-RT Rebuilt Buffers) │
+│  cabsim_channel:    Consumer<CabSimSwapPayload>  (Off-RT Rebuilt IRs)       │
+│  slimmable_channel: Consumer<Box<SlimModelPair>> (A2 Submodels)             │
 │  os_channel:        Consumer<Box<OsEnginePair>>  (Oversampling Engines)     │
 │  gc_channel:        Producer<GcItem>             (Replaced Asset Dealloc)   │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -265,71 +274,134 @@ When models, resamplers, or impulse responses are replaced during playback, drop
 RT Thread (Replaced Asset)
        │
        ▼
-[Tier 1: SPSC gc_tx (32 slots)] ──────► Drained by Main Thread (10 Hz poll)
+[Tier 1: SPSC gc_tx (32 slots)] ──────► Drained by Main Thread (periodic housekeeping)
        │ (if full)
        ▼
 [Tier 2: RT Parking Lot (16 slots)] ──► Flushed to SPSC on next block;
-       │                                Single-owner handoff on shutdown
+       │                                Drained during orderly teardown
        │ (if full)
        ▼
 [Tier 3: GcOverflowBuffer Atomic Ring] ──► Controlled Leak + Sets RT_STATUS_GC_OVERFLOW
 ```
 
-1. **Tier 1 (SPSC GC Queue)**: Discarded assets are pushed to `gc_tx` (32 slots) and deallocated by the main thread during its 10 Hz poll (`drain_gc_channels`).
-2. **Tier 2 (RT Parking Lot)**: If the queue is momentarily full, items are stored in a fixed array on the RT thread (`PARKING_LOT_CAPACITY = 16`) and retried on subsequent blocks.
-3. **Tier 3 (GC Overflow Buffer)**: If both tiers are saturated, items are deposited into an atomic overflow ring with controlled leak semantics, raising the diagnostic flag `RT_STATUS_GC_OVERFLOW`.
+1. **Tier 1 (SPSC GC Queue)**: Discarded assets are pushed to `gc_tx` (32 slots) and deallocated by the main thread during housekeeping calls to `drain_gc_channels`.
+2. **Tier 2 (RT Parking Lot)**: If the queue is momentarily full, items are stored in a fixed array on the RT thread (`parking_lot: [Option<GcItem>; 16]`) and retried on subsequent blocks.
+3. **Tier 3 (GC Overflow Buffer)**: If both tiers are saturated, items are converted into packed 64-bit representations (56-bit pointer + 8-bit type ID) and deposited into an atomic overflow ring (`GcOverflowBuffer`). If packed conversion is unavailable, the memory is safely leaked to guarantee Zero-Heap-Drop, raising the diagnostic flag `RT_STATUS_GC_OVERFLOW`.
 
 ---
 
-## 6. DSP Pipeline & Quantum Bounds
+## 6. DSP Pipeline, Latency Accounting & SPA Semantics
 
-The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks:
+The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`capture_dsp_pipeline_streaming`](../src/standalone/pw_host/rt_callback/process.rs):
 
 ```text
-Audio Input (PipeWire)
+Audio Input (PipeWire Host Buffer)
        │
        ▼
-[Capture Ring / Channel Split] ──► [Input Gain Stage]
-                                          │
-                                          ▼
-                                   [Noise Gate / Envelope]
-                                          │
-                                          ▼
-                                   [Neural Model (NAM Core)]
-                                          │
-                                          ▼
-                                   [CabSim (UPOLS Partitioned FFT)]
-                                          │
-                                          ▼
-                                   [Output Gain Stage]
-                                          │
-                                          ▼
-                                  [Playback Bridge] ──► Audio Output (PipeWire)
+[Stage 1: Input Stage & Cleanup]
+  - Gain LUT scaling + Denormal FTZ/DAZ enforcement
+  - Noise Gate FSM (DynamicHysteresis)
+  - Closed Gate Path: Causal CabSim IR Tail Drain (reverb preservation)
+       │
+       ▼
+[Stage 2: Neural Inference & Streaming Resampler]
+  - Polyphase Resampling (if host_rate != model_rate)
+  - Polyphase Half-Band Oversampling (Off / 2× / 4×)
+  - Core Neural Network Inference (WaveNet, LSTM, ConvNet, Linear)
+  - Downsampling Decimation stages
+       │
+       ▼
+[Stage 3: CabSim Partitioned FFT Convolution]
+  - UPOLS Frequency-Domain Filtering (Host sample rate)
+  - Partition size decoupled from quantum (32, 64, 128, 256 frames)
+       │
+       ▼
+[Stage 4: Output Gain Stage & Envelope Protection]
+  - Output Gain LUT scaling + Gate envelope smoothing
+       │
+       ▼
+[Stage 5: Final Delivery to DspBridge] ──► Audio Output (PipeWire Playback Stream)
 ```
 
 ### 6.1 Static Buffer Limits & Negotiation
 
 To guarantee deterministic memory bounds, all components enforce strict maximum limits:
 
-| Constant / Limit       | Boundary Constraint               | Architectural Enforcement                                                         |
-|:---------------------- |:--------------------------------- |:--------------------------------------------------------------------------------- |
-| `MAX_BRIDGE_BUF`       | 8192 samples                      | `DspBridge` width; callbacks reject larger descriptors fail-closed.               |
-| `MAX_RESAMP_BUF`       | 8192 samples                      | Bounds maximum memory allocation for resamplers and oversampling engines.         |
-| CabSim Partition Size  | Clamped to `[16, MAX_RESAMP_BUF]` | CLI `--cabsim-partition` domain `{32, 64, 128, 256}` (default `128`), decoupled from the host quantum. |
-| `--buffer-size` Domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`  | Validated at CLI parsing; invalid values reject before PipeWire graph connection. |
+| Constant / Limit       | Boundary Constraint               | Architectural Enforcement                                                                          |
+|:---------------------- |:--------------------------------- |:-------------------------------------------------------------------------------------------------- |
+| `MAX_BRIDGE_BUF`       | 8192 samples                      | `DspBridge` width; callbacks reject larger descriptors fail-closed.                                |
+| `MAX_RESAMP_BUF`       | 8192 samples                      | Bounds maximum memory allocation for resamplers and oversampling engines.                          |
+| CabSim Partition Size  | Clamped to `[16, MAX_RESAMP_BUF]` | CLI `--cabsim-partition` domain `{32, 64, 128, 256}` (default `128`), decoupled from host quantum. |
+| `--buffer-size` Domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`  | Validated at CLI parsing; invalid values reject before PipeWire graph connection.                  |
 
-### 6.2 Real-Time Watchdog & Dynamic Downgrade
+### 6.2 Adaptive Compute & Slimmable Submodel Swaps
 
-If DSP processing time exceeds 80% of the quantum deadline (`DEADLINE_EXCEEDED`), the engine transitions to a degraded state (`DEGRADE`), swapping to a lightweight A2 submodel via SPSC channels to prevent audible dropouts. When CPU contention subsides, full processing is automatically restored.
+When executing slimmable neural architectures (e.g. A2 models with dynamic layer pruning), real-time load is monitored by `AdaptiveCompute`:
 
-### 6.3 Latency Publication, Oversampling Accounting & Seqlock Snapshot
+1. **Triggering**: If processing cycles exceed the configured threshold, `try_slimmable_rebuild` raises `RT_STATUS_NEEDS_SLIMMABLE_REBUILD` and stores the target channel in `requested_slimmable_ch`, incrementing `requested_slimmable_generation` with `Ordering::Release`.
+2. **Off-RT Reconstruction**: The main thread detects the request, builds the replacement `SlimModelPair` on a background thread without audio interruption, and pushes it to `slimmable_channel`.
+3. **Atomic RT Swap**: `drain_slimmable_models` executes `SlimmableSwapHandler` under an engine scheduler budget (1 structural swap per callback), atomically replacing active left and right models (`install_pair`) and routing old models to the GC cascade as `GcItem::SlimModelPair`.
 
-Latency compensation in the PipeWire graph requires accurate, lock-free publication of all algorithmic DSP delays (resampling, CabSim UPOLS priming, and oversampling filter stages):
+---
 
-1. **Oversampling Conversion**: `OversampleEngine::latency_samples` returns native filter latency at model rate. `convert_os_latency_to_host(os_native, host_rate, model_rate)` converts this delay to host sample units.
-2. **Coherent Seqlock Snapshot**: `StreamStatusFlags` holds atomic counters for resampler, CabSim, and oversampling latencies, protected by `latency_sequence: AtomicU64`. The audio thread updates latencies without locks or allocation; non-RT watchers read consistent snapshots via `read_applied_latencies`.
-3. **Fail-Closed Metadata Stamp**: On starvation or descriptor validation errors, silence fallback routines (`deliver_playback_pair_fail_closed`, `deliver_silence_pair_fail_closed`) explicitly stamp chunk metadata (`offset = 0`, `size = 0`, `stride = 4`) to prevent downstream graph drivers from reading undefined memory regions.
-4. **SPA Semantics**: Detailed findings and recommendations regarding SPA `rate` vs `ns` parameters are documented in [docs/latency-spa-adr.md](latency-spa-adr.md).
+### 6.3 Algorithmic Latency Publication & Seqlock Snapshot
+
+Latency compensation in the PipeWire graph requires accurate, lock-free publication of all algorithmic DSP delays:
+
+1. **Oversampling Conversion**: `OversampleEngine::latency_samples` returns native filter latency at model rate. The function `convert_os_latency_to_host(os_native, host_rate, model_rate)` scales this delay to host sample units with integer ceiling:
+   $$\text{os\_host} = \left\lceil \frac{\text{os\_native} \times \text{host\_rate}}{\text{model\_rate}} \right\rceil$$
+2. **Coherent Seqlock Snapshot**: Algorithmic latencies (CabSim partition, resampler group delay, oversampling filter latency) are updated atomically by the audio thread and synchronized via a wait-free sequence lock (`latency_sequence: AtomicU64` in `StreamStatusFlags`):
+   - The audio writer increments `latency_sequence` with `Ordering::Release` before and after updating latency fields.
+   - Non-RT watchers in `run.rs` read the snapshot via `read_applied_latencies`, validating consistency before publishing updates to PipeWire via `pw_stream_set_parameter`.
+
+---
+
+### 6.4 PipeWire SPA Latency Semantics (`rate` vs `ns`)
+
+Latency parameters are published to the PipeWire graph using the SPA POD API (`SPA_PARAM_ProcessLatency` and `SPA_PARAM_Latency`) in [`src/standalone/pw_host/latency.rs`](../src/standalone/pw_host/latency.rs):
+
+```rust
+builder.add_property(SPA_LATENCY_min_rate, latency_samples);
+builder.add_property(SPA_LATENCY_max_rate, latency_samples);
+builder.add_property(SPA_LATENCY_min_ns, latency_ns);
+builder.add_property(SPA_LATENCY_max_ns, latency_ns);
+```
+
+#### Additive Delay Proof (PipeWire 1.6.2 Engine)
+
+Inspection of installed system headers (`spa/param/latency.h`) and PipeWire source code (`src/pipewire/stream.c`, function `pw_stream_get_time_n`) demonstrates how PipeWire calculates total graph delay:
+
+```c
+/* PipeWire src/pipewire/stream.c lines 980-990 */
+time->delay += (latency.min_rate + latency.max_rate) / 2;
+time->delay += ((latency.min_ns + latency.max_ns) / 2) * (int64_t)time->rate.denom
+             / ((int64_t)SPA_NSEC_PER_SEC * time->rate.num);
+```
+
+- **Additive Behavior**: PipeWire does **not** evaluate `rate` and `ns` as fallback alternatives; it evaluates both terms and sums them into `time->delay`.
+- **Double Compensation Risk**: When `latency_samples` is written to `min_rate`/`max_rate` and the exact same duration is converted to nanoseconds and written to `min_ns`/`max_ns`, PipeWire sums the two, doubling the reported delay in graph time calculations.
+- **Canonical DSP Emission**: For sample-based synchronous DSP nodes running at graph rate, the canonical configuration is:
+  $$\text{min\_rate} = \text{max\_rate} = \text{latency\_samples}, \quad \text{min\_ns} = \text{max\_ns} = 0$$
+  The `ns` parameter is reserved for fixed-time asynchronous components (e.g. USB packet intervals or Bluetooth frame scheduling) operating independently of graph sample rates.
+
+#### Starvation Success vs. SPA Validation Failure
+
+The playback callback strictly distinguishes expected pipeline starvation from host protocol violations:
+
+- **Bridge Starvation (Success Path)**: When the capture stream produces no new block during a quantum (due to paused input, active resampler rebuild, or clock drift), playback dequeues the buffer, validates descriptors, and delivers coherent analytical silence with `offset = 0`, `size = silence_bytes`, `stride = 4`. This is a normal operational condition and must never be reported as an SPA contract violation.
+- **Malformed SPA Descriptors (Validation Failure)**: A malformed descriptor (null or unaligned pointers, non-cardinal buffer sizes, out-of-bounds windows, asymmetric frame counts, or overlapping left/right channels) represents a host contract violation. The callback sets `RT_STATUS_HOST_CONTRACT_VIOLATION` (`E2304`), zeroes provably writable memory regions, and stamps `size = 0` to prevent downstream nodes from reading uninitialized memory.
+
+#### Operator Verification Protocol
+
+To inspect published graph latency on a live system:
+
+```bash
+# Inspect node latency published to PipeWire:
+pw-dump | jq '.[] | select(.info.props["node.name"] == "NAM-Audio-Pipe-playback") | .info.params.Latency'
+
+# Monitor real-time graph scheduling delay:
+pw-top
+```
 
 ---
 
@@ -395,13 +467,15 @@ nam-audio-pipe --diagnose-full
 
 ### 8.2 Error Taxonomy (`NamErrorCode`)
 
-| Code Range | Category              | Representative Identifiers                                                                    |
-|:---------- |:--------------------- |:--------------------------------------------------------------------------------------------- |
-| `E1xxx`    | Model, IR & CLI Setup | `E1001` NAM_LOAD_FAILED, `E1002` NAM_PARSE_FAILED, `E1003` IR_LOAD_FAILED, `E1004` DUAL_MODEL_RATE_MISMATCH, `E1005` INVALID_PARAMETER, `E1006` MODEL_DIM_MISMATCH, `E1007` RECORDING_INIT_FAILED, `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1300` UNSUPPORTED_ARCHITECTURE |
-| `E2xxx`    | Audio & Real-Time     | `E2001` DEADLINE_EXCEEDED / SAMPLE_RATE_MISMATCH, `E2004` OS_SCRATCH_CAPACITY, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2115` HW_SINK_PROBE_TRUNCATED, `E2120` PAGE_SIZE_QUERY_FAILED, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2202` CABSIM_BUILD_FAILED, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH, `E2400` BACKEND_FAILURE |
-| `E3xxx`    | SPSC / Lock-Free DSP  | `E3001` XRUN_DETECTED, `E3002` DENORMAL_DETECTED, `E3003` INFERENCE_FAULT, `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_STARVATION / GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED |
-| `E4xxx`    | Runtime & CLI         | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                       |
-| `E5xxx`    | System Resources      | `E5000` OUT_OF_MEMORY                                                                         |
+Typed error codes are managed by `neural_amp_modeler_rs::common::diagnostics::NamErrorCode`:
+
+| Code Range | Category              | Canonical Error Identifiers                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+|:---------- |:--------------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E1xxx`    | Model, IR & CLI Setup | `E1100` FILE_NOT_FOUND, `E1101` FILE_READ_ERROR, `E1102` UNKNOWN_EXTENSION, `E1200` NAM_JSON_PARSE_ERROR, `E1201` NAMB_CRC32_MISMATCH, `E1202` NAMB_INVALID_MAGIC, `E1203` NAMB_UNSUPPORTED_VERSION, `E1204` NAMB_TRUNCATED, `E1214` NAM_JSON_INVALID_SAMPLE_RATE, `E1220` NAM_JSON_INVALID_ENVELOPE, `E1300` UNSUPPORTED_ARCHITECTURE, `E1303` MODEL_BUILD_FAILED, `E1308` SEQUENTIAL_CHANNEL_MISMATCH, `E1400` WAV_INVALID_FORMAT, `E1401` WAV_INVALID_FILE |
+| `E2xxx`    | Audio & Real-Time     | `E2001` PROCESSING_OVERLOAD, `E2100` AUDIO_INIT_FAILED, `E2101` STREAM_ERROR, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2202` INVALID_CABSIM_PARTITION_SIZE, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_AFFINITY_FAILED, `E2302` BACKEND_FAILURE, `E2304` HOST_FORMAT_CONTRACT_VIOLATION                                                                                                                                                 |
+| `E3xxx`    | SPSC / Lock-Free DSP  | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED, `E3103` INVALID_SPSC_CAPACITY                                                                                                                                                                                                                                                                                                                                                          |
+| `E4xxx`    | Runtime & CLI         | `E4100` INVALID_GAIN_VALUE, `E4101` UNKNOWN_COMMAND, `E4102` CTRL_C_HANDLER_FAILED, `E4103` IR_LOAD_FAILED                                                                                                                                                                                                                                                                                                                                                    |
+| `E5xxx`    | System Resources      | `E5000` OUT_OF_MEMORY, `E5001` UNSUPPORTED_CPU_ARCHITECTURE                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 ### 8.3 Pure-Rust PipeWire Log Redirection (Rust 1.99 Variadics)
 

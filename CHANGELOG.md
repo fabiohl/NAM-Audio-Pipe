@@ -12,41 +12,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Long audit evidence:** partial `--only` runs write sibling receipts and preserve the previous full audit; full runs are validated with `pipe_long_receipt validate --strict`, and FAILED phases carry a typed `reason`.
-- **PipeWire capabilities:** live/recording tests fail closed instead of silently passing when the daemon, `pw-play` or `io_uring` is unavailable; the long suite declares those absences as typed GAPs before running them.
-- **Release provenance and packaging:** `--certify` never recompiles, the verifier is located without parsing help text, build and long `run_id` values are reconciled through `target/logs/build-run-id`, a stale release receipt is removed before a failed certification, and `LICENSE.txt` plus the engine `NOTICE` are included in the tarball and Flatpak.
-- **CI:** hosted long runs exclude `rt-deadline`/`rt-jitter`, and the MSRV job records and uploads provenance.
-
 ## [1.1.0] - 2026-11-01
 
-### Added
+### Added [1.1.0]
 
 - **PipeWire Latency Reporting:** Stream properties and latency reporting driven by the real PipeWire graph.
 - **Rust QA Receipts:** Long-phase receipt tooling in Rust with `run_id` support (flags or `NAM_RUN_ID`), unified phase logging and script-budget validation.
 - **CI Provenance:** Independent lint and quick jobs, engine provenance logging and an adjusted long-workflow timeout.
+- **A/B Optimization Ceremony Tooling:** Added `utils/ab-opt-ceremony.sh` and the `pipe_ab_opt` comparison binary backed by `src/receipt/ab_opt.rs`, generating `ab-opt-ceremony-receipt.json` with median P99 cycle evaluation across neural topologies (`wavenet_a1`, `wavenet_a2`, `lstm`) and an explicit 1.0% promotion margin rule.
+- **PipeWire SPA Latency Architecture Decision Record:** Added `docs/latency-spa-adr.md` defining PipeWire SPA latency accounting (`SPA_PARAM_Latency`), sample-rate vs nanosecond evaluation invariants, UPOLS partition alignment, and live graph latency publication.
+- **Engine Dependency Pinning:** Added `variables.env` as the authoritative single source of truth for upstream/sibling `NeuralAmpModeler-rs` engine repository, release tag (`v2.0.0`), and pinned commit hash.
 
-### Changed
+### Changed [1.1.0]
 
 - **Receipt and Workflow Architecture:** Migrated the QA script architecture to Rust-based receipts and workflows; cleaned up RT log-ring tests and modularized test log utilities.
 - **Recording and Standalone Modules:** Improved recording, receipt and standalone module structure with hardened error handling.
 - **CPU Headroom Documentation:** Updated CPU headroom benchmarks and PipeWire host execution metrics.
 - **Memory Guard:** Test and build scripts run under the project's memory guard to protect the host from OOM.
+- **PipeWire Host & Control Plane Architecture:** Decoupled PipeWire host initialization and stream negotiation into dedicated modules (`spa_format.rs`, `stream_status.rs`, `os_swap.rs`, `slimmable_swap.rs`), replacing polling sleeps with deterministic event-driven control plane wakeups (`ControlPlaneWakeup`).
+- **CLI Domain Extraction:** Refactored CLI argument parsing by moving domain models, path expansion, and argument validation into `src/standalone/cli_domain.rs`, streamlining `src/standalone/cli.rs`.
+- **Release Pipeline Hardening:** Updated `utils/build-release.sh` to enforce ceremony proofs under `--strict`, handle fallback to PGO-only when BOLT does not meet the promotion margin, and ensure non-recompiling `--certify` receipt reconciliation.
 
-### Fixed
+### Fixed [1.1.0]
 
 - **Telemetry Startup:** Suppressed false-positive telemetry startup drops and updated the Flatpak PipeWire permissions.
 - **Cab-sim Latency Tests:** Consumer tests now follow the engine's constant partition-sized priming latency (the ESR stream is compared after the full partition prefix).
+- **Recording Pool Pointer Safety:** Removed nullable raw pointer (`*mut u8`) in `RecordingPool` blocks (`src/recording/pool.rs`), substituting safe references and hardened slot validation (#2).
+- **Long Audit Evidence:** Partial `--only` runs write sibling receipts and preserve previous full audit evidence; full runs are validated via `pipe_long_receipt validate --strict`, and failed phases emit a typed `reason`.
+- **PipeWire Capabilities:** Live and recording tests fail closed instead of silently passing when the PipeWire daemon, `pw-play`, or `io_uring` is unavailable; the long audit suite declares those absences as typed GAPs before running.
+- **Release Provenance & Packaging:** `--certify` never recompiles, the verifier is located without parsing help text, build and long `run_id` values are reconciled through `target/logs/build-run-id`, stale release receipts are purged before a failed certification, and `LICENSE.txt` plus the engine `NOTICE` are bundled into distribution tarballs and Flatpak.
+- **CI Provenance & Matrix:** Hosted long workflow runs exclude isolated hardware phases (`rt-deadline`, `rt-jitter`), MSRV job records and uploads provenance logs, and workflow steps use pinned engine references.
+- **RT Log-Ring Robustness:** Hardened atomic ring buffer boundaries and log redirection to prevent buffer overflows or corrupted log lines under high-throughput logging.
 
 ---
 
 ## [1.0.0] - 2026-10-20
 
-### Added
+### Added [1.0.0]
 
 - **Native PipeWire Standalone Host:** Direct integration with `libpipewire-0.3` client API, processing audio over PipeWire multimedia graphs at quantum buffer sizes down to 64 samples (1.33 ms).
-- **Core Neural Engine Integration:** Embedded [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) 1.0.0 DSP core with full support for:
+- **Core Neural Engine Integration:** Embedded [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) DSP core with full support for:
   - WaveNet models (A1 and A2 standard and lite profiles).
   - LSTM models (1-layer and 2-layer recurrent network topologies).
   - ConvNet and Linear FIR architectures.
@@ -96,3 +101,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Standalone desktop application targeting `org.freedesktop.Platform` 25.08.
   - Scoped low-latency audio permissions (`--filesystem=xdg-run/pipewire-0`, `--socket=pulseaudio`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--filesystem=xdg-music`).
   - XDG desktop integration and complete hicolor icon theme hierarchy (SVG + 64x64 to 512x512 PNGs).
+
+[Unreleased]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.1.0...HEAD
+
+[1.1.0]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.0.0...v1.1.0
+
+[1.0.0]: https://github.com/fabiohl/NAM-Audio-Pipe/releases/tag/v1.0.0

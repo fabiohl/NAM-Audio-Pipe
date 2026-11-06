@@ -19,13 +19,14 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     </p>
     <p>Key features include:</p>
     <ul>
-      <li>Direct native PipeWire integration (libpipewire-0.3) at low quantum buffer sizes (down to 64 samples).</li>
-      <li>Inherited NeuralAmpModeler-rs DSP engine supporting WaveNet (A1/A2 standard and lite) and LSTM topologies.</li>
+      <li>Direct native PipeWire integration (libpipewire-0.3) at low quantum buffer sizes down to 64 samples (1.33 ms).</li>
+      <li>Embedded NeuralAmpModeler-rs DSP engine supporting WaveNet (A1/A2), LSTM, ConvNet, Linear FIR, and Sequential topologies in standard .nam and binary .namb v2 formats.</li>
       <li>Strict real-time safety: zero heap allocations, zero mutex locks, and zero blocking calls on the audio loop.</li>
-      <li>Integrated CabSim Impulse Response (IR) loader and zero-latency partitioned convolution.</li>
-      <li>Concurrent asynchronous 32-bit float WAV recording powered by Linux io_uring with 4 GiB auto-split and noise gate trim.</li>
-      <li>Half-band polyphase anti-aliasing oversampling (2× and 4×) and adaptive compute auto-slimming.</li>
-      <li>Hardware-accelerated SIMD AVX2/FMA baseline vectorization.</li>
+      <li>Integrated CabSim Impulse Response (IR) loader with zero-latency partitioned UPOLS convolution and configurable partition sizes (32–256 samples).</li>
+      <li>PipeWire SPA latency reporting with live graph feedback and exact sample delay compensation.</li>
+      <li>Concurrent asynchronous 32-bit float stereo WAV recording powered by Linux io_uring with pre-allocated slot pools, 4 GiB auto-split, and noise-gate trimming.</li>
+      <li>Half-band polyphase anti-aliasing oversampling (2× and 4×) and adaptive compute auto-slimming under CPU pressure.</li>
+      <li>Hardware-accelerated SIMD AVX2/FMA baseline vectorization (x86-64-v3) with Profile-Guided Optimization (PGO) and LLVM BOLT code reordering.</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.fabiohl.NAMAudioPipe.desktop</launchable>
@@ -53,7 +54,11 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <keyword>neural-network</keyword>
     <keyword>wavenet</keyword>
     <keyword>lstm</keyword>
+    <keyword>convnet</keyword>
     <keyword>dsp</keyword>
+    <keyword>io_uring</keyword>
+    <keyword>simd</keyword>
+    <keyword>real-time</keyword>
   </keywords>
   <supports>
     <control>keyboard</control>
@@ -70,11 +75,13 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
       <description>
         <p>NAM-Audio-Pipe 1.1.0:</p>
         <ul>
-          <li>PipeWire latency reporting and stream properties driven by the live graph.</li>
-          <li>Rust-based long-phase receipts with run-id provenance and unified phase logging.</li>
-          <li>Partition-aligned UPOLS cab-sim latency (constant partition priming, declared to the host).</li>
-          <li>Hardened recording, receipt and standalone modules; memory-guarded test and build scripts.</li>
-          <li>Independent CI lint and quick jobs with engine provenance and always-uploaded evidence.</li>
+          <li>PipeWire SPA latency reporting and stream properties dynamically synchronized with the multimedia graph.</li>
+          <li>Partition-aligned UPOLS cab-sim latency with constant partition priming declared to the host.</li>
+          <li>Rust-based QA receipts with run-id provenance, unified phase logging, and automated script-budget validation.</li>
+          <li>Hardened recording pool with safe memory references and resilient slot allocation under io_uring.</li>
+          <li>Automated A/B optimization ceremony (Plain vs PGO vs BOLT) with promotion proofs.</li>
+          <li>Independent CI lint and quick verification jobs with engine commit provenance and always-uploaded diagnostic bundles.</li>
+          <li>Memory-guarded test and build scripts to prevent host out-of-memory (OOM) conditions.</li>
         </ul>
       </description>
     </release>

@@ -9,7 +9,7 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 **NAM-Audio-Pipe** is an ultra-low latency, real-time standalone PipeWire host application for [Neural Amp Modeler (NAM)](https://www.neuralampmodeler.com/) simulation on Linux.
 
-Turn your Linux machine into a world-class, instantaneous guitar amplifier or studio rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine, NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
+Turn your Linux machine into a world-class, instantaneous guitar amplifier or studio rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine (v2.0.0), NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
 
 Whether practicing at home, tracking live in the studio, or performing on stage, NAM-Audio-Pipe delivers studio-grade tone with **analog-like responsiveness**, **sub-millisecond buffer sizes**, **zero dropouts**, and **one-touch lock-free WAV recording**.
 
@@ -36,7 +36,7 @@ Hand-written vector SIMD compute kernels (`x86-64-v3` AVX2/FMA baseline) monomor
 - **Const-Generic Optimization & Dynamic Topologies**: Features 24 distinct model variants (16 static const-generic profiles + zero-allocation dynamic fallbacks). Canonical channel counts ($CH=16, 12, 8, 4, 3$), kernel sizes, and receptive fields are monomorphized at compile time, enabling aggressive LLVM loop unrolling and register allocation.
 - **Zero-Vtable Dispatch**: The static `dispatch_simd!` engine eliminates all indirect function pointers and vtable lookups on the audio path. Compute kernels utilize tap-major memory layouts and instruction-level parallelism (`sum0..sum3`) unrolling.
 - **Adaptive Compute FSM**: Dynamic CPU load-monitoring state machine with hysteresis (`--slim auto`) that automatically throttles model complexity under system spikes (Full → Reduced → Minimal) using 32 ms click-free linear crossfades to prevent buffer dropouts.
-- **Microarchitecture Layout Optimization**: Compiled with Profile-Guided Optimization (PGO) and LLVM BOLT instruction reordering to maximize CPU Instruction Cache (I-Cache) and TLB hit rates.
+- **Microarchitecture Layout Optimization**: Compiled with Profile-Guided Optimization (PGO) and LLVM BOLT instruction reordering, validated and promoted through the automated A/B optimization ceremony (`utils/ab-opt-ceremony.sh`) to maximize CPU Instruction Cache (I-Cache) and TLB hit rates.
 
 ### 🛡️ 3. Strict Hard Real-Time Determinism (The Three Laws of Audio DSP)
 
@@ -51,7 +51,7 @@ Engineered from the ground up for zero-dropout live playing:
 
 No external audio libraries or third-party wrappers needed:
 
-- **Zero-Latency Cabinet Simulation**: Uniformly Partitioned Overlap-Save (UPOLS) FFT convolution engine runs cabinet impulse responses (`.wav`) in **$1.3\text{ µs}$** (for 512-sample IRs) with bounded, deterministic latency.
+- **Zero-Latency Cabinet Simulation & SPA Delay Accounting**: Uniformly Partitioned Overlap-Save (UPOLS) FFT convolution engine runs cabinet impulse responses (`.wav`) in **$1.3\text{ µs}$** (for 512-sample IRs) with bounded, deterministic latency and configurable partition sizes (`32`, `64`, `128`, `256` samples) via `--cabsim-partition`. Algorithmic priming latency is strictly declared to the PipeWire graph scheduler via SPA latency properties (`SPA_PARAM_Latency`), guaranteeing exact sample delay compensation across connected nodes (see [`docs/latency-spa-adr.md`](docs/latency-spa-adr.md)).
 - **Minimum-Phase Polyphase Sinc Resampling**: Native 256 phases × 64 taps Kaiser sinc resampler (Kaiser $\beta=12$, $>105\text{ dB}$ stopband attenuation, $< 0.05\text{ dB}$ passband ripple, zero pre-ringing, $0.7\text{–}1.3\text{ µs}$ execution) seamlessly adapts 48 kHz models to any host sample rate (44.1 kHz, 96 kHz, 192 kHz).
 - **Half-Band Anti-Aliasing Oversampling**: Multi-stage half-band polyphase FIR filters (`Off`, `2x`, `4x`, $>100\text{ dB}$ stopband attenuation) attenuate non-linear high-frequency foldover distortion on screaming high-gain leads.
 - **Selectable Activation Precision**: Choose between `standard` (exact Taylor minimax, +89.5 dB SNR) and `fast` (Padé polynomial minimax approximation) to tailor math precision against CPU cycles.
@@ -61,9 +61,10 @@ No external audio libraries or third-party wrappers needed:
 
 Capture your tone directly to pristine 32-bit float stereo WAV files without touching DAW software:
 
-- **Zero-Impact `io_uring` Engine**: Audio samples travel through a pre-allocated 64 KiB slot pool transport (~57% lower memory traffic than traditional rings) and write to disk via Linux `tokio-uring`.
+- **Zero-Impact `io_uring` Engine**: Audio samples travel through a pre-allocated 64 KiB slot pool transport with safe, non-nullable memory references (~57% lower memory traffic than traditional rings) and write to disk via Linux `tokio-uring`.
 - **Crash-Resilient Header Checkpointing**: Automatically updates WAV header chunk lengths and invokes `fsync` every 3 seconds. An unexpected power outage or signal kill loses at most 3 seconds instead of destroying the entire recording.
 - **Automatic 4 GiB RIFF File Splitting**: Seamlessly splits extended jam sessions into continuous, gapless `_partN.wav` segments.
+- **Noise Gate Silence Trimming**: Only commits audio blocks to disk when the silence gate is open, avoiding massive empty files during rehearsal pauses.
 
 ### 🐧 6. Deep Linux Real-Time Hardening
 
@@ -154,6 +155,7 @@ You will hear your guitar processed with full neural simulation in real time!
 | **Neural Amp Simulation**        | Full `NeuralAmpModeler-rs` engine (WaveNet A1/A2, LSTM, ConvNet, Linear, Sequential)         | Authentic tube amp tone with exact dynamic feel and pick-attack nuance                       |
 | **Native PipeWire Routing**      | Direct Client API (`libpipewire-0.3-dev`) via `pipewire` crate                               | Seamless integration with `qpwgraph`, `Helvum`, and system audio patchbays                   |
 | **Latency Benchmark**            | Native quantums down to 64 samples ($1.33\text{ ms}$ at 48 kHz)                              | Imperceptible latency matching real analog hardware amplifiers                               |
+| **SPA Latency Publication**      | Real-time `SPA_PARAM_Latency` synchronization based on active DSP stages and graph rate      | Exact host delay compensation preventing phase alignment errors in complex graphs            |
 | **Real-Time Safety**             | Strict zero heap allocations, zero mutex locks, zero blocking I/O                            | Absolute reliability on stage and in the studio—no audio glitches or xruns                   |
 | **Numerical Accuracy**           | Dual-oracle verified against C++ NAMCore $f32$ & $f64$ oracles (52 model baselines)          | Laboratory-grade fidelity ($>136.4\text{ dB}$ SNR on WaveNet, $>150.3\text{ dB}$ on ConvNet) |
 | **Const-Generic Profiles**       | 24 model variants (16 static compile-time profiles $CH=16, 12, 8, 4, 3$ + dynamic fallbacks) | Compile-time loop unrolling and optimal register allocation for canonical architectures      |
@@ -164,7 +166,7 @@ You will hear your guitar processed with full neural simulation in real time!
 | **Smart Silence Gate**           | Polymorphic gate (`on`/`off`/custom dBFS) with 10 dB Schmitt hysteresis                      | Silences pickup hum and hiss during pauses without cutting off sustain                       |
 | **Binary `.namb` v2 Format**     | Pre-transposed memory layout (Gate-Major LSTM, Interleaved-4 WaveNet) with CRC32             | Lightning-fast model loading and live hot-swapping in $< 1\text{ ms}$ (vs ~50 ms JSON)       |
 | **Denormal Armor**               | Symmetric −220 dBFS dither injection + hardware MXCSR FTZ/DAZ                                | Prevents 10–100× CPU microcode stalls on digital silence with zero net DC drift              |
-| **Asynchronous WAV Recording**   | Non-blocking slot pool transport + Linux `tokio-uring` engine                                | Lossless 32-bit float stereo recording straight to disk with zero audio thread burden        |
+| **Asynchronous WAV Recording**   | Non-blocking slot pool transport with safe references + Linux `tokio-uring` engine           | Lossless 32-bit float stereo recording straight to disk with zero audio thread burden        |
 | **Crash Protection**             | Periodic 3-second header checkpointing & 5-second graceful signal shutdown                   | Saves your take even if the host machine experiences a sudden power loss                     |
 | **Kernel Latency Tuning**        | Real-time PM QoS ($0\text{ µs}$), `mlockall`, THP disable, CPU IRQ isolation                 | Prevents CPU sleep states and operating system scheduler interruptions                       |
 | **Adaptive Compute**             | Dynamic CPU pressure monitoring (`--slim auto`) with 32 ms crossfading                       | Automatically throttles model complexity under system overload to prevent dropouts           |
@@ -217,14 +219,14 @@ Execution times for isolated DSP kernels measured per **64-sample block at 48 kH
 
 In live operation, `nam-audio-pipe` runs as a native PipeWire SPA client executing the complete end-to-end audio processing chain (Capture callback $\rightarrow$ Input gain & Noise Gate $\rightarrow$ Neural Model inference $\rightarrow$ UPOLS Cabinet Convolution $\rightarrow$ SPSC lock-free transport $\rightarrow$ Playback output):
 
-| Host Metric / Invariant               | Measured Specification                         | Architectural Guarantee                                            |
-|:------------------------------------- |:---------------------------------------------- |:------------------------------------------------------------------ |
-| **Native Quantum Support**            | Down to **64 samples** ($1.33\text{ ms}$ at 48 kHz) | Sub-millisecond buffer scheduling with zero driver jitter          |
-| **Full Rig CPU Budget Used (64 samp)**| **$< 8\%$** (WaveNet Standard + CabSim)        | Over **$> 92\%$** CPU headroom preserved for system and desktop UI |
-| **Real-Time Memory Allocations**      | **0 heap allocations**                         | Enforced via `CountingAllocator` in RT processing loop             |
-| **Lock-Free Concurrency**             | SPSC lock-free atomic queues                   | Zero mutexes, zero blocking system calls in audio callback         |
-| **Full-Chain Parity vs $f64$ Oracle** | WaveNet ESR $< 1.05 \times 10^{-12}$, LSTM $< 2.71 \times 10^{-11}$ | Bit-exact perceptual accuracy validated in `pipe_offline_parity.rs` |
-| **Thread Priority & Stability**       | `SCHED_FIFO` (priority 80–95) with PM QoS $0\text{ µs}$ | Deterministic audio deadlines with zero xruns under system load    |
+| Host Metric / Invariant                | Measured Specification                                              | Architectural Guarantee                                             |
+|:-------------------------------------- |:------------------------------------------------------------------- |:------------------------------------------------------------------- |
+| **Native Quantum Support**             | Down to **64 samples** ($1.33\text{ ms}$ at 48 kHz)                 | Sub-millisecond buffer scheduling with zero driver jitter           |
+| **Full Rig CPU Budget Used (64 samp)** | **$< 8\%$** (WaveNet Standard + CabSim)                             | Over **$> 92\%$** CPU headroom preserved for system and desktop UI  |
+| **Real-Time Memory Allocations**       | **0 heap allocations**                                              | Enforced via `CountingAllocator` in RT processing loop              |
+| **Lock-Free Concurrency**              | SPSC lock-free atomic queues                                        | Zero mutexes, zero blocking system calls in audio callback          |
+| **Full-Chain Parity vs $f64$ Oracle**  | WaveNet ESR $< 1.05 \times 10^{-12}$, LSTM $< 2.71 \times 10^{-11}$ | Bit-exact perceptual accuracy validated in `pipe_offline_parity.rs` |
+| **Thread Priority & Stability**        | `SCHED_FIFO` (priority 80–95) with PM QoS $0\text{ µs}$             | Deterministic audio deadlines with zero xruns under system load     |
 
 > **Why This Matters for Live Guitarists:** A complete standalone rig (WaveNet + CabSim + Noise Gate) executing within PipeWire uses only a fraction of a 64-sample quantum ($1.33\text{ ms}$ at 48 kHz). Musician players experience imperceptible latency indistinguishable from analog tube amplifiers, backed by ironclad real-time safety and zero audio dropouts.
 
@@ -334,10 +336,10 @@ For developers working on source code or rapid testing:
 
 ```bash
 # Direct development execution:
-cargo run --release -- --model /path/to/amp_model.nam
+cargo run --release --bin nam-audio-pipe -- --model /path/to/amp_model.nam
 
 # Build standard release binary:
-cargo build --release
+cargo build --release --bin nam-audio-pipe
 ```
 
 The compiled binary will be located at `target/release/nam-audio-pipe`.
@@ -352,27 +354,28 @@ For maximum performance in mission-critical live setups and stage environments, 
 # 1. Build hyper-optimized PGO + LLVM BOLT binary into target/dist/:
 ./utils/build-release.sh --strict
 
-# 2. Run the long audit against the artifact:
+# 2. Run the long audit against the canonical artifact:
 ./utils/tests-long.sh --strict --artifact
 
 # 3. Certify and install locally to ~/.local/bin/nam-audio-pipe:
 ./utils/build-release.sh --certify --install
 ```
 
-| Canonical Option | Purpose |
-|:---------------- |:------- |
-| `--package`      | Generates distribution tarball (`.tar.zst`) and Flatpak bundle (`.flatpak`) |
-| `--install`      | Valid with `--certify`; installs the certified binary to `~/.local/bin/nam-audio-pipe` (and Flatpak if packaged) |
-| `--strict`       | Enforces fail-closed mode: any optimization or verification gap aborts with error |
-| `--certify`      | Does not recompile; verifies and certifies canonical release receipts |
-| `-h, --help`     | Displays command-line help screen and exits |
+| Canonical Option | Purpose                                                                                                                                         |
+|:---------------- |:----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--strict`       | Enforces fail-closed mode: PGO is mandatory, BOLT requires ceremony proof (`target/logs/ab-opt-ceremony-receipt.json`), and unproven gaps abort |
+| `--package`      | Generates distribution tarball (`.tar.zst`) and Flatpak bundle (`.flatpak`) in `target/dist/`                                                   |
+| `--certify`      | Does not recompile: validates artifact SHA-256 and reconciles build receipt with long audit evidence                                            |
+| `--install`      | Valid with `--certify`: installs the certified binary to `~/.local/bin/nam-audio-pipe` (and Flatpak if packaged)                                |
+| `-h, --help`     | Displays command-line help screen and exits                                                                                                     |
 
 This automated builder executes:
 
 1. **Profile-Guided Optimization (PGO)**: Instruments DSP kernels across quantum matrices (32 to 1024 frames) and model families, generating profile traces to guide branch prediction and loop vectorization.
 2. **LLVM BOLT**: Rearranges basic blocks in machine code using Linux `perf` sample traces to minimize CPU Instruction Cache (I-Cache) and TLB misses.
-3. **Static Hotspot Gates**: Enforces zero `zmm` registers (AVX-512 opt-in policy), zero `libm` calls in RT paths, and zero heap allocations.
-4. **Verified Local Installation (`--certify --install`)**: Reconciles the build and audit receipts, then installs the verified artifact directly to `~/.local/bin/nam-audio-pipe`.
+3. **Automated A/B Optimization Ceremony**: Evaluates median P99 cycles across all canonical topologies (`wavenet_a1`, `wavenet_a2`, `lstm`) with an explicit 1.0% promotion margin (`utils/ab-opt-ceremony.sh`), cleanly falling back to proven PGO-only when BOLT margins are not met.
+4. **Static Hotspot Gates**: Enforces zero `zmm` registers (AVX-512 opt-in policy), zero `libm` calls in RT paths, and zero heap allocations.
+5. **Verified Local Installation (`--certify --install`)**: Reconciles the build and audit receipts, then installs the verified artifact directly to `~/.local/bin/nam-audio-pipe`.
 
 ---
 
@@ -399,29 +402,29 @@ For distributors and release publishing, the official release pipeline enforces 
 nam-audio-pipe [OPTIONS]
 ```
 
-| Flag / Option             | Parameter Domain / Values             | Default                         | Operational Description                                                                        |
-|:------------------------- |:------------------------------------- |:------------------------------- |:---------------------------------------------------------------------------------------------- |
-| `-m, --model <FILE>`      | Filepath (`.nam`, `.namb`)            | *None (Bypass)*                 | Path to neural amplifier model file. Invalid path fails fast before PipeWire initialization.   |
-| `-c, --cab <FILE>`        | Filepath (`.wav`)                     | *None (Bypass)*                 | Path to cabinet impulse response file. Missing file exits with code 2 unless `--cab-optional`. |
-| `--cab-optional`          | Flag                                  | `false`                         | Missing or unreadable `--cab` warns and continues without cabinet simulation.                  |
-| `-i, --input-gain <DB>`   | Float (`-20.0` to `+20.0` dB)         | `0.0`                           | Input gain adjustment prior to neural inference.                                               |
-| `-o, --output-gain <DB>`  | Float (`-20.0` to `+20.0` dB)         | `0.0`                           | Output gain adjustment after cabinet simulation.                                               |
-| `-b, --buffer-size <N>`   | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`      | `256`                           | PipeWire quantum block size in samples (`0` for auto-negotiation).                             |
-| `--cabsim-partition <N>`  | `32`, `64`, `128`, `256` samples      | `128`                           | Cab-sim UPOLS partition size. Lower values reduce algorithmic latency at slight CPU cost.      |
-| `--oversample <MODE>`     | `off`, `2x`, `4x`                     | `off`                           | Half-band polyphase anti-aliasing oversampling factor.                                         |
-| `--activation <MODE>`     | `standard`, `fast`                    | `standard`                      | Math precision: `standard` (exact Taylor minimax) vs `fast` (Padé polynomial approximation).   |
-| `--slim <MODE>`           | `auto`, `full`, `lite`                | `auto`                          | Adaptive compute: automatically swaps submodels under CPU pressure to prevent dropouts.        |
-| `--gate <MODE>`           | `on`, `off`, or `[-96.0, -20.0]` dBFS | `on` (`-70 dB`)                 | Silence gate configuration. Numeric thresholds derive close value via 10 dB Schmitt relation.  |
-| `--cpu <INDEX>`           | Integer core ID                       | *Dynamic IRQ selection*         | Manually binds the real-time audio thread to a specific CPU core.                              |
-| `--record`                | Flag                                  | `false`                         | Enables asynchronous 32-bit float stereo WAV recording via `io_uring`.                         |
-| `--record-dir <DIR>`      | Directory path                        | `$XDG_MUSIC_DIR/NAM-Audio-Pipe` (or `~/Music/NAM-Audio-Pipe`, else `.`) | Output directory for saved audio takes (auto-created if missing).                              |
-| `--fail-fast`             | Flag                                  | `false`                         | Disables bounded reconnect cycle: exits immediately on PipeWire daemon disconnect.             |
-| `--reconnect-timeout <S>` | Seconds (`integer >= 0`)              | `11.75` (6 attempts)            | Caps the total reconnect retry backoff budget (`0` behaves like `--fail-fast`).                |
-| `--color <WHEN>`          | `auto`, `always`, `never`             | `auto` (respects `NO_COLOR`)    | Controls ANSI color output for diagnostic banners and terminal messages.                       |
-| `--diagnose`              | Flag                                  | `false`                         | Emits technical diagnostic bundle and exits.                                                   |
-| `--diagnose-full`         | Flag                                  | `false`                         | Emits diagnostic bundle with unredacted raw paths and exits.                                   |
-| `--pause`                 | Flag                                  | `false`                         | Waits for Enter before exiting on interactive terminals (used by `.desktop` Diagnostics).      |
-| `-h, --help`              | Flag                                  | —                               | Displays command-line help screen and exits.                                                   |
+| Flag / Option                 | Parameter Domain / Values             | Default                                                                 | Operational Description                                                                        |
+|:----------------------------- |:------------------------------------- |:----------------------------------------------------------------------- |:---------------------------------------------------------------------------------------------- |
+| `-m, --model <FILE>`          | Filepath (`.nam`, `.namb`)            | *None (Bypass)*                                                         | Path to neural amplifier model file. Invalid path fails fast before PipeWire initialization.   |
+| `-c, --cab <FILE>`            | Filepath (`.wav`)                     | *None (Bypass)*                                                         | Path to cabinet impulse response file. Missing file exits with code 2 unless `--cab-optional`. |
+| `--cab-optional`              | Flag                                  | `false`                                                                 | Missing or unreadable `--cab` warns and continues without cabinet simulation.                  |
+| `-i, --input-gain <DB>`       | Float (`-20.0` to `+20.0` dB)         | `0.0`                                                                   | Input gain adjustment prior to neural inference.                                               |
+| `-o, --output-gain <DB>`      | Float (`-20.0` to `+20.0` dB)         | `0.0`                                                                   | Output gain adjustment after cabinet simulation.                                               |
+| `-b, --buffer-size <SAMPLES>` | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`      | `256`                                                                   | PipeWire quantum block size in samples (`0` for auto-negotiation).                             |
+| `--cabsim-partition <N>`      | `32`, `64`, `128`, `256` samples      | `128`                                                                   | Cab-sim UPOLS partition size. Lower values reduce algorithmic latency at slight CPU cost.      |
+| `--oversample <MODE>`         | `off`, `2x`, `4x`                     | `off`                                                                   | Half-band polyphase anti-aliasing oversampling factor.                                         |
+| `--activation <MODE>`         | `standard`, `fast`                    | `standard`                                                              | Math precision: `standard` (exact Taylor minimax) vs `fast` (Padé polynomial approximation).   |
+| `--slim <MODE>`               | `auto`, `full`, `lite`                | `auto`                                                                  | Adaptive compute: automatically swaps submodels under CPU pressure to prevent dropouts.        |
+| `--gate <MODE>`               | `on`, `off`, or `[-96.0, -20.0]` dBFS | `on` (`-70 dB`)                                                         | Silence gate configuration. Numeric thresholds derive close value via 10 dB Schmitt relation.  |
+| `--cpu <INDEX>`               | Integer core ID                       | *Dynamic IRQ selection*                                                 | Manually binds the real-time audio thread to a specific CPU core.                              |
+| `--record`                    | Flag                                  | `false`                                                                 | Enables asynchronous 32-bit float stereo WAV recording via `io_uring`.                         |
+| `--record-dir <DIR>`          | Directory path                        | `$XDG_MUSIC_DIR/NAM-Audio-Pipe` (or `~/Music/NAM-Audio-Pipe`, else `.`) | Output directory for saved audio takes (auto-created if missing).                              |
+| `--fail-fast`                 | Flag                                  | `false`                                                                 | Disables bounded reconnect cycle: exits immediately on PipeWire daemon disconnect.             |
+| `--reconnect-timeout <SECS>`  | Seconds (`integer >= 0`)              | `11.75` (6 attempts)                                                    | Caps the total reconnect retry backoff budget (`0` behaves like `--fail-fast`).                |
+| `--color <WHEN>`              | `auto`, `always`, `never`             | `auto` (respects `NO_COLOR`)                                            | Controls ANSI color output for diagnostic banners and terminal messages.                       |
+| `--diagnose`                  | Flag                                  | `false`                                                                 | Emits technical diagnostic bundle and exits.                                                   |
+| `--diagnose-full`             | Flag                                  | `false`                                                                 | Emits diagnostic bundle with unredacted raw paths and exits.                                   |
+| `--pause`                     | Flag                                  | `false`                                                                 | Waits for Enter before exiting on interactive terminals (used by `.desktop` Diagnostics).      |
+| `-h, --help`                  | Flag                                  | —                                                                       | Displays command-line help screen and exits.                                                   |
 
 ---
 
@@ -451,6 +454,7 @@ On startup, NAM-Audio-Pipe automatically registers dedicated capture and playbac
 | `NAM-Audio-Pipe-playback` | `Stream/Output/Audio` | Playback output streaming processed audio to speakers or headphones         |
 
 - **Zero-Context Switching**: Both nodes are bound to identical scheduling groups (`node.group = "nam-audio-pipe-dsp"`), ensuring execution on the same real-time driver thread (`nam-audio-pipe-loop`).
+- **SPA Latency Compensation**: Stream latency properties (`SPA_PARAM_Latency`) publish the exact algorithmic delay (cab-sim partition latency + resampler + oversampling) in sample units to the graph scheduler, eliminating phase smearing and timing misalignment.
 - **Feedback Protection**: Queries `pw-metadata` with an automatic 500 ms watchdog to discover the default output sink, automatically ignoring self-capture nodes to prevent acoustic feedback loops.
 - **Visual Patchbay Support**: Nodes are clearly labelled and easily connected using visual patchbays such as **`qpwgraph`**, **`Helvum`**, or **`Carla`**. Seamlessly patch physical guitar inputs, desktop browsers, media players, software synthesizers, or DAW tracks into `NAM-Audio-Pipe-input` for instant live processing and re-amping.
 
@@ -483,6 +487,7 @@ For complete architectural details on testing, verification phases, and real-tim
 
 - [`docs/architecture.md`](docs/architecture.md) — Comprehensive architecture bible: dual-stream PipeWire topology, `DspBridge` shared memory layout, SPSC GC cascade, Linux RT hardening, and asynchronous `io_uring` WAV recording.
 - [`docs/testing.md`](docs/testing.md) — Testing architecture, unit/integration inventory, 11-phase long audit suite, script contract, and compiler optimization pipeline.
+- [`docs/latency-spa-adr.md`](docs/latency-spa-adr.md) — Architecture decision record: PipeWire SPA latency publication, sample-rate vs nanosecond evaluation invariants, UPOLS partition alignment, and graph delay compensation.
 - [`CHANGELOG.md`](CHANGELOG.md) — Project release history, version milestones, and feature additions.
 
 ---
