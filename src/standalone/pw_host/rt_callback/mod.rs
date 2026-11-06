@@ -12,9 +12,11 @@ use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 
 mod cabsim_swap;
 mod commands;
+mod os_swap;
 mod process;
 mod rate_sync;
 mod resampler_swap;
+mod slimmable_swap;
 
 /// Offline RT swap-stress harness, available only under the `testing` feature.
 /// Reproduces the full capture-callback drain sequence with no PipeWire daemon

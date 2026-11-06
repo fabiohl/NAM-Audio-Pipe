@@ -330,7 +330,7 @@ fn marked_thread_offload_is_zero_alloc() {
     let _ = ring_consumer;
     reset_pw_log_dropped_for_test();
 
-    // Medido: alloc=0, dealloc=0, realloc=0 (4096 try_offload consults on the
+    // Measured: alloc=0, dealloc=0, realloc=0 (4096 try_offload consults on the
     // marked thread incl. decode + capture + saturation drops).
     assert_eq!(allocs, 0, "allocations on the marked RT log path");
     assert_eq!(deallocs, 0, "deallocation on the marked RT log path");

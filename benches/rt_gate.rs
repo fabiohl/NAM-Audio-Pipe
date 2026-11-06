@@ -6,8 +6,8 @@
 //! Promotes the offline `rt_deadline` real-load scenario (previously a single
 //! `RT_METRICS rt_deadline …` log line parsed by the old shell gate) to a
 //! Criterion suite, so the engine `nam_perf_gate` can evaluate it per scenario
-//! (coverage + machine verdict over `change/estimates.json`) exactly like the
-//! engine and plugin suites. Each scenario drives the production
+//! (coverage + machine verdict over `change/estimates.json`) using the same
+//! harness contract as the upstream engine. Each scenario drives the production
 //! [`RtSwapHarness`] single-block callback with the same real load the long
 //! suite uses (fixture-backed WaveNet A1/A2, LSTM and a synthetic stereo CabSim).
 //!

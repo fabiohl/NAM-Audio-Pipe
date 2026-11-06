@@ -5,8 +5,8 @@
 //! (`target/logs/long-audit-receipt.jsonl`).
 //!
 //! `utils/tests-long.sh` emits this JSONL as the **source of truth** using the
-//! same [`neural_amp_modeler_rs::testing::receipt`] schema the engine and
-//! NAM-Plug emit; the human `.txt` receipt (`receipt::long`) is the derived
+//! same [`neural_amp_modeler_rs::testing::receipt`] schema the engine emits;
+//! the human `.txt` receipt (`receipt::long`) is the derived
 //! view kept for compatibility during the transition. Both readers must agree —
 //! the release ceremony verifies both and rejects any divergence or tampering.
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Visible, de-duplicated recording alerts for the main control loop (F-UX-02a).
+//! Visible, de-duplicated recording alerts for the main control loop.
 //!
 //! A runtime recording failure (disk full `ENOSPC`, `EIO`) used to be silent
 //! until shutdown: the worker transitioned [`RecordingStatus`] to `Failed` and

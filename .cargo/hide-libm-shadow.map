@@ -17,8 +17,8 @@
 # loop: two `jmp` instructions, zero computation, zero syscalls, spinning
 # forever. Confirmed (via a live GDB attach reading the actual runtime GOT
 # contents — a static `nm`/`readelf` inspection is NOT sufficient to catch
-# this class of bug) to affect the test binary, the
-# standalone binary, and the CLAP plugin `cdylib`.
+# this class of bug) to affect the test binary and the
+# standalone binary.
 #
 # Fix: explicitly force every standard libm C symbol name to `local` binding
 # in our own binary's dynamic symbol table. A `local` symbol is never a

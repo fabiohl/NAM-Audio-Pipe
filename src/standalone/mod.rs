@@ -5,6 +5,7 @@
 
 pub mod banner;
 pub mod cli;
+mod cli_domain;
 pub mod colors;
 pub mod exit;
 pub mod launcher;

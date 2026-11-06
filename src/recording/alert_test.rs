@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the recording alert state machine (F-UX-02a): the first
+//! Unit tests for the recording alert state machine: the first
 //! observation is emitted once, reminders only after
 //! [`super::ALERT_REMINDER_INTERVAL`], a changed reason re-emits immediately and
 //! a resolved condition clears the latch. The clock is injected so the cadence

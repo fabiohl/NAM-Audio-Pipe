@@ -6,7 +6,7 @@
 //! The PipeWire log handler (`pw_host::log_redirect`) intercepts SPA log
 //! events raised by PipeWire internals. Those events can fire on the RT data
 //! thread, and dispatching them through `log::*` there would drag blocking
-//! locks and horizon allocations into the audio callback (F-APRT-01). The
+//! locks and horizon allocations into the audio callback. The
 //! handler therefore needs a cheap, lock-free answer to "am I running on the
 //! RT callback thread?".
 //!

@@ -163,7 +163,10 @@ fn burst_of_two_signals_within_grace_window_stays_cooperative() {
 #[test]
 fn grace_window_expiry_escalates_to_forced_exit() {
     const ENV_KEY: &str = "NAM_SIGNAL_GRACE_EXPIRY_E2E";
-    if std::env::var(ENV_KEY).is_ok() {
+    if matches!(
+        std::env::var(ENV_KEY).ok().as_deref().map(str::trim),
+        Some("1" | "true")
+    ) {
         let _guard = HandlerRestoreGuard::capture();
         install_termination_signal_handlers()
             .expect("termination handler installation must succeed");
@@ -223,7 +226,7 @@ fn grace_window_expiry_escalates_to_forced_exit() {
 /// A recording widens the grace window to [`super::RECORDING_GRACE_WINDOW_MS`];
 /// a second signal 700 ms after the first must then be swallowed (the graceful
 /// teardown — draining the ring, rewriting the header, `fsync` — is allowed to
-/// finish), exactly the F-UX-04 scenario that force-exited mid-finalization at
+/// finish), preventing a premature force-exit mid-finalization at
 /// the 500 ms default.
 ///
 /// Deterministic: the 700 ms interval is simulated by shifting the packed

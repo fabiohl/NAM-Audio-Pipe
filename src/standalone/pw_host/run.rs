@@ -68,7 +68,7 @@ use pipewire as pw;
 /// (`ReconnectCycle`, default 6 attempts with progressive 250 ms → 4 s
 /// exponential backoff — disabled under `--fail-fast` or `max_attempts == 0`).
 /// The budget is bounded **per episode** and replenished after
-/// `STABLE_RESET` of uninterrupted healthy streaming (F-UX-09), so isolated
+/// `STABLE_RESET` of uninterrupted healthy streaming, so isolated
 /// drops spread over a long session never accumulate into an exhaustion.
 /// The DSP state (`CaptureState`: models, resampler, cab-sim, gains) and the
 /// RT-side SPSC channels (`RtHostChannels`) live in heap `Box`es reached via
@@ -136,7 +136,7 @@ pub fn run_pipewire_host(
         }
     };
 
-    // F-UX-02a: turn the observable recording status into visible, de-duplicated
+    // Turn the observable recording status into visible, de-duplicated
     // alerts. Built once (outside the reconnect loop) so a reconnect never
     // resets the reminder cadence or re-emits an already-reported failure.
     let mut recording_alert = recording_status.as_ref().map(|_| RecordingAlert::new());
@@ -156,7 +156,7 @@ pub fn run_pipewire_host(
     // it touches them only before `thread_loop.start()` and after `thread_loop.stop()`.
     let bridge_ptr = bridge::allocate_dsp_bridge();
 
-    // Off-RT bring-up pre-roll (F-PR-11). Before any stream is created,
+    // Off-RT bring-up pre-roll. Before any stream is created,
     // the main thread holds exclusive access to the bridge (no RT producer or
     // consumer is live), so one quantum of analytical silence can be published
     // safely. The first playback quantum then reads a real silence block
@@ -219,14 +219,14 @@ pub fn run_pipewire_host(
         None => &raw mut dummy_recording_sender,
     };
 
-    // R-04: the RT parking lot (16 slots) lives HERE — a stack-local slot in
+    // The RT parking lot (16 slots) lives HERE — a stack-local slot in
     // the main thread, accessed by the RT callback through a raw pointer
     // (same contract as `rec_ptr`: the slot outlives the closure). While the
     // loop runs, the RT callback is the sole writer. After `thread_loop.stop()`
     // the main thread becomes single owner and the final drain releases the
     // 16 slots off-RT via `drain_gc_channels` — never on the audio thread.
     //
-    // H-01 (B-01): `rt_parking_lot_dirty` avoids scanning all 16 slots in steady
+    // `rt_parking_lot_dirty` avoids scanning all 16 slots in steady
     // state when no swaps occurred. It is set (Release) whenever an item cascades
     // to GC, and reset (Release) when the RT drain finishes emptying all slots.
     let mut rt_parking_lot: [Option<GcItem>; 16] = Default::default();
@@ -245,7 +245,7 @@ pub fn run_pipewire_host(
     // =========================================================
     // PM QoS lock: disable deep CPU C-States for the entire duration of the
     // audio host session, including reconnect backoff windows, so power transition
-    // latency does not induce jitter upon reconnection (D-09).
+    // latency does not induce jitter upon reconnection.
     let _cpu_dma_lock = rt_setup::lock_cpu_c_states();
 
     // Shared backend state machine: the capture and playback stream state
@@ -288,12 +288,12 @@ pub fn run_pipewire_host(
     // re-opens the retry storm for a generation that already failed.
     let mut rebuild_failures = handlers::RebuildFailureTracker::default();
 
-    // Finding F-RB-101: latch guard protecting against spurious `state_changed(Unconnected)`
+    // Latch guard protecting against spurious `state_changed(Unconnected)`
     // events emitted synchronously by `pw_stream_destroy()` during teardown and reconnection.
     // Lives outside the `'host` loop so it covers stream destruction across loop iterations.
     let mut teardown_guard: Option<super::status::TeardownGuard<'_>> = None;
 
-    // F-UX-13: emit the consolidated status banner exactly once, as soon as the
+    // Emit the consolidated status banner exactly once, as soon as the
     // first RT confirmations (rate / quantum / SCHED) are available.
     let mut banner_emitted = false;
 
@@ -379,7 +379,7 @@ pub fn run_pipewire_host(
             // - At initial startup: cabsim is None (latency = 0), resampler is initialized (usually 0 if host matches nam).
             // - After reconnect: models, IR, resampler, and cabsim in `state_ptr` survived!
             //   We reflect the exact latency of the installed resampler and cabsim (or 0 if bypassed/uninstalled),
-            //   avoiding both underestimating the resampler and overestimating an uninstalled cab-sim (D-08).
+            //   avoiding both underestimating the resampler and overestimating an uninstalled cab-sim.
             // SAFETY: The PipeWire main loop is stopped at this point (either pre-run
             // or between reconnect attempts after the previous loop exited). No RT thread or
             // audio callback is accessing `state_ptr` concurrently.
@@ -542,7 +542,7 @@ pub fn run_pipewire_host(
         // attempts guaranteed-futile) and fails fast.
         let mut panic_is_terminal = false;
         while !SHUTDOWN.load(Ordering::Acquire) {
-            // F-UX-02a: surface a runtime recording failure (or low-space
+            // Surface a runtime recording failure (or low-space
             // warning) immediately instead of only at shutdown. `try_lock` only
             // — the control loop never blocks on the worker's status mutex.
             if let (Some(alert), Some(status)) = (&mut recording_alert, &recording_status)
@@ -578,7 +578,7 @@ pub fn run_pipewire_host(
                 break;
             }
 
-            // F-UX-09: a healthy, streaming iteration feeds the stability
+            // A healthy, streaming iteration feeds the stability
             // window. After `STABLE_RESET` of uninterrupted streaming the
             // per-episode retry budget is replenished (isolated drops spread
             // over a long session never accumulate into an exhaustion), and the
@@ -626,7 +626,7 @@ pub fn run_pipewire_host(
                 &mut cabsim_producer,
             );
 
-            // Read the coherent DSP latency snapshot effectively applied on the audio thread (D-08 / S08.4 / F-PIPE-01).
+            // Read the coherent DSP latency snapshot effectively applied on the audio thread.
             // A coherent seqlock read ensures resampler, cabsim, and oversampling latencies form a consistent snapshot.
             let (active_resampler_latency, active_cabsim_latency, active_os_native_latency) =
                 backend_status.stream_status().read_applied_latencies();
@@ -717,7 +717,7 @@ pub fn run_pipewire_host(
                 &mut poll_state,
             );
 
-            // F-UX-13: one consolidated status banner, emitted a single time as
+            // One consolidated status banner, emitted a single time as
             // soon as the first real audio quantum is processed — the RT thread is
             // configured in that same first callback, so `SCHED_FIFO`/`mlockall`
             // are already visible. The gate is the effective quantum, NOT
@@ -753,7 +753,7 @@ pub fn run_pipewire_host(
                 banner_emitted = true;
             }
 
-            // R-04: while the loop runs, the parking lot is RT-owned (the callback
+            // While the loop runs, the parking lot is RT-owned (the callback
             // flushes it back to this SPSC every cycle), so this periodic drain
             // must NOT touch `rt_parking_lot` — concurrent `take()`s would race.
             // An empty main-side lot drains SPSC + overflow only; the 16 slots are
@@ -796,10 +796,10 @@ pub fn run_pipewire_host(
         // =========================================================
         // 6. INSTANCE TEARDOWN (per attempt)
         // =========================================================
-        // F-RB-101: Enter teardown BEFORE stopping the thread loop and destroying streams.
+        // Enter teardown BEFORE stopping the thread loop and destroying streams.
         teardown_guard = Some(backend_status.enter_teardown());
 
-        // Ordering invariant (R-13): stop the audio loop FIRST so the RT callback
+        // Ordering invariant: stop the audio loop FIRST so the RT callback
         // releases its `&mut` access to the recording producer (single-writer
         // SPSC contract). Only after `thread_loop.stop()` returns — which waits for
         // the loop thread to finish its current iteration — is the main thread the
@@ -824,13 +824,13 @@ pub fn run_pipewire_host(
         // is alive or accessing the bridge. The main thread is the sole owner of `bridge_ptr`.
         unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
 
-        // Re-arm the off-RT bring-up pre-roll (F-PR-11) for the next
+        // Re-arm the off-RT bring-up pre-roll for the next
         // reconnect attempt, still under the exclusive-access teardown window
         // (`thread_loop.stop()` above guarantees no live RT Writer/Reader).
         // SAFETY: same exclusive-access contract as `reset_to_silence` above.
         unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
 
-        // R-04: single-owner handoff — the loop thread has stopped, so the RT
+        // Single-owner handoff — the loop thread has stopped, so the RT
         // callback will never touch `rt_parking_lot` again. One canonical
         // `drain_gc_channels` now releases SPSC + overflow + the 16 parked slots
         // on the main thread, before any RT state is dropped.
@@ -845,13 +845,13 @@ pub fn run_pipewire_host(
             .fetch_add(final_drained as u32, Ordering::Relaxed);
         if final_drained > 0 {
             log::debug!(
-                "nam-audio-pipe: instance GC drain released {final_drained} item(s) off-RT (R-04)"
+                "nam-audio-pipe: instance GC drain released {final_drained} item(s) off-RT"
             );
         }
 
-        // F-RB-102 & F-RB-101: Explicitly drop the streams under the teardown guard.
-        // Listeners are dropped before streams (F-RB-102), and any synchronous
-        // `Unconnected` transitions are discarded by `observe_stream_state` (F-RB-101).
+        // Explicitly drop the streams under the teardown guard.
+        // Listeners are dropped before streams, and any synchronous
+        // `Unconnected` transitions are discarded by `observe_stream_state`.
         drop(app_state);
 
         // 6.1 Reconnect decision
@@ -902,7 +902,7 @@ pub fn run_pipewire_host(
     // =========================================================
     // 7. GRACEFUL SHUTDOWN (final)
     // =========================================================
-    // User feedback on the first cooperative SHUTDOWN observation (F-UX-04):
+    // User feedback on the first cooperative SHUTDOWN observation:
     // without it the terminal shows nothing while the ring drains and the WAV
     // header is rewritten + `fsync`ed, so the operator presses Ctrl+C again and
     // (past the grace window) forces an exit that can corrupt the capture. The
@@ -974,7 +974,7 @@ pub fn run_pipewire_host(
         ));
     }
 
-    // F-UX-13: analogous end-of-session summary (xruns, bridge drops,
+    // Analogous end-of-session summary (xruns, bridge drops,
     // recording), emitted only once a real streaming session was established.
     if banner_emitted {
         let summary = SessionSummary {
@@ -998,8 +998,8 @@ pub fn run_pipewire_host(
 /// Emits the first-connection backend diagnostic with a stage-specific hint.
 ///
 /// The two startup failures reached before the bounded-reconnect control loop
-/// used to bubble a raw `anyhow` error that `main` printed with no hint
-/// (F-UX-08). Emitting the structured diagnostic here keeps the remediation
+/// used to bubble a raw `anyhow` error that `main` printed with no hint.
+/// Emitting the structured diagnostic here keeps the remediation
 /// hint reachable (it is rendered into the support block consumed by
 /// `--diagnose`) and pairs with the classified `Backend` exit code in `main`.
 fn emit_startup_backend_diagnostic(

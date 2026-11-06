@@ -499,7 +499,7 @@ pub(super) fn handle_quantum_log(
 /// Rollback: on build failure the handler delivers `None` — safe cab-sim
 /// bypass — instead of letting the RT run an IR calibrated for a divergent
 /// rate. The RT latches the failed (rate, partition) key so it does not endlessly
-/// re-request rebuilds for the same failing parameters (D-06); a new rate or IR
+/// re-request rebuilds for the same failing parameters; a new rate or IR
 /// resets the latch and allows recovery.
 pub(super) fn handle_cabsim_rebuild(
     rt_status: &RtStatusFlags,

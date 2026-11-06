@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the disk-space estimation and low-space thresholds (F-UX-02b),
+//! Unit tests for the disk-space estimation and low-space thresholds,
 //! using injected free-space values (no real disk).
 
 use super::*;

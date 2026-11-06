@@ -63,7 +63,7 @@ pub struct StreamStatusFlags {
     /// Incremented by the playback callback each time the bridge produced no
     /// new DSP block (capture paused, resampler rebuild pending, clock drift or
     /// quantum miss) and the deterministic silence policy delivered a recycled
-    /// output buffer filled with `0.0f32` (G-RB-001). Telemetry only —
+    /// output buffer filled with `0.0f32`. Telemetry only —
     /// the hardware never repeats stale audio.
     pub playback_bridge_starvation: AtomicU32,
 
@@ -85,14 +85,14 @@ pub struct StreamStatusFlags {
     /// listener (`0` = never negotiated). Written on the host stream-negotiation
     /// thread (cold path, outside the RT audio data thread); read by the playback
     /// listener for the cross-stream rate comparison and by the main loop for
-    /// diagnostics (G-RB-001).
+    /// diagnostics.
     pub capture_negotiated_rate: AtomicU32,
 
     /// Last sample rate negotiated by the playback stream's host renegotiation
     /// listener (`0` = never negotiated). Written on the host stream-negotiation
     /// thread (cold path, outside the RT audio data thread); read by the capture
     /// listener for the cross-stream rate comparison and by the main loop for
-    /// diagnostics (G-RB-001).
+    /// diagnostics.
     pub playback_negotiated_rate: AtomicU32,
 
     /// Sticky latch guarding the capture stream format contract negotiated with the host.
@@ -107,21 +107,21 @@ pub struct StreamStatusFlags {
     /// Active state of the playback stream (1 = Streaming, 0 = Paused/Unconnected/Error).
     pub playback_active: AtomicU32,
 
-    /// Aggregate sticky latch guarding the strict format contract negotiated with the host (G-RB-001).
+    /// Aggregate sticky latch guarding the strict format contract negotiated with the host.
     ///
     /// `1` = both stream formats are valid (`F32P` planar stereo); `0` = a divergent format
     /// was negotiated on either stream.
     pub format_contract_ok: AtomicU32,
 
-    /// Algorithmic latency in samples of the resampler stage currently applied on the RT audio thread (D-08).
+    /// Algorithmic latency in samples of the resampler stage currently applied on the RT audio thread.
     /// Updated with `Ordering::Release` in `install_resampler` upon committing a swap.
     pub applied_resampler_latency: AtomicU32,
 
-    /// Algorithmic latency in samples of the cab-sim stage currently applied on the RT audio thread (D-08)
+    /// Algorithmic latency in samples of the cab-sim stage currently applied on the RT audio thread
     /// (`0` when bypassed / no pair active). Updated with `Ordering::Release` in `install_cabsim`.
     pub applied_cabsim_latency: AtomicU32,
 
-    /// Algorithmic latency in native model samples of the oversampling stage currently applied on the RT audio thread (F-PIPE-01)
+    /// Algorithmic latency in native model samples of the oversampling stage currently applied on the RT audio thread
     /// (`0` when bypassed / Off, `12` for X2, `18` for X4). Updated with `Ordering::Release` in `install_os_pair`.
     pub applied_oversample_latency: AtomicU32,
 
@@ -130,11 +130,11 @@ pub struct StreamStatusFlags {
     /// the resampler is installed, so latency conversion never assumes 48 kHz.
     pub applied_nam_rate: AtomicU32,
 
-    /// Sequence lock counter for the coherent multi-component latency snapshot (resampler, cabsim, oversample) (F-PIPE-01).
+    /// Sequence lock counter for the coherent multi-component latency snapshot (resampler, cabsim, oversample).
     /// Odd = write in progress; Even = clean snapshot.
     pub latency_sequence: AtomicU64,
 
-    /// Coherent 64-bit atomic latency snapshot (D-08 / S08.4).
+    /// Coherent 64-bit atomic latency snapshot.
     /// High 32 bits: resampler latency in samples.
     /// Low 32 bits: cabsim latency in samples.
     /// Eliminates transient latency tearing when reading aggregate DSP latency off-RT.
@@ -219,7 +219,7 @@ impl StreamStatusFlags {
         Self::unpack_latency_pair(self.applied_latency_pair.load(Ordering::Acquire))
     }
 
-    /// Atomically reads the coherent (resampler, cabsim, oversample_native) latency snapshot via seqlock (F-PIPE-01).
+    /// Atomically reads the coherent (resampler, cabsim, oversample_native) latency snapshot via seqlock.
     ///
     /// Single writer (the RT audio thread); writers bump the sequence before and
     /// after the stores. The `Acquire` fence before the closing sequence load
@@ -307,79 +307,5 @@ impl StreamStatusFlags {
 }
 
 #[cfg(all(test, any(feature = "testing", feature = "heap-audit")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn e2e_exact_reservoir_resolves_distinct_percentiles() {
-        // The log-linear histogram can collapse p50/p99/p999 onto the same bucket
-        // edge; the exact reservoir must keep distinct samples distinct.
-        let status = StreamStatusFlags::new();
-        for v in 1..=1000u64 {
-            status.e2e_exact.record(v);
-        }
-        let p50 = status.e2e_exact.percentile_exact(0.50);
-        let p99 = status.e2e_exact.percentile_exact(0.99);
-        let p999 = status.e2e_exact.percentile_exact(0.999);
-        assert!(
-            p50 < p99 && p99 < p999,
-            "exact percentiles must be distinct when the samples differ: {p50} < {p99} < {p999}"
-        );
-    }
-
-    #[test]
-    fn e2e_exact_reservoir_resets_to_empty() {
-        let status = StreamStatusFlags::new();
-        status.e2e_exact.record(1_000);
-        assert_eq!(status.e2e_exact.len(), 1);
-        status.e2e_exact.reset();
-        assert_eq!(status.e2e_exact.len(), 0);
-    }
-
-    #[test]
-    fn applied_latency_pair_coherent_snapshot() {
-        let status = StreamStatusFlags::new();
-        assert_eq!(status.read_applied_latency_pair(), (0, 0));
-
-        status.update_resampler_latency(32);
-        assert_eq!(status.read_applied_latency_pair(), (32, 0));
-        assert_eq!(status.applied_resampler_latency.load(Ordering::Acquire), 32);
-
-        status.update_cabsim_latency(128);
-        assert_eq!(status.read_applied_latency_pair(), (32, 128));
-        assert_eq!(status.applied_cabsim_latency.load(Ordering::Acquire), 128);
-
-        status.update_resampler_latency(0);
-        assert_eq!(status.read_applied_latency_pair(), (0, 128));
-
-        status.update_cabsim_latency(0);
-        assert_eq!(status.read_applied_latency_pair(), (0, 0));
-    }
-
-    #[test]
-    fn applied_latencies_coherent_seqlock_snapshot() {
-        let status = StreamStatusFlags::new();
-        assert_eq!(status.read_applied_latencies(), (0, 0, 0));
-
-        status.update_resampler_latency(32);
-        assert_eq!(status.read_applied_latencies(), (32, 0, 0));
-
-        status.update_cabsim_latency(128);
-        assert_eq!(status.read_applied_latencies(), (32, 128, 0));
-
-        status.update_oversample_latency(12);
-        assert_eq!(status.read_applied_latencies(), (32, 128, 12));
-
-        status.update_oversample_latency(18);
-        assert_eq!(status.read_applied_latencies(), (32, 128, 18));
-
-        status.update_resampler_latency(0);
-        assert_eq!(status.read_applied_latencies(), (0, 128, 18));
-
-        status.update_oversample_latency(0);
-        assert_eq!(status.read_applied_latencies(), (0, 128, 0));
-
-        status.update_cabsim_latency(0);
-        assert_eq!(status.read_applied_latencies(), (0, 0, 0));
-    }
-}
+#[path = "stream_status_test.rs"]
+mod tests;

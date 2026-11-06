@@ -13,7 +13,7 @@ fn test_dsp_bridge_concurrent_access() {
     // for the lifetime of this test, matching the standalone PipeWire host lifecycle.
     // We then obtain DspBridgeWriter and DspBridgeReader via BridgeRef.
     //
-    // Soundness & Aliasing Contract (Finding F-RB-112):
+    // Soundness & Aliasing Contract:
     // Under Stacked Borrows / Tree Borrows, concurrently creating whole-struct
     // references `&mut DspBridge` and `&DspBridge` between threads is undefined behavior.
     // By using `DspBridgeWriter` and `DspBridgeReader`, no thread ever forms `&mut DspBridge`.

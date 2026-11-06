@@ -88,6 +88,7 @@ mod reconnect;
 mod rt_callback;
 pub mod rt_log_ring;
 mod run;
+pub mod spa_format;
 pub mod status;
 pub mod stream_status;
 mod wakeup;
@@ -108,8 +109,7 @@ pub use wakeup::ControlPlaneWakeup;
 /// during which bridge clock-drift drops are treated as the expected startup
 /// ramp (the off-RT pre-rolled silence block plus the capture producer's first
 /// blocks) rather than real drift. Within this window the telemetry loop
-/// suppresses the `Drifting detected` warning and does not account the drops
-/// (F-PR-11).
+/// suppresses the `Drifting detected` warning and does not account the drops.
 pub const PLAYBACK_BRINGUP_QUANTUMS: u32 = 4;
 
 /// Hard cap on consecutive telemetry polls that may suppress bridge drift

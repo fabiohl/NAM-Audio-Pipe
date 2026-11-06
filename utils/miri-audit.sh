@@ -44,10 +44,12 @@ export MIRIFLAGS="${MIRIFLAGS:--Zmiri-disable-isolation}"
 PHASE_NAME=pool; CUR_LOG="$LOG_DIR/miri-audit-pool.log"; phase pool
 cargo +nightly miri test --lib recording::pool::pool_test 2>&1 | tee "$CUR_LOG"
 assert_ran_tests "$CUR_LOG" 13
+emit "PHASE: pool PASS log=$CUR_LOG"
 
 PHASE_NAME=bridge; CUR_LOG="$LOG_DIR/miri-audit-bridge.log"; phase bridge
 cargo +nightly miri test --lib standalone::pw_host::pw_host_test 2>&1 | tee "$CUR_LOG"
 assert_ran_tests "$CUR_LOG" 1
+emit "PHASE: bridge PASS log=$CUR_LOG"
 
 ok "Miri concurrency and aliasing audit completed successfully (pool 13/13 + bridge handshake)!"
 finish || exit 1

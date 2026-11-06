@@ -15,7 +15,7 @@ use neural_amp_modeler_rs::rt_hardening::{
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Whether the process-wide `mlockall` succeeded (F-UX-13).
+/// Whether the process-wide `mlockall` succeeded.
 ///
 /// The engine's `rt_hardening::mlockall_current` logs the outcome but does not
 /// publish it; the consolidated status banner needs the result, so it is

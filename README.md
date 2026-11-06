@@ -349,14 +349,20 @@ The compiled binary will be located at `target/release/nam-audio-pipe`.
 For maximum performance in mission-critical live setups and stage environments, compile using the automated multi-stage optimization pipeline combining **Profile-Guided Optimization (PGO)** and **LLVM BOLT**:
 
 ```bash
-# Build hyper-optimized PGO + LLVM BOLT binary and install locally:
-./utils/build-release.sh --install
+# 1. Build hyper-optimized PGO + LLVM BOLT binary into target/dist/:
+./utils/build-release.sh --strict
+
+# 2. Run the long audit against the artifact:
+./utils/tests-long.sh --strict --artifact
+
+# 3. Certify and install locally to ~/.local/bin/nam-audio-pipe:
+./utils/build-release.sh --certify --install
 ```
 
 | Canonical Option | Purpose |
 |:---------------- |:------- |
 | `--package`      | Generates distribution tarball (`.tar.zst`) and Flatpak bundle (`.flatpak`) |
-| `--install`      | Installs the optimized binary directly to `~/.local/bin/nam-audio-pipe` |
+| `--install`      | Valid with `--certify`; installs the certified binary to `~/.local/bin/nam-audio-pipe` (and Flatpak if packaged) |
 | `--strict`       | Enforces fail-closed mode: any optimization or verification gap aborts with error |
 | `--certify`      | Does not recompile; verifies and certifies canonical release receipts |
 | `-h, --help`     | Displays command-line help screen and exits |
@@ -366,7 +372,7 @@ This automated builder executes:
 1. **Profile-Guided Optimization (PGO)**: Instruments DSP kernels across quantum matrices (32 to 1024 frames) and model families, generating profile traces to guide branch prediction and loop vectorization.
 2. **LLVM BOLT**: Rearranges basic blocks in machine code using Linux `perf` sample traces to minimize CPU Instruction Cache (I-Cache) and TLB misses.
 3. **Static Hotspot Gates**: Enforces zero `zmm` registers (AVX-512 opt-in policy), zero `libm` calls in RT paths, and zero heap allocations.
-4. **Installs directly** to `~/.local/bin/nam-audio-pipe`.
+4. **Verified Local Installation (`--certify --install`)**: Reconciles the build and audit receipts, then installs the verified artifact directly to `~/.local/bin/nam-audio-pipe`.
 
 ---
 
@@ -375,14 +381,14 @@ This automated builder executes:
 For distributors and release publishing, the official release pipeline enforces strict separation between compilation, stress testing, and cryptographic verification:
 
 ```bash
-# 1. Build canonical optimized release artifact into target/dist/
-./utils/build-release.sh --strict --package --install
+# 1. Build canonical optimized release artifact and packages into target/dist/
+./utils/build-release.sh --strict --package
 
 # 2. Audit the canonical artifact under heavy soak, RT deadline, and zero-alloc stress
 ./utils/tests-long.sh --strict --artifact
 
-# 3. Certify release compliance using the generated receipts without recompilation
-./utils/build-release.sh --certify
+# 3. Certify release compliance using the generated receipts and install without recompilation
+./utils/build-release.sh --certify --install
 ```
 
 ---
@@ -408,9 +414,10 @@ nam-audio-pipe [OPTIONS]
 | `--gate <MODE>`           | `on`, `off`, or `[-96.0, -20.0]` dBFS | `on` (`-70 dB`)                 | Silence gate configuration. Numeric thresholds derive close value via 10 dB Schmitt relation.  |
 | `--cpu <INDEX>`           | Integer core ID                       | *Dynamic IRQ selection*         | Manually binds the real-time audio thread to a specific CPU core.                              |
 | `--record`                | Flag                                  | `false`                         | Enables asynchronous 32-bit float stereo WAV recording via `io_uring`.                         |
-| `--record-dir <DIR>`      | Directory path                        | `$XDG_MUSIC_DIR/NAM-Audio-Pipe` | Output directory for saved audio takes (auto-created if missing).                              |
+| `--record-dir <DIR>`      | Directory path                        | `$XDG_MUSIC_DIR/NAM-Audio-Pipe` (or `~/Music/NAM-Audio-Pipe`, else `.`) | Output directory for saved audio takes (auto-created if missing).                              |
 | `--fail-fast`             | Flag                                  | `false`                         | Disables bounded reconnect cycle: exits immediately on PipeWire daemon disconnect.             |
-| `--reconnect-timeout <S>` | Seconds (`float`)                     | `11.75` (6 attempts)            | Caps the total reconnect retry backoff budget.                                                 |
+| `--reconnect-timeout <S>` | Seconds (`integer >= 0`)              | `11.75` (6 attempts)            | Caps the total reconnect retry backoff budget (`0` behaves like `--fail-fast`).                |
+| `--color <WHEN>`          | `auto`, `always`, `never`             | `auto` (respects `NO_COLOR`)    | Controls ANSI color output for diagnostic banners and terminal messages.                       |
 | `--diagnose`              | Flag                                  | `false`                         | Emits technical diagnostic bundle and exits.                                                   |
 | `--diagnose-full`         | Flag                                  | `false`                         | Emits diagnostic bundle with unredacted raw paths and exits.                                   |
 | `--pause`                 | Flag                                  | `false`                         | Waits for Enter before exiting on interactive terminals (used by `.desktop` Diagnostics).      |
@@ -463,9 +470,9 @@ NAM-Audio-Pipe maintains enterprise-grade reliability through an automated testi
 # 3. Release chain (human operator only): build -> long audit -> certify.
 # The long suite covers accelerated soak, zero-alloc heap audit, RT deadline/jitter,
 # endurance, live PipeWire, io_uring and offline f64 parity.
-./utils/build-release.sh --strict --package --install
+./utils/build-release.sh --strict --package
 ./utils/tests-long.sh --strict --artifact
-./utils/build-release.sh --certify
+./utils/build-release.sh --certify --install
 ```
 
 For complete architectural details on testing, verification phases, and real-time compliance criteria, consult [`docs/testing.md`](docs/testing.md).
@@ -475,7 +482,7 @@ For complete architectural details on testing, verification phases, and real-tim
 ## 📚 Technical Documentation Directory
 
 - [`docs/architecture.md`](docs/architecture.md) — Comprehensive architecture bible: dual-stream PipeWire topology, `DspBridge` shared memory layout, SPSC GC cascade, Linux RT hardening, and asynchronous `io_uring` WAV recording.
-- [`docs/testing.md`](docs/testing.md) — Testing architecture, unit/integration inventory, 10-phase long audit suite, script contract, and compiler optimization pipeline.
+- [`docs/testing.md`](docs/testing.md) — Testing architecture, unit/integration inventory, 11-phase long audit suite, script contract, and compiler optimization pipeline.
 - [`CHANGELOG.md`](CHANGELOG.md) — Project release history, version milestones, and feature additions.
 
 ---

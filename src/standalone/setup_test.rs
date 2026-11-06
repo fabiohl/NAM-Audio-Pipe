@@ -29,7 +29,7 @@ fn test_load_initial_cabsim_none() {
     assert!(result.is_none());
 }
 
-// F-UX-07: an explicitly requested IR that cannot be loaded is fatal by
+// An explicitly requested IR that cannot be loaded is fatal by
 // default (same contract as `--model`); `--cab-optional` restores the
 // graceful `Ok(None)` path.
 #[test]

@@ -302,7 +302,7 @@ fi
 RECEIPT_BIN=target/debug/pipe_long_receipt
 # --strict is the operator release path: the A/B ceremony receipt is an input,
 # not something this script can synthesize. Fail during env_verify instead of
-# after the PGO/BOLT work when the proof is absent or invalid (F9).
+# after the PGO/BOLT work when the proof is absent or invalid.
 if [ "$DO_STRICT" = 1 ]; then
     CEREMONY_PREFLIGHT_LOG="$LOG_DIR/build-release-ceremony_preflight.log"
     if [ ! -f "$CEREMONY_RECEIPT" ]; then

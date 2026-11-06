@@ -136,11 +136,11 @@ pub struct CaptureState {
     pub os_drain: Option<OsSwapDrain>,
     /// Cab-sim rebuild failure latch: stores the `(host_rate, partition_size)` of the last
     /// build attempt that failed and installed safe-bypass (`None`).
-    /// Prevents RT callback from repeatedly requesting rebuilds for the same failing key (D-06).
+    /// Prevents RT callback from repeatedly requesting rebuilds for the same failing key.
     /// Cleared upon successful pair installation. Since IR is immutable per process in NAM-Audio-Pipe,
-    /// recovery from a failed latch occurs when host rate or partition policy changes (S08.4).
+    /// recovery from a failed latch occurs when host rate or partition policy changes.
     pub cabsim_failed_key: Option<(u32, usize)>,
-    /// Optional reference to the host stream status flags for publishing applied latency (D-08).
+    /// Optional reference to the host stream status flags for publishing applied latency.
     pub stream_status: Option<Arc<StreamStatusFlags>>,
 }
 

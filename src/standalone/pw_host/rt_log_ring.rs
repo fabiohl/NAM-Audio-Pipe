@@ -3,16 +3,15 @@
 
 //! Off-RT ring for PipeWire log events raised inside the RT data thread.
 //!
-//! Finding F-APRT-01: with the custom SPA log handler installed, PipeWire
-//! internals may log from the RT data loop, and the synchronous `log::*`
-//! dispatch there reaches `NamLogger` (mutex + formatting allocations). This
-//! module gives the marked RT thread (`rt_setup::rt_log_mark`) an
-//! alternative: the log event is copied — zero heap, zero lock, zero
-//! syscall — into a pre-allocated SPSC ring, and an off-RT drainer thread
-//! then replays the records through the very same `log::*` facade. `LogBuffer`
-//! capture, crash reports and diagnostics keep seeing PW logs (the redirect
-//! is not removed — what is removed is the synchronous `log::*` call on the
-//! RT thread).
+//! With the custom SPA log handler installed, PipeWire internals may log from
+//! the RT data loop, and the synchronous `log::*` dispatch there reaches
+//! `NamLogger` (mutex + formatting allocations). This module gives the marked
+//! RT thread (`rt_setup::rt_log_mark`) an alternative: the log event is copied
+//! — zero heap, zero lock, zero syscall — into a pre-allocated SPSC ring, and
+//! an off-RT drainer thread then replays the records through the very same
+//! `log::*` facade. `LogBuffer` capture, crash reports and diagnostics keep
+//! seeing PW logs (the redirect is not removed — what is removed is the
+//! synchronous `log::*` call on the RT thread).
 //!
 //! # Contracts
 //!
@@ -32,14 +31,13 @@
 //!   telemetry poll. The RT thread never blocks and never falls back to the
 //!   synchronous path under overload.
 //! - *Byte budget per event*: msg ≤ 256, topic ≤ 32, file ≤ 48; longer
-//!   strings truncate. Two documented deviations from the plan text: `file`
-//!   rides along because the real dispatch shape
+//!   strings truncate. `file` rides along because the dispatch shape
 //!   `[PipeWire] msg (file:line)` of ERROR/WARN/DEBUG/TRACE needs it (INFO
-//!   omits it), and the "topic id" is the topic TEXT copied at capture time
-//!   — the drainer never dereferences foreign pointers.
+//!   omits it), and the topic text is copied at capture time so the drainer
+//!   never dereferences foreign pointers.
 //! - *Rollback at (re)initialization*: the `NAM_PW_LOG_SYNC` environment
-//!   variable is consulted exactly once, by `install()` (any value, cold
-//!   path): with it set there is no ring and no drainer — behavior stays
+//!   variable is consulted once by `install()` (cold path): when set to `"1"`
+//!   or `"true"`, there is no ring and no drainer — behavior stays
 //!   bit-identical to the pre-ring host. It is never re-read while the
 //!   process runs; turning the ring off at runtime is `restore`, which
 //!   flips the routing gate off immediately (cold `Release` store read by
@@ -60,10 +58,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Rollback switch consulted exactly once, by `install()` at
-/// (re)initialization: when set (any value), the synchronous path is kept
-/// (no ring, no drainer). Switching a running ring off at runtime is
-/// `restore`, not this variable.
+/// Rollback switch consulted by `install()` at (re)initialization: when set to
+/// `"1"` or `"true"`, the synchronous path is kept (no ring, no drainer).
+/// Switching a running ring off at runtime is `restore`, not this variable.
 pub const SYNC_ROLLBACK_ENV: &str = "NAM_PW_LOG_SYNC";
 
 /// Ring capacity in records (~352 B each → ~344 KiB pre-allocated at install).
@@ -75,7 +72,7 @@ const FILE_CAP: usize = 48;
 /// Upper bound of the `topic` field; longer names truncate.
 const TOPIC_CAP: usize = 32;
 
-/// Upper bound of the message body (plan budget: msg ≤ 256).
+/// Upper bound of the message body (msg ≤ 256).
 const MSG_CAP: usize = 256;
 
 /// Compact captured log event transiting the SPSC ring.
@@ -278,8 +275,8 @@ pub(crate) fn drained_records_for_test() -> u64 {
     DRAINED_RECORDS.load(Ordering::Acquire)
 }
 
-/// Cumulative count of PW log events discarded with a full ring (plan
-/// identifier: `pw_log_dropped`; telemetry-visible via `poll_rt_status`).
+/// Cumulative count of PW log events discarded with a full ring
+/// (telemetry-visible via `poll_rt_status`).
 #[must_use]
 pub fn pw_log_dropped() -> u64 {
     PW_LOG_DROPPED.load(Ordering::Relaxed)
@@ -296,7 +293,13 @@ pub fn is_ring_routing_active() -> bool {
 /// Fail-closed: a failed drainer spawn keeps the synchronous path for every
 /// event (the ring is never enabled without a consumer).
 pub fn install() {
-    if std::env::var_os(SYNC_ROLLBACK_ENV).is_some() {
+    if matches!(
+        std::env::var(SYNC_ROLLBACK_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1" | "true")
+    ) {
         log::debug!(
             "[PW log] synchronous rollback requested via {SYNC_ROLLBACK_ENV} — ring not installed"
         );

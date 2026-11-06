@@ -21,7 +21,7 @@
 // there for why that approach failed).
 fn main() {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    // `rust-lld` (the linker used by default in this toolchain, rustc 1.97.1)
+    // `rust-lld` (the linker used by default in this toolchain)
     // errors by default on any version-script entry naming a symbol that
     // isn't actually defined in a given binary (unlike GNU `bfd`, which just
     // ignores it). Our map intentionally lists the *entire* standard libm

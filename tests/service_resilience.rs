@@ -118,7 +118,7 @@ impl Drop for ChildGuard {
 /// `cwd` so a chatty logger can never deadlock the child on a full pipe. The
 /// capture directory is pinned explicitly with `--record-dir <cwd>` so the
 /// recording worker writes `capture_*.wav` into the temp `cwd` regardless of the
-/// ambient `$XDG_MUSIC_DIR`/`$HOME` (F-UX-11 changed the default away from CWD).
+/// ambient `$XDG_MUSIC_DIR`/`$HOME`.
 fn spawn_host(args: &[&str], cwd: &std::path::Path) -> (ChildGuard, std::path::PathBuf) {
     let stderr_path = cwd.join("child-stderr.log");
     let stderr_file =

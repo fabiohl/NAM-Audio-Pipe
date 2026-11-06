@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Consolidated startup banner and end-of-session summary (F-UX-13).
+//! Consolidated startup banner and end-of-session summary.
 //!
 //! At `info` level a healthy session should read like a dashboard, not like a
 //! firehose: the first thing support asks for (model, cab-sim, rate, quantum,

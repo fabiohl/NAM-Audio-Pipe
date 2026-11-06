@@ -427,12 +427,12 @@ fn cabsim_partition_to_request(
 /// to 256 samples at constant rate) keeps the existing pair active with zero
 /// audio interruption and zero FFT rebuild.
 ///
-/// `failed_key` suppresses endless retries of deterministically failing IR builds
-/// (D-06): when a build fails and delivers safe-bypass `None`, the requested
+/// `failed_key` suppresses endless retries of deterministically failing IR builds:
+/// when a build fails and delivers safe-bypass `None`, the requested
 /// `(host_rate, partition)` is latched in `CaptureState::cabsim_failed_key` and
 /// suppressed on subsequent callbacks. Since IR raw samples are immutable per process in
 /// NAM-Audio-Pipe, a renegotiated host rate or partition policy resets the latch,
-/// resuming rebuild requests for the fresh parameters (S08.4).
+/// resuming rebuild requests for the fresh parameters.
 ///
 /// `already_pending` suppresses duplicate requests while a previous rebuild is
 /// in flight, for both the initial-install and the active-pair branches. Without

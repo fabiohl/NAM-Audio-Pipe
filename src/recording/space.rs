@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Disk-space estimation and low-space pre-warning (F-UX-02b).
+//! Disk-space estimation and low-space pre-warning.
 //!
 //! The recording worker originally detected a full disk only when the write itself
 //! failed with `ENOSPC` (after the fact). A long take could therefore consume the

@@ -1027,6 +1027,6 @@ fn app_state_drop_order_drops_listeners_before_streams() {
             "playback_listener",
             "playback_stream",
         ],
-        "AppState drop order MUST drop listeners before their associated streams to prevent use-after-free (F-RB-102)"
+        "AppState drop order MUST drop listeners before their associated streams to prevent use-after-free"
     );
 }

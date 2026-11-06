@@ -48,13 +48,13 @@ fn fixture_runs_reproduce_table_2_2_and_pgo_only_verdict() {
     let decision =
         evaluate_ceremony(&plain, &pgo, &bolt, 3, None, prov, lbr).expect("evaluate ceremony");
 
-    // Acceptance S2: verdict is PGO-ONLY, reason is bolt_margin_not_met
+    // Verdict is PGO-ONLY when BOLT fails to meet the 1.0% promotion margin.
     assert_eq!(decision.verdict, "PGO-ONLY");
     assert_eq!(decision.verdict_reason, "bolt_margin_not_met");
     assert!(decision.effective_reproducible_gain);
     assert!(!decision.bolt_reproducible_gain);
 
-    // Acceptance S3: provenance and bolt_lbr are emitted deterministically from fixtures
+    // Provenance and bolt_lbr are emitted deterministically from fixtures.
     let p = decision.provenance.as_ref().expect("provenance present");
     assert_eq!(p.git_sha, "5f743cb000000000000000000000000000000000");
     assert!(!p.git_dirty);
@@ -69,7 +69,7 @@ fn fixture_runs_reproduce_table_2_2_and_pgo_only_verdict() {
     assert_eq!(l.samples, 12500);
     assert_eq!(l.mode, "lbr");
 
-    // Verify per-topology gains against Table §2.2 (tolerance 0.02%)
+    // Verify per-topology gains (tolerance 0.02%).
     let get_topo = |name: &str| {
         decision
             .topologies

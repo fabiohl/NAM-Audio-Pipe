@@ -374,7 +374,7 @@ pub(crate) fn parse_sink_name_from_metadata(raw_stdout: &[u8]) -> Option<String>
 /// guaranteeing 0ms wake-up latency for RT audio processing.
 ///
 /// Reuses the engine's canonical RAII guard `neural_amp_modeler_rs::rt_hardening::PmQosGuard`
-/// without redundant local re-openings or duplicate system calls (D-09).
+/// without redundant local re-openings or duplicate system calls.
 ///
 /// **Warning:** This protection is **system-wide (global)** and affects all CPU cores,
 /// not just the thread executing this function.

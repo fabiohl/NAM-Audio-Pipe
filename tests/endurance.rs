@@ -461,7 +461,13 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         last.fds,
     );
     if minflt_thread_delta != 0 || majflt_thread_delta != 0 {
-        if std::env::var_os("NAM_RT_STRICT").is_none() {
+        if !matches!(
+            std::env::var("NAM_RT_STRICT")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "true")
+        ) {
             eprintln!(
                 "TEST_RESULT[endurance_real]=GAP:rt_thread_page_faults profile=release+testing window_secs={window_secs} \
                  elapsed_ms={} dsp_quantums={rt_blocks} blocks={blocks} windows_completed={windows_completed} \

@@ -515,7 +515,7 @@ mod heap_audit_tests {
                 );
                 (get_alloc_count(), get_dealloc_count(), get_realloc_count())
             };
-            // Medido: alloc=0, dealloc=0, realloc=0 (drain_cabsims RT cycle)
+            // Measured: alloc=0, dealloc=0, realloc=0 (drain_cabsims RT cycle)
             assert_eq!(
                 allocs, 0,
                 "heap allocations detected during {label}: count={allocs}"

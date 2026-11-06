@@ -315,7 +315,7 @@ To guarantee deterministic memory bounds, all components enforce strict maximum 
 |:---------------------- |:--------------------------------- |:--------------------------------------------------------------------------------- |
 | `MAX_BRIDGE_BUF`       | 8192 samples                      | `DspBridge` width; callbacks reject larger descriptors fail-closed.               |
 | `MAX_RESAMP_BUF`       | 8192 samples                      | Bounds maximum memory allocation for resamplers and oversampling engines.         |
-| CabSim Partition Size  | Clamped to `[1, MAX_RESAMP_BUF]`  | Initial setup and rebuild handlers support small quanta (`1..=MAX_RESAMP_BUF`) using chunked sub-blocks. |
+| CabSim Partition Size  | Clamped to `[16, MAX_RESAMP_BUF]` | CLI `--cabsim-partition` domain `{32, 64, 128, 256}` (default `128`), decoupled from the host quantum. |
 | `--buffer-size` Domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`  | Validated at CLI parsing; invalid values reject before PipeWire graph connection. |
 
 ### 6.2 Real-Time Watchdog & Dynamic Downgrade
@@ -397,9 +397,9 @@ nam-audio-pipe --diagnose-full
 
 | Code Range | Category              | Representative Identifiers                                                                    |
 |:---------- |:--------------------- |:--------------------------------------------------------------------------------------------- |
-| `E1xxx`    | Model Loading & I/O   | `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1300` UNSUPPORTED_ARCHITECTURE        |
-| `E2xxx`    | Audio & Real-Time     | `E2001` DEADLINE_EXCEEDED, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2120` PAGE_SIZE_QUERY_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION |
-| `E3xxx`    | SPSC / Lock-Free GC   | `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_CORRUPTED                         |
+| `E1xxx`    | Model, IR & CLI Setup | `E1001` NAM_LOAD_FAILED, `E1002` NAM_PARSE_FAILED, `E1003` IR_LOAD_FAILED, `E1004` DUAL_MODEL_RATE_MISMATCH, `E1005` INVALID_PARAMETER, `E1006` MODEL_DIM_MISMATCH, `E1007` RECORDING_INIT_FAILED, `E1100` FILE_NOT_FOUND, `E1200` NAM_JSON_PARSE_ERROR, `E1300` UNSUPPORTED_ARCHITECTURE |
+| `E2xxx`    | Audio & Real-Time     | `E2001` DEADLINE_EXCEEDED / SAMPLE_RATE_MISMATCH, `E2004` OS_SCRATCH_CAPACITY, `E2111` PM_QOS_WRITE_FAILED, `E2112` PM_QOS_ACCESS_DENIED, `E2113` HW_SINK_PROBE_FAILED, `E2114` HW_SINK_PROBE_TIMEOUT, `E2115` HW_SINK_PROBE_TRUNCATED, `E2120` PAGE_SIZE_QUERY_FAILED, `E2200` RESAMPLER_BUILD_FAILED, `E2201` RESAMPLER_CHANNEL_FULL, `E2202` CABSIM_BUILD_FAILED, `E2300` RT_PRIORITY_DENIED, `E2301` CPU_OUT_OF_BOUNDS, `E2302` RT_SCHED_FAILED, `E2303` RT_GETSCHED_FAILED, `E2304` SPA_FORMAT_CONTRACT_VIOLATION, `E2305` NON_FINITE_INPUT_CONTAINED, `E2306` CPU_AFFINITY_FAILED, `E2307` RATE_MISMATCH, `E2400` BACKEND_FAILURE |
+| `E3xxx`    | SPSC / Lock-Free DSP  | `E3001` XRUN_DETECTED, `E3002` DENORMAL_DETECTED, `E3003` INFERENCE_FAULT, `E3100` PARAM_CHANNEL_FULL, `E3101` GC_OVERFLOW, `E3102` GC_STARVATION / GC_CORRUPTED, `E3103` SLIMMABLE_SLICE_FAILED, `E3104` SLIMMABLE_RESET_FAILED |
 | `E4xxx`    | Runtime & CLI         | `E4100` INVALID_GAIN_VALUE, `E4103` CABSIM_BUILD_FAILED                                       |
 | `E5xxx`    | System Resources      | `E5000` OUT_OF_MEMORY                                                                         |
 
@@ -480,8 +480,10 @@ NAM-Audio-Pipe is distributed as a standalone desktop Flatpak application target
 ### 9.2 Developer Inspection & Build Commands
 
 ```bash
-# 1. Build optimized release binary and Flatpak bundle:
-./utils/build-release.sh --strict --install
+# 1. Build optimized release binary and Flatpak bundle, audit, and install:
+./utils/build-release.sh --strict --package
+./utils/tests-long.sh --strict --artifact
+./utils/build-release.sh --certify --install
 
 # 2. Inspect active sandbox permissions:
 flatpak info --show-permissions io.github.fabiohl.NAMAudioPipe

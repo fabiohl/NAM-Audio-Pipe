@@ -3,6 +3,7 @@
 
 use super::*;
 use std::ffi::OsStr;
+use std::path::Path;
 
 #[test]
 fn test_parse_args_diagnose() {
@@ -504,7 +505,7 @@ fn parse_args_accepts_cpu_zero() {
     assert_eq!(cli_args.cpu, Some(0));
 }
 
-// --expand_user_path (F-UX-12) --------------------------------------------
+// --expand_user_path --------------------------------------------------------
 
 #[test]
 fn expand_user_path_leaves_non_tilde_paths_unchanged() {
@@ -562,7 +563,7 @@ fn expand_user_path_without_home_is_a_clear_error() {
     }
 }
 
-// --input file validation (F-UX-12) ---------------------------------------
+// --input file validation -------------------------------------------------
 
 #[test]
 fn validate_readable_file_accepts_a_regular_file_and_returns_absolute_path() {

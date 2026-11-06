@@ -496,7 +496,7 @@ fn applied_latency_updated_on_install_and_preserved_on_discard() {
     assert_eq!(
         applied_latency.load(Ordering::Acquire),
         expected_lat,
-        "applied latency must be published upon install (D-08)"
+        "applied latency must be published upon install"
     );
 
     // Now push a superseded envelope with generation 2 while requested is 3

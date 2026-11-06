@@ -5,11 +5,11 @@
 //! Activation precision and resampler lifecycle fidelity tests.
 //!
 //! Validates:
-//! 1. S02.1: Propagation of `ActivationPrecision` to the PipeWire data thread,
+//! 1. Propagation of `ActivationPrecision` to the PipeWire data thread,
 //!    verifying that `Fast` and `Standard` modes are genuinely applied on the audio
 //!    thread and testing the measured audible fidelity difference on LSTM models
 //!    (~-13 dB ESR degradation as documented in NeuralAmpModeler-rs/docs/audio_fidelity_map.md §2).
-//! 2. S02.2 & S02.3: Idempotent resampler generation tracking, supersession,
+//! 2. Idempotent resampler generation tracking, supersession,
 //!    return to active rate, and bounded failure rollback with recovery.
 
 use nam_audio_pipe::standalone::pw_host::{PrologueOutcome, RtSwapHarness};
@@ -58,7 +58,7 @@ fn compute_esr_db(test: &[f32], reference: &[f32]) -> f64 {
     10.0 * (sum_diff_sq / sum_ref_sq).log10()
 }
 
-/// S02.1: Verifies that configuring the real-time thread with `Fast` vs `Standard`
+/// Verifies that configuring the real-time thread with `Fast` vs `Standard`
 /// activation takes genuine numerical effect during DSP inference on the executing thread.
 ///
 /// On LSTM architecture, the Padé approximation (`Fast`) diverges from exact activation
@@ -112,7 +112,7 @@ fn test_lstm_activation_precision_fidelity_measured() {
     );
 }
 
-/// S02.2: Verifies idempotent rate synchronization across multiple callbacks in RtSwapHarness.
+/// Verifies idempotent rate synchronization across multiple callbacks in RtSwapHarness.
 #[test]
 fn test_harness_rate_sync_idempotence_and_supersession() {
     let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
@@ -178,7 +178,7 @@ fn test_harness_rate_sync_idempotence_and_supersession() {
     );
 }
 
-/// S02.2: Verifies return to active rate ("retorno à taxa vigente") in RtSwapHarness.
+/// Verifies return to active rate ("retorno à taxa vigente") in RtSwapHarness.
 #[test]
 fn test_harness_return_to_active_rate() {
     let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)
@@ -227,7 +227,7 @@ fn test_harness_return_to_active_rate() {
     );
 }
 
-/// S02.3: Verifies failure latch and recovery with a new request in RtSwapHarness.
+/// Verifies failure latch and recovery with a new request in RtSwapHarness.
 #[test]
 fn test_harness_failure_rollback_and_recovery() {
     let (_producer, mut rt_side) = RtSwapHarness::new(48000, 48000)

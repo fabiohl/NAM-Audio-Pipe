@@ -8,7 +8,7 @@
 
 // Non-test production code must not rely on `unwrap`/`expect`: every fallible
 // path returns a typed error, and RT-adjacent invariants are handled with
-// explicit `let ... else`/`debug_assert!` instead of panics (F-PR-13). Modules
+// explicit `let ... else`/`debug_assert!` instead of panics. Modules
 // compiled only for the `testing` feature are test support, not production.
 #![cfg_attr(
     not(any(test, feature = "testing")),

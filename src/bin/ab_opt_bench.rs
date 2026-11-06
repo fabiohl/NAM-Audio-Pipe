@@ -612,9 +612,9 @@ fn run_measured(
     let mut resamp_out_r = vec![0.0; MAX_RESAMP_BUF];
     // Resolve the oversample factor before the scratch sizing and size
     // the oversample scratch exactly like the engine requires
-    // (`required_scratch_len`, F-PERF-18 pattern) — the streaming pipeline
-    // never reads `resamp_mid_l/r` / `model_out_l/r`, so the bench stops
-    // allocating the dead 128 KiB intermediates (F-PERF-17).
+    // (`required_scratch_len`) — the streaming pipeline
+    // never reads `resamp_mid_l/r` / `model_out_l/r`, so the bench avoids
+    // allocating dead intermediate buffers.
     let os_factor = match os_mode {
         MODE_OFF => OversampleFactor::Off,
         MODE_2X => OversampleFactor::X2,
@@ -683,8 +683,8 @@ fn run_measured(
             conv_pair: conv.as_mut(),
         };
         // Streaming scratch set (`StreamingDspBuffers`) — the production
-        // capture path never reads `resamp_mid_l/r` / `model_out_l/r`
-        // (F-PERF-17), so the bench passes the 8-buffer streaming set and lets
+        // capture path never reads `resamp_mid_l/r` / `model_out_l/r`,
+        // so the bench passes the 8-buffer streaming set and lets
         // the engine's `Into<DspBuffers>` adapter zero-slice the intermediates.
         let bufs = StreamingDspBuffers {
             resamp_out_l: &mut resamp_out_l,

@@ -341,7 +341,7 @@ impl SharedBackendStatus {
     ///
     /// Must be called with `guard` holding `self.lock_state()`.
     /// `Failed` is sticky and terminal — no-op if `self.failed` is true.
-    /// Transition to `Running` requires BOTH streams active AND both format contracts valid (D-05).
+    /// Transition to `Running` requires BOTH streams active AND both format contracts valid.
     fn update_stream_health_locked(&self, guard: &mut BackendState) {
         if self.failed.load(Ordering::Acquire) {
             return;
@@ -534,7 +534,7 @@ impl SharedBackendStatus {
 /// While this guard is alive, [`SharedBackendStatus::is_teardown_in_progress`]
 /// evaluates to `true`, preventing spurious `Unconnected` state transitions
 /// (triggered synchronously by `pw_stream_destroy()`) from poisoning
-/// subsequent reconnection attempts with premature `Failed` markers (F-RB-101).
+/// subsequent reconnection attempts with premature `Failed` markers.
 ///
 /// Dropping this guard (including during stack unwinding or normal function exit)
 /// resets the teardown latch to `false`.
@@ -573,7 +573,7 @@ pub fn observe_stream_state(
             // so it is logged below `ERROR` and the sticky `Failed` transition
             // is skipped.
             //
-            // Finding F-RB-101: if teardown/reconnect is in progress
+            // If teardown/reconnect is in progress
             // (e.g. `pw_stream_destroy()` destroying streams while reconnecting),
             // this synchronous `Unconnected` event is the direct consequence of
             // host teardown and must not poison the upcoming reconnection attempt

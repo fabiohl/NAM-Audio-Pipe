@@ -304,7 +304,7 @@ fn disk_writer_loop_discards_audio_before_metadata() {
     assert_eq!(wav_sample_count(&wav_path), 2);
 }
 
-/// R-13 — full `--record` lifecycle, end-to-end:
+/// Full `--record` lifecycle, end-to-end:
 ///
 /// 1. spawns `run_pipewire_host` with a REAL recording producer and the real
 ///    disk I/O thread (`disk_writer_loop`), inside a clean temp CWD;
@@ -472,7 +472,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let wav_path = found.expect("no WAV file created by the E2E recording session");
 
     // The `data` chunk size field (header) must equal the PCM bytes actually
-    // present in the file — the R-13 coherence invariant. A clean stop must
+    // present in the file — the coherence invariant. A clean stop must
     // never leave `data=0` (incomplete header from the detached-join path).
     let file_bytes = std::fs::read(&wav_path).expect("failed to read recorded WAV");
     let data_pos = file_bytes
@@ -486,16 +486,16 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
     let expected_payload = sample_count as u64 * 2 * 4; // stereo × 32-bit float
     assert_eq!(
         data_size as u64, payload_bytes,
-        "R-13: WAV 'data' header size ({data_size}) != PCM bytes actually written ({payload_bytes})"
+        "WAV 'data' header size ({data_size}) != PCM bytes actually written ({payload_bytes})"
     );
     assert_eq!(
         expected_payload, payload_bytes,
-        "R-13: hound duration disagrees with actual file payload ({} vs {payload_bytes})",
+        "hound duration disagrees with actual file payload ({} vs {payload_bytes})",
         expected_payload
     );
     assert!(
         data_size > 0,
-        "R-13: WAV 'data' size is 0 after a clean stop — header rewrite never completed"
+        "WAV 'data' size is 0 after a clean stop — header rewrite never completed"
     );
     eprintln!("TEST_RESULT[record_e2e]=PASS");
 }

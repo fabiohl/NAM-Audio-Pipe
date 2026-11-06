@@ -232,7 +232,7 @@ pub(crate) fn emit_decoded_pipewire_log(
 /// Valid UTF-8 borrows the buffer directly; a payload containing invalid
 /// bytes degrades to the static `"<non-utf8>"` fallback (the lossy bytes are
 /// never materialized into a heap string — the formatter must stay
-/// allocation-free even on hostile input, F-APRT-01). `None` when the buffer
+/// allocation-free even on hostile input). `None` when the buffer
 /// carries no NUL terminator, which a completed `vsnprintf` cannot produce
 /// but stays fail-closed anyway.
 fn stack_msg_to_str(buf: &[u8; 1024]) -> Option<&str> {
@@ -266,7 +266,7 @@ unsafe fn format_and_dispatch_variadic(
     let Some(msg) = stack_msg_to_str(&buf) else {
         return;
     };
-    // Off-RT ring for the marked RT thread (F-APRT-01): `msg` is consumed by
+    // Off-RT ring for the marked RT thread: `msg` is consumed by
     // the ring (queued or discarded+counted) or the sync dispatch follows as
     // before on unmarked threads / rollback mode. O(1), zero alloc, no locks.
     if rt_log_ring::try_offload(level, topic, file, line, msg) {
@@ -306,7 +306,7 @@ unsafe fn format_and_dispatch_va_tag(
     let Some(msg) = stack_msg_to_str(&buf) else {
         return;
     };
-    // Off-RT ring for the marked RT thread (F-APRT-01), same contract as the
+    // Off-RT ring for the marked RT thread, same contract as the
     // `vsnprintf` formatter above.
     if rt_log_ring::try_offload(level, topic, file, line, msg) {
         return;
@@ -461,7 +461,7 @@ pub fn init_pipewire_logging(level_filter: log::LevelFilter) {
     }
 
     HANDLER_INSTALLED.store(true, Ordering::Release);
-    // Off-RT ring install (F-APRT-01): cold path, main thread; reads
+    // Off-RT ring install: cold path, main thread; reads
     // `NAM_PW_LOG_SYNC` and refuses re-install; the marked data thread will
     // start routing through the ring instead of the synchronous dispatch.
     rt_log_ring::install();

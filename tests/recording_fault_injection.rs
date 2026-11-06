@@ -705,7 +705,7 @@ fn wav_metadata_change_splits_part2_byte_exact() {
     );
 }
 
-/// Combined integration test for Epic B (F-RB-103, F-RB-106, F-RB-107):
+/// Combined integration test for stalled I/O saturation and rate renegotiation:
 ///
 /// Exercises the combined scenario of:
 /// 1. Artificially stalled I/O (worker not draining yet) saturating the
@@ -1312,7 +1312,7 @@ fn count_threads() -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Ignored: durability checkpoint (F-UX-01)
+// Ignored: durability checkpoint
 // ---------------------------------------------------------------------------
 
 /// A capture killed mid-stream must remain readable up to the last periodic

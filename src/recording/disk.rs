@@ -54,7 +54,7 @@
 //! (SIGKILL, OOM-killer, power loss, unhandled signals, a stuck second
 //! Ctrl+C) leaves a `.wav` whose `data` chunk declares `0` bytes even with
 //! gigabytes already on disk — the whole take is unrecoverable by every
-//! standard reader (F-UX-01). The writer therefore rewrites the header with the
+//! standard reader. The writer therefore rewrites the header with the
 //! running byte count and `fsync`s it every [`CHECKPOINT_INTERVAL_SECS`] seconds
 //! of audio, from the disk thread, between blocks. A crash can then lose at
 //! most one checkpoint window (≤ `CHECKPOINT_INTERVAL_SECS` s) instead of the
@@ -112,10 +112,9 @@ static OUTPUT_PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// checkpoints.
 ///
 /// Every window the header is rewritten with the current `data_bytes_written`
-/// and `fsync`ed, bounding the audio a crash can lose (F-UX-01). The value is
-/// a policy choice from the finding's suggested 2–5 s range, not a measured
-/// threshold. `0` disables checkpointing (the header is then only corrected on
-/// `finalize`, i.e. the pre-fix behavior) — the documented rollback.
+/// and `fsync`ed, bounding the audio a crash can lose. The value is
+/// a policy choice in the 2–5 s range. `0` disables checkpointing (the header
+/// is then only corrected on `finalize`) — the documented rollback.
 ///
 /// The trigger is derived per-format as
 /// `CHECKPOINT_INTERVAL_SECS × sample_rate × channels × (bit_depth / 8)`
@@ -168,7 +167,7 @@ struct AsyncWavWriter<W: WriteAt> {
     current_offset: u64,
     /// Audio-data bytes accumulated since the last periodic header checkpoint.
     /// When it reaches `checkpoint_interval_bytes` the header is rewritten and
-    /// `fsync`ed, bounding the audio a crash can lose (F-UX-01).
+    /// `fsync`ed, bounding the audio a crash can lose.
     bytes_since_checkpoint: u64,
     /// Checkpoint trigger in audio-data bytes (`CHECKPOINT_INTERVAL_SECS` of
     /// audio at the current format). `0` disables checkpointing.
@@ -419,7 +418,7 @@ trait WavWriter {
     fn checkpoint_due(&self) -> bool;
 
     /// Rewrites the header with the running byte count and `fsync`s it, without
-    /// advancing the write offsets or the byte accounting (F-UX-01).
+    /// advancing the write offsets or the byte accounting.
     async fn checkpoint(&mut self) -> Result<()>;
 
     /// Rewrites the header with the final byte count and issues `fsync`.
@@ -647,7 +646,7 @@ async fn disk_writer_loop_inner<S: WavSink>(
     status: &SharedRecordingStatus,
 ) -> Result<()> {
     // One summary per session, populated as segments open and blocks land,
-    // rendered once when the capture is finalized (F-UX-11).
+    // rendered once when the capture is finalized.
     let mut summary = CaptureSummary::default();
     match receiver {
         RecordingReceiver::Pool { control, pool } => {
@@ -1012,7 +1011,7 @@ async fn open_new_part<S: WavSink>(
     log::info!("🎬 Created file: {}", filename.display());
     log::info!("🎧 Started writing strict PipeWire source audio...");
 
-    // Register the new segment for the end-of-session summary (F-UX-11).
+    // Register the new segment for the end-of-session summary.
     if summary.directory.as_os_str().is_empty()
         && let Some(parent) = filename.parent()
     {
@@ -1079,7 +1078,7 @@ fn maybe_check_space<S: WavSink>(
     }
 }
 
-/// Logs the end-of-session capture summary once the worker finalizes (F-UX-11).
+/// Logs the end-of-session capture summary once the worker finalizes.
 fn log_capture_summary(summary: &CaptureSummary) {
     let line = summary.render();
     if !line.is_empty() {
@@ -1119,7 +1118,7 @@ async fn write_block_with_overflow_rollover<S: WavSink>(
 
     if let Some(writer) = &mut *wav_writer {
         writer.write_block(block).await?;
-        // Summary accounting (F-UX-11): stereo f32 => frames = samples/2,
+        // Summary accounting: stereo f32 => frames = samples/2,
         // payload bytes = samples*4.
         let samples = block.valid_len() as u64;
         summary.add_block(samples / 2, samples * 4);

@@ -21,7 +21,7 @@ use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtS
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// Minimum spacing between gate-transition `info` lines (F-UX-13).
+/// Minimum spacing between gate-transition `info` lines.
 ///
 /// A gate threshold sitting near the guitar's noise floor can flap at the poll
 /// rate (≤ 10 Hz), burying real errors under a burst of "Silent Mode"/"Audio
@@ -129,8 +129,7 @@ pub struct TelemetryLatches {
     /// Audio deadline exceeded (`dsp_cycle_time > quantum budget`).
     pub deadline_exceeded: LatchedSignal,
     /// PW log ring saturation (`pw_host::rt_log_ring::pw_log_dropped`): PW
-    /// log events discarded with the SPSC ring full (F-APRT-01 off-RT
-    /// offload budget).
+    /// log events discarded with the SPSC ring full (off-RT offload budget).
     pub pw_log_dropped: LatchedSignal,
 }
 
@@ -162,7 +161,7 @@ pub struct PollState {
     /// Whether the bring-up transient has been drained and closed for the current
     /// streaming session.
     pub bringup_completed: bool,
-    /// Gate-transition log rate limiter (F-UX-13).
+    /// Gate-transition log rate limiter.
     pub gate_throttle: GateTransitionThrottle,
 }
 
@@ -566,21 +565,7 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.6 PLAYBACK BRIDGE STARVATION:
-    // The bridge produced no new DSP block (capture paused, resampler rebuild
-    // pending, clock drift or quantum miss). The playback callback delivered a
-    // recycled buffer filled with deterministic silence instead of repeating
-    // stale audio — expected behavior, surfaced as info telemetry.
-    // Latched: sustained starvation (e.g. paused capture) informs once
-    // per episode instead of every control-loop iteration.
-    // 5.6 PLAYBACK BRIDGE STARVATION:
-    // The bridge produced no new DSP block (capture paused, resampler rebuild
-    // pending, clock drift or quantum miss). The playback callback delivered a
-    // recycled buffer filled with deterministic silence instead of repeating
-    // stale audio — expected behavior, surfaced as info telemetry.
-    // Latched: sustained starvation (e.g. paused capture) informs once
-    // per episode instead of every control-loop iteration.
-    // 5.57 PW LOG RING SATURATION (F-APRT-01):
+    // 5.57 PW LOG RING SATURATION:
     // PW log events offloaded to the SPSC ring were DISCARDED with the ring
     // full. The marked RT thread never blocks and never falls back to the
     // synchronous dispatch — the diagnostic stream is instead SAMPLED, and
@@ -884,7 +869,7 @@ pub fn poll_rt_status(
         }
     }
 
-    // Silence transition detection. F-UX-13: gate chatter is rate-limited to at
+    // Silence transition detection: gate chatter is rate-limited to at
     // most one `info` line per second (suppressed transitions fold into the next
     // line as "(×N)") so a threshold near the noise floor cannot bury real
     // errors under a burst of silent/active lines.

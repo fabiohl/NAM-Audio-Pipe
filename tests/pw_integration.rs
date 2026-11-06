@@ -35,7 +35,7 @@ const E2E_MIN_WINDOW: Duration = Duration::from_secs(4);
 /// Hard ceiling for the measurement window (covers 2000 samples at q=256).
 const E2E_MAX_WINDOW: Duration = Duration::from_secs(15);
 
-/// R-17: the script (`utils/tests-long.sh` PHASE8) only executes
+/// The script (`utils/tests-long.sh` PHASE8) only executes
 /// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
 /// test therefore means the daemon vanished mid-run or the script↔test
 /// probes diverged — a silent `return` would let the script print
@@ -43,7 +43,7 @@ const E2E_MAX_WINDOW: Duration = Duration::from_secs(15);
 fn assert_daemon_probe_consistent() {
     if !common::probe_pipewire_daemon() {
         panic!(
-            "R-17: pw-cli info 0 failed inside the test after the script probe \
+            "pw-cli info 0 failed inside the test after the script probe \
              passed — daemon vanished or probes diverged. Refusing to emit \
              LIVE_PW=RAN without real DSP execution."
         );
@@ -258,7 +258,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     if env.calibrated() {
         // Tight gate relative to the host quantum: the bridge is one quantum
         // deep, so p99 must stay under 1.25·q + 100 µs and the maximum under
-        // 1.5·q (F-PR-07).
+        // 1.5·q.
         let p99_limit = quantum_ns + quantum_ns / 4 + 100_000;
         let max_limit = quantum_ns + quantum_ns / 2;
         assert!(
@@ -303,7 +303,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
 #[test]
 #[ignore = "requires a running PipeWire daemon (session or system); run by utils/tests-long.sh PHASE8"]
 fn test_pipewire_integration() {
-    // R-17: fail-closed divergence check — never a silent skip here (the
+    // Fail-closed divergence check — never a silent skip here (the
     // script probe already gated on the daemon).
     assert_daemon_probe_consistent();
 

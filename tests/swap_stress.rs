@@ -401,7 +401,7 @@ fn swap_soak_heap_audit_zero_alloc() {
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
 
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, full burst of 16x every swap kind)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, full burst of 16x every swap kind)
     assert_eq!(
         allocs, 0,
         "heap allocations detected on the RT thread across swap transitions: {allocs}"
@@ -434,7 +434,7 @@ fn swap_soak_heap_audit_includes_resampler() {
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
     h.consume_gc();
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler swap 96k install)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, resampler swap 96k install)
     assert_eq!(
         allocs, 0,
         "resampler install path allocated on RT: {allocs}"
@@ -488,7 +488,7 @@ fn swap_soak_heap_audit_audio_pipeline_zero_alloc() {
         }
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, 256 continuous audio blocks with model+cabsim)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, 256 continuous audio blocks with model+cabsim)
     assert_eq!(allocs, 0, "audio pipeline allocated on RT: {allocs}");
     assert_eq!(deallocs, 0, "dealloc no callback RT");
     assert_eq!(reallocs, 0, "realloc no callback RT");
@@ -535,7 +535,7 @@ fn swap_soak_heap_audit_capture_and_playback_normal() {
 
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, capture + bridge read + playback copy)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, capture + bridge read + playback copy)
     assert_eq!(
         allocs, 0,
         "capture/playback normal regime allocated on RT: {allocs}"
@@ -578,7 +578,7 @@ fn swap_soak_heap_audit_noise_gate_silence_transition() {
 
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, noise-gate silence open->closed->open)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, noise-gate silence open->closed->open)
     assert_eq!(
         allocs, 0,
         "noise-gate silence transition allocated on RT: {allocs}"
@@ -633,7 +633,7 @@ fn swap_soak_heap_audit_playback_bridge_starvation() {
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, playback bridge starvation fallback)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, playback bridge starvation fallback)
     assert_eq!(
         allocs, 0,
         "playback bridge starvation path allocated on RT: {allocs}"
@@ -698,7 +698,7 @@ fn swap_soak_heap_audit_malformed_ffi_fail_closed() {
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=64, fail-closed rejection of malformed FFI)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=64, fail-closed rejection of malformed FFI)
     assert_eq!(
         allocs, 0,
         "malformed FFI rejection allocated on RT: {allocs}"
@@ -768,7 +768,7 @@ fn swap_soak_heap_audit_oversized_quantum_fail_closed() {
         };
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
-    // Medido: alloc=0, dealloc=0, realloc=0 (quantum=8193, fail-closed rejection of oversized quantum)
+    // Measured: alloc=0, dealloc=0, realloc=0 (quantum=8193, fail-closed rejection of oversized quantum)
     assert_eq!(
         allocs, 0,
         "oversized quantum rejection allocated on RT: {allocs}"
@@ -854,7 +854,7 @@ fn swap_composite_structural_saturation_bound_measurement() {
     }
 
     total_installed += h.consume_gc();
-    // Medido: pops/callback p99=32, max=32 (ceiling=48), duration p99=0.94 µs (< 33.3 µs budget)
+    // Measured: pops/callback p99=32, max=32 (ceiling=48), duration p99=0.94 µs (< 33.3 µs budget)
     assert!(
         total_installed > 0,
         "structural swaps must be retired to GC"

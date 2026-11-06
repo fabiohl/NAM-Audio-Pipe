@@ -112,7 +112,7 @@ const RATE_WEIGHTS: [f64; 3] = [0.25, 0.50, 0.25];
 
 /// Process quantums (frames/block) exercised. Weight documents typical use:
 /// 64 stays dominant (low-latency default); 128 closes the PipeWire-common
-/// coverage gap (F-LL-08); 256 is the common quantum; 512 the safe/large
+/// coverage gap; 256 is the common quantum; 512 the safe/large
 /// margin; 32/1024 close the tail gaps (tiny/headroom quantums) with small
 /// weights so they enter the profile without dethroning 64.
 const QUANTUMS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
@@ -149,7 +149,7 @@ const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
 
 /// Total working storage for the four oversampled slices plus the two
 /// crossfade scratch slices (`MAX_RESAMP_BUF` each, matching the engine's
-/// R-16 guard).
+/// buffer guard).
 const OS_BUF_LEN: usize = MAX_OS_BUF * 4 + MAX_RESAMP_BUF * 2;
 
 /// DSP topology family classification used by the receipt.

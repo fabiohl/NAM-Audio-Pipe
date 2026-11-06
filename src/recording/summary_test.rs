@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for the end-of-session capture summary (F-UX-11), including the
+//! Unit tests for the end-of-session capture summary, including the
 //! two-segment acceptance case.
 
 use super::*;

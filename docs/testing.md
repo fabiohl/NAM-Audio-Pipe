@@ -19,7 +19,7 @@ This document details the automated testing architecture, verification suites, r
 |:------------------ |:---------------------------------------------------------------------- |:------------------------------------------------------------------ |
 | **`default`**      | Enables `dual-mono` by default (`default = ["dual-mono"]`).            | Production builds and baseline compilation checks.                 |
 | **`dual-mono`**    | Propagates `NeuralAmpModeler-rs/dual-mono` for stereo L/R processing. | Default feature enabled across standard builds and audio pipelines. |
-| **`testing`**      | Propagates `NeuralAmpModeler-rs/testing`, `dual-mono`, `serde`, `sha2`.| Mandatory for executing unit, integration, and verification tests. |
+| **`testing`**      | Propagates `NeuralAmpModeler-rs/testing`, `dep:serde`, `dep:sha2`.     | Mandatory for executing unit, integration, and verification tests. |
 | **`heap-audit`**   | Enables counting allocators to verify 0 heap allocations in RT paths.  | Used in the long suite's `heap-audit` phase and RT callback safety tests. |
 | **`rt-hardening`** | Mirrors `NeuralAmpModeler-rs/rt-hardening` for matrix uniformity.      | Unconditionally active in `[dependencies]`; opt-in feature mirror. |
 
@@ -143,7 +143,7 @@ Each unit test verifies strict architectural invariants directly within the rele
 - **Key Invariants**:
   - Command rings use bounded SPSC queues. The audio thread drains pending updates without blocking, while old resources are returned to an off-RT garbage collection (GC) queue for safe deallocation.
   - Resampler rebuild generation tracking is strictly idempotent across callbacks while a rebuild is in flight, preserving the target host rate even when atomic swap returns 0.
-  - Supports legitimate supersession and immediate unmuting on return to active rate ("retorno à taxa vigente"), invalidating in-flight envelopes.
+  - Supports legitimate supersession and immediate unmuting on return to active rate, invalidating in-flight envelopes.
   - Failure handling is bounded: fail-open rollback un-mutes with the fallback resampler and latches failure state locally to prevent retry/alloc/log storms on unrecoverable rate tuples.
 
 #### Backend State Machine & Fail-Fast SLA
@@ -309,17 +309,18 @@ Executable verification scripts in [`utils/`](../utils/) automate testing across
 
 Class A. It runs the following steps in order and aborts on the first failure:
 
-1. **Formatting:** `cargo fmt --all` is applied during local development (N-5); with `CI=true` it only verifies with `--check`.
+1. **Formatting:** `cargo fmt --all` is applied during local development; with `CI=true` it only verifies with `--check`.
 2. **Compilation matrix:** `cargo check --locked` for all-targets/all-features, lib/no-default-features, and all-targets/no-default-features.
 3. **Strict Clippy:** the same matrix with `-- -D warnings`.
-4. **Documentation:** `cargo doc --locked --no-deps --all-features` must build. Rustdoc warnings are capped while the pre-existing intra-doc link debt is addressed.
+4. **Documentation:** `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features` must build with zero warnings.
 5. **SPDX headers:** every tracked `.rs`, `.sh`, `.py`, `build.rs`, and `Cargo.toml` must carry `GPL-3.0-or-later` or `MIT`.
 6. **Text policies:** documented `#[allow(clippy::...)]` suppressions and the centralized `log::set_max_level` rule.
 7. **Packaging:** mandatory Flatpak/AppStream/desktop paths, plus `appstreamcli validate --no-net --strict` and `desktop-file-validate`.
+8. **Script budget:** verifies that every `utils/*.sh` script declares `# Orçamento: <n>` and stays within its line-count budget.
 
 ### 3.2 Quick Discipline ([`utils/tests-quick.sh`](../utils/tests-quick.sh))
 
-Class A with two invocations in the development profile: `cargo test --locked --features testing --no-fail-fast` (default `dual-mono`) and `cargo test --locked --no-default-features --features testing --no-fail-fast` (lean single-inference path). `#[ignore]` tests are skipped by construction; harnesses that assert per-channel `dual-mono` semantics are `#[cfg(feature = "dual-mono")]` and therefore absent from the lean run instead of producing false failures. The discipline emits `scope=quick`; it never builds release, never provisions infrastructure, never emits receipts, and never applies manual `--skip` lists. It is the suite expected at the end of each sprint and must stay within 5 minutes with a warm cache.
+Class A with two invocations in the development profile: `cargo test --locked --features testing --no-fail-fast` (default `dual-mono`) and `cargo test --locked --no-default-features --features testing --no-fail-fast` (lean single-inference path). `#[ignore]` tests are skipped by construction; harnesses that assert per-channel `dual-mono` semantics are `#[cfg(feature = "dual-mono")]` and therefore absent from the lean run instead of producing false failures. The discipline emits `scope=quick`; it never builds release, never provisions infrastructure, never emits receipts, and never applies manual `--skip` lists. It is the fast verification suite for routine development and must stay within 5 minutes with a warm cache.
 
 ### 3.3 Long Audit Suite ([`utils/tests-long.sh`](../utils/tests-long.sh))
 
@@ -346,25 +347,25 @@ Class B, operator-only. It records every phase result instead of aborting on the
 
 Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
 
-`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and writes `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file); it never deletes the previous full `long-audit-receipt.jsonl`. Non-selected phases are recorded as `SKIPPED`, no overall line is written, and the text receipt ends with `OVERALL: PARTIAL (--only: recibo sem overall, não certificável)` — or `OVERALL: FAILED` if any selected phase failed. A partial receipt is not certifiable. Without `--only`, `target/long` is removed and the receipt can be summarized and certified. After a full run, `pipe_long_receipt validate [--strict]` verifies the JSONL; strict failures now require the typed `reason` emitted for FAILED phases. While recording a deselected phase, the `pipe_long_receipt append` exit code `10` (`LongPhaseStatus::Skipped`) is accepted as success; any other non-zero code marks the receipt as failed. The `only-subset:` gap joins the selected phase names with `+` and carries no embedded spaces, so the gap list remains a single comma-delimited token.
+`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and writes `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file); it never deletes the previous full `long-audit-receipt.jsonl`. Non-selected phases are recorded as `SKIPPED`, no overall line is written, and the text receipt ends with an overall `PARTIAL` marker — or `OVERALL: FAILED` if any selected phase failed. A partial receipt is not certifiable. Without `--only`, `target/long` is removed and the receipt can be summarized and certified. After a full run, `pipe_long_receipt validate [--strict]` verifies the JSONL; strict failures now require the typed `reason` emitted for FAILED phases. While recording a deselected phase, the `pipe_long_receipt append` exit code `10` (`LongPhaseStatus::Skipped`) is accepted as success; any other non-zero code marks the receipt as failed. The `only-subset:` gap joins the selected phase names with `+` and carries no embedded spaces, so the gap list remains a single comma-delimited token.
 
 #### 3.3.1 Hosted CI and Manual Long Workflow (GitHub Actions)
 
-- **`ci.yml`:** lints and quick run as separate jobs per platform (`x86_64-linux-lints`, `x86_64-linux-quick`, `linux-arm64-lints`, `linux-arm64-quick`), so a lint failure cannot suppress the functional evidence, plus the `msrv` check (which validates `--locked --all-targets --all-features`). Sibling checkout ref is pinned deterministically via [`variables.env`](../variables.env) (`ENGINE_COMMIT`), and every `Load environment variables` step fails closed when `ENGINE_COMMIT` is empty after sourcing the file. The x86_64 jobs are blocking; the ARM64 lint job is blocking and the ARM64 quick job remains `continue-on-error` (advisory) pending D1 approval. The 2026-11-06 native aarch64 run passed the quick suite, but a single run is not treated as a stability gate; the job summary publishes the advisory note explicitly. The `msrv` cargo-check step uses the canonical `utils/_lib.sh` lifecycle (`lib_init`, `run_step`, `finish`), producing the five-column `target/logs/msrv-status.tsv` carrier (`scope=full`) through the same code path as every other discipline. Each job, including `msrv`, writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine_type=… engine_version=… engine_checksum=… auxiliary_engine=… rustc=… cargo=…`) and uploads `target/logs/**` (including the `*-status.tsv` carriers) with `if: always()`.
+- **`ci.yml`:** lints and quick run as separate jobs per platform (`x86_64-linux-lints`, `x86_64-linux-quick`, `linux-arm64-lints`, `linux-arm64-quick`), so a lint failure cannot suppress the functional evidence, plus the `msrv` check (which validates `--locked --all-targets --all-features`). Sibling checkout ref is pinned deterministically via [`variables.env`](../variables.env) (`ENGINE_COMMIT`), and every `Load environment variables` step fails closed when `ENGINE_COMMIT` is empty after sourcing the file. The x86_64 jobs are blocking; the ARM64 lint job is blocking and the ARM64 quick job remains `continue-on-error` (advisory) pending architectural stability approval, as a single run is not treated as a stability gate; the job summary publishes the advisory note explicitly. The `msrv` cargo-check step uses the canonical `utils/_lib.sh` lifecycle (`lib_init`, `run_step`, `finish`), producing the five-column `target/logs/msrv-status.tsv` carrier (`scope=full`) through the same code path as every other discipline. Each job, including `msrv`, writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine_type=… engine_version=… engine_checksum=… auxiliary_engine=… rustc=… cargo=…`) and uploads `target/logs/**` (including the `*-status.tsv` carriers) with `if: always()`.
 - **Provenance & Auxiliary Checkout:** each job writes `target/logs/ci-provenance.log` (`PHASE: provenance sha=… package_version=… engine_type=… engine_version=… engine_checksum=… auxiliary_engine=… rustc=… cargo=…`). The compiled engine provenance is extracted deterministically from `Cargo.lock` (`NeuralAmpModeler-rs` version `2.0.0` from crates.io with its locked SHA-256 checksum), distinguishing it from the auxiliary sibling checkout (`$GITHUB_WORKSPACE/NeuralAmpModeler-rs`), which is maintained for parity oracles, reference fixtures, and fallback models pinned by SHA in [`variables.env`](../variables.env). When the sibling is absent, the line records `auxiliary_engine=GAP:sibling_absent` while the compiled engine provenance remains valid and traceable.
 - **`long.yml`:** `workflow_dispatch` only, operator-triggered, **zero inputs**: the GitHub "Run workflow" button always uses the single recommended configuration. `timeout-minutes: 300`. Hosted runs provision BOLT and perf (`llvm-bolt`, `linux-tools`, `kernel.perf_event_paranoid=1`), the C++ parity oracle (`NeuralAmpModeler-rs/utils/setup-third-party.sh` + `ensure_namcore_render.sh`, exported as `NAM_CORE_RENDER_BIN` with `NAM_REQUIRE_CPP_ORACLE=1`), and run the fixed hosted-safe phase list `catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity`; `rt-deadline` and `rt-jitter` are reserved for the operator's isolated host. The hosted build is **never** invoked with `--strict`: that flag belongs to the operator release ceremony and requires `target/logs/ab-opt-ceremony-receipt.json`. A capability preflight records `target/logs/ci-capabilities.log` (`io_uring`, `pipewire`, `pw-play`, C++ oracle) before the build, so missing hosted capabilities are visible before any QA claim. Sibling engine checkout is pinned via `variables.env`. The workflow starts a private D-Bus session bus, `pipewire` and `wireplumber` in the same `XDG_RUNTIME_DIR`, and creates persistent `ci-null-sink` (`Audio/Sink`) and `ci-null-source` (`Audio/Source/Virtual`) adapter nodes via `pw-cli create-node`. The step fails closed if `wireplumber` exits or never connects (`application.name = "WirePlumber"` must appear in `pw-cli ls Client`) and unless both nodes appear in `pw-cli ls Node`. The always-on evidence manifest (`target/logs/evidence-manifest.json`) records `build_receipt`, `long_receipt_scope` (`full`/`partial`/`none`) and `certification_receipt`, so a failed build cannot be mistaken for a long audit. Receipt and log upload enforces `if-no-files-found: error`. The workflow never certifies and never rehearses certification; the operator runs `build-release.sh --certify` on the isolated host.
-- **Fidelity ownership (`D1`):** `docs/quality-contract.json` and `utils/quality-dashboard.sh` belong to the upstream engine (`NeuralAmpModeler-rs`); this repository has no local copy. Downstream fidelity and oracle parity are validated by the parity tests executed in `utils/tests-long.sh` (`catch-all` and `offline-parity`, plus the C++ `NAMCore` oracle when `NAM_CORE_RENDER_BIN` is provisioned).
+- **Fidelity ownership:** `docs/quality-contract.json` and `utils/quality-dashboard.sh` belong to the upstream engine (`NeuralAmpModeler-rs`); this repository has no local copy. Downstream fidelity and oracle parity are validated by the parity tests executed in `utils/tests-long.sh` (`catch-all` and `offline-parity`, plus the C++ `NAMCore` oracle when `NAM_CORE_RENDER_BIN` is provisioned).
 
 ### 3.4 Real-Time Criterion Bench
 
-The orphan `utils/tests-performance-regression.sh` wrapper was removed (D-03). [`benches/rt_gate.rs`](../benches/rt_gate.rs) remains available for operator-run Criterion measurements of the RT harness; it is not part of the quick or long disciplines.
+[`benches/rt_gate.rs`](../benches/rt_gate.rs) is available for operator-run Criterion measurements of the RT harness; it is not part of the quick or long disciplines.
 
 - **Diagnostic Manifest**: [`benches/rt_gate.manifest`](../benches/rt_gate.manifest) declares the operator scenario groups (`PIPE_Host/*`, `PIPE_AbOpt/*`); it is not consumed by an automated gate.
 - **Baseline Storage**: Baselines, when an operator keeps them, live in `.performance-baselines/` (gitignored) and are never updated automatically. Historical baselines prior to un-feedback `iter_batched_ref` input re-presentation are strictly incomparable.
 
 ---
 
-### 3.5 Manual Desktop Environment Checklist (E-04)
+### 3.5 Manual Desktop Environment Checklist
 
 Because desktop environments (GNOME, KDE Plasma, XFCE) handle terminal emulators differently, GUI launcher behavior is validated via a manual checklist after Flatpak installation:
 
@@ -376,16 +377,16 @@ Because desktop environments (GNOME, KDE Plasma, XFCE) handle terminal emulators
 
 ---
 
-### 3.6 Empirical Calibration & Evidence Registry (E-01…E-04)
+### 3.6 Empirical Calibration Procedures
 
 The following empirical measurements require physical hardware calibration by a human operator:
 
-| ID   | Measured Item                                               | Calibration Procedure                                                                 | Status |
-|:---- |:----------------------------------------------------------- |:------------------------------------------------------------------------------------- |:------ |
-| E-01 | Full-suite test receipts                                    | Operator executes `./utils/tests-long.sh` and submits `target/logs/long-receipt.txt`. | Open   |
-| E-02 | WAV finalization latency for 1 GiB capture on SSD / HDD     | Measured via `recording_ab_bench`; documented as `// Measured: finalize=... ms`.      | Open   |
-| E-03 | PipeWire daemon resurrection latency (p95 over 20 restarts) | Measured by restarting PipeWire; adjusts reconnect budget if $p95 > 10\text{ s}$.     | Open   |
-| E-04 | Desktop launcher integration across desktop environments    | Executed via manual checklist in §3.5.                                                | Open   |
+| Measured Item                                               | Calibration Procedure                                                                 |
+|:----------------------------------------------------------- |:------------------------------------------------------------------------------------- |
+| Full-suite test receipts                                    | Operator executes `./utils/tests-long.sh` and inspects `target/logs/long-receipt.txt`. |
+| WAV finalization latency for 1 GiB capture on SSD / HDD     | Measured via `recording_ab_bench` across target storage media.                         |
+| PipeWire daemon resurrection latency (p95 over 20 restarts) | Measured by restarting PipeWire; adjusts reconnect budget if $p95 > 10\text{ s}$.     |
+| Desktop launcher integration across desktop environments    | Executed via the manual checklist in §3.5.                                            |
 
 ---
 
@@ -459,7 +460,7 @@ The A/B optimization ceremony (`utils/ab-opt-ceremony.sh` and `pipe_ab_opt compa
 
 #### PGO-ONLY Fallback Policy & BOLT Promotion
 
-In accordance with release policy P1, BOLT is applied during release assembly (`utils/build-release.sh`) **only** when accompanied by a ceremony proof linked to the exact commit yielding the `PGO+BOLT` verdict.
+BOLT is applied during release assembly (`utils/build-release.sh`) **only** when accompanied by a ceremony proof linked to the exact commit yielding the `PGO+BOLT` verdict.
 
 When the ceremony proves `PGO-ONLY` with BOLT applied (`bolt_applied=true`, PGO achieves the >=1.0% margin across all topologies, but BOLT fails to beat PGO by >=1.0% on every topology, `verdict_reason=bolt_margin_not_met`):
 
@@ -479,9 +480,9 @@ Metrics `max` and `mean` cycles are recorded and reported per topology for diagn
 
 The ceremony measures **cycles**, not throughput: fewer cycles is the improvement. Both directions must be read with the same sign rule:
 
-- `gain_pct = (novo − antigo) / antigo × 100` — **negative = melhoria** (menos ciclos).
-- `improvement_pct = (antigo − novo) / antigo × 100` — positive = improvement; promotion requires `improvement_pct ≥ 1.0%` on every topology (equivalently `gain_pct ≤ −1.0%`).
-- Example (2026-11-06): `BOLT gain p99=-0.65%` is a 0.65% improvement, below the 1.0% margin, so BOLT is applied but the verdict is `PGO-ONLY` (`bolt_proof=fallback_pgo_only`).
+- `gain_pct = (new − old) / old × 100` — **negative = improvement** (fewer cycles).
+- `improvement_pct = (old − new) / old × 100` — positive = improvement; promotion requires `improvement_pct ≥ 1.0%` on every topology (equivalently `gain_pct ≤ −1.0%`).
+- Example: `BOLT gain p99=-0.65%` is a 0.65% improvement, below the 1.0% margin, so BOLT is applied but the verdict is `PGO-ONLY` (`bolt_proof=fallback_pgo_only`).
 
 #### Provenance & Fail-Closed Linkage
 
@@ -497,7 +498,7 @@ During release assembly, `build-release.sh` strictly enforces verifiable linkage
 - **`ceremony_lock_mismatch`**: Rejected if `receipt.provenance.cargo_lock_sha256` does not match the current `Cargo.lock` checksum.
 - **`verdict_not_optimized`**: Rejected if the verdict is neither `PGO+BOLT` nor `PGO-ONLY`.
 - **`ceremony_bolt_failed`**: Rejected if the verdict is `PGO-ONLY` but `bolt_applied` is not `true`.
-- Missing receipt under `--strict`: Fails closed immediately (DP-3), preventing silent degradation to `UNOPTIMIZED`.
+- Missing receipt under `--strict`: Fails closed immediately, preventing silent degradation to `UNOPTIMIZED`.
 
 #### Host Hygiene & Sysctl Restoration
 
@@ -524,7 +525,7 @@ During Phase 2, `src/bin/pgo_workload.rs` executes a comprehensive training matr
 
 The workload generates `target/logs/pgo-workload-receipt.json`, verifying that every model topology processes at least 1,000 blocks and no DSP stage is skipped.
 
-### 4.2 Static Assembly & Microarchitectural Gates (Phase 4.5)
+### 4.2 Static Assembly & Microarchitectural Gates
 
 After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disassembled hot-path (`target/logs/codegen/dsp_hotpath.asm`, mirrored to `target/dsp_hotpath.asm`), enforcing strict static architectural rules with explicit status verification and target-by-target coverage ([`utils/codegen-profile.json`](../utils/codegen-profile.json)):
 
@@ -541,7 +542,7 @@ Production builds execute a multi-stage optimization pipeline combining Profile-
 
 The `pgo_profile` phase chains `pgo_workload`, `pgo-check`, the `.profraw` count check, profile merge and the non-empty merged-profile check with `&&`. Any failure removes the PGO directory and aborts the release build: `pgo_workload` is deterministic internal code, so a partial profile can never be accepted. A host without `llvm-profdata` reports the typed `pgo_profdata_unavailable` gap and skips PGO instead of claiming a false `PASS`. When BOLT tooling is absent, `env_verify` emits `bolt_tools_unavailable` once and `bolt_optimize` does not duplicate it with `bolt_not_applied`; the latter is reserved for a BOLT-capable host where the optimization itself could not be applied. Every completed build phase (`env_verify`, `pgo_profile`, `compile_binary`, `bolt_optimize` when applied, `codegen_report`, `deliver_artifact`, `packaging`, `build_receipt`; `install_artifact` after `certify`) emits its canonical `PHASE: <name> PASS log=<path>` line.
 
-BOLT selects its profiling strategy from the host capabilities. Bare-metal hosts with hardware LBR keep `perf record -j any,u` followed by `perf2bolt`; hosted VMs that expose no LBR entries switch to BOLT instrumentation (`llvm-bolt -instrument` → workload → `merge-fdata`), which needs no PMU counters and is the preferred path whenever `merge-fdata` is present. When `merge-fdata` is unavailable, the sampled profile is still converted by `perf2bolt -nl` (no-LBR mode). A profile with fewer than 500 samples, a mismatched build ID, or a non-representative fdata set fails the phase; under `--strict` it aborts the build. This mirrors the instrumented strategy already validated on the `NAM-Plug` hosted runner.
+BOLT selects its profiling strategy from the host capabilities. Bare-metal hosts with hardware LBR keep `perf record -j any,u` followed by `perf2bolt`; hosted VMs that expose no LBR entries switch to BOLT instrumentation (`llvm-bolt -instrument` → workload → `merge-fdata`), which needs no PMU counters and is the preferred path whenever `merge-fdata` is present. When `merge-fdata` is unavailable, the sampled profile is still converted by `perf2bolt -nl` (no-LBR mode). A profile with fewer than 500 samples, a mismatched build ID, or a non-representative fdata set fails the phase; under `--strict` it aborts the build.
 
 ---
 
@@ -553,9 +554,9 @@ All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repo
 
 | Script                         | Primary Responsibility                                                                 | Target Audience / Frequency    |
 |:------------------------------ |:-------------------------------------------------------------------------------------- |:------------------------------ |
-| **`utils/lints.sh`**           | Class A: formatting applied (verified in CI), check/clippy matrix, doc, SPDX, text policies, packaging. | Continuous / Every commit |
-| **`utils/tests-quick.sh`**     | Class A: dev-profile `cargo test --features testing` plus `--no-default-features --features testing` (lean mono), skipping `#[ignore]`. | End of sprint                  |
-| **`utils/tests-long.sh`**      | Class B: 10-phase audit (soak, zero-alloc, RT, endurance, live PipeWire, io_uring, f64 parity). | Operator / Nightly / Release |
+| **`utils/lints.sh`**           | Class A: formatting applied (verified in CI), check/clippy matrix, doc, SPDX, text policies, packaging, script budget. | Continuous / Every commit |
+| **`utils/tests-quick.sh`**     | Class A: dev-profile `cargo test --features testing` plus `--no-default-features --features testing` (lean mono), skipping `#[ignore]`. | Pre-merge / Pre-release |
+| **`utils/tests-long.sh`**      | Class B: 11-phase audit (catch-all, soak, zero-alloc, RT, endurance, live PipeWire, io_uring, f64 parity). | Operator / Nightly / Release |
 | **`utils/build-release.sh`**   | Class C: builds the PGO/BOLT artifact and receipt; `--certify` reconciles without recompiling. | Production releases |
 | **`utils/miri-audit.sh`**      | Class D: out-of-band formal aliasing and data-race audit for lock-free rings.          | Maintenance / Unsafe code audit |
 
@@ -603,8 +604,6 @@ cargo test --features testing --test distribution_qa
 ./utils/build-release.sh --strict --package
 ./utils/tests-long.sh --strict --artifact
 ./utils/build-release.sh --certify --install
-```
-
 ```
 
 ---
@@ -678,7 +677,7 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long s
 
 ### 7.3 Core Automation Principles
 
-- **No tests of test tooling:** suites validate the audio product (DSP, inference, PipeWire host, CLAP/standalone CLI, packaging). Meta-tests over scripts, receipt schemas, or internal QA tools are forbidden.
+- **No tests of test tooling:** suites validate the audio product (DSP, inference, PipeWire host, standalone CLI, packaging). Meta-tests over scripts, receipt schemas, or internal QA tools are forbidden.
 - **Quick never provisions:** `tests-quick.sh` uses only fixtures and tooling already present; it never clones, downloads, or builds release artifacts.
 - **Long collects all failures:** `tests-long.sh` completes every preflight and phase, aggregating passes, gaps, and failures without early termination.
 - **Convention over parameterization:** defaults are the host's natural behavior (all cores, zero thermal cooldown, unpinned). Variables only override.
@@ -720,16 +719,10 @@ Detailed logs go to `target/logs/<script>-<phase>.log` through `tee`; the long s
 
 | Discipline / Script | Measured Duration | Budget Ceiling | Notes |
 | :------------------- | :----------------- | :-------------- | :----- |
-| `utils/lints.sh` | ≈13 s (warm cache, 2026-10-27) a ≈20 s | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging. |
+| `utils/lints.sh` | ≈13–20 s (warm cache) | ≤ 2 min | fmt + check/clippy matrix + doc + SPDX + policies + packaging + script-budget. |
 | `utils/tests-quick.sh` | ≈90–120 s (warm cache, two dev-profile passes) | ≤ 5 min | All non-ignored targets in the development profile, dual-mono and lean mono. |
-| `utils/tests-long.sh` | Not measured (per-phase timeouts) | — | Operator-run; collects all failures. |
+| `utils/tests-long.sh` | Per-phase timeouts | — | Operator-run; collects all failures. |
 | `utils/build-release.sh` | ≈204 s (PGO-only reference run) | — | Full BOLT time depends on the host toolchain and `perf` permissions. |
-
-#### QA footprint (métrica F-2, 2026-10-27)
-
-`wc -l`: shell **1.502**, py/awk **362**, Rust QA (`src/bin/*`) **6.024** →
-**7.888 linhas** de QA total. O bin órfão `long_receipt_check` (39 linhas) foi
-removido; os demais bins têm chamador ou são instrumento manual documentado.
 
 ---
 

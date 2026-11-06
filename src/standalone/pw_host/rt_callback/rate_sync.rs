@@ -37,7 +37,7 @@
 //!      fallback resampler, recording `sync_state.record_failure()`, and preventing retry storms.
 //!      If `failed_gen < requested_gen`, the stale failure from an obsolete request is discarded.
 //!
-//! 4. **Retorno à Taxa Vigente (Return to Active Rate):**
+//! 4. **Return to Active Rate:**
 //!    If the host or model reverts to the rate tuple of the active resampler while a rebuild is
 //!    in flight, `sync_rate` bumps `requested_rate_generation` (invalidating the in-flight build)
 //!    and immediately clears `RT_STATUS_RESAMP_SWAP_PENDING` and `RT_STATUS_NEEDS_RESAMPLER_REBUILD`,
@@ -118,7 +118,7 @@ pub fn sync_rate(
                 .load(Ordering::Relaxed)
                 == 0
         {
-            // Retorno à taxa vigente:
+            // Return to active rate:
             // A rebuild was in flight for a different rate (sync_state.last_requested_rates),
             // but the host/model has now returned to the active resampler's rate.
             // Invalidate the in-flight rebuild so that when its envelope arrives,

@@ -191,7 +191,6 @@ fn observe_rt_panic_transitions_backend_to_failed() {
 
 #[test]
 fn repeated_rt_panic_invocations_execute_hook_exactly_once() {
-    // Finding F-RB-105:
     // After an initial panic contained by catch_unwind in `run_rt_callback_body`,
     // the PipeWire data loop continues to invoke the `process()` RT callback at
     // every audio quantum until the main control loop observes
@@ -1031,7 +1030,7 @@ fn observe_unconnected_during_teardown_is_ignored_and_does_not_mark_failed() {
         &backend,
     );
 
-    // Finding F-RB-101: must NOT mark the backend as failed!
+    // Must NOT mark the backend as failed!
     assert!(
         !backend.is_failed(),
         "teardown in progress must suppress spurious Unconnected failure"

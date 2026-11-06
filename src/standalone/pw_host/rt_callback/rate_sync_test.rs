@@ -205,7 +205,7 @@ fn return_to_active_rate_invalidates_in_flight_and_unmutes() {
         assert_eq!(flags.requested_rate_generation.load(Ordering::Relaxed), 1);
     }
 
-    // Host renegotiates back to 48000 (retorno à taxa vigente)
+    // Host renegotiates back to 48000 (return to active rate)
     rate.store(48000, Ordering::Release);
     sync_rate(&rate, &rs, 48000, &flags, &mut sync_state);
 

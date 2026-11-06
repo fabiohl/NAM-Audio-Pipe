@@ -411,7 +411,7 @@ fn pool_scaling_limits_are_documented_and_enforced() {
     );
 }
 
-/// Adversarial stress test (Finding F-RB-106):
+/// Adversarial stress test:
 /// The work ring contains metadata barriers plus audio descriptors. Verifies
 /// that publishing audio never fails structurally due to work ring capacity,
 /// eliminating the permanent slot leak bug.

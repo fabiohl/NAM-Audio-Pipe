@@ -12,7 +12,7 @@ case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/lints.sh"; exit 0 ;; *) usag
 lib_init
 trap 'trap_fail $?' ERR
 
-# N-5: formatting is applied locally; CI only verifies it.
+# Formatting is applied locally; CI only verifies it.
 phase_fmt() {
   if [ "${CI:-}" = "true" ]; then cargo fmt --all -- --check; else cargo fmt --all && git diff --stat; fi
 }

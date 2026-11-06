@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Launcher exit behavior and terminal pause utilities (F-UX-05).
+//! Launcher exit behavior and terminal pause utilities.
 //!
 //! When the program is started with no arguments, the help is printed and the
 //! process exits immediately with code 0 (non-interactive CLI by design).

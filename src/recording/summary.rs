@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! End-of-session capture summary (F-UX-11).
+//! End-of-session capture summary.
 //!
 //! The recording worker accumulates one [`CaptureSegment`] per `_partN` file it
 //! opens (a mid-stream rate change or the 4 GiB RIFF rollover both start a new

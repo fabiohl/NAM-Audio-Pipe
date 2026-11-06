@@ -14,7 +14,7 @@ Keywords=audio;dsp;nam;guitar;amp;pipewire;
 StartupNotify=false
 Actions=RunBypass;Diagnostics;
 
-# F-UX-05: a launcher with no arguments prints the help and exits immediately
+# A launcher with no arguments prints the help and exits immediately
 # (non-interactive CLI by design). The actions below start the host or pause
 # explicitly via --pause (Diagnostics).
 [Desktop Action RunBypass]

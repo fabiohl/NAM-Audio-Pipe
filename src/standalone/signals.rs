@@ -47,7 +47,7 @@ pub const DEFAULT_GRACE_WINDOW_MS: u64 = 500;
 ///
 /// The graceful teardown of an active recording includes draining the SPSC ring,
 /// rewriting the header and `fsync`ing the capture file, which on HDD/USB/NFS
-/// can exceed 500 ms (F-UX-04). With this window a second Ctrl+C arriving while
+/// can exceed 500 ms. With this window a second Ctrl+C arriving while
 /// the file is finalizing is swallowed instead of force-exiting mid-`fsync` and
 /// corrupting the take. The window is restored to
 /// [`DEFAULT_GRACE_WINDOW_MS`] as soon as the recording worker's shutdown

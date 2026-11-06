@@ -967,7 +967,7 @@ fn rt_jitter_gate_10k_callbacks() {
         nominal_ns as f64 / 1e3,
     );
 
-    // T-03.3: Without cpu_isolated, the verdict is GAP:cpu_not_isolated in strict and in non-strict.
+    // Without cpu_isolated, the verdict is GAP:cpu_not_isolated in strict and in non-strict.
     // Execution on "first permitted" core is valid for diagnostic measurement but can never certify PASS.
     if !env.cpu_isolated {
         let env_str = env.format_env();
@@ -982,7 +982,7 @@ fn rt_jitter_gate_10k_callbacks() {
         return;
     }
 
-    // T-03.2: Deadline certification verdict on isolated calibrated RT environment.
+    // Deadline certification verdict on isolated calibrated RT environment.
     let deadline_ok = max_late_ns <= budget_max_ns
         && p9999_late_ns <= tail_limit_ns
         && p99_late_ns <= budget_p99_ns

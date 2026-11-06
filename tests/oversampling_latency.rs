@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Offline end-to-end impulse peak validation of oversampling and DSP latency accounting (F-PIPE-01).
+//! Offline end-to-end impulse peak validation of oversampling and DSP latency accounting.
 //!
 //! Evaluates the complete production capture pipeline (`RtSwapHarness` without PipeWire daemon)
 //! across combinations of oversampling factors (`Off`, `X2`, `X4`) and sample rates

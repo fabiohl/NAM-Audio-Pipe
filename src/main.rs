@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
         unsafe {
             pipewire::deinit();
         }
-        // F-UX-05: the `.desktop` "Diagnostics" action passes `--pause` so the
+        // The `.desktop` "Diagnostics" action passes `--pause` so the
         // launcher's terminal stays open long enough to read the support block.
         // The helper requires both stdin and stdout to be terminals, so a
         // redirected stdin can never block automation on an unread read.
@@ -281,7 +281,7 @@ fn main() -> anyhow::Result<()> {
         let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let failed_for_thread = Arc::clone(&failed_flag);
         let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        // F-UX-11: resolve the capture directory (--record-dir → XDG music →
+        // Resolve the capture directory (--record-dir → XDG music →
         // ~/Music → CWD) and create it eagerly; the worker's probe stays the
         // fail-fast gate that reports EROFS/EACCES with an actionable hint.
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -354,7 +354,7 @@ fn main() -> anyhow::Result<()> {
                 // A recording is in flight: widen the termination grace window so
                 // a second Ctrl+C arriving while the capture is drained, its
                 // header rewritten and `fsync`ed is swallowed instead of
-                // force-exiting mid-finalization (F-UX-04). The worker guard
+                // force-exiting mid-finalization. The worker guard
                 // disarms the window when shutdown completes.
                 signals::arm_recording_grace_window();
             }
@@ -384,7 +384,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Run the PipeWire host (blocking)
-    // F-UX-13: the static banner facts (model, cab-sim state, capture dir) are
+    // The static banner facts (model, cab-sim state, capture dir) are
     // resolved here; the host loop adds the runtime facts from `rt_status` and
     // emits one consolidated status banner after the first RT confirmations.
     let banner_request = BannerRequest {

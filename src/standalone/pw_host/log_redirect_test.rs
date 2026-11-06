@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 //! Tests for `log_redirect.rs`: level mapping, layout guards, variadic
-//! handler invocations, registration lifecycle and (for F-APRT-01) the
+//! handler invocations, registration lifecycle and the
 //! zero-allocation formatting contract of the PipeWire log formatters.
 
 use super::*;
@@ -264,8 +264,8 @@ fn stack_msg_to_str_is_zero_alloc_on_valid_invalid_and_corrupt_buffers() {
         (get_alloc_count(), get_dealloc_count(), get_realloc_count())
     };
 
-    // Medido: alloc=0, dealloc=0, realloc=0 (stack_msg_to_str over 3 payload
-    // shapes incl. non-UTF-8; formatter contract of F-APRT-01).
+    // Measured: alloc=0, dealloc=0, realloc=0 (stack_msg_to_str over 3 payload
+    // shapes incl. non-UTF-8).
     assert_eq!(allocs, 0, "allocations in the log formatter");
     assert_eq!(deallocs, 0, "deallocation in the log formatter");
     assert_eq!(reallocs, 0, "reallocations in the log formatter");

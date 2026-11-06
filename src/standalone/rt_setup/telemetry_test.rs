@@ -784,7 +784,7 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
     rt_log_ring::reset_pw_log_dropped_for_test();
 }
 
-/// F-PR-11: the off-RT `prime_silence` pre-roll delivers the first
+/// The off-RT `prime_silence` pre-roll delivers the first
 /// playback quantum through the normal wet path (no starvation), and the
 /// telemetry loop suppresses bridge clock-drift drops observed inside the
 /// bring-up window, accounting them only once the window closes.

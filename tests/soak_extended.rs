@@ -254,7 +254,7 @@ fn test_soak_320k_multichannel_swaps() {
 /// periodically across the full soak and asserts the post-warmup drift is
 /// strictly below the OS page-margin threshold (zero memory leak). Measures
 /// thread-specific rusage (`ru_minflt`, `ru_nivcsw`) on the RT audio callback
-/// thread post-warmup and gates on zero minor page faults (F-PR-06 / F-PR-08).
+/// thread post-warmup and gates on zero minor page faults.
 ///
 /// The full-length signal is pre-allocated once and kept alive across the
 /// soak so its heap footprint is part of the baseline (the delta isolates the
@@ -448,7 +448,13 @@ fn test_soak_rss_memory_stability() {
     // hosted QA a fault is a typed environment GAP; under `--strict` (operator
     // release) it remains a hard failure.
     if minflt_thread_delta != 0 || majflt_thread_delta != 0 {
-        if std::env::var_os("NAM_RT_STRICT").is_none() {
+        if !matches!(
+            std::env::var("NAM_RT_STRICT")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1" | "true")
+        ) {
             eprintln!(
                 "TEST_RESULT[soak]=GAP:rt_thread_page_faults profile=release+testing total_blocks={TOTAL_BLOCKS} \
                  minflt_thread_delta={minflt_thread_delta} majflt_thread_delta={majflt_thread_delta} \

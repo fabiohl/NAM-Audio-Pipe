@@ -19,7 +19,7 @@
 //!   loop unboundedly; `total_backoff_budget` is the hard cumulative time
 //!   ceiling of a single recovery episode.
 //!
-//! ## Per-episode budget and stability reset (F-UX-09)
+//! ## Per-episode budget and stability reset
 //!
 //! A real PipeWire restart takes 1–4 s, and isolated drops (USB, suspend/resume)
 //! are rare but repeated over a long session. A never-reset session budget would
@@ -30,7 +30,7 @@
 //! within a single incident the budget can never be reset (a failure always
 //! clears the healthy window), so no infinite reconnect loop can exist by
 //! construction. Setting [`STABLE_RESET`] to `Duration::MAX` disables
-//! replenishment; the shorter pre-F-UX-09 budget (3 attempts, 250 → 1000 ms) is
+//! replenishment; the shorter 3-attempt budget (250 → 1000 ms) is
 //! restored through the [`PRODUCTION_MAX_ATTEMPTS`] / [`PRODUCTION_MAX_BACKOFF_MS`]
 //! constants.
 //!
@@ -51,7 +51,7 @@ pub const PRODUCTION_INITIAL_BACKOFF_MS: u64 = 250;
 pub const PRODUCTION_MAX_BACKOFF_MS: u64 = 4000;
 
 /// Continuous healthy-streaming window that replenishes the per-episode retry
-/// budget (F-UX-09). `Duration::MAX` disables replenishment entirely — the
+/// budget. `Duration::MAX` disables replenishment entirely — the
 /// documented rollback to the never-reset budget.
 pub const STABLE_RESET: Duration = Duration::from_secs(60);
 
@@ -80,7 +80,7 @@ impl Default for ReconnectPolicy {
 }
 
 impl ReconnectPolicy {
-    /// Production defaults (F-UX-09): 6 attempts with progressive exponential
+    /// Production defaults: 6 attempts with progressive exponential
     /// backoff (250 ms, 500 ms, 1 s, 2 s, 4 s, 4 s — cumulative 11.75 s per
     /// episode) and reconnection enabled.
     pub fn production() -> Self {
@@ -184,7 +184,7 @@ pub enum StabilityEvent {
 ///
 /// The budget is bounded **per episode**: within a single incident it can never
 /// be reset, but [`ReconnectCycle::note_stable`] replenishes it after
-/// [`STABLE_RESET`] of uninterrupted healthy streaming (F-UX-09), so isolated
+/// [`STABLE_RESET`] of uninterrupted healthy streaming, so isolated
 /// drops spread over a long session never accumulate into an exhaustion.
 #[derive(Debug, Clone)]
 pub struct ReconnectCycle<C: Clock = SystemClock> {
@@ -256,7 +256,7 @@ impl<C: Clock> ReconnectCycle<C> {
         Some(self.policy.backoff_for_attempt(self.attempts_made))
     }
 
-    /// Reports one healthy, streaming control-loop iteration (F-UX-09).
+    /// Reports one healthy, streaming control-loop iteration.
     ///
     /// The first healthy poll after a recovery returns
     /// [`StabilityEvent::Restored`] (once); once the uninterrupted window

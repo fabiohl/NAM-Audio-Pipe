@@ -83,7 +83,7 @@ fn rebuild_requested_when_no_pair_active_and_not_pending() {
 
 #[test]
 fn rebuild_suppressed_when_failed_key_matches() {
-    // S08.4 / D-06: Recovery after a failed rebuild pushed None.
+    // Recovery after a failed rebuild pushed None.
     // In NAM-Audio-Pipe, IR is configured at startup and is immutable per process.
     // The latch keys strictly on (host_rate, partition), suppressing retries across
     // all subsequent callbacks until a renegotiated rate or partition policy changes the key.
@@ -143,10 +143,10 @@ fn rebuild_resumed_when_host_rate_or_partition_differs_from_failed_key() {
 
 #[test]
 fn rebuild_not_requested_on_partition_mismatch_quantum_decoupled() {
-    // O quantum do host não dirige rebuild — o driver agnóstico de bloco
-    // (`process_block`) fragmenta qualquer bloco internamente contra a
-    // partição fixa. Uma renegociação de quantum (ex.: 64 → 128 amostras a
-    // taxa constante) mantém o par ativo sem interrupção nem FFT pesada.
+    // The host quantum does not drive rebuild — the block-agnostic driver
+    // (`process_block`) fragments any block internally against the fixed
+    // partition. A quantum renegotiation (e.g.: 64 → 128 samples at constant
+    // rate) keeps the active pair without disruption or heavy FFT.
     let pair = make_pair(64, 48000);
     assert!(!cabsim_rebuild_needed(
         Some(&pair),
@@ -317,11 +317,11 @@ fn rebuild_first_install_gated_by_partition_domain() {
         None,
         false
     ));
-    // Quantum zero não é bloco de áudio válido.
+    // Quantum zero is not a valid audio block.
     assert!(!cabsim_rebuild_needed(
         None, true, 0, 48000, 64, None, false
     ));
-    // Quanta de 1 a 15 são explicitamente rejeitados pelo gate de instalação.
+    // Quanta from 1 to 15 are explicitly rejected by the installation gate.
     assert!(!cabsim_rebuild_needed(
         None, true, 1, 48000, 64, None, false
     ));
@@ -331,7 +331,7 @@ fn rebuild_first_install_gated_by_partition_domain() {
     assert!(!cabsim_rebuild_needed(
         None, true, 15, 48000, 64, None, false
     ));
-    // Bordas e valores típicos do domínio ainda instalam quando falta o par.
+    // Boundary and typical domain values still install when the pair is missing.
     assert!(cabsim_rebuild_needed(
         None, true, 16, 48000, 64, None, false
     ));
@@ -345,7 +345,7 @@ fn rebuild_first_install_gated_by_partition_domain() {
         false
     ));
     let pair = make_pair(16, 48000);
-    // Par ativo ignora o quantum — mesmo anômalo — a taxa constante.
+    // Active pair ignores the quantum — even anomalous values — at constant rate.
     assert!(!cabsim_rebuild_needed(
         Some(&pair),
         true,
@@ -375,9 +375,9 @@ fn rebuild_first_install_gated_by_partition_domain() {
     ));
 }
 
-/// Renegociação simulada de quantum: 128 → 256 amostras a taxa constante
-/// NÃO emite comando de rebuild — o par existente permanece ativo e nenhum
-/// `RT_STATUS_NEEDS_CABSIM_REBUILD` é levantado.
+/// Simulated quantum renegotiation: 128 → 256 samples at constant rate
+/// does NOT issue a rebuild command — the active pair remains active and no
+/// `RT_STATUS_NEEDS_CABSIM_REBUILD` is set.
 #[test]
 fn quantum_renegotiation_at_constant_rate_never_rebuilds() {
     for partition in [64usize, 128, 256] {
@@ -385,18 +385,18 @@ fn quantum_renegotiation_at_constant_rate_never_rebuilds() {
         for quantum in [16usize, 32, 64, 128, 256, 512, 1024] {
             assert!(
                 !cabsim_rebuild_needed(Some(&pair), true, quantum, 48000, partition, None, false),
-                "quantum {quantum} a 48 kHz com partição {partition} não deve rebuildar"
+                "quantum {quantum} at 48 kHz with partition {partition} must not rebuild"
             );
         }
     }
 }
 
-// ── cabsim_partition_to_request (política --cabsim-partition) ──────────────
+// ── cabsim_partition_to_request (--cabsim-partition policy) ───────────────
 
 #[test]
 fn partition_request_preserves_active_pair_partition() {
-    // Recalibração de taxa: o par ativo mantém a partição instalada — nem o
-    // quantum nem a nova taxa alteram a latência publicada.
+    // Rate recalibration: active pair preserves installed partition — neither
+    // quantum nor new rate alter published latency.
     let pair = make_pair(32, 48000);
     assert_eq!(cabsim_partition_to_request(Some(&pair), 128), 32);
     let pair = make_pair(256, 48000);
@@ -405,13 +405,12 @@ fn partition_request_preserves_active_pair_partition() {
 
 #[test]
 fn partition_request_first_install_uses_policy_not_quantum() {
-    // Primeira instalação: a partição vem da política `--cabsim-partition`
-    // (conjunto {32, 64, 128, 256}, padrão 128) — o quantum nunca dimensiona
-    // o par (a política é independente do quantum por construção).
+    // Initial install: partition comes from `--cabsim-partition` policy
+    // (domain {32, 64, 128, 256}, default 128) — host quantum never sizes the pair.
     assert_eq!(cabsim_partition_to_request(None, 32), 32);
     assert_eq!(cabsim_partition_to_request(None, 64), 64);
     assert_eq!(cabsim_partition_to_request(None, 128), 128);
     assert_eq!(cabsim_partition_to_request(None, 256), 256);
-    // O quantum do host não entra em nenhum dos ramos.
+    // Host quantum does not enter any branch.
     assert_eq!(cabsim_partition_to_request(None, 64), 64);
 }

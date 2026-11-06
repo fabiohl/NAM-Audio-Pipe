@@ -155,7 +155,7 @@ impl Clock for ManualClock {
 
 #[test]
 fn stable_streaming_replenishes_budget_after_reset() {
-    // F-UX-09 acceptance: three isolated failures, each separated by more than
+    // Three isolated failures, each separated by more than
     // STABLE_RESET of healthy streaming, never exhaust the per-episode budget.
     let clock = ManualClock::new();
     let mut cycle = ReconnectCycle::with_clock(ReconnectPolicy::production(), clock.clone());
@@ -183,7 +183,7 @@ fn stable_streaming_replenishes_budget_after_reset() {
 
 #[test]
 fn failures_within_stable_window_exhaust_budget() {
-    // F-UX-09 acceptance: seven failures inside the same ~10-second window (well
+    // Seven failures inside the same ~10-second window (well
     // below STABLE_RESET) exhaust the per-episode budget — the reset is strictly
     // per-episode and cannot be tricked by rapid flapping.
     let clock = ManualClock::new();
@@ -421,7 +421,7 @@ impl Drop for ShutdownRestore {
 
 #[test]
 fn teardown_latch_prevents_peer_stream_unconnected_from_poisoning_reconnect() {
-    // Finding F-RB-101: pw_stream_destroy() synchronously emits
+    // pw_stream_destroy() synchronously emits
     // state_changed(old, Unconnected) before cleaning hooks. If capture drops
     // (triggering reconnect), begin_reconnect clears failed = false. Then, when
     // playback is destroyed during teardown, its synchronous Unconnected event
@@ -517,7 +517,7 @@ fn teardown_latch_prevents_peer_stream_unconnected_from_poisoning_reconnect() {
 
 #[test]
 fn without_teardown_latch_peer_stream_unconnected_poisons_reconnect() {
-    // Negative test (counterfactual) reproducing finding F-RB-101:
+    // Negative test (counterfactual):
     // Without the teardown latch, if the peer stream emits Unconnected after
     // begin_reconnect, the upcoming attempt is immediately poisoned with failed = true.
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
@@ -581,7 +581,7 @@ fn without_teardown_latch_peer_stream_unconnected_poisons_reconnect() {
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Simulated underlying PipeWire `pw_stream` struct allocated on the heap.
-/// Models the layout and lifecycle contracts of PipeWire's C stream and hook list (F-RB-102 & F-RB-101).
+/// Models the layout and lifecycle contracts of PipeWire's C stream and hook list.
 struct MockStreamNode {
     name: &'static str,
     backend: Arc<SharedBackendStatus>,
@@ -600,7 +600,7 @@ struct MockListener {
 
 impl Drop for MockListener {
     fn drop(&mut self) {
-        // SAFETY: When AppState drop order is correct (F-RB-102), listeners drop
+        // SAFETY: When AppState drop order is correct, listeners drop
         // strictly BEFORE their respective streams. The heap node is therefore
         // guaranteed to be allocated and live. Under AddressSanitizer, if the node
         // were already freed by a premature Stream drop, dereferencing `self.node`
@@ -681,13 +681,13 @@ fn create_mock_pair(
 
 #[test]
 fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poisoning() {
-    // Finding F-RB-101 + F-RB-102 Combined Gate:
+    // Combined multi-cycle reconnect and drop-order gate:
     // 1. Simulates multiple reconnect cycles under localized stream failures (peer stream remains connected).
     // 2. In each cycle, Section 6 teardown drops `AppState` under `enter_teardown()`.
     // 3. Proves:
-    //    (a) Zero write-after-free: listeners drop cleanly before streams (F-RB-102), heap allocations verified.
+    //    (a) Zero write-after-free: listeners drop cleanly before streams, heap allocations verified.
     //    (b) Zero false-negative reconnections: teardown latch prevents peer stream's synchronous Unconnected
-    //        event from poisoning `backend.failed`, so every reconnect attempt begins healthy (F-RB-101).
+    //        event from poisoning `backend.failed`, so every reconnect attempt begins healthy.
     let _shutdown_lock = crate::standalone::SHUTDOWN_TEST_LOCK
         .lock()
         .expect("shutdown test lock");
@@ -764,19 +764,19 @@ fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poiso
         );
 
         // 5. Drop AppState under teardown guard (mirrors the production teardown in run.rs).
-        // - Listeners drop before streams (F-RB-102): zero UAF.
-        // - Surviving peer stream drop emits synchronous Unconnected (F-RB-101).
+        // - Listeners drop before streams: zero UAF.
+        // - Surviving peer stream drop emits synchronous Unconnected.
         // - Teardown latch prevents poisoning!
         drop(app_state);
 
         assert_eq!(
             uaf_counter.load(Ordering::SeqCst),
             0,
-            "Attempt {attempt_idx}: zero write-after-free must occur during AppState drop (F-RB-102)"
+            "Attempt {attempt_idx}: zero write-after-free must occur during AppState drop"
         );
         assert!(
             !backend.is_failed(),
-            "Attempt {attempt_idx}: teardown latch must prevent surviving stream destruction from poisoning reconnect (F-RB-101)"
+            "Attempt {attempt_idx}: teardown latch must prevent surviving stream destruction from poisoning reconnect"
         );
 
         // 6. Section 4.1: Re-instantiation creates new streams and clears teardown latch
@@ -818,10 +818,10 @@ fn combined_multi_cycle_reconnect_with_mock_streams_proves_zero_uaf_and_no_poiso
     assert_eq!(
         uaf_counter.load(Ordering::SeqCst),
         0,
-        "Total UAF write violations across entire multi-cycle run must be exactly 0 (F-RB-102)"
+        "Total UAF write violations across entire multi-cycle run must be exactly 0"
     );
     assert!(
         !backend.is_failed(),
-        "Host must reach final clean state without false-negative failures (F-RB-101)"
+        "Host must reach final clean state without false-negative failures"
     );
 }

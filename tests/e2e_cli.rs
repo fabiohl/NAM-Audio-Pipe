@@ -443,7 +443,7 @@ fn invalid_gate_threshold_exits_with_error_before_pipewire() {
     }
 }
 
-// --input file validation (F-UX-12) ----------------------------------------
+// --input file validation -------------------------------------------------
 // An explicitly provided --model/--cab that does not resolve to a readable
 // regular file is a legitimate *argument* error: it must fail fast with the
 // usage exit code (2) and the resolved absolute path, before any PipeWire
@@ -493,7 +493,7 @@ fn directory_as_model_path_exits_with_argument_error() {
     );
 }
 
-// --color policy (F-UX-10) -------------------------------------------------
+// --color policy ----------------------------------------------------------
 
 #[test]
 fn color_always_forces_ansi_in_help() {
@@ -512,7 +512,7 @@ fn color_always_forces_ansi_in_help() {
 
 #[test]
 fn no_color_env_disables_ansi_in_help() {
-    // Acceptance (F-UX-10): `NO_COLOR=1 … --help | grep -c $'\x1b'` == 0.
+    // Acceptance: `NO_COLOR=1 … --help | grep -c $'\x1b'` == 0.
     let output = binary()
         .env("NO_COLOR", "1")
         .arg("--help")
@@ -527,7 +527,7 @@ fn no_color_env_disables_ansi_in_help() {
     );
 }
 
-// --BrokenPipe tolerance (F-UX-03) -----------------------------------------
+// --BrokenPipe tolerance --------------------------------------------------
 // `nam-audio-pipe --help | head -1` closes the pipe while the process is still
 // writing; the write must be tolerated (no `println!` panic).
 
@@ -559,7 +559,7 @@ fn help_with_closed_stdout_pipe_does_not_panic() {
     );
 }
 
-// --runtime error classes (F-UX-06/07/08) ----------------------------------
+// --runtime error classes -------------------------------------------------
 // A file that exists (so it passes the argument pre-validation) but cannot be
 // loaded is a *runtime* failure: it must be labelled with its own class and
 // exit with the documented code, never as "Argument error".
