@@ -71,17 +71,19 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="1.1.0" date="2026-11-01" type="stable">
+    <release version="1.1.0" date="2026-11-07" type="stable">
       <description>
         <p>NAM-Audio-Pipe 1.1.0:</p>
         <ul>
-          <li>PipeWire SPA latency reporting and stream properties dynamically synchronized with the multimedia graph.</li>
+          <li>Integrated NeuralAmpModeler-rs v2.0.0 core DSP engine with pinned commit provenance.</li>
+          <li>PipeWire SPA latency reporting (SPA_PARAM_Latency) and stream properties dynamically synchronized with the multimedia graph.</li>
           <li>Partition-aligned UPOLS cab-sim latency with constant partition priming declared to the host.</li>
-          <li>Rust-based QA receipts with run-id provenance, unified phase logging, and automated script-budget validation.</li>
-          <li>Hardened recording pool with safe memory references and resilient slot allocation under io_uring.</li>
-          <li>Automated A/B optimization ceremony (Plain vs PGO vs BOLT) with promotion proofs.</li>
+          <li>Automated A/B optimization ceremony (Plain vs PGO vs LLVM BOLT) with explicit 1.0% promotion margin proofs.</li>
+          <li>Decoupled host control plane with deterministic event-driven stream negotiation and format handling.</li>
+          <li>Hardened asynchronous recording pool with safe memory references, eliminating nullable raw pointers (#2).</li>
+          <li>Rust-based QA receipts (pipe_long_receipt) with run-id provenance, calibrated RT environment evidence, and script-budget verification.</li>
           <li>Independent CI lint and quick verification jobs with engine commit provenance and always-uploaded diagnostic bundles.</li>
-          <li>Memory-guarded test and build scripts to prevent host out-of-memory (OOM) conditions.</li>
+          <li>Memory-guarded test and build scripts protecting host systems against out-of-memory (OOM) conditions.</li>
         </ul>
       </description>
     </release>

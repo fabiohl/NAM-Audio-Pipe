@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # tests-long.sh — long audit suite: soak, RT, live PipeWire, io_uring, offline parity and artifact certification. Classe B.
 # Uso: utils/tests-long.sh [--strict] [--artifact] [--only <nome>[,<nome>]] [-h|--help]
-# Orçamento: 340
+# Orçamento: 360  # Alocação para extração de evidências env em recibos de texto e gates RT
 # AI AGENTS MUST NEVER EXECUTE THIS SCRIPT DIRECTLY: execution is reserved for the human operator.
 # Structural validation is limited to --help.
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '

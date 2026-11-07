@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # tests-quick.sh — quick test discipline: cargo test in dev, skipping #[ignore]. Classe A.
 # Uso: utils/tests-quick.sh [-h|--help]
-# Orçamento: 40
+# Orçamento: 50   # Margem segura para formatação e captura de sumários
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."

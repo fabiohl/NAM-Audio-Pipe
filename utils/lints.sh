@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # lints.sh — formatação, análise estática e conformidade textual. Classe A.
 # Uso: utils/lints.sh [-h|--help]
-# Orçamento: 100
+# Orçamento: 110  # Margem segura para matriz de lints e packaging
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
