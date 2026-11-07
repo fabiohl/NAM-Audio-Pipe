@@ -179,7 +179,9 @@ run_phase() {
         FAIL) FAILS+=("$id"); emit "PHASE: $name FAIL rc=$rc log=$log"; tail -n 40 "$log" >&2 ;;
     esac
     if [ "$st" != ERROR ]; then
-        emit_text "PHASE${n}: $st log=$log duration_ms=$dur"
+        local env_sfx=""
+        [ -f "$log" ] && env_sfx=$(grep -oE '\benv=[^ ]+' "$log" | head -n1 || true)
+        emit_text "PHASE${n}: $st log=$log duration_ms=$dur${env_sfx:+ $env_sfx}"
     fi
 }
 # ── Phase bodies (return 0 when the commands succeeded, 1 otherwise) ─────────
