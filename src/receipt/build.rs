@@ -238,7 +238,7 @@ pub fn validate_ab_opt_ceremony_receipt<P: AsRef<Path>>(
         .get("verdict")
         .and_then(|v| v.as_str())
         .unwrap_or("UNOPTIMIZED");
-    if verdict != "PGO+BOLT" && verdict != "PGO-ONLY" {
+    if verdict != "PGO+BOLT" && verdict != "PGO-ONLY" && verdict != "UNOPTIMIZED" {
         return Err(CeremonyProofRejection::VerdictNotOptimized(
             verdict.to_string(),
         ));
@@ -247,9 +247,15 @@ pub fn validate_ab_opt_ceremony_receipt<P: AsRef<Path>>(
         let cause = doc
             .get("bolt_cause")
             .and_then(|v| v.as_str())
-            .unwrap_or("BOLT not applied")
-            .to_string();
-        return Err(CeremonyProofRejection::CeremonyBoltFailed(cause));
+            .unwrap_or("BOLT not applied");
+        let is_skipped = cause.starts_with("BOLT_SKIPPED:")
+            || cause == "BOLT not applied"
+            || doc.get("verdict_reason").and_then(|v| v.as_str()) == Some("bolt_not_applied");
+        if !is_skipped {
+            return Err(CeremonyProofRejection::CeremonyBoltFailed(
+                cause.to_string(),
+            ));
+        }
     }
 
     let lbr = doc.get("bolt_lbr");

@@ -598,7 +598,9 @@ fn cmd_build_receipt(args: &[String]) {
     } else if let Some(path) = ceremony_receipt.as_deref() {
         match validate_ab_opt_ceremony_receipt(path, Some(&git_commit), Some(&cargo_lock_sha256)) {
             Ok((proof_id, _, _, verdict)) => {
-                if verdict == "PGO-ONLY" || bolt_status == "not_proven" {
+                if verdict == "UNOPTIMIZED" {
+                    "fallback_plain".to_string()
+                } else if verdict == "PGO-ONLY" || bolt_status == "not_proven" {
                     "fallback_pgo_only".to_string()
                 } else {
                     proof_id
@@ -645,7 +647,15 @@ fn cmd_build_receipt(args: &[String]) {
 
     let fatal_strict_gaps: Vec<&String> = gaps
         .iter()
-        .filter(|g| g.as_str() != "bolt_not_proven")
+        .filter(|g| {
+            if bolt_proof == "fallback_plain" {
+                g.as_str() != "bolt_not_proven"
+                    && g.as_str() != "pgo_not_applied"
+                    && g.as_str() != "bolt_not_applied"
+            } else {
+                g.as_str() != "bolt_not_proven"
+            }
+        })
         .collect();
 
     let status = if !fatal_strict_gaps.is_empty() && strict {

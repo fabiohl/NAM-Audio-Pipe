@@ -192,6 +192,28 @@ fn test_certify_pgo_only_fallback_certified() {
 }
 
 #[test]
+fn test_certify_plain_only_fallback_certified() {
+    let (_dir, art, bld, lng, txt) = create_mock_release_env(
+        "plain_only",
+        false,
+        false,
+        "fallback_plain",
+        "PASS_WITH_GAPS",
+        false,
+        vec![
+            "bolt_not_proven".to_string(),
+            "pgo_not_applied".to_string(),
+            "bolt_not_applied".to_string(),
+        ],
+    );
+
+    let receipt = evaluate_certification(&art, &bld, &lng, &txt, true);
+    assert_eq!(receipt.status, "CERTIFIED");
+    assert_eq!(receipt.verdict, Some("PLAIN-ONLY".to_string()));
+    assert!(receipt.fails.is_empty(), "fails: {:?}", receipt.fails);
+}
+
+#[test]
 fn test_certify_unoptimized_rejected() {
     let (_dir, art, bld, lng, txt) =
         create_mock_release_env("unopt", false, false, "none", "PASSED", false, vec![]);

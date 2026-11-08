@@ -440,9 +440,13 @@ pub fn evaluate_certification(
                 let is_proven_pgo_only = receipt.optimizations.pgo_applied
                     && !receipt.optimizations.bolt_applied
                     && receipt.optimizations.bolt_proof == "fallback_pgo_only";
+                let is_proven_plain_only = !receipt.optimizations.pgo_applied
+                    && !receipt.optimizations.bolt_applied
+                    && receipt.optimizations.bolt_proof == "fallback_plain";
 
                 let valid_status = receipt.status == "PASSED"
-                    || (is_proven_pgo_only && receipt.status == "PASS_WITH_GAPS");
+                    || ((is_proven_pgo_only || is_proven_plain_only)
+                        && receipt.status == "PASS_WITH_GAPS");
 
                 if !valid_status {
                     fails.push("build_status_not_passed".to_string());
@@ -480,7 +484,12 @@ pub fn evaluate_certification(
                     &mut reasons,
                 );
                 for gap in &receipt.gaps {
-                    if gap == "bolt_not_proven" && is_proven_pgo_only {
+                    if gap == "bolt_not_proven" && (is_proven_pgo_only || is_proven_plain_only) {
+                        continue;
+                    }
+                    if (gap == "pgo_not_applied" || gap == "bolt_not_applied")
+                        && is_proven_plain_only
+                    {
                         continue;
                     }
                     gaps.push(format!("build:{gap}"));
@@ -495,7 +504,7 @@ pub fn evaluate_certification(
                             .to_string(),
                     );
                 }
-                if !receipt.optimizations.pgo_applied {
+                if !receipt.optimizations.pgo_applied && !is_proven_plain_only {
                     fails.push("unoptimized_verdict".to_string());
                     reasons.push(
                         "build receipt optimizations reflect unoptimized verdict (pgo_applied=false)"
@@ -679,6 +688,11 @@ pub fn evaluate_certification(
         Some("PGO+BOLT".to_string())
     } else if optimizations.pgo_applied && optimizations.bolt_proof == "fallback_pgo_only" {
         Some("PGO-ONLY".to_string())
+    } else if !optimizations.pgo_applied
+        && !optimizations.bolt_applied
+        && optimizations.bolt_proof == "fallback_plain"
+    {
+        Some("PLAIN-ONLY".to_string())
     } else {
         None
     };

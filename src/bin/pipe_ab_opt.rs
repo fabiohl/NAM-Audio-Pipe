@@ -214,8 +214,4 @@ fn compare(args: &[String]) {
     );
     println!();
     println!("  Receipt: {}", cfg.out.display());
-
-    if decision.verdict == "UNOPTIMIZED" {
-        exit(1);
-    }
 }

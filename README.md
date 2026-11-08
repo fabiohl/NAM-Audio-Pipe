@@ -372,7 +372,7 @@ For maximum performance in mission-critical live setups and stage environments, 
 ./utils/tests-long.sh --strict --artifact
 
 # 3. Certify and install locally to ~/.local/bin/nam-audio-pipe:
-./utils/build-release.sh --certify --install
+./utils/build-release.sh --strict --certify --install
 ```
 
 | Canonical Option | Purpose                                                                                                                                         |
@@ -405,7 +405,7 @@ For distributors and release publishing, the official release pipeline enforces 
 ./utils/tests-long.sh --strict --artifact
 
 # 3. Certify release compliance using the generated receipts and install without recompilation
-./utils/build-release.sh --certify --install
+./utils/build-release.sh --strict --certify --install
 ```
 
 ---
@@ -490,7 +490,7 @@ NAM-Audio-Pipe maintains enterprise-grade reliability through an automated testi
 # endurance, live PipeWire, io_uring and offline f64 parity.
 ./utils/build-release.sh --strict --package
 ./utils/tests-long.sh --strict --artifact
-./utils/build-release.sh --certify --install
+./utils/build-release.sh --strict --certify --install
 ```
 
 For complete architectural details on testing, verification phases, and real-time compliance criteria, consult [`docs/testing.md`](docs/testing.md).

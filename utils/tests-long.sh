@@ -10,6 +10,18 @@ set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -o pipefail
 cd "$(dirname "$0")/.."
 . utils/_lib.sh
+PARANOID_ORIG=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+restore_paranoid() {
+    local cur
+    cur=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
+    if [ -n "${PARANOID_ORIG:-}" ] && [ "$cur" != "$PARANOID_ORIG" ]; then
+        sudo -n sysctl -q -w kernel.perf_event_paranoid="$PARANOID_ORIG" 2>/dev/null || true
+    fi
+}
+trap restore_paranoid EXIT
+if [ "$PARANOID_ORIG" -gt 1 ]; then
+    sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null || true
+fi
 LONG_TARGET_DIR="${CARGO_TARGET_DIR:-target/long}"
 CARGO_TARGET_DIR="$LONG_TARGET_DIR"
 export CARGO_TARGET_DIR

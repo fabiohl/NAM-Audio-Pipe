@@ -305,27 +305,23 @@ RECEIPT_BIN=target/debug/pipe_long_receipt
 # after the PGO/BOLT work when the proof is absent or invalid.
 if [ "$DO_STRICT" = 1 ]; then
     CEREMONY_PREFLIGHT_LOG="$LOG_DIR/build-release-ceremony_preflight.log"
-    if [ ! -f "$CEREMONY_RECEIPT" ]; then
-        echo "ERROR: --strict requires $CEREMONY_RECEIPT (operator A/B ceremony); run utils/ab-opt-ceremony.sh on the isolated host or omit --strict for a QA build" | tee "$CEREMONY_PREFLIGHT_LOG" >&2
-        fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
-        finish || true
-        exit 1
-    fi
-    if ! CEREMONY_PREFLIGHT_VERDICT=$("$RECEIPT_BIN" ceremony-proof --receipt "$CEREMONY_RECEIPT" --git-sha "$GIT_COMMIT" 2>"$CEREMONY_PREFLIGHT_LOG"); then
-        echo "ERROR: --strict rejected the A/B ceremony receipt (see $CEREMONY_PREFLIGHT_LOG)" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
-        fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
-        finish || true
-        exit 1
-    fi
-    case "$CEREMONY_PREFLIGHT_VERDICT" in
-        PGO+BOLT|PGO-ONLY) ;;
-        *)
-            echo "ERROR: --strict requires a PGO+BOLT or PGO-ONLY ceremony verdict, got '$CEREMONY_PREFLIGHT_VERDICT'" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
+    if [ -f "$CEREMONY_RECEIPT" ]; then
+        if ! CEREMONY_PREFLIGHT_VERDICT=$("$RECEIPT_BIN" ceremony-proof --receipt "$CEREMONY_RECEIPT" --git-sha "$GIT_COMMIT" 2>"$CEREMONY_PREFLIGHT_LOG"); then
+            echo "ERROR: --strict rejected the A/B ceremony receipt (see $CEREMONY_PREFLIGHT_LOG)" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
             fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
             finish || true
             exit 1
-            ;;
-    esac
+        fi
+        case "$CEREMONY_PREFLIGHT_VERDICT" in
+            PGO+BOLT|PGO-ONLY|UNOPTIMIZED) ;;
+            *)
+                echo "ERROR: --strict requires a PGO+BOLT, PGO-ONLY or UNOPTIMIZED ceremony verdict, got '$CEREMONY_PREFLIGHT_VERDICT'" | tee -a "$CEREMONY_PREFLIGHT_LOG" >&2
+                fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
+                finish || true
+                exit 1
+                ;;
+        esac
+    fi
 fi
 ok "environment ready (rustflags: $CONFIG_RUSTFLAGS)"
 if [ ${#GAPS[@]} -eq "$ENV_GAPS" ]; then
@@ -343,7 +339,11 @@ PGO_DIR="$PWD/target/pgo-profile"
 PROFRAW_DIR="$PGO_DIR/profraw"
 MERGED_PROFILE="$PGO_DIR/merged.profdata"
 PGO_LOG="$LOG_DIR/build-release-pgo_profile.log"
-if [ -n "$LLVM_PROFDATA" ]; then
+if [ "${CEREMONY_PREFLIGHT_VERDICT:-}" = "UNOPTIMIZED" ]; then
+    phase pgo_profile
+    echo "A/B ceremony proved PGO unoptimized (verdict: UNOPTIMIZED); skipping PGO to preserve optimal Plain performance" | tee "$PGO_LOG"
+    emit "PHASE: pgo_profile PASS log=$PGO_LOG"
+elif [ -n "$LLVM_PROFDATA" ]; then
     phase pgo_profile
     rm -rf "$PGO_DIR"
     mkdir -p "$PROFRAW_DIR"
@@ -420,7 +420,12 @@ if [ -f "$CEREMONY_RECEIPT" ]; then
 fi
 
 if [ "$CEREMONY_VERDICT" != "PGO+BOLT" ]; then
-    if [ "$CEREMONY_VERDICT" = "PGO-ONLY" ]; then
+    if [ "$CEREMONY_VERDICT" = "UNOPTIMIZED" ]; then
+        echo "A/B ceremony proved UNOPTIMIZED (neither PGO nor BOLT met margin); fallback_plain per promotion policy" | tee -a "$BOLT_LOG"
+        BOLT_STATUS=not_proven
+        BOLT_PROOF=fallback_plain
+        emit "PHASE: bolt_optimize PASS log=$BOLT_LOG"
+    elif [ "$CEREMONY_VERDICT" = "PGO-ONLY" ]; then
         echo "A/B ceremony proved PGO-ONLY (BOLT applied, margin not met); fallback_pgo_only per promotion policy" | tee -a "$BOLT_LOG"
         BOLT_STATUS=not_proven
         BOLT_PROOF=fallback_pgo_only

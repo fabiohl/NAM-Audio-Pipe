@@ -3,7 +3,7 @@
   "targets": [
     {
       "id": "capture_dsp_pipeline",
-      "pattern": "setup_capture_stream::\\{closure#2\\}::\\{closure#0\\}(>|\\.|::.*call_once)?$|capture_dsp_pipeline_streaming|capture_dsp_pipeline$",
+      "pattern": "setup_capture_stream::\\{closure#2\\}::\\{closure#0\\}(>|\\.|.*call_once)?$|capture_dsp_pipeline_streaming|capture_dsp_pipeline$",
       "required": true,
       "expected_methods": ["closure#0", "call_once", "capture_dsp_pipeline"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 },

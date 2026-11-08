@@ -88,6 +88,7 @@ use pipewire::stream::StreamState;
 
 use common::pmu::PmuCounters;
 use common::proc::{ThreadRusage, read_thread_rusage};
+use nam_audio_pipe::standalone::rt_setup::thread::configure_process_wide;
 use neural_amp_modeler_rs::testing::metrics::percentile_exact;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -278,6 +279,14 @@ use common::rt_env::try_promote_sched_fifo;
 
 // ── Shared setup: full real-load harness (WaveNet A1/A2 + CabSim) ───────────
 
+/// Process-wide memory hardening and thread stack prefault to prevent minor
+/// page faults (`minflt`) during real-time timing loops.
+fn prefault_rt_memory() {
+    configure_process_wide();
+    let mut stack_probe = [0u8; 64 * 1024];
+    std::hint::black_box(&mut stack_probe);
+}
+
 /// Builds the harness with the task-spec real load: WaveNet A1 on L, WaveNet
 /// A2 on R, stereo CabSim active, unity gains. Returns it warm (commands
 /// drained, GC consumed) so the measurement loop starts from steady state.
@@ -315,6 +324,7 @@ fn rt_deadline_gate_10k_quantums() {
         eprintln!("TEST_RESULT[rt_deadline]=GAP:debug_build_measurement_invalid");
         return;
     }
+    prefault_rt_memory();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.sched_fifo {
@@ -461,6 +471,7 @@ fn rt_deadline_full() {
         eprintln!("TEST_RESULT[rt_deadline_full]=GAP:debug_build_measurement_invalid");
         return;
     }
+    prefault_rt_memory();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.sched_fifo {
@@ -832,6 +843,7 @@ fn rt_jitter_gate_10k_callbacks() {
         eprintln!("TEST_RESULT[rt_jitter]=GAP:debug_build_measurement_invalid");
         return;
     }
+    prefault_rt_memory();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.pinned_single_cpu {
@@ -877,12 +889,15 @@ fn rt_jitter_gate_10k_callbacks() {
     // and initial memory paging so the timing loop measures pure steady-state contention.
     std::thread::sleep(std::time::Duration::from_millis(50));
 
+    let mut dispatch_dispersions = vec![0u64; JITTER_CALLBACKS - 1];
+    let mut late_samples = vec![0u64; JITTER_CALLBACKS];
+    std::hint::black_box(dispatch_dispersions.as_mut_ptr());
+    std::hint::black_box(late_samples.as_mut_ptr());
+
     let rusage_before = read_thread_rusage().ok();
     let pmu = PmuCounters::open();
     pmu.start();
 
-    let mut dispatch_dispersions = Vec::with_capacity(JITTER_CALLBACKS - 1);
-    let mut late_samples = Vec::with_capacity(JITTER_CALLBACKS);
     let mut lost_cycles: u64 = 0;
     let mut next = now_ns() + nominal_ns;
     let mut prev = now_ns();
@@ -896,11 +911,11 @@ fn rt_jitter_gate_10k_callbacks() {
             lost_cycles += 1;
             next = t_k;
         }
-        late_samples.push(late_ns);
+        late_samples[block] = late_ns;
         next += nominal_ns;
 
         if block > 0 {
-            dispatch_dispersions.push(t_k.abs_diff(prev).abs_diff(nominal_ns));
+            dispatch_dispersions[block - 1] = t_k.abs_diff(prev).abs_diff(nominal_ns);
         }
         prev = t_k;
 

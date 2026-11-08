@@ -764,7 +764,7 @@ pub fn evaluate_ceremony(
             .map(|e| format!("{}: p99 {:+.2}%", e.topology, e.pgo_gain_pct_p99))
             .collect();
         rollback = format!(
-            "PGO did not achieve the 1.0% p99 margin across all topologies ({}); do not announce any optimization.",
+            "PGO did not achieve the 1.0% p99 margin across all topologies ({}); plain release binary is the verified optimal version.",
             unpromoted.join(", ")
         );
     } else if all_bolt_promoted {

@@ -582,7 +582,7 @@ NAM-Audio-Pipe is distributed as a standalone desktop Flatpak application target
 # 1. Build optimized release binary and Flatpak bundle, audit, and install:
 ./utils/build-release.sh --strict --package
 ./utils/tests-long.sh --strict --artifact
-./utils/build-release.sh --certify --install
+./utils/build-release.sh --strict --certify --install
 
 # 2. Inspect active sandbox permissions:
 flatpak info --show-permissions io.github.fabiohl.NAMAudioPipe

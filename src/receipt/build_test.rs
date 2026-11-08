@@ -126,3 +126,48 @@ fn test_ceremony_clean_head_accepted() {
     assert_eq!(fdata_sha.as_deref(), Some("abcdef"));
     assert_eq!(verdict, "PGO-ONLY");
 }
+
+#[test]
+fn test_ceremony_unoptimized_verdict_accepted() {
+    let prov = json!({
+        "git_sha": "head_commit_sha",
+        "git_dirty": false,
+        "cargo_lock_sha256": "lock_1234",
+    });
+    let (_dir, path) = make_temp_receipt("unopt", prov, "UNOPTIMIZED");
+    let res = validate_ab_opt_ceremony_receipt(&path, Some("head_commit_sha"), Some("lock_1234"));
+    assert!(res.is_ok());
+    let (proof_id, samples, fdata_sha, verdict) = res.unwrap();
+    assert!(proof_id.starts_with("ab-opt-ceremony:"));
+    assert_eq!(samples.as_deref(), Some("1000"));
+    assert_eq!(fdata_sha.as_deref(), Some("abcdef"));
+    assert_eq!(verdict, "UNOPTIMIZED");
+}
+
+#[test]
+fn test_ceremony_pgo_only_bolt_skipped_accepted() {
+    let prov = json!({
+        "git_sha": "head_commit_sha",
+        "git_dirty": false,
+        "cargo_lock_sha256": "lock_1234",
+    });
+    let dir = TempDir::new("pgo_skipped");
+    let path = dir.path.join("ab-opt-ceremony-receipt.json");
+    let doc = json!({
+        "schema_version": 2,
+        "tool": "ab-opt-ceremony",
+        "verdict": "PGO-ONLY",
+        "verdict_reason": "bolt_not_applied",
+        "bolt_applied": false,
+        "bolt_cause": "BOLT_SKIPPED: hardware LBR unavailable (-j any,u unsupported on AMD/VM)",
+        "provenance": prov,
+    });
+    let mut f = fs::File::create(&path).expect("create file");
+    f.write_all(doc.to_string().as_bytes()).expect("write");
+
+    let res = validate_ab_opt_ceremony_receipt(&path, Some("head_commit_sha"), Some("lock_1234"));
+    assert!(res.is_ok());
+    let (proof_id, _samples, _fdata_sha, verdict) = res.unwrap();
+    assert!(proof_id.starts_with("ab-opt-ceremony:"));
+    assert_eq!(verdict, "PGO-ONLY");
+}

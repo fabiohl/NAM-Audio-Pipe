@@ -204,7 +204,11 @@ if [ "$USE_PGO" = 1 ]; then
         else
             LBR=0
         fi
-        if ! run_timed "$VARIANT_TIMEOUT_S" perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
+        if [ "$LBR" = 0 ]; then
+            BOLT_CAUSE="BOLT_SKIPPED: hardware LBR unavailable (-j any,u unsupported on AMD/VM)"
+            gap bolt_lbr_unsupported
+            echo "  reason: $BOLT_CAUSE"
+        elif ! run_timed "$VARIANT_TIMEOUT_S" perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
             ${PIN[@]+"${PIN[@]}"} "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
             --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
             BOLT_CAUSE="BOLT_FAILED: perf record session failed."

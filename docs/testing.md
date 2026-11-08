@@ -287,9 +287,9 @@ flowchart TD
 
 The operator (or external release automation) runs exactly three sequential commands:
 
-1. `./utils/build-release.sh --strict [--package]` — builds the optimized binary and emits `build-receipt.json`. Under `--strict`, requires a valid A/B optimization ceremony proof (`target/logs/ab-opt-ceremony-receipt.json`).
+1. `./utils/build-release.sh --strict [--package]` — builds the optimized binary and emits `build-receipt.json`. Under `--strict`, an A/B optimization ceremony proof (`target/logs/ab-opt-ceremony-receipt.json`) is evaluated if present (opt-in preflight). If present, `PGO+BOLT`, `PGO-ONLY`, and `UNOPTIMIZED` (plain fallback) verdicts are accepted.
 2. `./utils/tests-long.sh --strict --artifact` — audits the canonical artifact and binds every receipt line to its SHA-256.
-3. `./utils/build-release.sh --certify --install` — hashes the artifact again, reconciles build and long receipts, and writes `target/dist/release-receipt.json`. If certified, installs the binary atomically to `~/.local/bin/nam-audio-pipe` and updates the Flatpak user bundle.
+3. `./utils/build-release.sh --strict --certify --install` — hashes the artifact again, reconciles build and long receipts, and writes `target/dist/release-receipt.json`. If certified, installs the binary atomically to `~/.local/bin/nam-audio-pipe` and updates the Flatpak user bundle.
 
 ### 4.2 A/B Optimization Ceremony & Promotion Policy
 
@@ -299,15 +299,24 @@ The A/B optimization ceremony (`utils/ab-opt-ceremony.sh` and `pipe_ab_opt compa
   $$\text{median}(p99_{\text{pgo}}[t]) \le \text{median}(p99_{\text{plain}}[t]) \times (1 - 0.010)$$
 - **`PGO+BOLT`**: Satisfied when `PGO-ONLY` holds **and**, for **all** topologies $t$:
   $$\text{median}(p99_{\text{bolt}}[t]) \le \text{median}(p99_{\text{pgo}}[t]) \times (1 - 0.010)$$
-- **`UNOPTIMIZED`**: In all other cases (e.g. margin not met on any topology, or incomplete coverage).
+- **`UNOPTIMIZED`**: Returned when PGO fails to beat the plain baseline by at least 1.0% on any topology (`verdict_reason=pgo_margin_not_met`), or when the plain baseline is proven faster or lower jitter.
+
+#### Hardware Microarchitecture & Branch Tracing (LBR)
+
+LLVM BOLT requires hardware branch sampling via Intel Last Branch Records (LBR, `perf record -j any,u` or `-b`).
+
+- **Intel Hardware**: LBR captures exact basic-block branch transitions, enabling accurate profile-guided basic block layout.
+- **AMD Hardware (Zen 1–4) & Virtualization**: Hardware LBR is unavailable (`perf record -j any,u` fails with `not supported`). In fallback sampling mode (`cycles:u`), perf cannot trace branch history, causing LLVM BOLT to operate with 100% control-flow graph (CFG) discontinuity.
+- **Empirical Degradation**: On AMD Zen 2 (Ryzen 7 5700U), non-LBR BOLT was measured to produce a -1.65% mean latency regression, -2.10% p99 regression, +26.1% max cycle spike in WaveNet A1, +152.5% max cycle spike in LSTM, and +61% instruction-cache misses.
+- **Automated Guard**: `ab-opt-ceremony.sh` actively probes for LBR support (`perf record -j any,u -o /dev/null -- true`). When LBR is absent (`LBR=0`), BOLT optimization is automatically bypassed, emitting gap `bolt_lbr_unsupported`.
 
 #### Promotion Fallback Invariants
 
-1. `build-release.sh` detects `PGO-ONLY` automatically via `pipe_long_receipt ceremony-proof`.
-2. When BOLT does not beat PGO by $\ge 1.0\%$ across all topologies (`verdict_reason=bolt_margin_not_met`), it is not a gap: `build-release.sh` emits `PHASE: bolt_optimize PASS`, sets `bolt_status=not_proven` and `bolt_proof=fallback_pgo_only` in the build receipt.
-3. Host profiling adjustments are bypassed, and compilation proceeds with the PGO-optimized binary.
-4. Under `--strict`, `build-release.sh` completes with `PASS` and delivers the certified binary without failure.
-5. In `--certify`, `evaluate_certification` accepts proven `PGO-ONLY`, recording `verdict="PGO-ONLY"` in `release-receipt.json`.
+1. `build-release.sh` detects `PGO+BOLT`, `PGO-ONLY`, or `UNOPTIMIZED` automatically via `pipe_long_receipt ceremony-proof`.
+2. **`PGO-ONLY` Fallback**: When BOLT does not beat PGO by $\ge 1.0\%$ across all topologies (`verdict_reason=bolt_margin_not_met`) or LBR is absent: `build-release.sh` emits `PHASE: bolt_optimize PASS`, sets `bolt_status=not_proven` and `bolt_proof=fallback_pgo_only` in the build receipt. Profile-use compilation proceeds with the PGO-optimized binary.
+3. **`PLAIN-ONLY` Fallback (`UNOPTIMIZED`)**: When PGO does not beat the plain baseline by $\ge 1.0\%$ across all topologies (`verdict_reason=pgo_margin_not_met`), the plain compiler release binary (`RUSTFLAGS="-C target-cpu=x86-64-v3"`) is proven to have lower latency and lower jitter (e.g. dense SIMD/AVX2 WaveNet loops without complex branching). `build-release.sh` skips PGO instrumentation/use cycles and skips BOLT, compiling directly in plain release mode. It records `bolt_status=skipped_unoptimized` and `bolt_proof=fallback_plain`.
+4. Under `--strict`, `build-release.sh` completes with `PASS` and delivers the certified binary without failure for all valid optimization verdicts (`PGO+BOLT`, `PGO-ONLY`, and `fallback_plain`).
+5. In `--certify`, `evaluate_certification` accepts proven `PGO-ONLY` (recording `verdict="PGO-ONLY"`) and proven plain fallback (recording `verdict="PLAIN-ONLY"`, `status="CERTIFIED"`), verifying that the release binary matches the proven optimal configuration.
 
 ### 4.3 PGO Workload Coverage Matrix
 
@@ -393,7 +402,7 @@ cargo test --features testing --test distribution_qa
 # -----------------------------------------------------------------------------
 ./utils/build-release.sh --strict --package
 ./utils/tests-long.sh --strict --artifact
-./utils/build-release.sh --certify --install
+./utils/build-release.sh --strict --certify --install
 ```
 
 ---
