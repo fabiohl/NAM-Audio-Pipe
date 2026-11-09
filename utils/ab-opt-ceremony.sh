@@ -258,6 +258,7 @@ GIT_DIRTY=false
 if [ -n "$(git status --porcelain 2>/dev/null)" ]; then GIT_DIRTY=true; fi
 CARGO_LOCK_SHA=$(sha256sum Cargo.lock 2>/dev/null | awk '{print $1}' || echo "unknown")
 RUSTC_VV_SHA=$(rustc -vV 2>/dev/null | sha256sum | awk '{print $1}' || echo "unknown")
+[ -f variables.env ] && . ./variables.env
 ENGINE_COMMIT="${ENGINE_COMMIT:-unknown}"
 ISOLATED=$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)
 GOVERNOR=$(cat "/sys/devices/system/cpu/cpu${bench_core:-0}/cpufreq/scaling_governor" 2>/dev/null || echo "unknown")

@@ -77,7 +77,9 @@ body:
     attributes:
       label: Confirmation
       options:
-        - label: I verified that the system CPU frequency governor is set to `performance`.
+        - label: I have searched existing issues to ensure this is not a duplicate.
           required: true
+        - label: I checked if the system CPU frequency governor is set to `performance` (if feasible).
+          required: false
         - label: I tested with different buffer sizes (e.g. 64 vs 128 samples).
-          required: true
+          required: false

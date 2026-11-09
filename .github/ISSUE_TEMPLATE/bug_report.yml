@@ -102,9 +102,11 @@ body:
     attributes:
       label: Pre-submission Checklist
       options:
+        - label: I have searched existing issues to ensure this is not a duplicate.
+          required: true
         - label: I verified that PipeWire is running and functional on the system.
           required: true
-        - label: I tested with the latest release / `main` branch of NAM-Audio-Pipe.
-          required: true
-        - label: I verified whether user permissions allow real-time scheduling (e.g. `limits.conf` / `rtkit`).
-          required: true
+        - label: I tested with the latest release / `main` branch of NAM-Audio-Pipe (if feasible).
+          required: false
+        - label: I checked whether user permissions allow real-time scheduling (e.g. `limits.conf` / `rtkit`).
+          required: false
