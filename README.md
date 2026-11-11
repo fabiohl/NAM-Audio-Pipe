@@ -317,7 +317,7 @@ NAM-Audio-Pipe can be run directly via Cargo, compiled into a standalone hyper-o
 
 ### Option A: Standalone Flatpak Application (Recommended for Users)
 
-NAM-Audio-Pipe is packaged as an autonomous desktop Flatpak (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform//25.08` runtime. It provides an isolated, reliable environment with direct low-latency PipeWire IPC access.
+NAM-Audio-Pipe is packaged as an autonomous desktop Flatpak (`io.github.fabiohl.NAMAudioPipe`), targeting the `org.freedesktop.Platform//26.08` runtime. It provides an isolated, reliable environment with direct low-latency PipeWire IPC access.
 
 #### Install Local Bundle
 

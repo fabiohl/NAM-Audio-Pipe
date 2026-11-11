@@ -547,7 +547,7 @@ This enables identical zero-overhead variadic formatting into the fixed 1024-byt
 
 ## 9. Flatpak Packaging & Sandbox Architecture
 
-NAM-Audio-Pipe is distributed as a standalone desktop Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//25.08`:
+NAM-Audio-Pipe is distributed as a standalone desktop Flatpak application targeting `io.github.fabiohl.NAMAudioPipe` on runtime `org.freedesktop.Platform//26.08`:
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐

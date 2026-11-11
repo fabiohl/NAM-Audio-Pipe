@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Flatpak Runtime Migration to Freedesktop SDK 26.08:** Upgraded `packaging/flatpak/io.github.fabiohl.NAMAudioPipe.yml` and `utils/build-release.sh` to target `org.freedesktop.Platform//26.08` and `org.freedesktop.Sdk//26.08`, leveraging glibc 2.44, PipeWire 1.6.x client IPC, and Wayland 1.26.
+
 ### Fixed
 
 - **Release Ceremony Strict Certification:** Enforced `--strict` flag propagation in `.agents/scripts/release-ceremony.sh` when invoking `utils/build-release.sh --strict --certify --install`, ensuring that `release-receipt.json` accurately asserts `strict_mode: true`.

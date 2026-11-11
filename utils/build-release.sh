@@ -768,8 +768,8 @@ EOF
     ICONS_SRC=packaging/flatpak/icons/hicolor
     APP_ID=io.github.fabiohl.NAMAudioPipe
     SDK_NAME=org.freedesktop.Sdk
-    if ! flatpak info org.freedesktop.Sdk//25.08 >/dev/null 2>&1; then SDK_NAME=org.freedesktop.Platform; fi
-    if ! flatpak build-init "$FLATPAK_BUILD_DIR" "$APP_ID" "$SDK_NAME" org.freedesktop.Platform 25.08 >> "$PKG_LOG" 2>&1; then
+    if ! flatpak info org.freedesktop.Sdk//26.08 >/dev/null 2>&1; then SDK_NAME=org.freedesktop.Platform; fi
+    if ! flatpak build-init "$FLATPAK_BUILD_DIR" "$APP_ID" "$SDK_NAME" org.freedesktop.Platform 26.08 >> "$PKG_LOG" 2>&1; then
         fail_phase packaging 1 "$PKG_LOG"
         die "flatpak build-init failed"
     fi
