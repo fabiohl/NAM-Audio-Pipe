@@ -112,6 +112,10 @@ pub struct PipewireHostConfig {
     pub banner: crate::standalone::banner::BannerRequest,
     /// Explicit activation precision mode (`Standard` exact-grade or `Fast` Padé).
     pub activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
+    /// Cabinet IR level policy (`--ir-level-policy`).
+    pub ir_level_policy: crate::standalone::cli_domain::IrLevelPolicy,
+    /// Optional hardware playback output limit (`--output-limit`).
+    pub output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
 }
 
 /// Playback DSP Pipeline (Bridge → Hardware).
@@ -123,6 +127,7 @@ pub fn playback_dsp_cycle(
     rt_status: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
     pb_frame_count: u32,
+    output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
 ) {
     let should_measure = (pb_frame_count & 0xF) == 0;
     let t_pb_start = if should_measure {
@@ -209,7 +214,7 @@ pub fn playback_dsp_cycle(
     // slice is formed, so the call is sound for valid descriptors and returns `None`
     // (silencing) otherwise.
     let Some(_n_out) = (unsafe {
-        deliver_playback_pair_fail_closed(
+        deliver_playback_pair_fail_closed_with_limit(
             ptr_l,
             max_l,
             chunk_l,
@@ -220,6 +225,7 @@ pub fn playback_dsp_cycle(
             src_r as *const f32,
             n_bytes,
             rt_status,
+            output_limit,
         )
     }) else {
         return;
@@ -251,7 +257,41 @@ pub fn playback_dsp_cycle(
     }
 }
 
-/// Delivers processed audio to a pair of SPA output buffers fail-closed.
+/// Stateless hard-clamp for hardware playback (`[-1.0, 1.0]`, `NaN -> 0.0`).
+#[inline(always)]
+fn hard_clamp_playback_sample(s: f32) -> f32 {
+    if s.is_nan() { 0.0 } else { s.clamp(-1.0, 1.0) }
+}
+
+/// Copies `src` to `dst`, applying `output_limit` (`Off` = raw memcpy, `Clamp` = hard clamp to `[-1.0, 1.0]`).
+///
+/// # Safety
+/// `src` and `dst` must be valid, disjoint, non-overlapping buffers of at least `n_out` `f32` elements.
+#[inline(always)]
+unsafe fn copy_playback_channel(
+    src: *const f32,
+    dst: &mut [f32],
+    n_out: usize,
+    output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
+) {
+    match output_limit {
+        crate::standalone::cli_domain::OutputLimitPolicy::Off => {
+            // SAFETY: caller guarantees `src` and `dst` are valid, disjoint, non-overlapping of length `n_out`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), n_out);
+            }
+        }
+        crate::standalone::cli_domain::OutputLimitPolicy::Clamp => {
+            // SAFETY: caller guarantees `src` is valid for `n_out` reads and disjoint from `dst`.
+            let src_slice = unsafe { std::slice::from_raw_parts(src, n_out) };
+            for (d, &s) in dst.iter_mut().zip(src_slice.iter()) {
+                *d = hard_clamp_playback_sample(s);
+            }
+        }
+    }
+}
+
+/// Delivers processed audio to a pair of SPA output buffers fail-closed (no output limit).
 ///
 /// Validates pointer alignment, bounds, symmetry, and disjunction via
 /// [`handle_spa_pair_fail_closed`]. If valid, copies `n_out` samples from `src_l`/`src_r`
@@ -281,6 +321,49 @@ pub unsafe fn deliver_playback_pair_fail_closed(
     n_bytes: usize,
     rt_status: &RtStatusFlags,
 ) -> Option<usize> {
+    // SAFETY: same safety preconditions forwarded directly to `deliver_playback_pair_fail_closed_with_limit`.
+    unsafe {
+        deliver_playback_pair_fail_closed_with_limit(
+            ptr_l,
+            max_l,
+            chunk_l,
+            ptr_r,
+            max_r,
+            chunk_r,
+            src_l,
+            src_r,
+            n_bytes,
+            rt_status,
+            crate::standalone::cli_domain::OutputLimitPolicy::Off,
+        )
+    }
+}
+
+/// Delivers processed audio to a pair of SPA output buffers fail-closed with an explicit
+/// [`OutputLimitPolicy`](crate::standalone::cli_domain::OutputLimitPolicy).
+///
+/// # Safety
+/// - `src_l` and `src_r` must point to valid contiguous slices of at least `n_bytes / size_of::<f32>()` floats.
+/// - If `ptr_l` / `ptr_r` are valid, they must point to writable memory of size `max_l` / `max_r`.
+/// - `chunk_l` and `chunk_r`, if non-null, must point to valid `spa_chunk` memory.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Raw SPA descriptor fields plus audio sources and output limit policy"
+)]
+pub unsafe fn deliver_playback_pair_fail_closed_with_limit(
+    ptr_l: usize,
+    max_l: usize,
+    chunk_l: *mut pw::spa::sys::spa_chunk,
+    ptr_r: usize,
+    max_r: usize,
+    chunk_r: *mut pw::spa::sys::spa_chunk,
+    src_l: *const f32,
+    src_r: *const f32,
+    n_bytes: usize,
+    rt_status: &RtStatusFlags,
+    output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
+) -> Option<usize> {
     let (_n_bytes, n_out) = match handle_spa_pair_fail_closed(
         ptr_l, max_l, chunk_l, 0, n_bytes, ptr_r, max_r, chunk_r, 0, n_bytes, rt_status,
     ) {
@@ -297,14 +380,14 @@ pub unsafe fn deliver_playback_pair_fail_closed(
     let out_l = unsafe { std::slice::from_raw_parts_mut(ptr_l as *mut f32, n_out) };
     // SAFETY: `src_l` and `out_l` are valid, disjoint non-overlapping buffers of length `n_out`.
     unsafe {
-        core::ptr::copy_nonoverlapping(src_l, out_l.as_mut_ptr(), n_out);
+        copy_playback_channel(src_l, out_l, n_out, output_limit);
     }
     // SAFETY: `check_spa_buffer_pair` proved alignment, bounds, frame
     // symmetry and strict pointer disjunction, so `out_r` is well-formed.
     let out_r = unsafe { std::slice::from_raw_parts_mut(ptr_r as *mut f32, n_out) };
     // SAFETY: `src_r` and `out_r` are valid, disjoint non-overlapping buffers of length `n_out`.
     unsafe {
-        core::ptr::copy_nonoverlapping(src_r, out_r.as_mut_ptr(), n_out);
+        copy_playback_channel(src_r, out_r, n_out, output_limit);
     }
 
     // Informs the hardware exactly how much sound was delivered this time.

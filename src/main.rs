@@ -191,6 +191,7 @@ fn main() -> anyhow::Result<()> {
         args.cab_path.as_deref(),
         args.cabsim_partition,
         args.cab_optional,
+        args.ir_level_policy,
         &mut cabsim_producer,
     ) {
         Ok(Some(ir)) => (Some(ir.raw_samples), ir.source_rate, CabStatus::Loaded),
@@ -427,6 +428,8 @@ fn main() -> anyhow::Result<()> {
             activation: args
                 .activation
                 .unwrap_or(neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard),
+            ir_level_policy: args.ir_level_policy,
+            output_limit: args.output_limit,
         },
         gc_consumer,
         slimmable_consumer,

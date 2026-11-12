@@ -12,9 +12,10 @@ use neural_amp_modeler_rs::math::constants::{GAIN_MAX_DB, GAIN_MIN_DB};
 pub(crate) use super::cli_domain::parse_gate_mode;
 pub use super::cli_domain::{
     BUFFER_SIZE_AUTO, BUFFER_SIZE_MAX, BUFFER_SIZE_MIN, BufferSizeError, CABSIM_PARTITION_ALLOWED,
-    CABSIM_PARTITION_DEFAULT, CabSimPartitionError, GateConfig, exit_with_error, expand_user_path,
-    print_help, resolve_record_dir, validate_buffer_size, validate_cabsim_partition,
-    validate_readable_file, write_stdout,
+    CABSIM_PARTITION_DEFAULT, CabSimPartitionError, GateConfig, IrLevelPolicy, OutputLimitPolicy,
+    exit_with_error, expand_user_path, parse_ir_level_policy, parse_output_limit, print_help,
+    resolve_record_dir, validate_buffer_size, validate_cabsim_partition, validate_readable_file,
+    write_stdout,
 };
 use crate::standalone::colors::ColorFlag;
 use lexopt::prelude::*;
@@ -67,6 +68,10 @@ pub struct CliArgs {
     /// the exact algorithmic latency of the cab-sim stage, decoupled from the
     /// host quantum. Defaults to [`CABSIM_PARTITION_DEFAULT`].
     pub cabsim_partition: u32,
+    /// Cabinet IR level policy (`--ir-level-policy`, defaults to `PeakNormalized`).
+    pub ir_level_policy: IrLevelPolicy,
+    /// Optional hardware playback output limit (`--output-limit`, defaults to `Off`).
+    pub output_limit: OutputLimitPolicy,
     /// Immediate diagnostic flag.
     pub diagnose: bool,
     /// Immediate diagnostic flag with full (unredacted) paths.
@@ -130,6 +135,8 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut output_gain = 0.0;
     let mut buffer_size = 256;
     let mut cabsim_partition = CABSIM_PARTITION_DEFAULT;
+    let mut ir_level_policy = IrLevelPolicy::default();
+    let mut output_limit = OutputLimitPolicy::default();
     let mut diagnose = false;
     let mut diagnose_full = false;
     let mut slim_override = SlimOverride::Auto;
@@ -364,6 +371,21 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                 cabsim_partition =
                     validate_cabsim_partition(parsed).unwrap_or_else(|e| exit_with_error(e));
             }
+            Long("ir-level-policy") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid --ir-level-policy value."));
+                ir_level_policy =
+                    parse_ir_level_policy(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
+            Long("output-limit") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid --output-limit value."));
+                output_limit = parse_output_limit(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
             _ => exit_with_error(arg.unexpected()),
         }
     }
@@ -381,6 +403,8 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         output_gain,
         buffer_size,
         cabsim_partition,
+        ir_level_policy,
+        output_limit,
         diagnose,
         diagnose_full,
         slim_override,

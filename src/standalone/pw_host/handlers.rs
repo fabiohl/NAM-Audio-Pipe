@@ -505,6 +505,7 @@ pub(super) fn handle_cabsim_rebuild(
     rt_status: &RtStatusFlags,
     ir_raw_samples: Option<&[f32]>,
     ir_source_rate: u32,
+    ir_level_policy: crate::standalone::cli_domain::IrLevelPolicy,
     _sys: &SystemSnapshot,
     cabsim_producer: &mut rtrb::Producer<Box<CabSimSwapPayload>>,
 ) -> Option<u32> {
@@ -543,6 +544,7 @@ pub(super) fn handle_cabsim_rebuild(
         ir_source_rate,
         target_host_rate,
         partition_size,
+        ir_level_policy,
     ) {
         Ok(pair) => {
             // Publish the exact real latency of the cab-sim stage at the
@@ -613,29 +615,32 @@ pub(super) fn handle_cabsim_rebuild(
 }
 
 /// Builds a stereo-decoupled [`CabSimPair`] from the preserved original IR,
-/// resampled for the applied host output rate. Off-RT only (allocates).
+/// resampled for the applied host output rate and scaled by `policy`. Off-RT only (allocates).
 fn build_cabsim_pair(
     raw_samples: &[f32],
     ir_source_rate: u32,
     target_host_rate: u32,
     partition_size: usize,
+    policy: crate::standalone::cli_domain::IrLevelPolicy,
 ) -> anyhow::Result<CabSimPair> {
     if raw_samples.is_empty() {
         anyhow::bail!("IR has no samples");
     }
-    let resampled: Option<Vec<f32>> = if ir_source_rate != 0 && ir_source_rate != target_host_rate {
-        Some(
-            CabSimIr::resample(raw_samples, ir_source_rate, target_host_rate).map_err(|e| {
-                anyhow::anyhow!("IR resample ({ir_source_rate} -> {target_host_rate} Hz): {e}")
-            })?,
-        )
+    let mut samples: Vec<f32> = if ir_source_rate != 0 && ir_source_rate != target_host_rate {
+        CabSimIr::resample(raw_samples, ir_source_rate, target_host_rate).map_err(|e| {
+            anyhow::anyhow!("IR resample ({ir_source_rate} -> {target_host_rate} Hz): {e}")
+        })?
     } else {
-        None
+        raw_samples.to_vec()
     };
-    let samples: &[f32] = resampled.as_deref().unwrap_or(raw_samples);
+    let _ = crate::standalone::cli_domain::apply_ir_level_policy(
+        &mut samples,
+        policy,
+        target_host_rate,
+    );
 
     let build_adapter = || {
-        ConvEngine::new(samples, partition_size)
+        ConvEngine::new(&samples, partition_size)
             .map_err(|e| anyhow::anyhow!("Cab-sim engine: {e}"))
             .and_then(|engine| {
                 CabSimAdapter::new(Box::new(engine))

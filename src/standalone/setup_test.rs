@@ -25,7 +25,14 @@ fn test_load_initial_model_none() {
 #[test]
 fn test_load_initial_cabsim_none() {
     let mut channels = setup_communication_channels().expect("test SPSC setup");
-    let result = load_initial_cabsim(None, 128, false, &mut channels.cabsim_producer).unwrap();
+    let result = load_initial_cabsim(
+        None,
+        128,
+        false,
+        Default::default(),
+        &mut channels.cabsim_producer,
+    )
+    .unwrap();
     assert!(result.is_none());
 }
 
@@ -36,9 +43,15 @@ fn test_load_initial_cabsim_none() {
 fn load_initial_cabsim_missing_path_is_fatal_by_default() {
     let mut channels = setup_communication_channels().expect("test SPSC setup");
     let missing = std::path::Path::new("/nonexistent/definitely/missing_ir.wav");
-    let err = load_initial_cabsim(Some(missing), 128, false, &mut channels.cabsim_producer)
-        .err()
-        .expect("a missing --cab must be fatal by default");
+    let err = load_initial_cabsim(
+        Some(missing),
+        128,
+        false,
+        Default::default(),
+        &mut channels.cabsim_producer,
+    )
+    .err()
+    .expect("a missing --cab must be fatal by default");
     assert!(
         err.to_string().contains("Cab-sim IR load failed"),
         "fatal error must name the failure, got: {err}"
@@ -49,8 +62,14 @@ fn load_initial_cabsim_missing_path_is_fatal_by_default() {
 fn load_initial_cabsim_missing_path_is_optional_with_flag() {
     let mut channels = setup_communication_channels().expect("test SPSC setup");
     let missing = std::path::Path::new("/nonexistent/definitely/missing_ir.wav");
-    let result = load_initial_cabsim(Some(missing), 128, true, &mut channels.cabsim_producer)
-        .expect("--cab-optional must keep going without the IR");
+    let result = load_initial_cabsim(
+        Some(missing),
+        128,
+        true,
+        Default::default(),
+        &mut channels.cabsim_producer,
+    )
+    .expect("--cab-optional must keep going without the IR");
     assert!(result.is_none());
 }
 

@@ -289,6 +289,18 @@ pub fn print_help() {
     );
     let _ = writeln!(
         out,
+        "      --ir-level-policy <MODE> Cab-sim IR level policy: peak-normalized (default),\n\
+                                   preserved (1:1 WAV amplitude), or legacy-nam-plugin\n\
+                                   (10^(-18/20) * 48000/fs)"
+    );
+    let _ = writeln!(
+        out,
+        "      --output-limit <MODE> Playback hardware output limit: off (default) or clamp\n\
+                                   (hard clamp to [-1.0, 1.0]; not a dynamic limiter; float\n\
+                                   WAV --record output is never clamped)"
+    );
+    let _ = writeln!(
+        out,
         "      --diagnose          Print technical support block and exit"
     );
     let _ = writeln!(
@@ -492,4 +504,110 @@ pub(crate) fn parse_gate_mode(value: &str) -> Result<GateConfig, String> {
     }
 
     Ok(GateConfig::from_open_db(open_db))
+}
+
+/// Level policy applied to a cabinet impulse response before convolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IrLevelPolicy {
+    /// Normalize the IR kernel so its absolute peak is 1.0 (0 dBFS).
+    #[default]
+    PeakNormalized,
+    /// Preserve the original WAV amplitude (1:1 gain, no peak normalization).
+    Preserved,
+    /// Apply the legacy C++ NeuralAmpModelerPlugin level scaling:
+    /// `10^(-18/20) * (48000 / target_rate)` on the unnormalized IR.
+    /// Preserves Rust polyphase sinc resampling and full IR length.
+    LegacyNamPlugin,
+}
+
+impl IrLevelPolicy {
+    /// Stable CLI/log identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeakNormalized => "peak-normalized",
+            Self::Preserved => "preserved",
+            Self::LegacyNamPlugin => "legacy-nam-plugin",
+        }
+    }
+}
+
+/// Parses `--ir-level-policy <MODE>`.
+pub fn parse_ir_level_policy(val: &str) -> Result<IrLevelPolicy, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "peak-normalized" | "peak" => Ok(IrLevelPolicy::PeakNormalized),
+        "preserved" | "raw" | "unity" => Ok(IrLevelPolicy::Preserved),
+        "legacy-nam-plugin" | "legacy" => Ok(IrLevelPolicy::LegacyNamPlugin),
+        _ => Err(format!(
+            "Invalid --ir-level-policy: '{val}'. Use peak-normalized, preserved, or legacy-nam-plugin."
+        )),
+    }
+}
+
+/// Optional hardware playback output limit policy.
+///
+/// Explicitly distinguishes a stateless hard clamp from a dynamic limiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputLimitPolicy {
+    /// No output limiting (default): playback delivers raw f32 samples.
+    #[default]
+    Off,
+    /// Hard clamp playback samples to `[-1.0, 1.0]` (maps `NaN` to `0.0`).
+    /// This is a stateless hard clip, NOT a dynamic limiter; float WAV
+    /// recording (`--record`) is never clamped.
+    Clamp,
+}
+
+impl OutputLimitPolicy {
+    /// Stable CLI/log identifier.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Clamp => "clamp",
+        }
+    }
+}
+
+/// Parses `--output-limit <MODE>`.
+pub fn parse_output_limit(val: &str) -> Result<OutputLimitPolicy, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "off" | "none" => Ok(OutputLimitPolicy::Off),
+        "clamp" | "hard-clamp" => Ok(OutputLimitPolicy::Clamp),
+        _ => Err(format!(
+            "Invalid --output-limit: '{val}'. Use off or clamp."
+        )),
+    }
+}
+
+/// Applies `policy` in-place to `samples` at `target_rate` Hz.
+///
+/// Returns the scalar gain factor applied (1.0 when unchanged or silent).
+pub fn apply_ir_level_policy(samples: &mut [f32], policy: IrLevelPolicy, target_rate: u32) -> f32 {
+    match policy {
+        IrLevelPolicy::PeakNormalized => {
+            let peak =
+                samples.iter().fold(
+                    0.0f32,
+                    |acc, &s| {
+                        if s.is_finite() { acc.max(s.abs()) } else { acc }
+                    },
+                );
+            if peak <= 0.0 || (peak - 1.0).abs() < f32::EPSILON {
+                return 1.0;
+            }
+            let gain = 1.0 / peak;
+            for s in samples.iter_mut() {
+                *s *= gain;
+            }
+            gain
+        }
+        IrLevelPolicy::Preserved => 1.0,
+        IrLevelPolicy::LegacyNamPlugin => {
+            let rate = f64::from(target_rate.max(1));
+            let gain = (10.0_f64.powf(-18.0 / 20.0) * (48_000.0 / rate)) as f32;
+            for s in samples.iter_mut() {
+                *s *= gain;
+            }
+            gain
+        }
+    }
 }

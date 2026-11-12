@@ -122,6 +122,8 @@ pub fn run_pipewire_host(
         recording_status,
         banner,
         activation,
+        ir_level_policy,
+        output_limit,
     } = config;
 
     // Bounded reconnect policy. `--fail-fast` disables the recovery cycle
@@ -444,6 +446,7 @@ pub fn run_pipewire_host(
                 &latency_str,
                 rt_status.clone(),
                 backend_for_playback.clone(),
+                output_limit,
             )?;
 
             Ok((cs, cl, ps, pl, initial_latency_samples))
@@ -622,6 +625,7 @@ pub fn run_pipewire_host(
                 &rt_status,
                 ir_raw_samples.as_deref(),
                 ir_source_rate,
+                ir_level_policy,
                 &sys,
                 &mut cabsim_producer,
             );

@@ -107,6 +107,8 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
                 recording_status: None,
                 banner: Default::default(),
                 activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+                ir_level_policy: Default::default(),
+                output_limit: Default::default(),
             },
             gc_cons,
             sl_cons,

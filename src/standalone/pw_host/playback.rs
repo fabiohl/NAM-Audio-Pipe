@@ -109,6 +109,7 @@ pub fn playback_param_changed_handler(
 ///
 /// The `process()` closure reads from `DspBridge` (filled by the capture stream)
 /// and delivers to hardware via `playback_dsp_cycle`.
+#[expect(clippy::too_many_arguments)]
 pub fn setup_playback_stream<'c>(
     core: &'c pw::core::Core,
     bridge_ptr: BridgeRef,
@@ -117,6 +118,7 @@ pub fn setup_playback_stream<'c>(
     latency_str: &str,
     rt_status: Arc<RtStatusFlags>,
     backend_status: Arc<SharedBackendStatus>,
+    output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let bridge_ptr_playback = DspBridgeReader::from_ref(bridge_ptr)
         .context("BridgeRef cannot be null when setting up playback stream")?;
@@ -213,6 +215,7 @@ pub fn setup_playback_stream<'c>(
                         &rt_status_playback,
                         &stream_status_playback,
                         pb_frame_count,
+                        output_limit,
                     );
                 }),
             );

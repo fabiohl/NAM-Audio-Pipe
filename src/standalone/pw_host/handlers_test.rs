@@ -436,7 +436,14 @@ fn cabsim_push_full_keeps_needs_for_retry() {
     }))
     .unwrap();
 
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
 
     assert!(
         flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD),
@@ -444,7 +451,14 @@ fn cabsim_push_full_keeps_needs_for_retry() {
     );
 
     let _ = cons.pop().unwrap();
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     assert!(cons.pop().is_ok());
@@ -466,7 +480,14 @@ fn cabsim_rebuild_resamples_to_requested_host_rate() {
         request_cabsim_rebuild(&flags, 64, target_rate);
         let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
-        handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+        handle_cabsim_rebuild(
+            &flags,
+            Some(&ir),
+            48000,
+            Default::default(),
+            &sys,
+            &mut prod,
+        );
 
         assert!(
             !flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD),
@@ -508,7 +529,14 @@ fn cabsim_rebuild_same_rate_no_resample() {
     request_cabsim_rebuild(&flags, 64, 48000);
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     let pair = cons.pop().unwrap().pair.expect("pair delivered");
@@ -525,7 +553,14 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 16384, 48000);
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(
@@ -539,7 +574,14 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 1, 48000);
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(
@@ -552,7 +594,14 @@ fn cabsim_rebuild_clamps_out_of_domain_partition_size() {
     let flags = RtStatusFlags::new();
     request_cabsim_rebuild(&flags, 64, 48000);
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     let pair = cons.pop().unwrap().pair.expect("pair delivered");
     assert_eq!(pair.partition_size(), 64);
@@ -567,7 +616,14 @@ fn cabsim_rebuild_failure_pushes_none_bypass() {
     let (mut prod, mut cons) = rtrb::RingBuffer::<Box<CabSimSwapPayload>>::new(2);
 
     // Empty raw samples make the IR resample fail deterministically.
-    handle_cabsim_rebuild(&flags, Some(&empty), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&empty),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
 
     assert!(!flags.check_flag(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD));
     assert!(
@@ -619,7 +675,14 @@ fn cabsim_full_protocol_installs_latest_and_gcs_retired_pair() {
     ));
 
     request_cabsim_rebuild(&flags, 64, 96000);
-    handle_cabsim_rebuild(&flags, Some(&ir), 48000, &sys, &mut prod);
+    handle_cabsim_rebuild(
+        &flags,
+        Some(&ir),
+        48000,
+        Default::default(),
+        &sys,
+        &mut prod,
+    );
 
     let mut budget = SwapBudget::new(STRUCTURAL_SWAPS_PER_CALLBACK);
     drain_cabsims(

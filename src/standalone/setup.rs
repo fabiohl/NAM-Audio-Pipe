@@ -201,6 +201,7 @@ pub fn load_initial_cabsim(
     cab_path: Option<&Path>,
     cabsim_partition: u32,
     cab_optional: bool,
+    ir_level_policy: crate::standalone::cli_domain::IrLevelPolicy,
     cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
 ) -> anyhow::Result<Option<InitialCabSimIr>> {
     let Some(cab_path) = cab_path else {
@@ -209,11 +210,18 @@ pub fn load_initial_cabsim(
 
     let partition_size = initial_cabsim_partition_size(cabsim_partition);
 
-    match CabSimIr::load(cab_path, 0, true) {
+    match CabSimIr::load(cab_path, 0, false) {
         Ok(cabsim) => {
-            let source_rate = cabsim.sample_rate;
+            let source_rate = cabsim.original_rate;
+            let raw_samples = cabsim.samples;
+            let mut kernel_samples = raw_samples.clone();
+            let _ = crate::standalone::cli_domain::apply_ir_level_policy(
+                &mut kernel_samples,
+                ir_level_policy,
+                source_rate,
+            );
             let build_adapter = || {
-                ConvEngine::new(&cabsim.samples, partition_size)
+                ConvEngine::new(&kernel_samples, partition_size)
                     .map_err(|e| anyhow::anyhow!("Cab-sim engine init: {e}"))
                     .and_then(|engine| {
                         CabSimAdapter::new(Box::new(engine))
@@ -253,7 +261,7 @@ pub fn load_initial_cabsim(
                 },
             ));
             Ok(Some(InitialCabSimIr {
-                raw_samples: cabsim.samples,
+                raw_samples,
                 source_rate,
             }))
         }
