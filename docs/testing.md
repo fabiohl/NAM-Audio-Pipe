@@ -251,7 +251,7 @@ Class B script, operator-only. It records every phase result instead of aborting
 
 Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
 
-`--only <name>[,<name>]` accepts only canonical phase names. It preserves `target/long` and writes `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file). Non-selected phases are recorded as `SKIPPED`. A partial receipt is not certifiable. Without `--only`, the receipt can be validated via `pipe_long_receipt validate [--strict]` and certified for release.
+`--only <name>[,<name>]` accepts only canonical phase names. It sets `SCOPE=partial` and emits `MODE: partial`, preserving `target/long` and writing `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file). Non-selected phases are recorded as `SKIPPED`. A partial receipt is audited cleanly but strictly rejected by `pipe_long_receipt certify`. Without `--only`, the receipt can be validated via `pipe_long_receipt validate [--strict]` and certified for release.
 
 #### 3.3.1 Hosted CI and Manual Long Workflow (GitHub Actions)
 
@@ -422,7 +422,8 @@ The following contractual rules are enforced across test suites and CI checks:
 | **RT Deadline Processing**  | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                         | `tests/rt_metrics.rs`, `utils/tests-long.sh` (`rt-deadline`) |
 | **Target CPU Baseline**     | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                     | `.cargo/config.toml`                                         |
 | **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`.                          | `tests/distribution_qa.rs`, `utils/lints.sh`                 |
-| **Release Provenance**      | `target/dist/build-receipt.json` records artifact SHA-256, git provenance, locked engine provenance, and PGO/BOLT optimization evidence. | `src/receipt/build.rs`, `utils/build-release.sh`             |
+| **Release Provenance**      | `target/dist/build-receipt.json` records artifact SHA-256, git provenance, locked engine provenance, and PGO/BOLT optimization evidence; reconciled fail-closed via `pipe_long_receipt build-status`. | `src/receipt/build.rs`, `utils/build-release.sh`             |
+| **Metrology Tail Precision**| E2E latency gate enforces conservative histogram upper bounds (`p99_source=histogram`), while exact reservoir samples are labeled for coverage (`p99_exact_coverage=full\|partial`). | `tests/pw_integration.rs`                                    |
 
 ---
 

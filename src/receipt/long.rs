@@ -14,13 +14,13 @@
 //! SUITE: tests-long
 //! STRICT: 0|1
 //! NAM_RT_STRICT: 0|1               (strict-mode propagation evidence; optional)
-//! MODE: simulate|full
+//! MODE: simulate|full|partial
 //! SOAK_PURPOSE: accelerated_timeline ...     (purpose of the accelerated soak; optional)
 //! ENDURANCE_PURPOSE: real_wall_clock ...     (purpose of the real endurance; optional)
 //! PHASE1: PASS|FAIL|GAP|SIMULATED log=target/logs/... [duration_ms=N]
 //! ... (PHASE2..PHASE6; PHASE6 = real wall-clock endurance)
 //! GAP: <typed reason>            (zero or more)
-//! OVERALL: PASSED|FAILED|COMPLETED_WITH_GAPS|SIMULATED
+//! OVERALL: PASSED|FAILED|COMPLETED_WITH_GAPS|SIMULATED|PARTIAL ...
 //! ```
 //!
 //! Unknown line types, duplicated mandatory fields, invalid values, a missing
@@ -64,7 +64,7 @@ pub struct LongReceipt {
     pub suite: String,
     /// `STRICT:` flag (release gate only passes with `1`).
     pub strict: bool,
-    /// `MODE:` value (`simulate` or `full`).
+    /// `MODE:` value (`simulate`, `full`, or `partial`).
     pub mode: String,
     /// `NAM_RT_STRICT:` propagation evidence. `None` when the line is
     /// absent (receipts written before the field existed remain parseable).
@@ -217,9 +217,9 @@ pub fn parse_long_receipt(text: &str) -> Result<LongReceipt, String> {
             }
         } else if let Some(v) = line.strip_prefix("MODE:") {
             let v = v.trim();
-            if v != "simulate" && v != "full" {
+            if v != "simulate" && v != "full" && v != "partial" {
                 return Err(format!(
-                    "line {lineno}: invalid MODE: value {v:?} (expected simulate or full)"
+                    "line {lineno}: invalid MODE: value {v:?} (expected simulate, full, or partial)"
                 ));
             }
             if mode.replace(v.to_string()).is_some() {
@@ -227,7 +227,10 @@ pub fn parse_long_receipt(text: &str) -> Result<LongReceipt, String> {
             }
         } else if let Some(v) = line.strip_prefix("OVERALL:") {
             let v = v.trim();
-            if !matches!(v, "PASSED" | "FAILED" | "COMPLETED_WITH_GAPS" | "SIMULATED") {
+            let valid = matches!(v, "PASSED" | "FAILED" | "COMPLETED_WITH_GAPS" | "SIMULATED")
+                || v == "PARTIAL"
+                || v.starts_with("PARTIAL ");
+            if !valid {
                 return Err(format!("line {lineno}: invalid OVERALL: verdict {v:?}"));
             }
             if overall.replace(v.to_string()).is_some() {
@@ -251,10 +254,12 @@ pub fn parse_long_receipt(text: &str) -> Result<LongReceipt, String> {
     let mode = mode.ok_or("missing MODE: line")?;
     let overall = overall.ok_or("missing OVERALL: line")?;
 
-    for n in 1..=5 {
-        let id = format!("PHASE{n}");
-        if !phases.iter().any(|p| p.id == id) {
-            return Err(format!("missing mandatory phase {id} in receipt"));
+    if mode != "partial" {
+        for n in 1..=5 {
+            let id = format!("PHASE{n}");
+            if !phases.iter().any(|p| p.id == id) {
+                return Err(format!("missing mandatory phase {id} in receipt"));
+            }
         }
     }
 
@@ -300,6 +305,26 @@ impl LongReceipt {
                 .all(|p| p.status == LongPhaseStatus::Simulated)
             {
                 return Err("simulate receipt must carry only SIMULATED phase statuses".into());
+            }
+            return Ok(());
+        }
+        if self.mode == "partial" {
+            let has_fail = self
+                .phases
+                .iter()
+                .any(|p| p.status == LongPhaseStatus::Fail);
+            let is_partial = self.overall == "PARTIAL" || self.overall.starts_with("PARTIAL ");
+            if has_fail && self.overall != "FAILED" {
+                return Err(format!(
+                    "partial receipt with failing phase must close with OVERALL: FAILED, got {:?}",
+                    self.overall
+                ));
+            }
+            if !has_fail && !is_partial {
+                return Err(format!(
+                    "partial receipt without failures must close with OVERALL: PARTIAL, got {:?}",
+                    self.overall
+                ));
             }
             return Ok(());
         }
@@ -426,4 +451,68 @@ pub fn verify_release_certification_file(path: &Path) -> Result<LongReceipt, Str
         )
     })?;
     Ok(receipt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_FULL_RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 1
+MODE: full
+SOAK_PURPOSE: accelerated_timeline - automated soak verification
+ENDURANCE_PURPOSE: real_wall_clock - automated endurance verification
+PHASE1: PASS log=target/logs/1.log
+PHASE2: PASS log=target/logs/2.log
+PHASE3: PASS log=target/logs/3.log env=pinned:1,isolated:1,fifo:1
+PHASE4: PASS log=target/logs/4.log env=pinned:1,isolated:1,fifo:1
+PHASE5: PASS log=target/logs/5.log
+PHASE6: PASS log=target/logs/6.log
+OVERALL: PASSED
+";
+
+    const SAMPLE_PARTIAL_RECEIPT: &str = "\
+SUITE: tests-long
+STRICT: 1
+NAM_RT_STRICT: 1
+MODE: partial
+SOAK_PURPOSE: accelerated_timeline - automated soak verification
+ENDURANCE_PURPOSE: real_wall_clock - automated endurance verification
+PHASE1: PASS log=target/logs/1.log
+OVERALL: PARTIAL (--only: recibo sem overall, não certificável)
+";
+
+    #[test]
+    fn test_parse_full_receipt_passes_certification() {
+        let parsed = parse_long_receipt(SAMPLE_FULL_RECEIPT).expect("parse full receipt");
+        assert_eq!(parsed.mode, "full");
+        assert!(parsed.audit().is_ok());
+        assert!(parsed.verify_release_certification().is_ok());
+    }
+
+    #[test]
+    fn test_parse_partial_receipt_audits_cleanly_but_rejects_certification() {
+        let parsed = parse_long_receipt(SAMPLE_PARTIAL_RECEIPT).expect("parse partial receipt");
+        assert_eq!(parsed.mode, "partial");
+        assert!(parsed.audit().is_ok());
+        let cert_err = parsed.verify_release_certification();
+        assert!(cert_err.is_err());
+        assert!(cert_err.unwrap_err().contains("MODE: full"));
+    }
+
+    #[test]
+    fn test_parse_partial_with_failure() {
+        let content = "\
+SUITE: tests-long
+STRICT: 0
+NAM_RT_STRICT: 0
+MODE: partial
+PHASE1: FAIL log=target/logs/1.log
+OVERALL: FAILED
+";
+        let parsed = parse_long_receipt(content).expect("parse partial failed receipt");
+        assert!(parsed.audit().is_ok());
+    }
 }

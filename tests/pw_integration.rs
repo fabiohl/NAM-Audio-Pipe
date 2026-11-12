@@ -199,6 +199,8 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     #[cfg(not(any(feature = "testing", feature = "heap-audit")))]
     let (p50_exact_ns, p99_exact_ns, p999_exact_ns) = (0u64, 0u64, 0u64);
 
+    let p99_exact_coverage = if samples <= 2048 { "full" } else { "partial" };
+
     spsc::SHUTDOWN.store(true, Ordering::Relaxed);
 
     let host_result = match pw_thread.join() {
@@ -239,7 +241,8 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
         "E2E_METRICS buffer_size={buffer_size} samples={samples} p50_ns={p50_ns} p99_ns={p99_ns} \
          p999_ns={p999_ns} max_ns={max_ns} p50_exact_ns={p50_exact_ns} p99_exact_ns={p99_exact_ns} \
          p999_exact_ns={p999_exact_ns} starvation={starvation} \
-         bringup_discard={bringup_discard} steady_dropped={dropped_frames} quantum={quantum} rate={rate}"
+         bringup_discard={bringup_discard} steady_dropped={dropped_frames} quantum={quantum} rate={rate} \
+         p99_source=histogram p99_exact_coverage={p99_exact_coverage}"
     );
 
     // Steady-state contract: after warm-up the bridge must not starve nor

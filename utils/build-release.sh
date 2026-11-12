@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # build-release.sh — builds the canonical Pipe artifact (PGO+BOLT), packages it and emits the typed build receipt. Classe C.
 # Uso: utils/build-release.sh [--strict] [--package] [--install] [--certify] [-h|--help]
-# Orçamento: 900
+# Orçamento: 920  # Reconciliação tipada de gaps via pipe_long_receipt build-status
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 SCRIPT_NAME=build-release
 SCRIPT_DIR="$PWD/utils"
 LOG_DIR=target/logs
-SCOPE=build
+SCOPE="${SCOPE:-full}"
 DIST_DIR=target/dist
 DIST_BIN="$DIST_DIR/nam-audio-pipe"
 BUILD_RECEIPT="$DIST_DIR/build-receipt.json"
@@ -894,5 +894,18 @@ ok "build receipt: $BUILD_RECEIPT"
 # The long audit reuses this id so build and long receipts reconcile even when
 # the three commands run as independent processes.
 printf '%s\n' "$NAM_RUN_ID" > "$LOG_DIR/build-run-id"
+if [ -f "$BUILD_RECEIPT" ]; then
+    if ! status_output=$("$RECEIPT_BIN" build-status --receipt "$BUILD_RECEIPT" --run-id "$NAM_RUN_ID" 2>>"$RECEIPT_LOG"); then
+        rm -f "$BUILD_RECEIPT"
+        fail_phase build_receipt 1 "$RECEIPT_LOG"
+        finish
+        exit 1
+    fi
+    while IFS= read -r line; do
+        case "$line" in
+            GAP:\ *) g="${line#GAP: }"; [ -n "$g" ] && gap "$g" ;;
+        esac
+    done <<< "$status_output"
+fi
 emit "PHASE: build_receipt PASS log=$RECEIPT_LOG"
 finish

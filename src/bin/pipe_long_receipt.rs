@@ -13,8 +13,8 @@
 //! receipt with the strict long audit and writes `release-receipt.json`.
 //!
 //! Subcommands: `append`, `summary`, `validate [--strict]`, `pgo-check`,
-//! `bolt-proof`, `build-receipt`, `certify`, `verify-artifact`, `verify-release`,
-//! `flatpak-path`.
+//! `bolt-proof`, `build-receipt`, `build-status`, `certify`, `verify-artifact`,
+//! `verify-release`, `flatpak-path`.
 //! Exit codes: 0 success; 1 I/O or verification error; 2 usage error;
 //! 3 `flatpak-path` when the release declares no bundle.
 
@@ -58,6 +58,7 @@ fn main() {
         "ceremony-proof" => cmd_ceremony_proof(&args[1..]),
         "bolt-proof" => cmd_ceremony_proof(&args[1..]),
         "build-receipt" => cmd_build_receipt(&args[1..]),
+        "build-status" => cmd_build_status(&args[1..]),
         "certify" => cmd_certify(&args[1..]),
         "verify-artifact" => cmd_verify_artifact(&args[1..]),
         "verify-release" => cmd_verify_release(&args[1..]),
@@ -93,6 +94,7 @@ fn print_help() {
     println!(
         "  pipe_long_receipt build-receipt --artifact <path> [--out <file>] [--strict] [options...]"
     );
+    println!("  pipe_long_receipt build-status --receipt <file> [--run-id <id>]");
     println!(
         "  pipe_long_receipt certify [--artifact <path>] [--build-receipt <path>] [--long-receipt <path>] [--text-receipt <path>] [--out <file>] [--strict]"
     );
@@ -724,6 +726,65 @@ fn cmd_build_receipt(args: &[String]) {
         exit(1);
     }
     println!("BUILD_RECEIPT: {status} log={out} sha256={artifact_sha256}");
+    exit(0);
+}
+
+fn cmd_build_status(args: &[String]) {
+    let flags = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => die_usage("build-status", &e),
+    };
+    let receipt_path_str = match required(&flags, "receipt") {
+        Ok(v) => v.clone(),
+        Err(e) => die_usage("build-status", &e),
+    };
+    let receipt_path = Path::new(&receipt_path_str);
+    if !receipt_path.exists() {
+        eprintln!("build-status: receipt file not found: {receipt_path_str}");
+        exit(1);
+    }
+    let content = match fs::read_to_string(receipt_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("build-status: failed to read {receipt_path_str}: {e}");
+            exit(1);
+        }
+    };
+    let receipt: BuildReceipt = match serde_json::from_str(&content) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("build-status: invalid build receipt schema: {e}");
+            exit(1);
+        }
+    };
+
+    let expected_run_id = flags
+        .get("run-id")
+        .cloned()
+        .or_else(|| env::var("NAM_RUN_ID").ok())
+        .filter(|s| !s.is_empty());
+
+    if let Some(expected) = expected_run_id {
+        match &receipt.provenance.run_id {
+            Some(rid) if rid == &expected => {}
+            Some(rid) => {
+                eprintln!("build-status: run_id mismatch: receipt={rid} != expected={expected}");
+                exit(1);
+            }
+            None => {
+                eprintln!("build-status: receipt missing run_id, expected={expected}");
+                exit(1);
+            }
+        }
+    }
+
+    println!("BUILD_STATUS: {}", receipt.status);
+    if let Some(rid) = &receipt.provenance.run_id {
+        println!("BUILD_RUN_ID: {rid}");
+    }
+    for gap in &receipt.gaps {
+        println!("GAP: {gap}");
+    }
     exit(0);
 }
 

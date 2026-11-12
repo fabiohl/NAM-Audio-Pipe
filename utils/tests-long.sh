@@ -100,7 +100,7 @@ is_phase_selected() {
 if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; fi
 # A partial run must never destroy the previous full receipt: it writes to a
 # sibling set of paths that cannot be mistaken for a certifiable audit.
-if [ ${#ONLY_PHASES[@]} -gt 0 ]; then TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"; RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"; FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"; fi
+if [ ${#ONLY_PHASES[@]} -gt 0 ]; then SCOPE="partial"; TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"; RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"; FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"; fi
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_TARGET_DIR" = "target/long" ]; then rm -rf target/long; fi
 rm -f "$RECEIPT" "$FAIL_REASONS" "$TEXT_RECEIPT"
 if [ "$USE_ARTIFACT" = 1 ]; then [ -f "$ARTIFACT_PATH" ] || { echo "ERRO: --artifact especificado mas $ARTIFACT_PATH não existe." >&2; exit 2; }; ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}'); fi
@@ -313,7 +313,9 @@ ensure_receipt_bin || { echo "ERRO: pipe_long_receipt indisponível" >&2; LONG_R
 emit_text "SUITE: tests-long"
 emit_text "STRICT: $STRICT"
 emit_text "NAM_RT_STRICT: ${NAM_RT_STRICT:-0}"
-emit_text "MODE: full"
+MODE="full"
+[ ${#ONLY_PHASES[@]} -gt 0 ] && MODE="partial"
+emit_text "MODE: $MODE"
 emit_text "SOAK_PURPOSE: accelerated_timeline — compressed timeline (320k blocks), fail-closed validation windows"
 emit_text "ENDURANCE_PURPOSE: real_wall_clock — wall-clock (NAM_ENDURANCE_SECONDS), fail-closed windows"
 run_phase 0 catch-all 900 body_catch_all
