@@ -737,3 +737,22 @@ fn validate_cli_inputs_missing_cab_is_usage_error_without_optional() {
         "a missing --cab without --cab-optional must remain a usage error"
     );
 }
+
+#[test]
+fn test_parse_args_gain_boundary_values() {
+    // S02 / T02.1: Domain boundary tests for input and output gains [-96.0, 30.0] dB
+    let args_min = vec!["nam-audio-pipe", "-i", "-96.0", "-o", "-96.0", "-b", "256"];
+    let cli_min = parse_args_from(lexopt::Parser::from_iter(args_min));
+    assert_eq!(cli_min.input_gain, -96.0);
+    assert_eq!(cli_min.output_gain, -96.0);
+
+    let args_max = vec!["nam-audio-pipe", "-i", "30.0", "-o", "30.0", "-b", "256"];
+    let cli_max = parse_args_from(lexopt::Parser::from_iter(args_max));
+    assert_eq!(cli_max.input_gain, 30.0);
+    assert_eq!(cli_max.output_gain, 30.0);
+
+    let args_defaults = vec!["nam-audio-pipe", "-b", "256"];
+    let cli_def = parse_args_from(lexopt::Parser::from_iter(args_defaults));
+    assert_eq!(cli_def.input_gain, 0.0);
+    assert_eq!(cli_def.output_gain, 0.0);
+}

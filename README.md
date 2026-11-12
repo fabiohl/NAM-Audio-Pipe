@@ -56,6 +56,9 @@ No external audio libraries or third-party wrappers needed:
 - **Half-Band Anti-Aliasing Oversampling**: Multi-stage half-band polyphase FIR filters (`Off`, `2x`, `4x`, $>100\text{ dB}$ stopband attenuation) attenuate non-linear high-frequency foldover distortion on screaming high-gain leads.
 - **Selectable Activation Precision**: Choose between `standard` (exact Taylor minimax, +89.5 dB SNR) and `fast` (Padé polynomial minimax approximation) to tailor math precision against CPU cycles.
 - **Smart Schmitt Silence Gate**: Dual-threshold noise gate with 10 dB Schmitt hysteresis and auto-gain normalization to silence pickup hum without cutting off delicate note decays.
+- **Deliberate DSP Architectural Boundaries (P06)**:
+  - **Omission of Integrated Tone Stack (EQ)**: Omitted by deliberate design to keep the standalone pipeline lean, deterministic, and modular. Equalization and tone shaping are best placed within the PipeWire graph via dedicated audio filter nodes or external visual patchbays (e.g. `qpwgraph` + Calf/LSP/Carla plugins).
+  - **Omission of Post-Cabinet DC Filter**: Omitted by deliberate design. While symmetrical dither and floating-point denormal armoring prevent hardware microcode slowdowns, **there is no claim of absolute immunity to DC offset** (which may arise from asymmetric non-linear models). Users requiring steep sub-bass DC filtering can route the stream through a high-pass filter in the audio graph. This decision remains open and may be reevaluated in future revisions based on user requirements.
 
 ### 💾 5. High-Performance Asynchronous WAV Recording (`--record`)
 
