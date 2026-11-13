@@ -12,17 +12,17 @@ use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::pw_host::capture::state::{CaptureState, RtHostChannels};
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{
-    GcItem, RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_NEEDS_RESAMPLER_REBUILD,
-    RT_STATUS_RESAMP_SWAP_PENDING, RtStatusFlags, SwapBudget,
+    GcItem, GcSink, RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_IS_SILENT,
+    RT_STATUS_NEEDS_RESAMPLER_REBUILD, RT_STATUS_RESAMP_SWAP_PENDING, RtStatusFlags, SwapBudget,
 };
 use neural_amp_modeler_rs::dsp::pipeline::{
-    DspPipelineContext, MAX_BRIDGE_BUF, StreamingDspBuffers, capture_dsp_pipeline_streaming,
+    DspPipelineContext, MAX_BRIDGE_BUF, StreamingDspBuffers,
 };
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::math::dsp::gain_lut::GainLUT;
 
 use super::{
-    STRUCTURAL_SWAPS_PER_CALLBACK, drain_cabsims_with_status, drain_os_engines_with_status,
+    STRUCTURAL_SWAPS_PER_CALLBACK, drain_cabsims_with_slot_status, drain_os_engines_with_status,
     drain_resamplers_with_status, drain_slimmable_models, receive_commands, sync_rate,
     try_slimmable_rebuild,
 };
@@ -589,13 +589,21 @@ pub fn send_recording_audio(
     }
 }
 
+/// Exclusive cabinet runtime state passed into [`run_capture_dsp_pipeline`].
+pub struct PipeCabRuntime<'a> {
+    pub nam_slot: Option<&'a mut crate::standalone::cabinet::CabNamSlot>,
+    pub target_bypass: bool,
+    pub dry_delay: &'a mut crate::standalone::cabinet::CabDryDelay,
+    pub bypass_state: &'a mut crate::standalone::cabinet::CabBypassState,
+}
+
 /// Executes the active capture DSP pipeline under either [`GateMode::Silence`] (legacy
 /// block-RMS hysteresis with CPU skip and post-IR fade) or [`GateMode::Musical`]
 /// (continuous reference-compatible quadratic expander with pre-model detector and pre-IR gain).
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "Unified RT DSP pipeline supporting Silence and Musical gate topologies"
+    reason = "Unified RT DSP pipeline supporting Silence and Musical gate topologies and exclusive cab slot"
 )]
 pub(crate) fn run_capture_dsp_pipeline(
     samples_l: &mut [f32],
@@ -608,28 +616,14 @@ pub(crate) fn run_capture_dsp_pipeline(
     user_input_gain_mult: f32,
     gate_mode: crate::standalone::cli::GateMode,
     musical_gate: &mut crate::dsp::musical_gate::MusicalNoiseGate,
+    cab: PipeCabRuntime<'_>,
 ) -> usize {
-    if gate_mode == crate::standalone::cli::GateMode::Silence {
-        return capture_dsp_pipeline_streaming(
-            samples_l,
-            samples_r,
-            n_samples,
-            ctx,
-            stream_resample,
-            bufs,
-            current_host_rate,
-        );
-    }
-
-    use neural_amp_modeler_rs::common::spsc::{
-        RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_IS_SILENT,
-    };
+    use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateState};
+    use neural_amp_modeler_rs::dsp::gate_flags::report_gate_flags;
     use neural_amp_modeler_rs::dsp::pipeline::{
         MAX_RESAMP_BUF, apply_input_stage, apply_output_stage, run_inference_streaming,
         write_bridge,
     };
-
-    musical_gate.ensure_sample_rate(current_host_rate);
 
     let n = n_samples
         .min(samples_l.len())
@@ -637,7 +631,14 @@ pub(crate) fn run_capture_dsp_pipeline(
         .min(MAX_RESAMP_BUF);
     if n != n_samples || bufs.resamp_out_l.len() < n || bufs.resamp_out_r.len() < n {
         ctx.rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
-        ctx.rt_status.clear_flag(RT_STATUS_IS_SILENT);
+        if gate_mode == crate::standalone::cli::GateMode::Musical {
+            ctx.rt_status.clear_flag(RT_STATUS_IS_SILENT);
+        } else {
+            let safe_l = bufs.resamp_out_l.len().min(n);
+            bufs.resamp_out_l[..safe_l].fill(0.0);
+            let safe_r = bufs.resamp_out_r.len().min(n);
+            bufs.resamp_out_r[..safe_r].fill(0.0);
+        }
         if let Some(ref writer) = ctx.bridge_writer {
             writer.write_silence();
         }
@@ -650,21 +651,81 @@ pub(crate) fn run_capture_dsp_pipeline(
         return 0;
     }
 
-    // Musical Gate Detector: post user input gain, pre model input calibration (`cal_in`).
-    // Keep both channels updated continuously across mono <-> stereo transitions.
-    musical_gate.process_trigger_scaled(
-        samples_l,
-        samples_r,
-        n,
-        false,
-        user_input_gain_mult as f64,
-    );
+    if gate_mode == crate::standalone::cli::GateMode::Musical {
+        musical_gate.ensure_sample_rate(current_host_rate);
+        // Musical Gate Detector: post user input gain, pre model input calibration (`cal_in`).
+        // Keep both channels updated continuously across mono <-> stereo transitions.
+        musical_gate.process_trigger_scaled(
+            samples_l,
+            samples_r,
+            n,
+            false,
+            user_input_gain_mult as f64,
+        );
+    }
+
+    // Take `conv_pair` upfront so `ctx` can be borrowed freely by Stages 1-2.
+    let mut wav_pair = ctx.conv_pair.take();
 
     // Stage 1: Sanitize, input gain (+ model `cal_in`), mono hysteresis, denormal dither.
-    let _ = apply_input_stage(samples_l, samples_r, n, &mut ctx);
+    let gate_state = apply_input_stage(samples_l, samples_r, n, &mut ctx);
+    if gate_mode == crate::standalone::cli::GateMode::Silence {
+        report_gate_flags(ctx.rt_status, gate_state);
+        if gate_state == GateState::Closed {
+            stream_resample.reset();
+            bufs.os_in_l[..n].fill(0.0);
+            cab.dry_delay
+                .process_zeros(bufs.os_in_l, bufs.os_model_l, n, *ctx.process_mono);
+            let drained_wav = if !cab.target_bypass
+                && !cab.bypass_state.was_steady_bypassed()
+                && let Some(ref mut pair) = wav_pair
+                && pair.remaining_tail_samples() > 0
+            {
+                bufs.resamp_out_l[..n].fill(0.0);
+                bufs.resamp_out_r[..n].fill(0.0);
+                pair.drain_tail_stereo(
+                    &mut bufs.resamp_out_l[..n],
+                    &mut bufs.resamp_out_r[..n],
+                    Some(ctx.rt_status),
+                );
+                if *ctx.process_mono {
+                    bufs.resamp_out_r[..n].copy_from_slice(&bufs.resamp_out_l[..n]);
+                }
+                true
+            } else {
+                false
+            };
 
-    // Stage 2: Oversampling, neural inference, and output resampling (`silence_hysteresis`
-    // remains permanently Open in Musical mode so inference runs continuously).
+            if drained_wav {
+                let mut tail_gate = DynamicHysteresis::new();
+                apply_output_stage(
+                    bufs.resamp_out_l,
+                    bufs.resamp_out_r,
+                    n,
+                    ctx.output_gain_mult,
+                    &mut tail_gate,
+                    ctx.rt_status,
+                    *ctx.process_mono,
+                    ctx.adaptive,
+                    current_host_rate,
+                );
+                write_bridge(
+                    bufs.resamp_out_l,
+                    bufs.resamp_out_r,
+                    n,
+                    ctx.bridge_writer,
+                    *ctx.process_mono,
+                );
+                return n;
+            }
+            if let Some(ref writer) = ctx.bridge_writer {
+                writer.write_silence();
+            }
+            return 0;
+        }
+    }
+
+    // Stage 2: Oversampling, neural inference, and output resampling.
     let n_pw = run_inference_streaming(
         samples_l,
         samples_r,
@@ -681,59 +742,32 @@ pub(crate) fn run_capture_dsp_pipeline(
         bufs.crossfade_scratch_r,
     );
 
-    // Musical Gate Gain: applied post-model, pre-CabSim IR so amp noise is attenuated while
-    // cabinet impulse tails decay naturally.
-    musical_gate.apply_gain(
+    if gate_mode == crate::standalone::cli::GateMode::Musical {
+        // Musical Gate Gain: applied post-model, pre-cabinet so cabinet tails ring naturally.
+        musical_gate.apply_gain(
+            bufs.resamp_out_l,
+            bufs.resamp_out_r,
+            n_pw,
+            *ctx.process_mono,
+        );
+    }
+
+    // Stage 3: Exclusive Cabinet slot (WAV UPOLS or 1-in/1-out NAM/NAMB) + constant-latency bypass.
+    cab.bypass_state.process_stage(
+        cab.target_bypass,
+        wav_pair,
+        cab.nam_slot,
+        cab.dry_delay,
+        bufs.os_in_l,
+        bufs.os_in_r,
         bufs.resamp_out_l,
         bufs.resamp_out_r,
+        bufs.os_model_l,
+        bufs.os_model_r,
         n_pw,
         *ctx.process_mono,
+        ctx.rt_status,
     );
-
-    // Stage 3: CabSim IR convolution.
-    let convolved = if let Some(ref mut pair) = ctx.conv_pair {
-        if *ctx.process_mono {
-            pair.l
-                .process_block(&mut bufs.resamp_out_l[..n_pw], Some(ctx.rt_status));
-        } else {
-            pair.process_block_stereo(
-                &mut bufs.resamp_out_l[..n_pw],
-                &mut bufs.resamp_out_r[..n_pw],
-                Some(ctx.rt_status),
-            );
-        }
-        if n_pw > 0 {
-            pair.rearm_tail();
-        }
-        true
-    } else if let Some(ref mut conv) = ctx.conv {
-        conv.process_in_place(&mut bufs.resamp_out_l[..n_pw], Some(ctx.rt_status));
-        if !*ctx.process_mono {
-            conv.process_in_place(&mut bufs.resamp_out_r[..n_pw], Some(ctx.rt_status));
-        }
-        if n_pw > 0 {
-            conv.rearm_tail();
-        }
-        true
-    } else {
-        false
-    };
-
-    if convolved
-        && *ctx.process_mono
-        && bufs.resamp_out_l.len() >= n_pw
-        && bufs.resamp_out_r.len() >= n_pw
-        && n_pw > 0
-    {
-        // SAFETY: Bounds checked above; `resamp_out_l` and `resamp_out_r` are distinct slices.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                bufs.resamp_out_l.as_ptr(),
-                bufs.resamp_out_r.as_mut_ptr(),
-                n_pw,
-            );
-        }
-    }
 
     // Stage 4: Output gain, clipping detection, and adaptive compute state.
     apply_output_stage(
@@ -775,6 +809,7 @@ pub fn process_dsp_buffer(
     user_input_gain_mult: f32,
     gate_mode: crate::standalone::cli::GateMode,
     musical_gate: &mut crate::dsp::musical_gate::MusicalNoiseGate,
+    cab_rt: PipeCabRuntime<'_>,
     frame_count: &mut u32,
     rt_status_for_process: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
@@ -968,6 +1003,7 @@ pub fn process_dsp_buffer(
             user_input_gain_mult,
             gate_mode,
             musical_gate,
+            cab_rt,
         );
 
         let t_dsp_end = if should_measure {
@@ -1197,10 +1233,11 @@ pub fn rt_quantum_prologue(
             param_pops: 0,
         };
     };
-    drain_cabsims_with_status(
+    drain_cabsims_with_slot_status(
         cabsim_drain,
         &mut budget,
         &mut state.active_cabsim,
+        &mut state.active_cab_nam,
         Some(&mut state.cabsim_failed_key),
         state.stream_status.as_deref(),
         rt_status,
@@ -1209,6 +1246,43 @@ pub fn rt_quantum_prologue(
         parking_lot_dirty,
         &channels.gc_overflow,
     );
+
+    if let Some(nam_cons) = state.cab_nam_consumer.as_mut() {
+        let mut gc = GcSink {
+            producer: &mut channels.gc_producer,
+            parking_lot,
+            overflow: &channels.gc_overflow,
+            rt_status,
+            parking_lot_dirty: Some(parking_lot_dirty),
+        };
+        let stream_status_ref = state.stream_status.as_deref();
+        crate::standalone::cabinet::drain_cab_nam_payloads(
+            nam_cons,
+            &rt_status.requested_cabsim_generation,
+            &rt_status.applied_cabsim_generation,
+            &mut state.active_cabsim,
+            &mut state.active_cab_nam,
+            &|lat| {
+                if let Some(status) = stream_status_ref {
+                    status.update_cabsim_latency(lat);
+                }
+            },
+            &mut gc,
+        );
+    }
+
+    let active_cab_lat = state
+        .active_cabsim
+        .as_ref()
+        .map(|p| p.l.latency_samples())
+        .or_else(|| {
+            state
+                .active_cab_nam
+                .as_ref()
+                .map(|n| n.latency_samples() as usize)
+        })
+        .unwrap_or(0);
+    state.cab_dry_delay.set_delay(active_cab_lat);
 
     let prev_gate_params = state.gate_params;
     let (param_changed, param_pops) = receive_commands(

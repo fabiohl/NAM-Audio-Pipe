@@ -23,6 +23,13 @@ use std::path::PathBuf;
 pub enum CabStatus {
     /// An IR was loaded and is active.
     Loaded,
+    /// A WAV IR or neural cabinet (`.nam`/`.namb`) is loaded, with format label and bypass state.
+    Asset {
+        /// Short uppercase asset format (`"WAV"`, `"NAM"`, `"NAMB"`).
+        kind: &'static str,
+        /// Whether `--cab-bypass` is engaged (loaded asset and constant latency preserved).
+        bypassed: bool,
+    },
     /// No cab-sim IR is loaded (`--cab` absent).
     #[default]
     Absent,
@@ -115,6 +122,22 @@ pub fn render_banner(info: &BannerInfo, color: bool) -> String {
     };
     let cab = match info.request.cab {
         CabStatus::Loaded => format!("{} loaded", mark(true, color)),
+        CabStatus::Asset {
+            kind,
+            bypassed: false,
+        } => {
+            let note = if kind == "WAV" { "UPOLS" } else { "unity gain" };
+            format!("{} loaded [{kind}] ({note})", mark(true, color))
+        }
+        CabStatus::Asset {
+            kind,
+            bypassed: true,
+        } => {
+            format!(
+                "{} bypassed [{kind}] (constant latency)",
+                paint("⏸", "33", color)
+            )
+        }
         CabStatus::Absent => format!("{} none (optional)", paint("○", "33", color)),
         CabStatus::SkippedOptional => {
             format!("{} skipped (--cab-optional)", paint("⚠", "33", color))

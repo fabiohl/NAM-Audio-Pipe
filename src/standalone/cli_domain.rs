@@ -260,11 +260,18 @@ pub fn print_help() {
     );
     let _ = writeln!(
         out,
-        "  -c, --cab <FILE>        Path to the cab-sim IR (.wav). Supports ~, ../, etc."
+        "  -c, --cab <FILE>        Path to the cabinet asset (.wav IR, or 1-in/1-out .nam/.namb model).\n\
+                                   Single exclusive slot; neural cabinets run at unity gain and differ\n\
+                                   in CPU/latency from UPOLS WAV IRs. Supports ~, ../, etc."
     );
     let _ = writeln!(
         out,
-        "      --cab-optional      Continue without cab-sim when --cab is missing \
+        "      --cab-bypass        Bypass the cabinet stage while preserving the loaded asset\n\
+                                   and constant latency (zero-click dry delay alignment)"
+    );
+    let _ = writeln!(
+        out,
+        "      --cab-optional      Continue without cabinet when --cab is missing \
          or fails to load (default: a bad --cab is fatal)"
     );
     let _ = writeln!(

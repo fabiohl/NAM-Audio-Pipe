@@ -56,11 +56,13 @@ pub fn validate_cli_inputs(args: &CliArgs) -> Result<(), String> {
 pub struct CliArgs {
     /// Path to the neural model file.
     pub model_path: Option<PathBuf>,
-    /// Path to the cab-sim impulse response (.wav) file.
+    /// Path to the exclusive cabinet slot (.wav IR, or 1-in/1-out .nam/.namb model).
     pub cab_path: Option<PathBuf>,
-    /// When set (`--cab-optional`), a failed cab-sim IR load is non-fatal:
+    /// Start with the cabinet slot bypassed while keeping the loaded asset and constant latency.
+    pub cab_bypass: bool,
+    /// When set (`--cab-optional`), a failed cab-sim load is non-fatal:
     /// the host warns and continues without cab-sim. Without it, an explicitly
-    /// requested IR that cannot be loaded aborts the process.
+    /// requested cabinet that cannot be loaded aborts the process.
     pub cab_optional: bool,
     /// Input gain in dB.
     pub input_gain: f32,
@@ -155,6 +157,7 @@ pub fn parse_args() -> CliArgs {
 pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut model_path = None;
     let mut cab_path = None;
+    let mut cab_bypass = false;
     let mut cab_optional = false;
     let mut input_gain = 0.0;
     let mut output_gain = 0.0;
@@ -211,6 +214,9 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                     expand_user_path(&p_str, home.as_deref())
                         .unwrap_or_else(|e| exit_with_error(e)),
                 );
+            }
+            Long("cab-bypass") => {
+                cab_bypass = true;
             }
             Long("cab-optional") => {
                 cab_optional = true;
@@ -459,6 +465,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     CliArgs {
         model_path,
         cab_path,
+        cab_bypass,
         cab_optional,
         input_gain,
         output_gain,

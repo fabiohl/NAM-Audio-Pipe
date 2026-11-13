@@ -27,7 +27,7 @@ pub mod harness;
 
 #[cfg(test)]
 pub use cabsim_swap::drain_cabsims;
-pub use cabsim_swap::{CabSimSwapDrain, cabsim_swap_drain, drain_cabsims_with_status};
+pub use cabsim_swap::{CabSimSwapDrain, cabsim_swap_drain, drain_cabsims_with_slot_status};
 pub use commands::{
     OsSwapDrain, STRUCTURAL_SWAPS_PER_CALLBACK, SlimmableSwapDrain, drain_os_engines_with_status,
     drain_slimmable_models, os_swap_drain, receive_commands, slimmable_swap_drain,
@@ -35,7 +35,7 @@ pub use commands::{
 };
 #[cfg(not(feature = "testing"))]
 pub(crate) use process::handle_spa_pair_fail_closed;
-pub use process::{PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
+pub use process::{PipeCabRuntime, PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
 #[cfg(feature = "testing")]
 pub use process::{
     handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,

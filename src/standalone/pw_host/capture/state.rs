@@ -145,6 +145,18 @@ pub struct CaptureState {
     pub cabsim_failed_key: Option<(u32, usize)>,
     /// Optional reference to the host stream status flags for publishing applied latency.
     pub stream_status: Option<Arc<StreamStatusFlags>>,
+    /// Active neural cabinet runtime slot (mutually exclusive with `active_cabsim`).
+    pub active_cab_nam: Option<crate::standalone::cabinet::CabNamSlot>,
+    /// Dedicated unboxed SPSC consumer for neural cabinet slot installs/rebuilds.
+    pub cab_nam_consumer: Option<rtrb::Consumer<crate::standalone::cabinet::PipeCabNamPayload>>,
+    /// True when the startup `--cab` is a `.nam`/`.namb` neural cabinet (for rate rebuild gating).
+    pub has_nam_cab: bool,
+    /// Shared lock-free bypass flag for the cabinet stage (`--cab-bypass` or runtime tests).
+    pub cab_bypass: Arc<std::sync::atomic::AtomicBool>,
+    /// Pre-allocated circular dry delay line matching cabinet latency.
+    pub cab_dry_delay: Box<crate::standalone::cabinet::CabDryDelay>,
+    /// 64-sample raised-cosine crossfader & reset-before-engage controller.
+    pub cab_bypass_state: crate::standalone::cabinet::CabBypassState,
 }
 
 impl CaptureState {
@@ -322,6 +334,12 @@ impl CaptureState {
             os_drain: None,
             cabsim_failed_key: None,
             stream_status: None,
+            active_cab_nam: None,
+            cab_nam_consumer: None,
+            has_nam_cab: false,
+            cab_bypass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cab_dry_delay: Box::new(crate::standalone::cabinet::CabDryDelay::new(0)),
+            cab_bypass_state: crate::standalone::cabinet::CabBypassState::new(false),
         }
     }
 

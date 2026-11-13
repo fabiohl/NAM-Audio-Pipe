@@ -482,6 +482,20 @@ impl SwapRtSide {
             crossfade_scratch_l: &mut *self.state.xfd_scratch_l,
             crossfade_scratch_r: &mut *self.state.xfd_scratch_r,
         };
+        let target_cab_bypass = self
+            .state
+            .cab_bypass
+            .load(std::sync::atomic::Ordering::Acquire);
+        let cab_rt = super::PipeCabRuntime {
+            nam_slot: self
+                .state
+                .active_cab_nam
+                .as_mut()
+                .filter(|slot| slot.host_rate == rate),
+            target_bypass: target_cab_bypass,
+            dry_delay: &mut self.state.cab_dry_delay,
+            bypass_state: &mut self.state.cab_bypass_state,
+        };
         super::process::run_capture_dsp_pipeline(
             in_l,
             in_r,
@@ -493,6 +507,7 @@ impl SwapRtSide {
             self.state.user_input_gain_mult,
             self.state.gate_mode,
             &mut self.state.musical_gate,
+            cab_rt,
         )
     }
 
@@ -975,6 +990,40 @@ impl RtSwapHarness {
 
     pub fn active_cabsim(&self) -> Option<&CabSimPair> {
         self.rt.active_cabsim()
+    }
+
+    pub fn attach_cab_nam_channel(
+        &mut self,
+    ) -> rtrb::Producer<crate::standalone::cabinet::PipeCabNamPayload> {
+        let (prod, cons) = rtrb::RingBuffer::new(8);
+        self.rt.state.cab_nam_consumer = Some(cons);
+        prod
+    }
+
+    pub fn active_cab_nam(&self) -> Option<&crate::standalone::cabinet::CabNamSlot> {
+        self.rt.state.active_cab_nam.as_ref()
+    }
+
+    pub fn set_cab_bypass(&self, bypassed: bool) {
+        self.rt
+            .state
+            .cab_bypass
+            .store(bypassed, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn applied_cab_latency(&self) -> u32 {
+        self.rt
+            .stream_status
+            .applied_cabsim_latency
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn bump_cab_nam_generation(&self) -> u64 {
+        self.rt
+            .rt_status
+            .requested_cabsim_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release)
+            + 1
     }
 
     pub fn process_mono(&self) -> bool {

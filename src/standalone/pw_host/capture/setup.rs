@@ -253,6 +253,15 @@ pub fn setup_capture_stream<'c>(
                         state.user_input_gain_mult,
                         state.gate_mode,
                         &mut state.musical_gate,
+                        rt_callback::PipeCabRuntime {
+                            nam_slot: state
+                                .active_cab_nam
+                                .as_mut()
+                                .filter(|slot| slot.host_rate == current_host_rate),
+                            target_bypass: state.cab_bypass.load(Ordering::Acquire),
+                            dry_delay: &mut state.cab_dry_delay,
+                            bypass_state: &mut state.cab_bypass_state,
+                        },
                         &mut state.frame_count,
                         &rt_status_for_process,
                         &stream_status_for_process,
@@ -313,7 +322,7 @@ pub fn setup_capture_stream<'c>(
                         state.active_cabsim.as_deref(),
                         state.cabsim_partition_policy,
                     );
-                    if cabsim_rebuild_needed(
+                    let wav_needs_rebuild = cabsim_rebuild_needed(
                         state.active_cabsim.as_deref(),
                         state.ir_raw_samples.is_some(),
                         last_n_samples,
@@ -323,7 +332,19 @@ pub fn setup_capture_stream<'c>(
                         rt_status_for_process.check_flag(
                             neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
                         ),
-                    ) {
+                    );
+                    let nam_needs_rebuild = nam_cab_rebuild_needed(
+                        state.active_cab_nam.as_ref(),
+                        state.has_nam_cab,
+                        last_n_samples,
+                        current_host_rate,
+                        partition_to_request,
+                        state.cabsim_failed_key,
+                        rt_status_for_process.check_flag(
+                            neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
+                        ),
+                    );
+                    if wav_needs_rebuild || nam_needs_rebuild {
                         // Write data BEFORE raising the flag (Release barrier must cover
                         // the preceding stores so the consumer sees the correct values).
                         // The `--cabsim-partition` policy sizes EVERY install (initial
@@ -472,6 +493,29 @@ fn cabsim_rebuild_needed(
             (BUFFER_SIZE_MIN as usize..=MAX_RESAMP_BUF).contains(&n_samples)
         }
         Some(pair) => pair.sample_rate != host_rate,
+    }
+}
+
+fn nam_cab_rebuild_needed(
+    active: Option<&crate::standalone::cabinet::CabNamSlot>,
+    has_nam: bool,
+    n_samples: usize,
+    host_rate: u32,
+    partition: usize,
+    failed_key: Option<(u32, usize)>,
+    already_pending: bool,
+) -> bool {
+    if !has_nam || already_pending {
+        return false;
+    }
+    match active {
+        None => {
+            if matches!(failed_key, Some((r, p)) if r == host_rate && p == partition) {
+                return false;
+            }
+            (BUFFER_SIZE_MIN as usize..=MAX_RESAMP_BUF).contains(&n_samples)
+        }
+        Some(slot) => slot.host_rate != host_rate,
     }
 }
 

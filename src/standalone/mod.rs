@@ -4,6 +4,7 @@
 //! Modules specific to standalone execution (PipeWire, CLI).
 
 pub mod banner;
+pub mod cabinet;
 pub mod calibration;
 pub mod cli;
 mod cli_domain;

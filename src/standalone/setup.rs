@@ -343,6 +343,92 @@ pub fn load_initial_cabsim(
     }
 }
 
+/// Loads the single exclusive cabinet slot (`.wav` IR or 1-in/1-out `.nam`/`.namb` model)
+/// and dispatches the initial runtime structure over the matching SPSC ring.
+pub fn load_initial_cabinet(
+    cab_path: Option<&Path>,
+    cabsim_partition: u32,
+    cab_optional: bool,
+    ir_level_policy: crate::standalone::cli_domain::IrLevelPolicy,
+    cabsim_producer: &mut Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
+    cab_nam_producer: &mut Producer<crate::standalone::cabinet::PipeCabNamPayload>,
+    sys: &SystemSnapshot,
+) -> anyhow::Result<Option<crate::standalone::cabinet::InitialCabSetup>> {
+    use crate::standalone::cabinet::{
+        CabAssetKind, InitialCabSetup, PipeCabNamPayload, build_cab_nam_slot,
+        disambiguate_cab_path, parse_and_validate_cab_nam,
+    };
+
+    let Some(cab_path) = cab_path else {
+        return Ok(None);
+    };
+    let display_name = disambiguate_cab_path(cab_path);
+
+    let result: anyhow::Result<InitialCabSetup> = (|| {
+        let bytes = std::fs::read(cab_path)
+            .map_err(|e| anyhow::anyhow!("Failed to read '{}': {e}", cab_path.display()))?;
+        let kind = CabAssetKind::detect(cab_path, &bytes)?;
+        match kind {
+            CabAssetKind::WavIr => {
+                // Delegate WAV loading through the canonical UPOLS path; we already checked readability.
+                let ir = load_initial_cabsim(
+                    Some(cab_path),
+                    cabsim_partition,
+                    false,
+                    ir_level_policy,
+                    cabsim_producer,
+                )?
+                .ok_or_else(|| anyhow::anyhow!("WAV IR load returned None"))?;
+                Ok(InitialCabSetup::WavIr {
+                    raw_samples: ir.raw_samples,
+                    source_rate: ir.source_rate,
+                    display_name: display_name.clone(),
+                })
+            }
+            CabAssetKind::NamModel | CabAssetKind::NambModel => {
+                let (_, meta) = parse_and_validate_cab_nam(&bytes, kind)?;
+                let slot = build_cab_nam_slot(&bytes, kind, &display_name, 48_000, sys)?;
+                let lat = slot.latency_samples();
+                let source_rate = slot.source_rate;
+                log::info!(
+                    "{} Cabinet [{}] loaded: {} ({}, {} Hz, unity gain; latency={} samples @ 48000 Hz)",
+                    "🎛️".cyan(),
+                    kind.badge(),
+                    display_name,
+                    meta.architecture,
+                    source_rate,
+                    lat,
+                );
+                let _ = cab_nam_producer.push(PipeCabNamPayload::from_slot(0, slot));
+                Ok(InitialCabSetup::Nam {
+                    raw_bytes: bytes,
+                    kind,
+                    source_rate,
+                    display_name: display_name.clone(),
+                    meta,
+                })
+            }
+        }
+    })();
+
+    match result {
+        Ok(setup) => Ok(Some(setup)),
+        Err(e) => {
+            if cab_optional {
+                log::warn!(
+                    "{} Cabinet load failed ({}): {} — continuing without cabinet (--cab-optional)",
+                    "⚠️".yellow(),
+                    display_name,
+                    e
+                );
+                Ok(None)
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "setup_test.rs"]
 mod setup_test;

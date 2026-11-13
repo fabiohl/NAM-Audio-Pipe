@@ -42,6 +42,7 @@ pub type CabSimSwapDrain = RtSwapDrain<CabSimSwapRing>;
 /// `active_cabsim` or `applied_cabsim_generation`.
 pub(crate) struct CabSimSwapHandler<'a> {
     active_cabsim: &'a mut Option<Box<CabSimPair>>,
+    active_cab_nam: Option<&'a mut Option<crate::standalone::cabinet::CabNamSlot>>,
     failed_key: Option<&'a mut Option<(u32, usize)>>,
     applied_latency: Option<&'a AtomicU32>,
     applied_latency_pair: Option<&'a AtomicU64>,
@@ -81,6 +82,10 @@ impl RtSwapHandler for CabSimSwapHandler<'_> {
         if payload.pair.is_some() {
             if let Some(failed) = self.failed_key.as_deref_mut() {
                 *failed = None;
+            }
+            // Enforce strict single-slot exclusivity: retire any active neural cabinet to GC.
+            if let Some(nam_slot) = self.active_cab_nam.as_deref_mut().and_then(Option::take) {
+                nam_slot.retire_to_gc(gc);
             }
         } else {
             let rate = self
@@ -141,6 +146,7 @@ pub fn drain_cabsims_with_pair(
     };
     let mut handler = CabSimSwapHandler {
         active_cabsim,
+        active_cab_nam: None,
         failed_key,
         applied_latency,
         applied_latency_pair,
@@ -150,16 +156,17 @@ pub fn drain_cabsims_with_pair(
     drain.drain(&mut handler, budget, &mut gc);
 }
 
-/// Drains the cab-sim pair SPSC channel and swaps the active pair atomically with complete `StreamStatusFlags` seqlock snapshot support.
+/// Drains WAV IR swaps while enforcing strict single-slot exclusivity against any active neural cabinet.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"
+    reason = "RT callback drain signature: engine drain + shared budget + exclusive cab slot + GC parameters"
 )]
-pub fn drain_cabsims_with_status(
+pub fn drain_cabsims_with_slot_status(
     drain: &mut CabSimSwapDrain,
     budget: &mut SwapBudget,
     active_cabsim: &mut Option<Box<CabSimPair>>,
+    active_cab_nam: &mut Option<crate::standalone::cabinet::CabNamSlot>,
     failed_key: Option<&mut Option<(u32, usize)>>,
     stream_status: Option<&StreamStatusFlags>,
     rt_status_for_process: &RtStatusFlags,
@@ -177,6 +184,7 @@ pub fn drain_cabsims_with_status(
     };
     let mut handler = CabSimSwapHandler {
         active_cabsim,
+        active_cab_nam: Some(active_cab_nam),
         failed_key,
         applied_latency: stream_status.map(|s| &s.applied_cabsim_latency),
         applied_latency_pair: stream_status.map(|s| &s.applied_latency_pair),

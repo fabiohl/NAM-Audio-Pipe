@@ -614,6 +614,66 @@ pub(super) fn handle_cabsim_rebuild(
     }
 }
 
+/// Handles dynamic host-rate recalibration of a loaded 1-in/1-out neural cabinet (`.nam`/`.namb`).
+pub(super) fn handle_cabinet_nam_rebuild(
+    rt_status: &RtStatusFlags,
+    raw_bytes: &[u8],
+    kind: crate::standalone::cabinet::CabAssetKind,
+    display_name: &str,
+    sys: &SystemSnapshot,
+    cab_nam_producer: &mut rtrb::Producer<crate::standalone::cabinet::PipeCabNamPayload>,
+) -> Option<u32> {
+    if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_CABSIM_REBUILD) {
+        return None;
+    }
+    let generation = rt_status
+        .requested_cabsim_generation
+        .load(Ordering::Acquire);
+    let target_host_rate = rt_status.requested_cabsim_host_rate.load(Ordering::Relaxed);
+    if target_host_rate == 0 {
+        return None;
+    }
+
+    match crate::standalone::cabinet::build_cab_nam_slot(
+        raw_bytes,
+        kind,
+        display_name,
+        target_host_rate,
+        sys,
+    ) {
+        Ok(slot) => {
+            let lat = slot.latency_samples();
+            log::info!(
+                "{} Cabinet [{}] recalibrated for host rate {} Hz (latency={} samples)",
+                "🔄".cyan(),
+                kind.badge(),
+                target_host_rate,
+                lat,
+            );
+            let payload =
+                crate::standalone::cabinet::PipeCabNamPayload::from_slot(generation, slot);
+            if cab_nam_producer.push(payload).is_err() {
+                log::warn!(
+                    "[E3100 | PARAM_CHANNEL_FULL] Neural cabinet channel full — rebuild will be retried (PW={} Hz).",
+                    target_host_rate
+                );
+                return None;
+            }
+            rearm_cabsim_if_superseded(rt_status, generation);
+            Some(lat)
+        }
+        Err(e) => {
+            log::error!(
+                "[E4103 | CABSIM_BUILD_FAILED] Failed to recalibrate neural cabinet [{}] ({} Hz): {e:#}",
+                kind.badge(),
+                target_host_rate,
+            );
+            rearm_cabsim_if_superseded(rt_status, generation);
+            Some(0)
+        }
+    }
+}
+
 /// Builds a stereo-decoupled [`CabSimPair`] from the preserved original IR,
 /// resampled for the applied host output rate and scaled by `policy`. Off-RT only (allocates).
 fn build_cabsim_pair(

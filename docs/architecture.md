@@ -308,7 +308,7 @@ RT Thread (Replaced Asset)
 
 ## 6. DSP Pipeline, Latency Accounting & SPA Semantics
 
-The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`run_capture_dsp_pipeline`](../src/standalone/pw_host/rt_callback/process.rs), branching on `GateMode`: in `Silence` mode (default), [`capture_dsp_pipeline_streaming`](../src/standalone/pw_host/rt_callback/process.rs) runs block-RMS `DynamicHysteresis` with CPU-skipping and `--record` silence trimming; in `Musical` mode, [`MusicalNoiseGate`](../src/dsp/musical_gate.rs) evaluates triggers post user input gain / pre model calibration (`cal_in`), keeps neural inference continuous, and applies quadratic expansion post-model / pre-CabSim IR so cabinet decay tails ring naturally.
+The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`run_capture_dsp_pipeline`](../src/standalone/pw_host/rt_callback/process.rs), branching on `GateMode`: in `Silence` mode (default), [`capture_dsp_pipeline_streaming`](../src/standalone/pw_host/rt_callback/process.rs) runs block-RMS `DynamicHysteresis` with CPU-skipping and `--record` silence trimming; in `Musical` mode, [`MusicalNoiseGate`](../src/dsp/musical_gate.rs) evaluates triggers post user input gain / pre model calibration (`cal_in`), keeps neural inference continuous, and applies quadratic expansion post-model / pre-cabinet stage so decay tails ring naturally.
 
 ```text
 Audio Input (PipeWire Host Buffer)
@@ -327,9 +327,9 @@ Audio Input (PipeWire Host Buffer)
   - Downsampling Decimation stages
        │
        ▼
-[Stage 3: CabSim Partitioned FFT Convolution]
-  - UPOLS Frequency-Domain Filtering (Host sample rate)
-  - Partition size decoupled from quantum (32, 64, 128, 256 frames)
+[Stage 3: Single Exclusive Cabinet Slot & Bypass Crossfader]
+  - WavIr (`CabSimPair` UPOLS FFT at host sample rate, `--cabsim-partition` 32..256) OR NamModel (`CabNamSlot` 1-in/1-out `.nam`/`.namb` at unity gain with dedicated `StreamingResampleBuffer`, off-RT `PipeCabNamPayload` swap & GC retirement)
+  - Independent `--cab-bypass` via `CabDryDelay` (constant SPA latency), 64-sample cosine crossfade, lazy `reset()` on re-engage, and steady-state DSP skip
        │
        ▼
 [Stage 4: Output Gain Stage & Envelope Protection]

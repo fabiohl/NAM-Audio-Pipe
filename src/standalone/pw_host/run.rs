@@ -80,11 +80,66 @@ use pipewire as pw;
 /// Returns the recording worker outcome when `--record` was used (`None`
 /// otherwise), so the caller can turn a failed/panicked/timed-out recording
 /// into a non-zero process exit.
+/// Optional neural cabinet and bypass configuration passed to [`run_pipewire_host_with_cabinet`].
+#[derive(Default)]
+pub struct HostCabinetOptions {
+    /// Loaded neural cabinet asset bytes/metadata for host-rate renegotiation off-RT.
+    pub initial_nam_cab: Option<crate::standalone::cabinet::InitialCabSetup>,
+    /// Unboxed SPSC ring for neural cabinet slot swaps/rate recalibration.
+    pub cab_nam_channels: Option<(
+        rtrb::Producer<crate::standalone::cabinet::PipeCabNamPayload>,
+        rtrb::Consumer<crate::standalone::cabinet::PipeCabNamPayload>,
+    )>,
+    /// Initial cabinet bypass state (`--cab-bypass`).
+    pub cab_bypass: bool,
+}
+
+/// Runs the full PipeWire host loop with the canonical cabinetless / WAV IR contract.
 #[expect(
     clippy::too_many_arguments,
     reason = "FFI design or complex DSP kernel signature required by construction"
 )]
 pub fn run_pipewire_host(
+    consumer: Consumer<ParamPayload>,
+    gc_producer: rtrb::Producer<GcItem>,
+    gc_overflow: Arc<GcOverflowBuffer>,
+    resampler_consumer: Consumer<Box<ResamplerSwapPayload>>,
+    resampler_producer: rtrb::Producer<Box<ResamplerSwapPayload>>,
+    cabsim_consumer: Consumer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
+    cabsim_producer: rtrb::Producer<Box<neural_amp_modeler_rs::common::spsc::CabSimSwapPayload>>,
+    rt_status: Arc<RtStatusFlags>,
+    config: PipewireHostConfig,
+    gc_consumer: Consumer<GcItem>,
+    slimmable_consumer: Consumer<Box<SlimModelPair>>,
+    os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
+    recording_data_available: Option<Arc<AtomicBool>>,
+    recording_worker: Option<RecordingWorkerGuard>,
+) -> anyhow::Result<Option<RecordingWorkerOutcome>> {
+    run_pipewire_host_with_cabinet(
+        consumer,
+        gc_producer,
+        gc_overflow,
+        resampler_consumer,
+        resampler_producer,
+        cabsim_consumer,
+        cabsim_producer,
+        rt_status,
+        config,
+        gc_consumer,
+        slimmable_consumer,
+        os_consumer,
+        recording_data_available,
+        recording_worker,
+        HostCabinetOptions::default(),
+    )
+}
+
+/// Runs the full PipeWire host loop with single-slot cabinet (WAV or 1x1 NAM/NAMB) and bypass support.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "FFI design or complex DSP kernel signature required by construction"
+)]
+pub fn run_pipewire_host_with_cabinet(
     consumer: Consumer<ParamPayload>,
     gc_producer: rtrb::Producer<GcItem>,
     gc_overflow: Arc<GcOverflowBuffer>,
@@ -101,6 +156,7 @@ pub fn run_pipewire_host(
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
     recording_data_available: Option<Arc<AtomicBool>>,
     mut recording_worker: Option<RecordingWorkerGuard>,
+    mut cabinet: HostCabinetOptions,
 ) -> anyhow::Result<Option<RecordingWorkerOutcome>> {
     let PipewireHostConfig {
         buffer_size,
@@ -185,6 +241,27 @@ pub fn run_pipewire_host(
     rt_state.activation = activation;
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;
+    let (mut cab_nam_producer, cab_nam_consumer) = match cabinet.cab_nam_channels.take() {
+        Some((p, c)) => (Some(p), Some(c)),
+        None => (None, None),
+    };
+    let nam_cab_source = match cabinet.initial_nam_cab.take() {
+        Some(crate::standalone::cabinet::InitialCabSetup::Nam {
+            raw_bytes,
+            kind,
+            display_name,
+            ..
+        }) => {
+            rt_state.has_nam_cab = true;
+            Some((raw_bytes, kind, display_name))
+        }
+        _ => None,
+    };
+    rt_state.cab_nam_consumer = cab_nam_consumer;
+    rt_state
+        .cab_bypass
+        .store(cabinet.cab_bypass, Ordering::Release);
+    rt_state.cab_bypass_state = crate::standalone::cabinet::CabBypassState::new(cabinet.cab_bypass);
     // The cab-sim partition policy (--cabsim-partition) sizes every pair
     // installation; the RT callback publishes it on the first-install
     // request instead of inheriting the host quantum. Read-only after this
@@ -633,14 +710,27 @@ pub fn run_pipewire_host(
             };
 
             let _ = handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer);
-            let _ = handlers::handle_cabsim_rebuild(
-                &rt_status,
-                ir_raw_samples.as_deref(),
-                ir_source_rate,
-                ir_level_policy,
-                &sys,
-                &mut cabsim_producer,
-            );
+            if let (Some((raw_bytes, kind, display_name)), Some(nam_prod)) =
+                (nam_cab_source.as_ref(), cab_nam_producer.as_mut())
+            {
+                let _ = handlers::handle_cabinet_nam_rebuild(
+                    &rt_status,
+                    raw_bytes,
+                    *kind,
+                    display_name,
+                    &sys,
+                    nam_prod,
+                );
+            } else {
+                let _ = handlers::handle_cabsim_rebuild(
+                    &rt_status,
+                    ir_raw_samples.as_deref(),
+                    ir_source_rate,
+                    ir_level_policy,
+                    &sys,
+                    &mut cabsim_producer,
+                );
+            }
 
             // Read the coherent DSP latency snapshot effectively applied on the audio thread.
             // A coherent seqlock read ensures resampler, cabsim, and oversampling latencies form a consistent snapshot.

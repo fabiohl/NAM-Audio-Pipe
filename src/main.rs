@@ -191,34 +191,68 @@ fn main() -> anyhow::Result<()> {
     let has_model_r = model_setup.has_model_r;
     let model_architecture = model_setup.architecture;
 
-    // 7. LOAD THE CAB-SIM IR: If you said "use cabinet X",
-    // this is where the computer opens that WAV file and builds the convolution engine.
-    // The UPOLS partition comes from `--cabsim-partition` (never from the
-    // quantum), fixing the published cab-sim latency in samples.
-    let (ir_raw_samples, ir_source_rate, cab_status) = match setup::load_initial_cabsim(
-        args.cab_path.as_deref(),
-        args.cabsim_partition,
-        args.cab_optional,
-        args.ir_level_policy,
-        &mut cabsim_producer,
-    ) {
-        Ok(Some(ir)) => (Some(ir.raw_samples), ir.source_rate, CabStatus::Loaded),
-        Ok(None) => (
-            None,
-            0,
-            if args.cab_path.is_some() {
-                CabStatus::SkippedOptional
-            } else {
-                CabStatus::Absent
-            },
-        ),
-        Err(e) => exit::exit_runtime_error(
-            exit::ExitKind::CabIr,
-            format!("{e:#}"),
-            "The cab-sim IR could not be loaded. Verify it is a valid .wav impulse \
-             response, or pass --cab-optional to continue without cab-sim.",
-        ),
-    };
+    // 7. LOAD THE CABINET SLOT: accepts .wav IRs (UPOLS) or 1-in/1-out .nam/.namb
+    // neural cabinets (unity gain, zero amp calibration or IR policy leakage).
+    let (mut cab_nam_producer, cab_nam_consumer) =
+        rtrb::RingBuffer::<nam_audio_pipe::standalone::cabinet::PipeCabNamPayload>::new(8);
+    let (ir_raw_samples, ir_source_rate, initial_nam_cab, cab_status) =
+        match setup::load_initial_cabinet(
+            args.cab_path.as_deref(),
+            args.cabsim_partition,
+            args.cab_optional,
+            args.ir_level_policy,
+            &mut cabsim_producer,
+            &mut cab_nam_producer,
+            &sys,
+        ) {
+            Ok(Some(nam_audio_pipe::standalone::cabinet::InitialCabSetup::WavIr {
+                raw_samples,
+                source_rate,
+                ..
+            })) => (
+                Some(raw_samples),
+                source_rate,
+                None,
+                CabStatus::Asset {
+                    kind: "WAV",
+                    bypassed: args.cab_bypass,
+                },
+            ),
+            Ok(Some(
+                setup @ nam_audio_pipe::standalone::cabinet::InitialCabSetup::Nam { kind, .. },
+            )) => (
+                None,
+                0,
+                Some(setup),
+                CabStatus::Asset {
+                    kind: kind.badge(),
+                    bypassed: args.cab_bypass,
+                },
+            ),
+            Ok(None) => (
+                None,
+                0,
+                None,
+                if args.cab_path.is_some() {
+                    CabStatus::SkippedOptional
+                } else {
+                    CabStatus::Absent
+                },
+            ),
+            Err(e) => exit::exit_runtime_error(
+                exit::ExitKind::CabIr,
+                format!("{e:#}"),
+                "The cabinet asset could not be loaded. Verify it is a valid .wav IR or a \
+                 1-in/1-out .nam/.namb cabinet model without post-stack head, or pass \
+                 --cab-optional to continue without cabinet.",
+            ),
+        };
+    if args.cab_bypass {
+        log::info!(
+            "{} Cabinet stage starts BYPASSED (--cab-bypass; loaded asset & constant latency preserved)",
+            "⏸".yellow()
+        );
+    }
 
     // Initial gains
     if initial_in_gain != 0.0 {
@@ -405,7 +439,7 @@ fn main() -> anyhow::Result<()> {
         cab: cab_status,
         recording_dir: banner_recording_dir,
     };
-    let res = pw_host::run_pipewire_host(
+    let res = pw_host::run_pipewire_host_with_cabinet(
         consumer,
         gc_producer,
         gc_overflow,
@@ -445,6 +479,11 @@ fn main() -> anyhow::Result<()> {
         os_consumer,
         recording_data_available,
         recording_worker,
+        pw_host::HostCabinetOptions {
+            initial_nam_cab,
+            cab_nam_channels: Some((cab_nam_producer, cab_nam_consumer)),
+            cab_bypass: args.cab_bypass,
+        },
     );
 
     log::info!("{} Shutting down NAM-Audio-Pipe...", "🔌".yellow());
