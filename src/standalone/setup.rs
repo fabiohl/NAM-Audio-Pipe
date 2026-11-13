@@ -66,6 +66,22 @@ fn model_load_hint(e: &loader::LoadError) -> &'static str {
             "The model architecture is not supported by this build. Update \
              NAM-Audio-Pipe or use a supported architecture."
         }
+        NamErrorCode::NamJsonUnknownActivation => {
+            "The model declares an unknown or invalid activation configuration. \
+             Verify primary/secondary activations and re-export the model."
+        }
+        NamErrorCode::InvalidModelTopology | NamErrorCode::InvalidFeatureTopology => {
+            "The model topology or conditioning/gating/FiLM configuration is \
+             invalid or inconsistent. Verify layer dimensions and re-export the model."
+        }
+        NamErrorCode::NamJsonSampleRateMismatch => {
+            "A nested submodel sample rate does not match the parent model sample rate. \
+             Re-export the model with consistent sample rates."
+        }
+        NamErrorCode::WeightCountMismatch | NamErrorCode::LinearWeightCountMismatch => {
+            "The number of weights in the file does not match the declared topology. \
+             Re-export or verify the model weights."
+        }
         NamErrorCode::NamJsonParseError | NamErrorCode::NambInvalidMagic => {
             "The model file is not a valid NAM model (corrupted or truncated). \
              Re-export or re-download it."

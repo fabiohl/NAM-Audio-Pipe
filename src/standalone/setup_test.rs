@@ -81,6 +81,7 @@ fn load_initial_cabsim_missing_path_is_optional_with_flag() {
 
 #[test]
 fn model_load_hint_is_specific_per_root_cause() {
+    use neural_amp_modeler_rs::common::diagnostics::NamErrorCode;
     use neural_amp_modeler_rs::loader::{JsonError, LoadError};
     // Unsupported version → re-export/upgrade hint.
     let version = LoadError::Json(JsonError::UnsupportedVersion {
@@ -88,6 +89,24 @@ fn model_load_hint_is_specific_per_root_cause() {
         reason: "future schema".to_string(),
     });
     assert!(model_load_hint(&version).contains("newer NAM version"));
+    // Unknown activation → activation/re-export hint.
+    let unknown_act = LoadError::InvalidTopology {
+        code: NamErrorCode::NamJsonUnknownActivation,
+        reason: "unknown activation 'Swish'".to_string(),
+    };
+    assert!(model_load_hint(&unknown_act).contains("activation"));
+    // Invalid model topology → topology/version hint.
+    let bad_topo = LoadError::InvalidTopology {
+        code: NamErrorCode::InvalidModelTopology,
+        reason: "gating_mode invalid".to_string(),
+    };
+    assert!(model_load_hint(&bad_topo).contains("topology"));
+    // Sample rate mismatch → host sample rate hint.
+    let bad_rate = LoadError::InvalidTopology {
+        code: NamErrorCode::NamJsonSampleRateMismatch,
+        reason: "non-positive sample rate".to_string(),
+    };
+    assert!(model_load_hint(&bad_rate).contains("sample rate"));
     // Unsupported architecture → update/architecture hint.
     let arch = LoadError::UnsupportedArchitecture("SomeFutureNet".to_string());
     assert!(model_load_hint(&arch).contains("architecture"));
