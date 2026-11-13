@@ -63,6 +63,8 @@ fn main() -> anyhow::Result<()> {
     colors::init_from_env();
     let args = cli::parse_args();
 
+    let calibration_config = args.calibration_config();
+    let output_mode_explicit = args.output_mode_explicit;
     let model_path = args.model_path;
     let initial_in_gain = args.input_gain;
     let initial_out_gain = args.output_gain;
@@ -177,7 +179,13 @@ fn main() -> anyhow::Result<()> {
 
     // 6. LOAD THE MODEL: If a model path was provided, open the .nam file,
     // parse architecture & metadata, and push it to the audio thread.
-    let model_setup = setup::load_initial_model(model_path.as_deref(), &sys, &mut producer);
+    let model_setup = setup::load_initial_model(
+        model_path.as_deref(),
+        &sys,
+        calibration_config,
+        output_mode_explicit,
+        &mut producer,
+    );
     let full_wavenet_model_l = model_setup.full_wavenet_model_l;
     let full_wavenet_model_r = model_setup.full_wavenet_model_r;
     let has_model_r = model_setup.has_model_r;

@@ -16,7 +16,13 @@ fn test_setup_communication_channels() {
 fn test_load_initial_model_none() {
     let mut channels = setup_communication_channels().expect("test SPSC setup");
     let sys = SystemSnapshot::capture();
-    let result = load_initial_model(None, &sys, &mut channels.param_producer);
+    let result = load_initial_model(
+        None,
+        &sys,
+        crate::standalone::calibration::CalibrationConfig::default(),
+        false,
+        &mut channels.param_producer,
+    );
     assert!(result.full_wavenet_model_l.is_none());
     assert!(result.full_wavenet_model_r.is_none());
     assert!(result.architecture.is_empty());

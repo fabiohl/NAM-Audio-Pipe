@@ -295,6 +295,21 @@ pub fn print_help() {
     );
     let _ = writeln!(
         out,
+        "      --calibrate-input <on|off> Compensate ADC input level against model metadata\n\
+                                   'input_level_dbu' [default: off]"
+    );
+    let _ = writeln!(
+        out,
+        "      --input-calibration-level <DBU> Interface 0 dBFS reference level in dBu\n\
+                                   [-60.0, 60.0] [default: 12.0]"
+    );
+    let _ = writeln!(
+        out,
+        "      --output-mode <MODE> Model output level mode: raw, normalized (default, -18 LUFS),\n\
+                                   or calibrated (uses model 'output_level_dbu')"
+    );
+    let _ = writeln!(
+        out,
         "      --output-limit <MODE> Playback hardware output limit: off (default) or clamp\n\
                                    (hard clamp to [-1.0, 1.0]; not a dynamic limiter; float\n\
                                    WAV --record output is never clamped)"

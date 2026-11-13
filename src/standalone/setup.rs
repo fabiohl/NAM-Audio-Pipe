@@ -3,6 +3,9 @@
 
 //! Setup and initialization helpers for off-RT resources and SPSC channels.
 
+use crate::standalone::calibration::{
+    CalibrationConfig, ModelCalibrationMeta, resolve_model_calibration,
+};
 use crate::standalone::{colors::Colorize, exit};
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::{
@@ -74,12 +77,19 @@ fn model_load_hint(e: &loader::LoadError) -> &'static str {
     }
 }
 
-/// Encapsulates neural model loading, active diagnostics state updates, and SPSC payload dispatch.
-pub fn load_initial_model(
+/// Encapsulates neural model loading, calibration validation, diagnostics updates, and SPSC dispatch.
+///
+/// # Errors
+///
+/// Returns a user-actionable error string when the model fails to load or when
+/// explicit calibration / output-mode requirements are missing from model metadata.
+pub fn try_load_initial_model(
     model_path: Option<&Path>,
     sys: &SystemSnapshot,
+    calibration: CalibrationConfig,
+    output_mode_explicit: bool,
     producer: &mut Producer<ParamPayload>,
-) -> InitialModelSetup {
+) -> Result<InitialModelSetup, String> {
     let mut full_wavenet_model_l = None;
     let mut full_wavenet_model_r = None;
     let mut architecture = String::new();
@@ -87,56 +97,73 @@ pub fn load_initial_model(
 
     if let Some(path) = model_path {
         log::info!("{} Loading model...", "📂".cyan());
-        match loader::load_and_build_model(path, sys, true, loader::LoadOptions::default()) {
-            Ok(loaded) => {
-                if let Ok(mut name) = ACTIVE_MODEL_NAME.write() {
-                    *name = path.to_string_lossy().into_owned();
-                }
-                ACTIVE_SAMPLE_RATE.store(loaded.sample_rate, Ordering::Relaxed);
+        let loaded = loader::load_and_build_model(path, sys, true, loader::LoadOptions::default())
+            .map_err(|e| format!("Model load failed: {e}\nHint: {}", model_load_hint(&e)))?;
 
-                architecture = loaded.architecture.clone();
-
-                let model_info = loaded.model_info(path);
-                if let Ok(mut info_guard) = ACTIVE_MODEL_INFO.write() {
-                    *info_guard = Some(model_info);
-                }
-                let mem_bytes = loaded.model_memory_bytes().unwrap_or(0);
-                ACTIVE_MODEL_MEMORY_BYTES.store(mem_bytes, Ordering::Relaxed);
-
-                has_model_r = loaded.model_r.is_some();
-
-                full_wavenet_model_l = loaded.model_l.as_ref().and_then(|m| {
-                    if let StaticModel::WavenetDyn(w) = m.as_ref() {
-                        clone_wavenet_for_slimmable_storage(w).ok()
-                    } else {
-                        None
-                    }
-                });
-
-                full_wavenet_model_r = loaded.model_r.as_ref().and_then(|m| {
-                    if let StaticModel::WavenetDyn(w) = m.as_ref() {
-                        clone_wavenet_for_slimmable_storage(w).ok()
-                    } else {
-                        None
-                    }
-                });
-
-                let _ = producer.push(ParamPayload::LoadModel {
-                    model_l: loaded.model_l,
-                    model_r: loaded.model_r,
-                    input_mult_adj: loaded.input_mult_adj,
-                    output_mult_adj: loaded.output_mult_adj,
-                    sample_rate: loaded.sample_rate,
-                });
-            }
-            Err(e) => {
-                exit::exit_runtime_error(
-                    exit::ExitKind::Model,
-                    format!("Model load failed: {e}"),
-                    model_load_hint(&e),
-                );
-            }
+        let cal_meta = ModelCalibrationMeta {
+            has_model: true,
+            loudness: loaded.loudness(),
+            input_level_dbu: loaded.input_level_dbu(),
+            output_level_dbu: loaded.output_level_dbu(),
+        };
+        let resolved_cal = resolve_model_calibration(cal_meta, calibration, output_mode_explicit)?;
+        if let Some(warn_msg) = &resolved_cal.warning {
+            log::warn!("{} {warn_msg}", "⚠️".yellow());
         }
+
+        if let Ok(mut name) = ACTIVE_MODEL_NAME.write() {
+            *name = path.to_string_lossy().into_owned();
+        }
+        ACTIVE_SAMPLE_RATE.store(loaded.sample_rate, Ordering::Relaxed);
+
+        architecture = loaded.architecture.clone();
+
+        let model_info = loaded.model_info(path);
+        if let Ok(mut info_guard) = ACTIVE_MODEL_INFO.write() {
+            *info_guard = Some(model_info);
+        }
+        let mem_bytes = loaded.model_memory_bytes().unwrap_or(0);
+        ACTIVE_MODEL_MEMORY_BYTES.store(mem_bytes, Ordering::Relaxed);
+
+        has_model_r = loaded.model_r.is_some();
+
+        full_wavenet_model_l = loaded.model_l.as_ref().and_then(|m| {
+            if let StaticModel::WavenetDyn(w) = m.as_ref() {
+                clone_wavenet_for_slimmable_storage(w).ok()
+            } else {
+                None
+            }
+        });
+
+        full_wavenet_model_r = loaded.model_r.as_ref().and_then(|m| {
+            if let StaticModel::WavenetDyn(w) = m.as_ref() {
+                clone_wavenet_for_slimmable_storage(w).ok()
+            } else {
+                None
+            }
+        });
+
+        log::info!(
+            "{} Calibration: calibrate_input={}, ref={:.1} dBu (in_mult={:.6}), output_mode={} (out_mult={:.6})",
+            "🎚️".cyan(),
+            if calibration.calibrate_input {
+                "on"
+            } else {
+                "off"
+            },
+            calibration.input_calibration_level_dbu,
+            resolved_cal.input_mult,
+            calibration.output_mode,
+            resolved_cal.output_mult,
+        );
+
+        let _ = producer.push(ParamPayload::LoadModel {
+            model_l: loaded.model_l,
+            model_r: loaded.model_r,
+            input_mult_adj: resolved_cal.input_mult,
+            output_mult_adj: resolved_cal.output_mult,
+            sample_rate: loaded.sample_rate,
+        });
     } else {
         ACTIVE_MODEL_MEMORY_BYTES.store(0, Ordering::Relaxed);
         log::warn!(
@@ -146,11 +173,30 @@ pub fn load_initial_model(
         );
     }
 
-    InitialModelSetup {
+    Ok(InitialModelSetup {
         full_wavenet_model_l,
         full_wavenet_model_r,
         has_model_r,
         architecture,
+    })
+}
+
+/// Encapsulates neural model loading, terminating with exit code on validation/load failure.
+pub fn load_initial_model(
+    model_path: Option<&Path>,
+    sys: &SystemSnapshot,
+    calibration: CalibrationConfig,
+    output_mode_explicit: bool,
+    producer: &mut Producer<ParamPayload>,
+) -> InitialModelSetup {
+    match try_load_initial_model(model_path, sys, calibration, output_mode_explicit, producer) {
+        Ok(setup) => setup,
+        Err(msg) => exit::exit_runtime_error(
+            exit::ExitKind::Model,
+            msg,
+            "Verify the model metadata ('loudness', 'input_level_dbu', 'output_level_dbu') \
+             or pass --calibrate-input off / --output-mode raw.",
+        ),
     }
 }
 

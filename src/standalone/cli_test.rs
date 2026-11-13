@@ -756,3 +756,26 @@ fn test_parse_args_gain_boundary_values() {
     assert_eq!(cli_def.input_gain, 0.0);
     assert_eq!(cli_def.output_gain, 0.0);
 }
+
+#[test]
+fn test_parse_args_calibration_defaults_and_flags() {
+    let def = parse_args_from(lexopt::Parser::from_iter(["nam-audio-pipe", "-b", "256"]));
+    assert!(!def.calibrate_input);
+    assert_eq!(def.input_calibration_level_dbu, 12.0);
+    assert_eq!(def.output_mode, OutputMode::Normalized);
+    assert!(!def.output_mode_explicit);
+
+    let custom = parse_args_from(lexopt::Parser::from_iter([
+        "nam-audio-pipe",
+        "--calibrate-input",
+        "on",
+        "--input-calibration-level",
+        "-24.5",
+        "--output-mode",
+        "calibrated",
+    ]));
+    assert!(custom.calibrate_input);
+    assert_eq!(custom.input_calibration_level_dbu, -24.5);
+    assert_eq!(custom.output_mode, OutputMode::Calibrated);
+    assert!(custom.output_mode_explicit);
+}

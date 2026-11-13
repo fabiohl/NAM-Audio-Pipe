@@ -9,6 +9,10 @@
 use neural_amp_modeler_rs::math::activations::ActivationPrecision;
 use neural_amp_modeler_rs::math::constants::{GAIN_MAX_DB, GAIN_MIN_DB};
 
+pub use super::calibration::{
+    CalibrationConfig, INPUT_CALIBRATION_LEVEL_DEFAULT_DBU, OutputMode, parse_calibrate_input,
+    parse_input_calibration_level, parse_output_mode,
+};
 pub(crate) use super::cli_domain::parse_gate_mode;
 pub use super::cli_domain::{
     BUFFER_SIZE_AUTO, BUFFER_SIZE_MAX, BUFFER_SIZE_MIN, BufferSizeError, CABSIM_PARTITION_ALLOWED,
@@ -70,6 +74,14 @@ pub struct CliArgs {
     pub cabsim_partition: u32,
     /// Cabinet IR level policy (`--ir-level-policy`, defaults to `PeakNormalized`).
     pub ir_level_policy: IrLevelPolicy,
+    /// Enable ADC-to-model input calibration (`--calibrate-input <on|off>`, default `off`).
+    pub calibrate_input: bool,
+    /// ADC 0 dBFS calibration level in dBu (`--input-calibration-level <DBU>`, default `12.0`).
+    pub input_calibration_level_dbu: f32,
+    /// Model output gain mode (`--output-mode <raw|normalized|calibrated>`, default `normalized`).
+    pub output_mode: OutputMode,
+    /// Tracks whether `--output-mode` was explicitly specified on the command line.
+    pub output_mode_explicit: bool,
     /// Optional hardware playback output limit (`--output-limit`, defaults to `Off`).
     pub output_limit: OutputLimitPolicy,
     /// Immediate diagnostic flag.
@@ -111,6 +123,17 @@ pub struct CliArgs {
     pub pause: bool,
 }
 
+impl CliArgs {
+    /// Returns the grouped calibration configuration derived from parsed CLI options.
+    pub fn calibration_config(&self) -> CalibrationConfig {
+        CalibrationConfig {
+            calibrate_input: self.calibrate_input,
+            input_calibration_level_dbu: self.input_calibration_level_dbu,
+            output_mode: self.output_mode,
+        }
+    }
+}
+
 /// Parses command-line arguments and validates any explicitly provided input files.
 ///
 /// `--diagnose`/`--diagnose-full` skip the file validation (they must work
@@ -136,6 +159,10 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut buffer_size = 256;
     let mut cabsim_partition = CABSIM_PARTITION_DEFAULT;
     let mut ir_level_policy = IrLevelPolicy::default();
+    let mut calibrate_input = false;
+    let mut input_calibration_level_dbu = INPUT_CALIBRATION_LEVEL_DEFAULT_DBU;
+    let mut output_mode = OutputMode::default();
+    let mut output_mode_explicit = false;
     let mut output_limit = OutputLimitPolicy::default();
     let mut diagnose = false;
     let mut diagnose_full = false;
@@ -379,6 +406,30 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                 ir_level_policy =
                     parse_ir_level_policy(&val_str).unwrap_or_else(|e| exit_with_error(e));
             }
+            Long("calibrate-input") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid --calibrate-input value."));
+                calibrate_input =
+                    parse_calibrate_input(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
+            Long("input-calibration-level") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val.into_string().unwrap_or_else(|_| {
+                    exit_with_error("Invalid --input-calibration-level value.")
+                });
+                input_calibration_level_dbu =
+                    parse_input_calibration_level(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
+            Long("output-mode") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid --output-mode value."));
+                output_mode = parse_output_mode(&val_str).unwrap_or_else(|e| exit_with_error(e));
+                output_mode_explicit = true;
+            }
             Long("output-limit") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
                 let val_str = val
@@ -404,6 +455,10 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         buffer_size,
         cabsim_partition,
         ir_level_policy,
+        calibrate_input,
+        input_calibration_level_dbu,
+        output_mode,
+        output_mode_explicit,
         output_limit,
         diagnose,
         diagnose_full,

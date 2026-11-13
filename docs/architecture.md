@@ -348,6 +348,7 @@ To guarantee deterministic memory bounds, all components enforce strict maximum 
 | `MAX_BRIDGE_BUF`       | 8192 samples                      | `DspBridge` width; callbacks reject larger descriptors fail-closed.                                |
 | `MAX_RESAMP_BUF`       | 8192 samples                      | Bounds maximum memory allocation for resamplers and oversampling engines.                          |
 | CabSim Partition Size  | Clamped to `[16, MAX_RESAMP_BUF]` | CLI `--cabsim-partition` domain `{32, 64, 128, 256}` (default `128`), decoupled from host quantum. |
+| Calibration Level Domain | `[-60.0, +60.0]` dBu (`f64::powf`) | `--calibrate-input`, `--input-calibration-level`, and `--output-mode` validated at startup in `setup::try_load_initial_model` against model metadata; CabSim IRs remain isolated from amp multipliers. |
 | `--buffer-size` Domain | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`  | Validated at CLI parsing; invalid values reject before PipeWire graph connection.                  |
 
 ### 6.2 Adaptive Compute & Slimmable Submodel Swaps
