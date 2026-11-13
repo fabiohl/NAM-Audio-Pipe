@@ -15,6 +15,7 @@
     warn(clippy::unwrap_used, clippy::expect_used)
 )]
 
+pub mod dsp;
 pub mod receipt;
 pub mod recording;
 pub mod standalone;

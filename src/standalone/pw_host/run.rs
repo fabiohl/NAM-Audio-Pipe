@@ -118,6 +118,7 @@ pub fn run_pipewire_host(
         fail_fast,
         reconnect_timeout,
         gate_config,
+        gate_mode,
         stream_status,
         recording_status,
         banner,
@@ -170,6 +171,17 @@ pub fn run_pipewire_host(
     unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
 
     let mut rt_state = Box::new(CaptureState::init(&sys, oversample, gate_config));
+    rt_state.configure_gate_mode(gate_mode);
+    log::info!(
+        "Gate topology: {} (threshold open: {}).",
+        gate_mode.as_str(),
+        match gate_config {
+            crate::standalone::cli::GateConfig::Off => "OFF".to_string(),
+            crate::standalone::cli::GateConfig::Threshold {
+                threshold_open_db, ..
+            } => format!("{threshold_open_db:.1} dB"),
+        }
+    );
     rt_state.activation = activation;
     rt_state.ir_raw_samples = ir_raw_samples.clone();
     rt_state.ir_source_rate = ir_source_rate;

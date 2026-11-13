@@ -103,6 +103,7 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
                 fail_fast: true,
                 reconnect_timeout: None,
                 gate_config: cli::GateConfig::Off,
+                gate_mode: Default::default(),
                 stream_status: Some(stream_status_clone),
                 recording_status: None,
                 banner: Default::default(),

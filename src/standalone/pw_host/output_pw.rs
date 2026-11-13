@@ -100,6 +100,8 @@ pub struct PipewireHostConfig {
     /// through), while a [`GateConfig::Threshold`] carries the open/close dBFS
     /// thresholds of the Schmitt trigger (auto hysteresis of 10 dB).
     pub gate_config: GateConfig,
+    /// Noise gate topology from `--gate-mode <silence|musical>` (defaults to `Silence`).
+    pub gate_mode: crate::standalone::cli::GateMode,
     /// Optional externally-owned stream status flags (for integration testing).
     pub stream_status: Option<std::sync::Arc<StreamStatusFlags>>,
     /// Optional observable recording status: when `--record` is

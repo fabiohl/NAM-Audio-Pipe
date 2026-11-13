@@ -430,6 +430,7 @@ fn main() -> anyhow::Result<()> {
             fail_fast: args.fail_fast,
             reconnect_timeout: args.reconnect_timeout,
             gate_config: args.gate,
+            gate_mode: args.gate_mode,
             stream_status: None,
             recording_status: recording_status.clone(),
             banner: banner_request,

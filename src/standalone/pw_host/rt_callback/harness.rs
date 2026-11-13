@@ -55,7 +55,7 @@ use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
     BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF,
-    StreamingDspBuffers, capture_dsp_pipeline_streaming,
+    StreamingDspBuffers,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -482,7 +482,18 @@ impl SwapRtSide {
             crossfade_scratch_l: &mut *self.state.xfd_scratch_l,
             crossfade_scratch_r: &mut *self.state.xfd_scratch_r,
         };
-        capture_dsp_pipeline_streaming(in_l, in_r, n, ctx, &mut self.state.stream, bufs, rate)
+        super::process::run_capture_dsp_pipeline(
+            in_l,
+            in_r,
+            n,
+            ctx,
+            &mut self.state.stream,
+            bufs,
+            rate,
+            self.state.user_input_gain_mult,
+            self.state.gate_mode,
+            &mut self.state.musical_gate,
+        )
     }
 
     /// Drains and drops the GC channel (main-thread side). Returns the number
@@ -543,6 +554,20 @@ impl SwapRtSide {
 
     pub fn current_host_rate(&self) -> u32 {
         self.current_host_rate
+    }
+
+    pub fn gate_mode(&self) -> crate::standalone::cli::GateMode {
+        self.state.gate_mode
+    }
+
+    pub fn musical_gate_attenuating(&self) -> bool {
+        self.state
+            .musical_gate
+            .is_attenuating(self.state.process_mono)
+    }
+
+    pub fn configure_gate_mode(&mut self, gate_mode: crate::standalone::cli::GateMode) {
+        self.state.configure_gate_mode(gate_mode);
     }
 
     pub fn gc_pending(&self) -> usize {
@@ -732,6 +757,18 @@ impl RtSwapHarness {
             GateConfig::Off
         };
         Self::new_with_gate_config(host_rate, nam_rate, gate_config)
+    }
+
+    /// Builds a harness with an explicit `GateConfig` and `GateMode`.
+    pub fn new_with_gate_config_and_mode(
+        host_rate: u32,
+        nam_rate: u32,
+        gate_config: GateConfig,
+        gate_mode: crate::standalone::cli::GateMode,
+    ) -> anyhow::Result<Self> {
+        let mut harness = Self::new_with_gate_config(host_rate, nam_rate, gate_config)?;
+        harness.rt.configure_gate_mode(gate_mode);
+        Ok(harness)
     }
 
     /// Builds a harness pre-configured for `host_rate` ↔ `nam_rate` (both
@@ -1005,5 +1042,20 @@ impl RtSwapHarness {
     /// Returns a playback-side reader for the harness's internal `DspBridge`.
     pub fn bridge_reader(&self) -> DspBridgeReader {
         self.rt.bridge_reader()
+    }
+
+    /// Configures the active gate topology (`Silence` vs `Musical`).
+    pub fn configure_gate_mode(&mut self, gate_mode: crate::standalone::cli::GateMode) {
+        self.rt.configure_gate_mode(gate_mode);
+    }
+
+    /// Returns the active gate topology.
+    pub fn gate_mode(&self) -> crate::standalone::cli::GateMode {
+        self.rt.gate_mode()
+    }
+
+    /// Returns `true` when the musical gate is actively attenuating audio (`> 0.5 dB` GR).
+    pub fn musical_gate_attenuating(&self) -> bool {
+        self.rt.musical_gate_attenuating()
     }
 }

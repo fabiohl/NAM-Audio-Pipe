@@ -86,6 +86,9 @@ pub struct CaptureState {
     pub input_gain_mult: f32,
     pub output_gain_mult: f32,
     pub gate_params: GateParams,
+    pub gate_config: crate::standalone::cli::GateConfig,
+    pub gate_mode: crate::standalone::cli::GateMode,
+    pub musical_gate: crate::dsp::musical_gate::MusicalNoiseGate,
     pub silence_hysteresis: DynamicHysteresis,
     pub mono_hysteresis: DynamicHysteresis,
     pub process_mono: bool,
@@ -292,6 +295,9 @@ impl CaptureState {
             input_gain_mult: 1.0,
             output_gain_mult: 1.0,
             gate_params,
+            gate_config,
+            gate_mode: crate::standalone::cli::GateMode::Silence,
+            musical_gate: crate::dsp::musical_gate::MusicalNoiseGate::new(48_000),
             silence_hysteresis: DynamicHysteresis::new(),
             mono_hysteresis: DynamicHysteresis::new(),
             process_mono: false,
@@ -316,6 +322,42 @@ impl CaptureState {
             os_drain: None,
             cabsim_failed_key: None,
             stream_status: None,
+        }
+    }
+
+    /// Configures the active gate topology (`Silence` vs `Musical`) and synchronizes thresholds.
+    pub fn configure_gate_mode(&mut self, gate_mode: crate::standalone::cli::GateMode) {
+        self.gate_mode = gate_mode;
+        self.apply_gate_resolution(gain_lut::get_gain_lut());
+    }
+
+    /// Synchronizes silence-hysteresis squares and musical expander settings after initialization
+    /// or runtime `GateParams` command updates.
+    pub fn apply_gate_resolution(&mut self, lut: &gain_lut::GainLUT) {
+        match self.gate_mode {
+            crate::standalone::cli::GateMode::Silence => {
+                let (open_sq, close_sq) = match self.gate_config {
+                    GateConfig::Off => (0.0, 0.0),
+                    GateConfig::Threshold { .. } => {
+                        let open_lin = lut.db_to_linear(self.gate_params.threshold_open_db);
+                        let close_lin = lut.db_to_linear(self.gate_params.threshold_close_db);
+                        (open_lin * open_lin, close_lin * close_lin)
+                    }
+                };
+                self.threshold_open_sq = open_sq;
+                self.threshold_close_sq = close_sq;
+                self.musical_gate
+                    .set_threshold(self.gate_params.threshold_open_db as f64, false);
+            }
+            crate::standalone::cli::GateMode::Musical => {
+                let enabled = matches!(self.gate_config, GateConfig::Threshold { .. })
+                    && self.gate_params.threshold_open_db > -120.0;
+                self.threshold_open_sq = 0.0;
+                self.threshold_close_sq = 0.0;
+                self.silence_hysteresis.reset();
+                self.musical_gate
+                    .set_threshold(self.gate_params.threshold_open_db as f64, enabled);
+            }
         }
     }
 }

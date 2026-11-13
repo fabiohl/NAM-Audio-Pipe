@@ -395,6 +395,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
                 fail_fast: true,
                 reconnect_timeout: None,
                 gate_config: cli::GateConfig::default_on(),
+                gate_mode: Default::default(),
                 stream_status: None,
                 recording_status: None,
                 banner: Default::default(),

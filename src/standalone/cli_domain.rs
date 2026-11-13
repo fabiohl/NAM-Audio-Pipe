@@ -348,6 +348,13 @@ pub fn print_help() {
     );
     let _ = writeln!(
         out,
+        concat!(
+            "      --gate-mode MODE     Gate topology: 'silence' (block RMS, post-IR, CPU-skipping)\n",
+            "                           or 'musical' (reference quadratic expander, pre-IR) [default: silence]"
+        )
+    );
+    let _ = writeln!(
+        out,
         "      --cpu INDEX          Pin RT audio thread to explicit CPU core index"
     );
     let _ = writeln!(
@@ -447,6 +454,40 @@ impl GateConfig {
             threshold_open_db: open_db,
             threshold_close_db: (open_db - Self::DEFAULT_HYSTERESIS_DB).max(Self::MIN_THRESHOLD_DB),
         }
+    }
+}
+
+/// Noise gate algorithm selector from `--gate-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GateMode {
+    /// Block-RMS hysteresis gate with CPU skip and silence trimming (`--record`).
+    #[default]
+    Silence,
+    /// Continuous reference-compatible quadratic downward expander (pre-model detector, pre-IR gain).
+    Musical,
+}
+
+impl GateMode {
+    /// Returns the canonical lowercase CLI/log label for this gate mode.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Silence => "silence",
+            Self::Musical => "musical",
+        }
+    }
+}
+
+/// Parses `--gate-mode <silence|musical>` (`sil` / `mus` shorthands also accepted).
+pub(crate) fn parse_gate_selector(value: &str) -> Result<GateMode, String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "silence" | "sil" => Ok(GateMode::Silence),
+        "musical" | "mus" => Ok(GateMode::Musical),
+        _ => Err(format!(
+            "Invalid --gate-mode '{}'. Expected 'silence' or 'musical'.",
+            value
+        )),
     }
 }
 

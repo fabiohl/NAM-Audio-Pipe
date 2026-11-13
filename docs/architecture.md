@@ -308,7 +308,7 @@ RT Thread (Replaced Asset)
 
 ## 6. DSP Pipeline, Latency Accounting & SPA Semantics
 
-The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`capture_dsp_pipeline_streaming`](../src/standalone/pw_host/rt_callback/process.rs):
+The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`run_capture_dsp_pipeline`](../src/standalone/pw_host/rt_callback/process.rs), branching on `GateMode`: in `Silence` mode (default), [`capture_dsp_pipeline_streaming`](../src/standalone/pw_host/rt_callback/process.rs) runs block-RMS `DynamicHysteresis` with CPU-skipping and `--record` silence trimming; in `Musical` mode, [`MusicalNoiseGate`](../src/dsp/musical_gate.rs) evaluates triggers post user input gain / pre model calibration (`cal_in`), keeps neural inference continuous, and applies quadratic expansion post-model / pre-CabSim IR so cabinet decay tails ring naturally.
 
 ```text
 Audio Input (PipeWire Host Buffer)

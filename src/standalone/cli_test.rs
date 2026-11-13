@@ -779,3 +779,34 @@ fn test_parse_args_calibration_defaults_and_flags() {
     assert_eq!(custom.output_mode, OutputMode::Calibrated);
     assert!(custom.output_mode_explicit);
 }
+
+#[test]
+fn test_parse_gate_mode_selector_values() {
+    assert_eq!(parse_gate_selector("silence").unwrap(), GateMode::Silence);
+    assert_eq!(parse_gate_selector("SIL").unwrap(), GateMode::Silence);
+    assert_eq!(parse_gate_selector("musical").unwrap(), GateMode::Musical);
+    assert_eq!(parse_gate_selector("Mus").unwrap(), GateMode::Musical);
+    assert!(parse_gate_selector("exp").is_err());
+}
+
+#[test]
+fn test_parse_args_gate_mode_flag() {
+    let def = parse_args_from(lexopt::Parser::from_iter(["nam-audio-pipe", "-b", "256"]));
+    assert_eq!(def.gate_mode, GateMode::Silence);
+
+    let mus = parse_args_from(lexopt::Parser::from_iter([
+        "nam-audio-pipe",
+        "--gate-mode",
+        "musical",
+        "--gate",
+        "-55dB",
+    ]));
+    assert_eq!(mus.gate_mode, GateMode::Musical);
+    assert!(matches!(
+        mus.gate,
+        GateConfig::Threshold {
+            threshold_open_db,
+            ..
+        } if (threshold_open_db - (-55.0)).abs() < 1e-6
+    ));
+}

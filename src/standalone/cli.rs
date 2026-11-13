@@ -13,14 +13,14 @@ pub use super::calibration::{
     CalibrationConfig, INPUT_CALIBRATION_LEVEL_DEFAULT_DBU, OutputMode, parse_calibrate_input,
     parse_input_calibration_level, parse_output_mode,
 };
-pub(crate) use super::cli_domain::parse_gate_mode;
 pub use super::cli_domain::{
     BUFFER_SIZE_AUTO, BUFFER_SIZE_MAX, BUFFER_SIZE_MIN, BufferSizeError, CABSIM_PARTITION_ALLOWED,
-    CABSIM_PARTITION_DEFAULT, CabSimPartitionError, GateConfig, IrLevelPolicy, OutputLimitPolicy,
-    exit_with_error, expand_user_path, parse_ir_level_policy, parse_output_limit, print_help,
-    resolve_record_dir, validate_buffer_size, validate_cabsim_partition, validate_readable_file,
-    write_stdout,
+    CABSIM_PARTITION_DEFAULT, CabSimPartitionError, GateConfig, GateMode, IrLevelPolicy,
+    OutputLimitPolicy, exit_with_error, expand_user_path, parse_ir_level_policy,
+    parse_output_limit, print_help, resolve_record_dir, validate_buffer_size,
+    validate_cabsim_partition, validate_readable_file, write_stdout,
 };
+pub(crate) use super::cli_domain::{parse_gate_mode, parse_gate_selector};
 use crate::standalone::colors::ColorFlag;
 use lexopt::prelude::*;
 use neural_amp_modeler_rs::dsp::adaptive::SlimOverride;
@@ -115,6 +115,8 @@ pub struct CliArgs {
     /// Noise gate configuration: `Off`, or `Threshold { open, close }` in dBFS
     /// (defaults to [`GateConfig::default_on`] = open at `-70.0 dB`).
     pub gate: GateConfig,
+    /// Noise gate topology from `--gate-mode <silence|musical>` (defaults to [`GateMode::Silence`]).
+    pub gate_mode: GateMode,
     /// Terminal color policy from `--color` (defaults to [`ColorFlag::Auto`]).
     pub color: ColorFlag,
     /// Wait for Enter before exiting after a terminal-only, exit-immediate
@@ -175,6 +177,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
     let mut fail_fast = false;
     let mut reconnect_timeout = None;
     let mut gate = GateConfig::default_on();
+    let mut gate_mode = GateMode::default();
     let mut color = ColorFlag::Auto;
     let mut pause = false;
     let mut has_args = false;
@@ -235,6 +238,13 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
                     .into_string()
                     .unwrap_or_else(|_| exit_with_error("Invalid gate mode value."));
                 gate = parse_gate_mode(&val_str).unwrap_or_else(|e| exit_with_error(e));
+            }
+            Long("gate-mode") => {
+                let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
+                let val_str = val
+                    .into_string()
+                    .unwrap_or_else(|_| exit_with_error("Invalid --gate-mode value."));
+                gate_mode = parse_gate_selector(&val_str).unwrap_or_else(|e| exit_with_error(e));
             }
             Long("color") => {
                 let val = parser.value().unwrap_or_else(|e| exit_with_error(e));
@@ -471,6 +481,7 @@ pub fn parse_args_from(mut parser: lexopt::Parser) -> CliArgs {
         fail_fast,
         reconnect_timeout,
         gate,
+        gate_mode,
         color,
         pause,
     }
