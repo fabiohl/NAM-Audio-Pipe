@@ -100,7 +100,6 @@ tokio-uring = "0.5"
 anyhow = "1.0.104"
 libc = "0.2.191"
 log = "0.4.35"
-env_logger = { version = "0.11.11", default-features = false }
 # Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs):
 # the engine-owned unified receipt schema has no `fail_reason` field, so
 # the cause is emitted to a sibling `*.fail-reasons.json` JSONL. Already in the

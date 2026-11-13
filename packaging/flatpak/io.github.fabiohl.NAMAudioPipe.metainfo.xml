@@ -71,19 +71,14 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="1.1.0" date="2026-11-07" type="stable">
+    <release version="1.2.0" date="2026-11-12" type="stable">
       <description>
-        <p>NAM-Audio-Pipe 1.1.0:</p>
+        <p>NAM-Audio-Pipe 1.2.0:</p>
         <ul>
-          <li>Integrated NeuralAmpModeler-rs v2.0.0 core DSP engine with pinned commit provenance.</li>
-          <li>PipeWire SPA latency reporting (SPA_PARAM_Latency) and stream properties dynamically synchronized with the multimedia graph.</li>
-          <li>Partition-aligned UPOLS cab-sim latency with constant partition priming declared to the host.</li>
-          <li>Automated A/B optimization ceremony (Plain vs PGO vs LLVM BOLT) with explicit 1.0% promotion margin proofs.</li>
-          <li>Decoupled host control plane with deterministic event-driven stream negotiation and format handling.</li>
-          <li>Hardened asynchronous recording pool with safe memory references, eliminating nullable raw pointers (#2).</li>
-          <li>Rust-based QA receipts (pipe_long_receipt) with run-id provenance, calibrated RT environment evidence, and script-budget verification.</li>
-          <li>Independent CI lint and quick verification jobs with engine commit provenance and always-uploaded diagnostic bundles.</li>
-          <li>Memory-guarded test and build scripts protecting host systems against out-of-memory (OOM) conditions.</li>
+          <li>Integrated NeuralAmpModeler-rs v2.1.0 core DSP engine with updated linear model prewarm calibration.</li>
+          <li>Explicit --ir-level-policy cab-sim level mode selection (Preserve, GainMatched, Normalized).</li>
+          <li>Playback-only --output-limit safety clamp for interactive PipeWire monitoring without altering offline captures.</li>
+          <li>Validated CLI gain boundary enforcement (--input-gain / --output-gain) and documented DSP scope guarantees.</li>
         </ul>
       </description>
     </release>

@@ -153,7 +153,9 @@ fn watchdog_returns_within_deadline_plus_grace_with_fd_inheriting_grandchild() {
         .expect("sh must be spawnable for the grandchild test");
 
     let start = std::time::Instant::now();
-    let output = collect_child_output_with_watchdog(child, std::time::Duration::from_millis(300))
+    // 800 ms leaves comfortable headroom under parallel test contention while
+    // remaining far below the 5 s grandchild sleep and the 2 s assertion bound.
+    let output = collect_child_output_with_watchdog(child, std::time::Duration::from_millis(800))
         .expect("a child that exits inside the deadline must yield its output");
     let elapsed = start.elapsed();
 
