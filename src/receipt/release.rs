@@ -455,6 +455,16 @@ pub fn evaluate_certification(
                         receipt.status
                     ));
                 }
+                if !receipt.engine_provenance.is_pinned() {
+                    fails.push("build_engine_unpinned".to_string());
+                    reasons.push(format!(
+                        "engine provenance is not pinned: dependency_type='{}' resolved_commit={:?} pinned_commit={:?} resolved_dirty={:?}",
+                        receipt.engine_provenance.dependency_type,
+                        receipt.engine_provenance.resolved_commit,
+                        receipt.engine_provenance.pinned_commit,
+                        receipt.engine_provenance.resolved_dirty
+                    ));
+                }
                 if receipt.provenance.git_dirty {
                     fails.push("build_worktree_dirty".to_string());
                     reasons.push(
@@ -660,6 +670,9 @@ pub fn evaluate_certification(
                     dependency_type: "unknown".to_string(),
                     version: "unknown".to_string(),
                     checksum: None,
+                    resolved_commit: None,
+                    resolved_dirty: None,
+                    pinned_commit: None,
                 },
                 BuildOptimizations {
                     pgo_applied: false,

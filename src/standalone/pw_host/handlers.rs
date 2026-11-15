@@ -668,6 +668,22 @@ pub(super) fn handle_cabinet_nam_rebuild(
                 kind.badge(),
                 target_host_rate,
             );
+            let partition = rt_status
+                .requested_cabsim_partition_size
+                .load(Ordering::Relaxed);
+            let payload = crate::standalone::cabinet::PipeCabNamPayload::failed(
+                generation,
+                kind,
+                target_host_rate,
+                partition,
+            );
+            if cab_nam_producer.push(payload).is_err() {
+                log::warn!(
+                    "[E3100 | PARAM_CHANNEL_FULL] Neural cabinet failure notice channel full — the rebuild decision will be retried (PW={} Hz).",
+                    target_host_rate
+                );
+                return None;
+            }
             rearm_cabsim_if_superseded(rt_status, generation);
             Some(0)
         }

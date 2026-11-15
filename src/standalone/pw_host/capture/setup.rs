@@ -496,6 +496,10 @@ fn cabsim_rebuild_needed(
     }
 }
 
+/// Neural cabinet rebuild predicate. A latched failure for the same `(host_rate, partition)`
+/// suppresses requests in both branches: the last installed slot is kept fail-closed (and
+/// gated off by its stale rate), so without the latch a persistent build failure would
+/// re-request a rebuild on every callback.
 fn nam_cab_rebuild_needed(
     active: Option<&crate::standalone::cabinet::CabNamSlot>,
     has_nam: bool,
@@ -508,13 +512,11 @@ fn nam_cab_rebuild_needed(
     if !has_nam || already_pending {
         return false;
     }
+    if matches!(failed_key, Some((r, p)) if r == host_rate && p == partition) {
+        return false;
+    }
     match active {
-        None => {
-            if matches!(failed_key, Some((r, p)) if r == host_rate && p == partition) {
-                return false;
-            }
-            (BUFFER_SIZE_MIN as usize..=MAX_RESAMP_BUF).contains(&n_samples)
-        }
+        None => (BUFFER_SIZE_MIN as usize..=MAX_RESAMP_BUF).contains(&n_samples),
         Some(slot) => slot.host_rate != host_rate,
     }
 }

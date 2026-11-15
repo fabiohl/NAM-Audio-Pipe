@@ -3,7 +3,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 # tests-long.sh — long audit suite: soak, RT, live PipeWire, io_uring, offline parity and artifact certification. Classe B.
 # Uso: utils/tests-long.sh [--strict] [--artifact] [--only <nome>[,<nome>]] [-h|--help]
-# Orçamento: 360  # Alocação para extração de evidências env em recibos de texto e gates RT
+# Orçamento: 380  # extração de evidências env + staging run-scoped e promoção atômica dos recibos
 # AI AGENTS MUST NEVER EXECUTE THIS SCRIPT DIRECTLY: execution is reserved for the human operator.
 # Structural validation is limited to --help.
 set -x; PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
@@ -30,9 +30,8 @@ PERF_GATE_BIN=""
 ARTIFACT_PATH="target/dist/nam-audio-pipe"
 ARTIFACT_SHA256=""
 USE_ARTIFACT=0
-TEXT_RECEIPT="$LOG_DIR/long-receipt.txt"
-RECEIPT="$LOG_DIR/long-audit-receipt.jsonl"
-FAIL_REASONS="$LOG_DIR/long-audit-receipt.fail-reasons.json"
+TEXT_RECEIPT_FINAL="$LOG_DIR/long-receipt.txt"
+RECEIPT_FINAL="$LOG_DIR/long-audit-receipt.jsonl"
 LONG_RECEIPT_FAILED=0
 CUR_LOG=""
 PRE_GAPS=()
@@ -82,10 +81,18 @@ if [ -z "${NAM_RUN_ID:-}" ] && [ -s target/logs/build-run-id ]; then
     export NAM_RUN_ID
 fi
 lib_init; PHASE_NAME=phase-selection
+# Post-init usage/precondition failures still close the discipline: exactly one
+# RESULT and the typed carrier are written before exiting with the usage code.
+fail_precondition() {
+    FAILS+=("${PHASE_NAME:-precondition}")
+    emit "PHASE: ${PHASE_NAME:-precondition} FAIL rc=2 log=none ($1)"
+    finish || true
+    exit 2
+}
 for o in ${ONLY_PHASES[@]+"${ONLY_PHASES[@]}"}; do
     o=$(printf '%s' "$o" | tr '[:upper:]_' '[:lower:]-'); valid=0
     for p in "${PHASES[@]}"; do [ "${p%%|*}" = "$o" ] && valid=1; done
-    [ "$valid" = 1 ] || { echo "ERRO: fase desconhecida: $o" >&2; exit 2; }
+    [ "$valid" = 1 ] || fail_precondition "fase desconhecida: $o"
 done
 # Seleção somente por nome canônico de fase.
 is_phase_selected() {
@@ -98,12 +105,15 @@ is_phase_selected() {
     return 1
 }
 if [ "$STRICT" = 1 ]; then export NAM_RT_STRICT=1; fi
-# A partial run must never destroy the previous full receipt: it writes to a
-# sibling set of paths that cannot be mistaken for a certifiable audit.
-if [ ${#ONLY_PHASES[@]} -gt 0 ]; then SCOPE="partial"; TEXT_RECEIPT="$LOG_DIR/long-receipt.partial.txt"; RECEIPT="$LOG_DIR/long-audit-receipt.partial.jsonl"; FAIL_REASONS="$LOG_DIR/long-audit-receipt.partial.fail-reasons.json"; fi
+# Staging is run-scoped: phase appends never touch the canonical receipts. Only
+# a full run whose summary+validate succeed promotes the staging files.
+RECEIPT="$LOG_DIR/long-audit-receipt.${NAM_RUN_ID}.partial.jsonl"
+TEXT_RECEIPT="$LOG_DIR/long-receipt.${NAM_RUN_ID}.partial.txt"
+FAIL_REASONS="$LOG_DIR/long-audit-receipt.${NAM_RUN_ID}.partial.fail-reasons.json"
+[ ${#ONLY_PHASES[@]} -gt 0 ] && SCOPE="partial"
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_TARGET_DIR" = "target/long" ]; then rm -rf target/long; fi
 rm -f "$RECEIPT" "$FAIL_REASONS" "$TEXT_RECEIPT"
-if [ "$USE_ARTIFACT" = 1 ]; then [ -f "$ARTIFACT_PATH" ] || { echo "ERRO: --artifact especificado mas $ARTIFACT_PATH não existe." >&2; exit 2; }; ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}'); fi
+if [ "$USE_ARTIFACT" = 1 ]; then [ -f "$ARTIFACT_PATH" ] || fail_precondition "--artifact especificado mas $ARTIFACT_PATH não existe."; ARTIFACT_SHA256=$(sha256sum "$ARTIFACT_PATH" | awk '{print $1}'); fi
 HAS_CHRT_FIFO=0
 if command -v chrt >/dev/null 2>&1 && chrt -f 80 true >/dev/null 2>&1; then HAS_CHRT_FIFO=1; fi
 ensure_receipt_bin() {
@@ -125,7 +135,7 @@ probe_io_uring_capability() {
     run_cmd "$to" "$bin" >/dev/null 2>&1; rc=$?
     return "$rc"
 }
-emit_text() { printf '%s\n' "$*" | tee -a "$TEXT_RECEIPT"; }
+emit_text() { printf '%s\n' "$*" | tee -a "$TEXT_RECEIPT" || { FAILS+=(text_receipt); LONG_RECEIPT_FAILED=1; }; }
 run_cmd() { local to="$1"; shift; timeout --kill-after=30 "$to" "$@"; }
 run_rt_cmd() {
     local to="$1"; shift
@@ -350,4 +360,18 @@ if [ ${#FAILS[@]} -gt 0 ]; then emit_text "OVERALL: FAILED"
 elif [ ${#ONLY_PHASES[@]} -gt 0 ]; then emit_text "OVERALL: PARTIAL (--only: recibo sem overall, não certificável)"
 elif [ ${#GAPS[@]} -gt 0 ]; then emit_text "OVERALL: COMPLETED_WITH_GAPS"
 else emit_text "OVERALL: PASSED"; fi
+if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ] && [ ${#FAILS[@]} -eq 0 ]; then
+    # Promote the derived text view first and the canonical JSONL last: a
+    # failed move never replaces the previous certifiable receipt.
+    if mv -f "$TEXT_RECEIPT" "$TEXT_RECEIPT_FINAL"; then
+        emit "PHASE: text-receipt-publish PASS log=$TEXT_RECEIPT_FINAL"
+    else
+        FAILS+=(text_receipt_publish); emit "PHASE: text-receipt-publish FAIL"
+    fi
+    if mv -f "$RECEIPT" "$RECEIPT_FINAL"; then
+        emit "PHASE: receipt-publish PASS log=$RECEIPT_FINAL"
+    else
+        FAILS+=(receipt_publish); emit "PHASE: receipt-publish FAIL"
+    fi
+fi
 finish

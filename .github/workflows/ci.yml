@@ -315,7 +315,6 @@ jobs:
   linux-arm64-quick:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 40
-    continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -490,6 +489,7 @@ jobs:
           printf 'PHASE: provenance sha=%s package_version=%s engine_type=%s engine_version=%s engine_checksum=%s auxiliary_engine=%s rustc=%s toolchain=msrv-1.99.0 cargo=%s\n' \
             "$sha" "$version" "$eng_type" "$eng_ver" "$eng_chk" "$aux_engine" "$rustc_version" "$(cargo --version)" | tee target/logs/ci-provenance.log
       - name: Cargo check (MSRV)
+        id: msrv-check
         shell: bash
         run: |
           set -euo pipefail
@@ -507,7 +507,7 @@ jobs:
         uses: ./.github/actions/qa-summary
         with:
           title: msrv (1.99.0)
-          note: ${{ job.status == 'success' && 'MSRV cargo check passed.' || 'MSRV cargo check failed.' }}
+          note: ${{ steps.msrv-check.outcome == 'success' && 'MSRV cargo check passed.' || 'MSRV cargo check failed.' }}
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

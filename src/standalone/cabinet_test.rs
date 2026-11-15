@@ -3,7 +3,9 @@
 
 use super::*;
 use neural_amp_modeler_rs::SystemSnapshot;
+use neural_amp_modeler_rs::common::spsc::GcOverflowBuffer;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 fn linear_cab_json(sample_rate: u32, gain: f32, gear_type: Option<&str>) -> String {
     let meta = match gear_type {
@@ -100,4 +102,163 @@ fn validates_1x1_and_gear_tags_without_calibration_or_head() {
         .unwrap_err()
         .to_string();
     assert!(ch_err.contains("1-in/1-out"), "got {ch_err}");
+}
+
+#[test]
+fn active_cabinet_latency_follows_the_single_installed_source() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        44_100,
+        &sys,
+    )
+    .expect("linear cabinet builds at a mismatched host rate");
+    assert_eq!(active_cabinet_latency(None, None), 0);
+    assert_eq!(
+        active_cabinet_latency(None, Some(&slot)),
+        slot.latency_samples()
+    );
+}
+
+#[test]
+fn failed_neural_rebuild_latches_key_and_keeps_last_safe_state() {
+    let (mut prod, mut cons) = rtrb::RingBuffer::<PipeCabNamPayload>::new(4);
+    prod.push(PipeCabNamPayload::failed(
+        7,
+        CabAssetKind::NamModel,
+        44_100,
+        64,
+    ))
+    .unwrap();
+    let requested = AtomicU64::new(7);
+    let applied = AtomicU64::new(0);
+    let mut wav: Option<Box<CabSimPair>> = None;
+    let mut nam: Option<CabNamSlot> = None;
+    let mut failed: Option<(u32, usize)> = None;
+    let (mut gc_p, _gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
+    let mut parking_lot: [Option<GcItem>; 16] = [const { None }; 16];
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let mut gc = GcSink {
+        producer: &mut gc_p,
+        parking_lot: &mut parking_lot,
+        overflow: &gc_overflow,
+        rt_status: &flags,
+        parking_lot_dirty: Some(&parking_lot_dirty),
+    };
+
+    drain_cab_nam_payloads(
+        &mut cons,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+
+    assert_eq!(failed, Some((44_100, 64)));
+    assert!(nam.is_none());
+    assert!(wav.is_none());
+    assert_eq!(applied.load(Ordering::Acquire), 7);
+}
+
+#[test]
+fn successful_neural_install_clears_failed_latch() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        48_000,
+        &sys,
+    )
+    .expect("linear cabinet builds");
+    let (mut prod, mut cons) = rtrb::RingBuffer::<PipeCabNamPayload>::new(4);
+    prod.push(PipeCabNamPayload::from_slot(8, slot)).unwrap();
+    let requested = AtomicU64::new(8);
+    let applied = AtomicU64::new(0);
+    let mut wav: Option<Box<CabSimPair>> = None;
+    let mut nam: Option<CabNamSlot> = None;
+    let mut failed: Option<(u32, usize)> = Some((48_000, 64));
+    let (mut gc_p, _gc_c) = rtrb::RingBuffer::<GcItem>::new(8);
+    let mut parking_lot: [Option<GcItem>; 16] = [const { None }; 16];
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let mut gc = GcSink {
+        producer: &mut gc_p,
+        parking_lot: &mut parking_lot,
+        overflow: &gc_overflow,
+        rt_status: &flags,
+        parking_lot_dirty: Some(&parking_lot_dirty),
+    };
+
+    drain_cab_nam_payloads(
+        &mut cons,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+
+    assert_eq!(failed, None);
+    assert!(nam.is_some());
+    assert_eq!(applied.load(Ordering::Acquire), 8);
+}
+
+#[test]
+fn neural_reengage_drains_prewarm_then_crossfades_to_wet() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let mut slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        48_000,
+        &sys,
+    )
+    .expect("linear cabinet builds");
+    let mut bypass = CabBypassState::new(true);
+    let mut delay = CabDryDelay::new(0);
+    let flags = RtStatusFlags::new();
+    let n = 8;
+    let mut dry_l = vec![0.0f32; n];
+    let mut dry_r = vec![0.0f32; n];
+    let mut wet_l = vec![1.0f32; n];
+    let mut wet_r = vec![1.0f32; n];
+    let mut scratch_l = vec![0.0f32; n];
+    let mut scratch_r = vec![0.0f32; n];
+    let mut last = 0.0f32;
+    for _ in 0..32 {
+        wet_l[..n].fill(1.0);
+        wet_r[..n].fill(1.0);
+        let active = bypass.process_stage(
+            false,
+            None,
+            Some(&mut slot),
+            &mut delay,
+            &mut dry_l,
+            &mut dry_r,
+            &mut wet_l,
+            &mut wet_r,
+            &mut scratch_l,
+            &mut scratch_r,
+            n,
+            false,
+            &flags,
+        );
+        assert!(active);
+        last = wet_l[n - 1];
+    }
+    assert!((last - 0.5).abs() < 1e-5, "settled at {last}");
 }

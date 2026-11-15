@@ -13,6 +13,14 @@ case "${1:-}" in "") ;; -h|--help) echo "Uso: utils/miri-audit.sh"; exit 0 ;; *)
 lib_init
 trap 'trap_fail $?' ERR
 
+# Post-init preconditions close the discipline (RESULT + carrier) before exit 2.
+precondition_fail() {
+    FAILS+=(precondition)
+    emit "PHASE: precondition FAIL rc=2 log=none ($1)"
+    finish || true
+    exit 2
+}
+
 echo "Miri concurrency & UB audit gate"
 echo "  TARGET: recording::pool::pool_test (RecordingPool SPSC ring, 13/13)"
 echo "  TARGET: standalone::pw_host::pw_host_test (DspBridge handshake)"
@@ -22,15 +30,15 @@ echo "  EXCLUDED: rt_callback/harness.rs (AVX2/FMA intrinsics, ~10,000x slowdown
 # precondition (exit 2), never a silent success.
 command -v rustup >/dev/null 2>&1 || {
     echo "MIRI: rustup not found — install a nightly toolchain with the miri component." >&2
-    exit 2
+    precondition_fail "rustup not found"
 }
 rustup toolchain list 2>/dev/null | grep -q "nightly" || {
     echo "MIRI: no nightly toolchain — rustup toolchain install nightly --profile minimal" >&2
-    exit 2
+    precondition_fail "no nightly toolchain"
 }
 cargo +nightly miri --version >/dev/null 2>&1 || {
     echo "MIRI: component missing — rustup component add miri --toolchain nightly" >&2
-    exit 2
+    precondition_fail "miri component missing"
 }
 
 PHASE_NAME=preflight; CUR_LOG="$LOG_DIR/miri-audit-preflight.log"; phase preflight

@@ -1267,21 +1267,15 @@ pub fn rt_quantum_prologue(
                     status.update_cabsim_latency(lat);
                 }
             },
+            Some(&mut state.cabsim_failed_key),
             &mut gc,
         );
     }
 
-    let active_cab_lat = state
-        .active_cabsim
-        .as_ref()
-        .map(|p| p.l.latency_samples())
-        .or_else(|| {
-            state
-                .active_cab_nam
-                .as_ref()
-                .map(|n| n.latency_samples() as usize)
-        })
-        .unwrap_or(0);
+    let active_cab_lat = crate::standalone::cabinet::active_cabinet_latency(
+        state.active_cabsim.as_deref(),
+        state.active_cab_nam.as_ref(),
+    ) as usize;
     state.cab_dry_delay.set_delay(active_cab_lat);
 
     let prev_gate_params = state.gate_params;

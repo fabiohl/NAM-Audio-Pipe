@@ -252,9 +252,9 @@ Class B script, operator-only. It records every phase result instead of aborting
 | **`phase9`**       | `recording`      | `io_uring_probe` and live PipeWire capability gates, then `tests/recording.rs` and `tests/recording_fault_injection.rs` (`--ignored`).                                                                                                      | 1200 s          | `target/logs/long-recording.log`      |
 | **`phase10`**      | `offline-parity` | `tests/pipe_offline_parity.rs` plus `--diagnose` on the canonical artifact when `--artifact` is used. Compares against f64 oracle and NAMCore C++ oracle (`NAM_CORE_RENDER_BIN`).                                                           | 900 s           | `target/logs/long-offline-parity.log` |
 
-Every phase writes `target/logs/long-<name>.log`. The human-readable text receipt is `target/logs/long-receipt.txt` and the typed JSONL receipt is `target/logs/long-audit-receipt.jsonl`.
+Every phase writes `target/logs/long-<name>.log`. Each run appends its structured phases to the run-scoped staging receipt `target/logs/long-audit-receipt.<NAM_RUN_ID>.partial.jsonl` (with the run-scoped `long-receipt.<NAM_RUN_ID>.partial.txt` text view). The canonical `target/logs/long-receipt.txt` and `target/logs/long-audit-receipt.jsonl` are replaced atomically only after `summary` and `validate` succeed on a complete run; a start, error, interruption or partial run never deletes or overwrites the previous canonical receipts.
 
-`--only <name>[,<name>]` accepts only canonical phase names. It sets `SCOPE=partial` and emits `MODE: partial`, preserving `target/long` and writing `target/logs/long-audit-receipt.partial.jsonl` (with `long-receipt.partial.txt` and the sibling partial fail-reasons file). Non-selected phases are recorded as `SKIPPED`. A partial receipt is audited cleanly but strictly rejected by `pipe_long_receipt certify`. Without `--only`, the receipt can be validated via `pipe_long_receipt validate [--strict]` and certified for release.
+`--only <name>[,<name>]` accepts only canonical phase names. It sets `SCOPE=partial` and emits `MODE: partial`, preserving `target/long` and keeping the run-scoped staging files (`target/logs/long-audit-receipt.<NAM_RUN_ID>.partial.jsonl`, the `long-receipt.<NAM_RUN_ID>.partial.txt` text view and the sibling partial fail-reasons file) without promoting them. Non-selected phases are recorded as `SKIPPED`. A partial receipt is audited cleanly but strictly rejected by `pipe_long_receipt certify`. Without `--only`, the receipt can be validated via `pipe_long_receipt validate [--strict]` and, only after success, certified for release.
 
 #### 3.3.1 Hosted CI and Manual Long Workflow (GitHub Actions)
 
@@ -448,7 +448,7 @@ All automation scripts in `utils/` follow a lean, predictable contract designed 
 1. **Phase Announcement**: `PHASE: <phase_name>`
 2. **Phase Completion**: `PHASE: <phase_name> PASS|FAIL|GAP ... log=<path>`
 3. **Unified Final Line**: `RESULT: PASS|PASS_WITH_GAPS|FAIL (<seconds>s) fails=<list|none> gaps=<list|none> scope=<full|partial>`
-4. **Exit Codes**: `0` for success or `PASS_WITH_GAPS` outside strict mode; `1` for failure or gaps under `--strict`; `2` for usage errors.
+4. **Exit Codes**: `0` for success or `PASS_WITH_GAPS` outside strict mode; `1` for failure or gaps under `--strict`; `2` for usage errors. A usage/precondition failure detected after `lib_init` still closes through `finish`, so it emits exactly one `RESULT: FAIL` and writes the typed carrier before exiting `2`.
 5. **Typed Status Carrier**: Each `finish` writes `target/logs/<script>-status.tsv`: one line, five TAB-separated columns:
    $$\text{<discipline>}\quad\text{<STATUS>}\quad\text{<gaps>}\quad\text{<fails>}\quad\text{<scope>}$$
 

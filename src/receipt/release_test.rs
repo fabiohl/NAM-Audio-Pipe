@@ -81,7 +81,10 @@ fn create_mock_release_env(
         "engine_provenance": {
             "dependency_type": "workspace_or_path",
             "version": "2.0.0",
-            "checksum": null
+            "checksum": null,
+            "resolved_commit": "8fb2e52176d47c92257fcf90bb9f574b9ae3706d",
+            "resolved_dirty": false,
+            "pinned_commit": "8fb2e52176d47c92257fcf90bb9f574b9ae3706d"
         },
         "optimizations": {
             "pgo_applied": pgo_applied,
@@ -269,4 +272,25 @@ fn test_certify_verdict_mismatch_rejected() {
         "fails: {:?}",
         receipt.fails
     );
+}
+
+#[test]
+fn test_certify_rejects_dirty_or_unpinned_engine() {
+    let (_dir, art, bld, lng, txt) = create_mock_release_env(
+        "pgo_bolt",
+        true,
+        true,
+        "ab-opt-ceremony:proof-abc-123",
+        "PASSED",
+        false,
+        vec![],
+    );
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&bld).expect("read")).expect("json");
+    doc["engine_provenance"]["resolved_dirty"] = json!(true);
+    fs::write(&bld, doc.to_string()).expect("write");
+
+    let receipt = evaluate_certification(&art, &bld, &lng, &txt, true);
+    assert_eq!(receipt.status, "REJECTED");
+    assert!(receipt.fails.iter().any(|f| f == "build_engine_unpinned"));
 }

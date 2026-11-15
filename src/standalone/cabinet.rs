@@ -267,6 +267,19 @@ fn prewarm_cab_model(model: &mut StaticModel) {
     }
 }
 
+/// Latency contributed by the single active cabinet source (WAV pair or neural slot).
+///
+/// The two sources are mutually exclusive, so at most one contributes. Used both by the
+/// reconnect path (initial latency snapshot) and the RT prologue (dry-delay alignment), so the
+/// two never disagree about what the installed cabinet adds to the graph.
+#[must_use]
+#[inline]
+pub fn active_cabinet_latency(wav: Option<&CabSimPair>, nam: Option<&CabNamSlot>) -> u32 {
+    wav.map(|pair| pair.l.latency_samples() as u32)
+        .or_else(|| nam.map(CabNamSlot::latency_samples))
+        .unwrap_or(0)
+}
+
 /// Active neural cabinet runtime slot owned by the RT audio callback.
 pub struct CabNamSlot {
     pub kind: CabAssetKind,
@@ -286,14 +299,31 @@ impl CabNamSlot {
         self.resampler.latency_samples()
     }
 
-    /// Resets resampler and neural model state without allocations (called before re-engaging from bypass).
-    pub fn reset(&mut self) {
+    /// Starts re-engaging from bypass: resets the resampler and arms the model prewarm
+    /// without running it. The silence feed is drained over several callbacks by
+    /// [`Self::warm_step`], so the RT callback never pays the full prewarm in one block.
+    pub fn begin_reset(&mut self) {
         self.resampler.reset();
-        prewarm_cab_model(&mut self.model_l);
+        self.model_l.prewarm_reset();
         #[cfg(feature = "dual-mono")]
         if let Some(ref mut model_r) = self.model_r {
-            prewarm_cab_model(model_r);
+            model_r.prewarm_reset();
         }
+    }
+
+    /// Advances the armed prewarm by at most `budget` silence samples per model and reports
+    /// whether every model is warm. Each call is bounded by the caller's per-callback budget.
+    pub fn warm_step(&mut self, budget: usize) -> bool {
+        self.model_l.prewarm_step(budget);
+        let left_warm = self.model_l.prewarm_complete();
+        #[cfg(feature = "dual-mono")]
+        let right_warm = self.model_r.as_mut().is_none_or(|model_r| {
+            model_r.prewarm_step(budget);
+            model_r.prewarm_complete()
+        });
+        #[cfg(not(feature = "dual-mono"))]
+        let right_warm = true;
+        left_warm && right_warm
     }
 
     /// Processes stereo planar buffers in-place at unity gain using preallocated RT scratch buffers.
@@ -437,6 +467,9 @@ pub struct PipeCabNamPayload {
     pub model_l: Option<Box<StaticModel>>,
     #[cfg(feature = "dual-mono")]
     pub model_r: Option<Box<StaticModel>>,
+    /// `Some(partition)` marks a failed build: nothing is installed and the RT drain
+    /// latches `(host_rate, partition)` so the same request is not rebuilt until it changes.
+    pub failed_partition: Option<u32>,
 }
 
 impl PipeCabNamPayload {
@@ -452,6 +485,23 @@ impl PipeCabNamPayload {
             model_l: Some(slot.model_l),
             #[cfg(feature = "dual-mono")]
             model_r: slot.model_r,
+            failed_partition: None,
+        }
+    }
+
+    /// Builds the failure notice for a neural cabinet rebuild that produced no slot.
+    #[must_use]
+    pub fn failed(generation: u64, kind: CabAssetKind, host_rate: u32, partition: u32) -> Self {
+        Self {
+            generation,
+            host_rate,
+            kind,
+            source_rate: 0,
+            resampler: None,
+            model_l: None,
+            #[cfg(feature = "dual-mono")]
+            model_r: None,
+            failed_partition: Some(partition),
         }
     }
 
@@ -536,11 +586,33 @@ impl CabDryDelay {
     }
 }
 
+/// Routes the delayed dry signal to both wet outputs (unity, no cabinet processing).
+#[inline]
+fn emit_dry(
+    wet_l: &mut [f32],
+    wet_r: &mut [f32],
+    dry_l: &[f32],
+    dry_r: &[f32],
+    n: usize,
+    process_mono: bool,
+) {
+    wet_l[..n].copy_from_slice(&dry_l[..n]);
+    if process_mono {
+        wet_r[..n].copy_from_slice(&dry_l[..n]);
+    } else {
+        wet_r[..n].copy_from_slice(&dry_r[..n]);
+    }
+}
+
 /// Lock-free 64-sample raised-cosine crossfade state for the cabinet bypass switch.
 pub struct CabBypassState {
     curve: [f32; CAB_BYPASS_CROSSFADE_SAMPLES + 1],
     step: usize,
     was_bypassed: bool,
+    /// Set whenever the cabinet was bypassed; consumed by the next re-engage reset.
+    warm_pending: bool,
+    /// True while a neural cabinet's prewarm is being drained (output stays dry).
+    warming: bool,
 }
 
 impl Default for CabBypassState {
@@ -569,6 +641,8 @@ impl CabBypassState {
                 CAB_BYPASS_CROSSFADE_SAMPLES
             },
             was_bypassed: initially_bypassed,
+            warm_pending: initially_bypassed,
+            warming: false,
         }
     }
 
@@ -615,26 +689,41 @@ impl CabBypassState {
         // Always advance the dry delay with pre-cabinet audio so bypass transitions never jump.
         dry_delay.process_block(&wet_l[..n], &wet_r[..n], dry_l, dry_r, n, process_mono);
 
+        if target_bypass {
+            self.warm_pending = true;
+        }
+
         // Steady bypass: output delayed dry directly and skip heavy DSP.
         if target_bypass && self.step == 0 {
+            self.warming = false;
             self.was_bypassed = true;
-            wet_l[..n].copy_from_slice(&dry_l[..n]);
-            if process_mono {
-                wet_r[..n].copy_from_slice(&dry_l[..n]);
-            } else {
-                wet_r[..n].copy_from_slice(&dry_r[..n]);
-            }
+            emit_dry(wet_l, wet_r, dry_l, dry_r, n, process_mono);
             return true;
         }
 
         // Reset stale convolution tails / recurrent states right before re-engaging wet.
-        if !target_bypass && self.step == 0 {
+        // A neural cabinet only arms its prewarm here; the feed is drained below.
+        if !target_bypass && self.step == 0 && self.warm_pending {
+            self.warm_pending = false;
             if let Some(pair) = wav_pair.as_deref_mut() {
                 pair.l.reset();
                 pair.r.reset();
             } else if let Some(nam) = nam_slot.as_deref_mut() {
-                nam.reset();
+                nam.begin_reset();
+                self.warming = true;
             }
+        }
+
+        // Neural warm-up: stay dry while the prewarm drains within the per-callback budget,
+        // then engage wet from step 0 so the crossfade starts from a fully warm model.
+        if self.warming {
+            let warm = nam_slot.as_deref_mut().is_none_or(|nam| nam.warm_step(n));
+            if !warm {
+                self.was_bypassed = true;
+                emit_dry(wet_l, wet_r, dry_l, dry_r, n, process_mono);
+                return true;
+            }
+            self.warming = false;
         }
         self.was_bypassed = false;
 
@@ -681,6 +770,10 @@ impl CabBypassState {
 
 /// Checks if `requested_nam_gen` exceeds `applied_gen` atomically on the RT drain.
 #[inline]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The drain needs both generation counters, the exclusive WAV/NAM slots, the latency sink, the failure latch and the GC sink"
+)]
 pub fn drain_cab_nam_payloads(
     consumer: &mut rtrb::Consumer<PipeCabNamPayload>,
     requested_generation: &AtomicU64,
@@ -688,6 +781,7 @@ pub fn drain_cab_nam_payloads(
     active_wav: &mut Option<Box<CabSimPair>>,
     active_nam: &mut Option<CabNamSlot>,
     active_cabsim_latency: &dyn Fn(u32),
+    failed_key: Option<&mut Option<(u32, usize)>>,
     gc: &mut GcSink<'_>,
 ) {
     let target_gen = requested_generation.load(Ordering::Acquire);
@@ -709,6 +803,16 @@ pub fn drain_cab_nam_payloads(
     let Some(mut chosen) = latest else {
         return;
     };
+    if let Some(partition) = chosen.failed_partition {
+        // Fail-closed: the last installed slot is kept (its host rate no longer matches,
+        // so the stage gates it off), and the request is latched until the key changes.
+        if let Some(failed) = failed_key {
+            *failed = Some((chosen.host_rate, partition as usize));
+        }
+        applied_generation.store(chosen.generation, Ordering::Release);
+        chosen.retire_remainder_to_gc(gc);
+        return;
+    }
     let (Some(model_l), Some(resampler)) = (chosen.model_l.take(), chosen.resampler.take()) else {
         chosen.retire_remainder_to_gc(gc);
         return;
@@ -735,6 +839,9 @@ pub fn drain_cab_nam_payloads(
     };
     let lat = slot.latency_samples();
     *active_nam = Some(slot);
+    if let Some(failed) = failed_key {
+        *failed = None;
+    }
     active_cabsim_latency(lat);
     applied_generation.store(chosen.generation, Ordering::Release);
 }

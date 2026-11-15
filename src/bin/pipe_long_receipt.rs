@@ -28,7 +28,7 @@ use std::str::FromStr;
 use nam_audio_pipe::receipt::LONG_ROSTER;
 use nam_audio_pipe::receipt::build::{
     BuildArtifacts, BuildOptimizations, BuildProvenance, BuildReceipt, PackageInfo,
-    extract_engine_provenance, hash_file, parse_pgo_workload_receipt,
+    extract_engine_provenance, hash_file, parse_pgo_workload_receipt, resolve_engine_identity,
     validate_ab_opt_ceremony_receipt, validate_pgo_matrix,
 };
 use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
@@ -582,7 +582,9 @@ fn cmd_build_receipt(args: &[String]) {
 
     let cargo_lock_path = Path::new(&cargo_lock);
     let cargo_lock_sha256 = hash_file(cargo_lock_path).unwrap_or_else(|_| "absent".to_string());
-    let engine_provenance = extract_engine_provenance(cargo_lock_path);
+    let project_root = cargo_lock_path.parent().unwrap_or(Path::new("."));
+    let engine_provenance = extract_engine_provenance(cargo_lock_path)
+        .with_identity(resolve_engine_identity(project_root));
 
     let tarball_sha256 = tarball_path
         .as_ref()
@@ -643,6 +645,9 @@ fn cmd_build_receipt(args: &[String]) {
     }
     if codegen_status != "pass" {
         gaps.push(format!("codegen_gate_{codegen_status}"));
+    }
+    if !engine_provenance.is_pinned() {
+        gaps.push("engine_unpinned".to_string());
     }
     gaps.sort();
     gaps.dedup();

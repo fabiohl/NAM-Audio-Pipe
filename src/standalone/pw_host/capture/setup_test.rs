@@ -414,3 +414,48 @@ fn partition_request_first_install_uses_policy_not_quantum() {
     // Host quantum does not enter any branch.
     assert_eq!(cabsim_partition_to_request(None, 64), 64);
 }
+
+#[test]
+fn neural_rebuild_suppressed_for_mismatched_slot_when_failed_key_matches() {
+    let sys = neural_amp_modeler_rs::SystemSnapshot::capture();
+    let json = r#"{
+        "version":"0.6.0","architecture":"Linear","sample_rate":48000,
+        "config":{"receptive_field":1,"bias":false},
+        "weights":[0.5]
+    }"#;
+    let slot = crate::standalone::cabinet::build_cab_nam_slot(
+        json.as_bytes(),
+        crate::standalone::cabinet::CabAssetKind::NamModel,
+        "cab.nam",
+        48000,
+        &sys,
+    )
+    .expect("linear cabinet builds");
+    assert!(nam_cab_rebuild_needed(
+        Some(&slot),
+        true,
+        64,
+        44100,
+        64,
+        None,
+        false
+    ));
+    assert!(!nam_cab_rebuild_needed(
+        Some(&slot),
+        true,
+        64,
+        44100,
+        64,
+        Some((44100, 64)),
+        false
+    ));
+    assert!(nam_cab_rebuild_needed(
+        Some(&slot),
+        true,
+        64,
+        44100,
+        128,
+        Some((44100, 64)),
+        false
+    ));
+}

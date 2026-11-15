@@ -468,20 +468,20 @@ pub fn run_pipewire_host_with_cabinet(
 
             // Compute actual initial DSP latency from the currently installed state in `state_ptr`:
             // - At initial startup: cabsim is None (latency = 0), resampler is initialized (usually 0 if host matches nam).
-            // - After reconnect: models, IR, resampler, and cabsim in `state_ptr` survived!
-            //   We reflect the exact latency of the installed resampler and cabsim (or 0 if bypassed/uninstalled),
-            //   avoiding both underestimating the resampler and overestimating an uninstalled cab-sim.
+            // - After reconnect: models, IR, resampler, and cabinet (WAV or neural) in `state_ptr` survived!
+            //   We reflect the exact latency of the installed resampler and active cabinet source (or 0 if
+            //   bypassed/uninstalled), avoiding both underestimating the resampler or a neural cabinet and
+            //   overestimating an uninstalled cab-sim.
             // SAFETY: The PipeWire main loop is stopped at this point (either pre-run
             // or between reconnect attempts after the previous loop exited). No RT thread or
             // audio callback is accessing `state_ptr` concurrently.
             let (initial_resamp_lat, initial_cab_lat, initial_os_native, initial_nam_rate) = unsafe {
                 let state = &*state_ptr;
                 let resamp = state.stream.latency_samples();
-                let cab = state
-                    .active_cabsim
-                    .as_ref()
-                    .map(|pair| pair.l.latency_samples() as u32)
-                    .unwrap_or(0);
+                let cab = crate::standalone::cabinet::active_cabinet_latency(
+                    state.active_cabsim.as_deref(),
+                    state.active_cab_nam.as_ref(),
+                );
                 let os = state.os_l.latency_samples() as u32;
                 (resamp, cab, os, state.current_nam_rate)
             };
@@ -1049,6 +1049,11 @@ pub fn run_pipewire_host_with_cabinet(
     // it into a non-zero process exit, so a dead backend is never mistaken for
     // a successful run.
     if let Some((stream, reason)) = &backend_failure {
+        let diag_sr = rt_state.shared_target_rate.load(Ordering::Relaxed);
+        let diag_bs = {
+            let observed = rt_status.last_n_samples.load(Ordering::Relaxed);
+            if observed != 0 { observed } else { buffer_size }
+        };
         NamDiagnostic::new(NamErrorCode::BackendFailure, &sys)
             .message(format!(
                 "PipeWire backend failed: the '{stream}' stream lost connectivity \
@@ -1059,6 +1064,10 @@ pub fn run_pipewire_host_with_cabinet(
                  and NAM-Audio-Pipe. The process exited with a non-zero code \
                  instead of remaining alive without audio.",
             )
+            .param("host_name", "PipeWire")
+            .param("sample_rate", diag_sr)
+            .param("buffer_size", diag_bs)
+            .param("channel_count", 2)
             .param("stream", *stream)
             .param("reason", reason)
             .param("reconnect_attempts", reconnect.attempts_made())

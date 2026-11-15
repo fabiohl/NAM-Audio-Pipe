@@ -60,6 +60,12 @@ pub struct EngineProvenance {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksum: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_dirty: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_commit: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -419,6 +425,9 @@ pub fn extract_engine_provenance(cargo_lock_path: &Path) -> EngineProvenance {
             dependency_type: "missing_lockfile".to_string(),
             version: "unknown".to_string(),
             checksum: None,
+            resolved_commit: None,
+            resolved_dirty: None,
+            pinned_commit: None,
         };
     };
     let mut in_pkg = false;
@@ -455,6 +464,119 @@ pub fn extract_engine_provenance(cargo_lock_path: &Path) -> EngineProvenance {
         dependency_type: dep_type,
         version,
         checksum,
+        resolved_commit: None,
+        resolved_dirty: None,
+        pinned_commit: None,
+    }
+}
+
+/// Identity of the engine source actually consumed by a path dependency.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EngineSourceIdentity {
+    pub resolved_commit: Option<String>,
+    pub resolved_dirty: Option<bool>,
+    pub pinned_commit: Option<String>,
+}
+
+/// Path declared for `NeuralAmpModeler-rs` under `[patch.crates-io]`, if any.
+pub fn engine_patch_path(cargo_toml: &str) -> Option<String> {
+    let mut in_patch = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_patch = trimmed == "[patch.crates-io]";
+            continue;
+        }
+        if in_patch && trimmed.starts_with("NeuralAmpModeler-rs") {
+            let rest = trimmed.split_once("path")?.1;
+            let start = rest.find('"')? + 1;
+            let end = start + rest[start..].find('"')?;
+            return Some(rest[start..end].to_string());
+        }
+    }
+    None
+}
+
+/// `ENGINE_COMMIT` declared in a `variables.env` file.
+pub fn pinned_engine_commit(variables_env: &str) -> Option<String> {
+    variables_env.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("ENGINE_COMMIT=")?;
+        Some(value.trim().trim_matches('"').to_string())
+    })
+}
+
+fn git_in_repo_root(dir: &Path, args: &[&str]) -> Option<String> {
+    let canonical = fs::canonicalize(dir).ok()?;
+    let top = git_stdout(&canonical, &["rev-parse", "--show-toplevel"])?;
+    if fs::canonicalize(top).ok()? != canonical {
+        return None;
+    }
+    git_stdout(&canonical, args)
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Resolve the engine source actually used by the project's `[patch.crates-io]`
+/// path, comparing its HEAD and worktree state with `variables.env` `ENGINE_COMMIT`.
+/// Only the path declared by the project is followed; no sibling layout is assumed.
+pub fn resolve_engine_identity(project_root: &Path) -> EngineSourceIdentity {
+    let pinned_commit = fs::read_to_string(project_root.join("variables.env"))
+        .ok()
+        .and_then(|s| pinned_engine_commit(&s));
+    let Some(patch) = fs::read_to_string(project_root.join("Cargo.toml"))
+        .ok()
+        .and_then(|s| engine_patch_path(&s))
+    else {
+        return EngineSourceIdentity {
+            pinned_commit,
+            ..EngineSourceIdentity::default()
+        };
+    };
+    let engine_dir = project_root.join(patch);
+    let resolved_commit = git_in_repo_root(&engine_dir, &["rev-parse", "HEAD"]);
+    let resolved_dirty =
+        git_in_repo_root(&engine_dir, &["status", "--porcelain"]).map(|status| !status.is_empty());
+    EngineSourceIdentity {
+        resolved_commit,
+        resolved_dirty,
+        pinned_commit,
+    }
+}
+
+impl EngineProvenance {
+    pub fn with_identity(mut self, identity: EngineSourceIdentity) -> Self {
+        if self.dependency_type != "crates.io" {
+            self.resolved_commit = identity.resolved_commit;
+            self.resolved_dirty = identity.resolved_dirty;
+            self.pinned_commit = identity.pinned_commit;
+        }
+        self
+    }
+
+    /// Crates.io sources are pinned by the lockfile checksum. Path or git sources
+    /// are pinned only when the resolved HEAD equals `ENGINE_COMMIT` and the tree is clean.
+    pub fn is_pinned(&self) -> bool {
+        if self.dependency_type == "crates.io" {
+            return true;
+        }
+        match (
+            &self.resolved_commit,
+            &self.pinned_commit,
+            self.resolved_dirty,
+        ) {
+            (Some(resolved), Some(pinned), Some(false)) => resolved == pinned,
+            _ => false,
+        }
     }
 }
 

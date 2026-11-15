@@ -36,6 +36,8 @@ pub use commands::{
 #[cfg(not(feature = "testing"))]
 pub(crate) use process::handle_spa_pair_fail_closed;
 pub use process::{PipeCabRuntime, PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
+#[cfg(test)]
+pub(crate) use process::run_capture_dsp_pipeline;
 #[cfg(feature = "testing")]
 pub use process::{
     handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,

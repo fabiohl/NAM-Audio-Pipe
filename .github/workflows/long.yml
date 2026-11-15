@@ -196,9 +196,10 @@ jobs:
         # Recommended hosted-safe configuration, fixed by design. rt-deadline
         # and rt-jitter are reserved for the operator's isolated host; the
         # build above is non-strict. No dispatch inputs are required.
-        run: >-
-          ./utils/tests-long.sh --artifact --only
-          'catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity'
+        run: |
+          sudo prlimit --memlock=unlimited:unlimited --pid "$$" || true
+          ./utils/tests-long.sh --artifact --only \
+            'catch-all,soak,heap-audit,concurrency,endurance,pw-resilience,pw-live,recording,offline-parity'
       - name: Write evidence manifest
         if: always()
         run: |
@@ -206,7 +207,7 @@ jobs:
           build=false; if [ -f target/dist/build-receipt.json ]; then build=true; fi
           long_scope=none
           if [ -f target/logs/long-audit-receipt.jsonl ]; then long_scope=full
-          elif [ -f target/logs/long-audit-receipt.partial.jsonl ]; then long_scope=partial
+          elif compgen -G "target/logs/long-audit-receipt.*.partial.jsonl" > /dev/null || [ -f target/logs/long-audit-receipt.partial.jsonl ]; then long_scope=partial
           fi
           certify=false
           if [ -f target/dist/release-receipt.json ]; then certify=true; fi
