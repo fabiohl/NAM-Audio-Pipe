@@ -80,9 +80,11 @@ fn main() -> anyhow::Result<()> {
     if args.diagnose || args.diagnose_full {
         pipewire::init();
         pw_host::init_pipewire_logging(level_filter);
-        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
-            pw_host::identity::pw_library_version(),
-        );
+        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
+            "nam-audio-pipe {} / {}",
+            env!("CARGO_PKG_VERSION"),
+            pw_host::identity::pw_library_version()
+        ));
         let bundle =
             neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
         // `write_stdout` tolerates a closed pipe (e.g. `--diagnose | head`) instead
@@ -109,9 +111,11 @@ fn main() -> anyhow::Result<()> {
     // and calibrate internal "clocks" to ensure sound output without delays (latency).
     pipewire::init();
     pw_host::init_pipewire_logging(level_filter);
-    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(
-        pw_host::identity::pw_library_version(),
-    );
+    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
+        "nam-audio-pipe {} / {}",
+        env!("CARGO_PKG_VERSION"),
+        pw_host::identity::pw_library_version()
+    ));
 
     rt_setup::calibrate_tsc();
 

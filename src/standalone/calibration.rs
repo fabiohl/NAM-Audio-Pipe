@@ -1,55 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Input calibration and output mode contracts for NAM-Audio-Pipe.
+//! CLI calibration configuration layered on the shared engine math.
 //!
-//! Aligns CLI model level handling with upstream `NeuralAmpModelerPlugin`:
+//! The dBu bounds, [`OutputMode`] semantics, [`ModelCalibrationMeta`] snapshot
+//! and [`compute_calibration_gains`] equations live in
+//! `neural_amp_modeler_rs::dsp::calibration`. This module only adds the
+//! standalone CLI adapter ([`CalibrationConfig`]), the `--calibrate-input` /
+//! `--input-calibration-level` / `--output-mode` parsers and the startup
+//! validation policy (`resolve_model_calibration`), while keeping the
+//! historical [`compute_calibration_multipliers`] tuple API used across setup.
+//!
+//! Semantics preserved from the previous local copy:
 //! - New invocations default to `calibrate_input = false`,
 //!   `input_calibration_level_dbu = 12.0 dBu`, and `output_mode = Normalized`.
-//! - Multipliers are computed directly via `f64::powf` (no `GainLUT` ±30 dB
-//!   truncation) across `[-60.0, +60.0]` dBu.
+//! - Multipliers are computed in `f64` (no `GainLUT` ±30 dB truncation) across
+//!   `[-60.0, +60.0]` dBu.
 //! - Startup validation rejects explicit calibration/mode requests when the
 //!   model lacks the required metadata and never fabricates missing dBu values.
 
-use std::fmt;
+pub use neural_amp_modeler_rs::dsp::calibration::{
+    CalibrationGains, DEFAULT_CALIBRATION_DBU, MAX_CALIBRATION_DBU, MIN_CALIBRATION_DBU,
+    ModelCalibrationMeta, OutputMode, TARGET_LOUDNESS_DB, compute_calibration_gains,
+    sanitize_calibration_level_dbu,
+};
 
-/// Minimum supported ADC input calibration level in dBu.
-pub const INPUT_CALIBRATION_LEVEL_MIN_DBU: f32 = -60.0;
-/// Maximum supported ADC input calibration level in dBu.
-pub const INPUT_CALIBRATION_LEVEL_MAX_DBU: f32 = 60.0;
 /// Upstream default ADC input calibration level in dBu (0 dBFS reference).
-pub const INPUT_CALIBRATION_LEVEL_DEFAULT_DBU: f32 = 12.0;
-/// Upstream LUFS normalization target in dB.
-pub const TARGET_LOUDNESS_DB: f32 = -18.0;
-
-/// Output gain mode matching upstream `NeuralAmpModelerPlugin`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputMode {
-    /// Unity output multiplier (0 dB model output scaling).
-    Raw,
-    /// Normalize output to `TARGET_LOUDNESS_DB` (`-18 dB`) using model `loudness`.
-    #[default]
-    Normalized,
-    /// Compensate output against `input_calibration_level_dbu` using model `output_level_dbu`.
-    Calibrated,
-}
-
-impl OutputMode {
-    /// Stable CLI/log identifier.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Raw => "raw",
-            Self::Normalized => "normalized",
-            Self::Calibrated => "calibrated",
-        }
-    }
-}
-
-impl fmt::Display for OutputMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+pub use neural_amp_modeler_rs::dsp::calibration::DEFAULT_CALIBRATION_DBU as INPUT_CALIBRATION_LEVEL_DEFAULT_DBU;
+/// Maximum supported ADC input calibration level in dBu.
+pub use neural_amp_modeler_rs::dsp::calibration::MAX_CALIBRATION_DBU as INPUT_CALIBRATION_LEVEL_MAX_DBU;
+/// Minimum supported ADC input calibration level in dBu.
+pub use neural_amp_modeler_rs::dsp::calibration::MIN_CALIBRATION_DBU as INPUT_CALIBRATION_LEVEL_MIN_DBU;
 
 /// User-selected calibration configuration passed to startup model setup.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -77,19 +58,6 @@ impl Default for CalibrationConfig {
     fn default() -> Self {
         Self::new_project_default()
     }
-}
-
-/// Optional calibration metadata extracted from a loaded `.nam` / `.namb` model.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ModelCalibrationMeta {
-    /// Whether a neural model is active (`false` during true bypass).
-    pub has_model: bool,
-    /// Integrated model loudness in LUFS.
-    pub loudness: Option<f32>,
-    /// Capture interface 0 dBFS input level in dBu.
-    pub input_level_dbu: Option<f32>,
-    /// Capture interface 0 dBFS output level in dBu.
-    pub output_level_dbu: Option<f32>,
 }
 
 /// Resolved linear multipliers and optional startup warning for model loading.
@@ -146,58 +114,32 @@ pub fn parse_output_mode(val: &str) -> Result<OutputMode, String> {
     }
 }
 
+/// Drops non-finite metadata before feeding the shared calibration equations.
 #[inline]
-fn db_to_linear_f64(db: f64) -> f32 {
-    10.0_f64.powf(db / 20.0) as f32
-}
-
-#[inline]
-fn sanitize_level_dbu(level: f32) -> f32 {
-    if level.is_finite() {
-        level.clamp(
-            INPUT_CALIBRATION_LEVEL_MIN_DBU,
-            INPUT_CALIBRATION_LEVEL_MAX_DBU,
-        )
-    } else {
-        INPUT_CALIBRATION_LEVEL_DEFAULT_DBU
+fn sanitize_meta(meta: ModelCalibrationMeta) -> ModelCalibrationMeta {
+    ModelCalibrationMeta {
+        has_model: meta.has_model,
+        input_level_dbu: meta.input_level_dbu.filter(|v| v.is_finite()),
+        output_level_dbu: meta.output_level_dbu.filter(|v| v.is_finite()),
+        loudness: meta.loudness.filter(|v| v.is_finite()),
     }
 }
 
 /// Computes `(input_mult, output_mult)` directly without failing on missing metadata.
 ///
 /// Missing metadata never synthesizes fake dBu values and yields unity (`1.0`).
+/// Thin tuple adapter over [`compute_calibration_gains`].
 pub fn compute_calibration_multipliers(
     meta: ModelCalibrationMeta,
     config: CalibrationConfig,
 ) -> (f32, f32) {
-    if !meta.has_model {
-        return (1.0, 1.0);
-    }
-
-    let cal_dbu = f64::from(sanitize_level_dbu(config.input_calibration_level_dbu));
-
-    let in_mult = if config.calibrate_input {
-        match meta.input_level_dbu.filter(|v| v.is_finite()) {
-            Some(in_dbu) => db_to_linear_f64(cal_dbu - f64::from(in_dbu)),
-            None => 1.0,
-        }
-    } else {
-        1.0
-    };
-
-    let out_mult = match config.output_mode {
-        OutputMode::Raw => 1.0,
-        OutputMode::Normalized => match meta.loudness.filter(|v| v.is_finite()) {
-            Some(loudness) => db_to_linear_f64(f64::from(TARGET_LOUDNESS_DB) - f64::from(loudness)),
-            None => 1.0,
-        },
-        OutputMode::Calibrated => match meta.output_level_dbu.filter(|v| v.is_finite()) {
-            Some(out_dbu) => db_to_linear_f64(f64::from(out_dbu) - cal_dbu),
-            None => 1.0,
-        },
-    };
-
-    (in_mult, out_mult)
+    let gains = compute_calibration_gains(
+        sanitize_meta(meta),
+        config.calibrate_input,
+        config.input_calibration_level_dbu,
+        config.output_mode,
+    );
+    (gains.input_mult, gains.output_mult)
 }
 
 /// Validates model metadata against `config` and resolves startup multipliers.
@@ -295,7 +237,10 @@ mod tests {
         let exp_in = 10.0_f64.powf((-60.0 - 18.3) / 20.0) as f32;
         let exp_out = 10.0_f64.powf((12.3 - (-60.0)) / 20.0) as f32;
         assert!((in_m - exp_in).abs() <= 1e-9);
-        assert!((out_m - exp_out).abs() <= 1e-3);
+        // The shared engine computes `output_level_dbu - cal_dbu` in f32 and then
+        // converts to f64; on a ~4121x calibrated gain that is ~0.35 ppm, well
+        // below any audible threshold but above a 1e-3 absolute tolerance.
+        assert!((out_m - exp_out).abs() <= 2e-3);
 
         let raw = compute_calibration_multipliers(meta, CalibrationConfig::new_project_default());
         assert_eq!(raw.0, 1.0);

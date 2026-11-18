@@ -290,18 +290,18 @@ fn build_resampler_pair(
     _generation: u64,
     _rt_status: &RtStatusFlags,
 ) -> (
-    Result<NamResampler, anyhow::Error>,
+    Result<NamResampler, NamErrorCode>,
     Result<StreamingResampleBuffer, NamErrorCode>,
 ) {
     #[cfg(feature = "testing")]
     if resampler_fault::inject(_rt_status, _generation) {
         return (
-            Err(anyhow::anyhow!("injected resampler build fault")),
+            Err(NamErrorCode::OutOfMemory),
             Err(NamErrorCode::OutOfMemory),
         );
     }
     (
-        NamResampler::new_simple(host_rate, nam_rate),
+        NamResampler::new_simple_typed(host_rate, nam_rate),
         StreamingResampleBuffer::new(host_rate, nam_rate, MAX_RESAMP_BUF),
     )
 }
@@ -377,9 +377,9 @@ pub(super) fn handle_resampler_rebuild(
             }
             (Err(e), _) => {
                 log::error!(
-                    "[E2200 | RESAMPLER_BUILD_FAILED] Failed to rebuild resampler for PW={} Hz \
-                     and NAM={} Hz ({e}) — audio will continue with the previous resampler; if \
-                     the sample rate is incorrect, restart NAM-Audio-Pipe.",
+                    "Failed to rebuild resampler for PW={} Hz and NAM={} Hz ({e}) — audio will \
+                     continue with the previous resampler; if the sample rate is incorrect, \
+                     restart NAM-Audio-Pipe.",
                     target_host_rate,
                     target_nam_rate
                 );
@@ -396,9 +396,9 @@ pub(super) fn handle_resampler_rebuild(
             }
             (_, Err(e)) => {
                 log::error!(
-                    "[E2200 | RESAMPLER_BUILD_FAILED] Failed to create streaming resample buffer \
-                     for PW={} Hz and NAM={} Hz ({e:?}) — audio will continue with the previous \
-                     resampler; if the sample rate is incorrect, restart NAM-Audio-Pipe.",
+                    "Failed to create streaming resample buffer for PW={} Hz and NAM={} Hz \
+                     ({e:?}) — audio will continue with the previous resampler; if the sample \
+                     rate is incorrect, restart NAM-Audio-Pipe.",
                     target_host_rate,
                     target_nam_rate
                 );

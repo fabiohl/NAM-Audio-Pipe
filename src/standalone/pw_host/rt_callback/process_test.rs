@@ -2119,3 +2119,156 @@ fn prologue_outcome_accessors() {
     assert_eq!(s.structural_applied(), 1);
     assert_eq!(s.param_pops(), 0);
 }
+
+// ── Neural cabinet tail drain (F-PIPE-01) ────────────────────────────────────
+
+/// When the Silence Gate closes while a neural cabinet slot is active, the
+/// cabinet must ring out for `remaining_tail` host-rate samples (zero input)
+/// instead of being cut to silence on the first closed block, mirroring the
+/// WAV IR path and the NAM-Plug behavior.
+#[test]
+fn test_silence_gate_closed_drains_neural_cabinet_tail() {
+    use crate::standalone::cabinet::{CabAssetKind, build_cab_nam_slot};
+    use crate::standalone::cli::{GateConfig, GateMode};
+    use neural_amp_modeler_rs::SystemSnapshot;
+    use neural_amp_modeler_rs::common::spsc::{RT_STATUS_IS_SILENT, RtStatusFlags};
+    use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+    use neural_amp_modeler_rs::dsp::pipeline::{DspPipelineContext, StreamingDspBuffers};
+
+    let sys = SystemSnapshot::capture();
+    let json = r#"{
+        "version":"0.6.0",
+        "architecture":"Linear",
+        "sample_rate":48000,
+        "config":{"receptive_field":1,"bias":false},
+        "weights":[1.0]
+    }"#;
+    let mut slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        48_000,
+        &sys,
+    )
+    .expect("linear 1x1 cabinet builds");
+
+    let mut state = CaptureState::init(
+        &sys,
+        OversampleFactor::Off,
+        GateConfig::Threshold {
+            threshold_open_db: -40.0,
+            threshold_close_db: -50.0,
+        },
+    );
+    let rt_status = RtStatusFlags::new();
+    let n = 64;
+    let mut samples_l = vec![0.0f32; n];
+    let mut samples_r = vec![0.0f32; n];
+
+    let run_block = |samples_l: &mut [f32],
+                     samples_r: &mut [f32],
+                     slot: &mut crate::standalone::cabinet::CabNamSlot,
+                     state: &mut CaptureState| {
+        let ctx = DspPipelineContext {
+            resampler: &mut state.resampler,
+            os_l: &mut state.os_l,
+            os_r: &mut state.os_r,
+            active_model_l: &mut state.active_model_l,
+            active_model_r: &mut state.active_model_r,
+            input_gain_mult: state.input_gain_mult,
+            output_gain_mult: state.output_gain_mult,
+            gate_params: &state.gate_params,
+            silence_hysteresis: &mut state.silence_hysteresis,
+            mono_hysteresis: &mut state.mono_hysteresis,
+            threshold_open_sq: state.threshold_open_sq,
+            threshold_close_sq: state.threshold_close_sq,
+            process_mono: &mut state.process_mono,
+            rt_status: &rt_status,
+            adaptive: &mut state.adaptive_compute,
+            bridge_writer: None,
+            conv: None,
+            conv_pair: None,
+        };
+        let bufs = StreamingDspBuffers {
+            resamp_out_l: &mut *state.resamp_out_l,
+            resamp_out_r: &mut *state.resamp_out_r,
+            os_in_l: &mut state.os_in_l,
+            os_in_r: &mut state.os_in_r,
+            os_model_l: &mut state.os_model_l,
+            os_model_r: &mut state.os_model_r,
+            crossfade_scratch_l: &mut *state.xfd_scratch_l,
+            crossfade_scratch_r: &mut *state.xfd_scratch_r,
+        };
+        let cab = PipeCabRuntime {
+            nam_slot: Some(slot),
+            target_bypass: false,
+            dry_delay: &mut state.cab_dry_delay,
+            bypass_state: &mut state.cab_bypass_state,
+        };
+        run_capture_dsp_pipeline(
+            samples_l,
+            samples_r,
+            n,
+            ctx,
+            &mut state.stream,
+            bufs,
+            48_000,
+            state.user_input_gain_mult,
+            GateMode::Silence,
+            &mut state.musical_gate,
+            cab,
+            crate::standalone::rt_setup::rdtsc_nanos(),
+        )
+    };
+
+    // Loud input opens the gate and arms the neural cabinet tail budget.
+    for _ in 0..40 {
+        samples_l.fill(0.5);
+        samples_r.fill(0.5);
+        let out = run_block(&mut samples_l, &mut samples_r, &mut slot, &mut state);
+        assert!(out > 0, "audible input must produce output");
+    }
+    assert!(
+        slot.remaining_tail_samples() > 0,
+        "active cabinet processing must arm the tail budget"
+    );
+    let budget = slot.tail_budget;
+    assert!(budget >= 128, "tail budget must have the 128-sample floor");
+
+    // Digital silence closes the gate: the tail must drain before full silence.
+    let mut closed_seen = false;
+    let mut closed_blocks = 0usize;
+    let mut tail_blocks = 0usize;
+    for _ in 0..4000 {
+        samples_l.fill(0.0);
+        samples_r.fill(0.0);
+        let out = run_block(&mut samples_l, &mut samples_r, &mut slot, &mut state);
+        if rt_status.check_flag(RT_STATUS_IS_SILENT) {
+            closed_seen = true;
+            closed_blocks += 1;
+            if out > 0 {
+                tail_blocks += 1;
+                assert!(
+                    slot.remaining_tail_samples() < slot.tail_budget,
+                    "closed-gate output must consume the tail budget"
+                );
+            } else if slot.remaining_tail_samples() == 0 {
+                break;
+            }
+        }
+    }
+    assert!(closed_seen, "the silence gate never closed");
+    assert!(
+        tail_blocks >= budget.div_ceil(n),
+        "expected >= {} drained blocks, got {tail_blocks}",
+        budget.div_ceil(n)
+    );
+    assert_eq!(slot.remaining_tail_samples(), 0);
+    assert!(closed_blocks > tail_blocks);
+
+    // Once the tail is exhausted the callback emits literal silence.
+    samples_l.fill(0.0);
+    samples_r.fill(0.0);
+    let out = run_block(&mut samples_l, &mut samples_r, &mut slot, &mut state);
+    assert_eq!(out, 0, "an exhausted cabinet tail must emit silence");
+}

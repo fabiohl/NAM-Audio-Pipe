@@ -307,7 +307,7 @@ pub fn poll_rt_status(
         .observe(slimmable_slice_failed)
     {
         log::error!(
-            "[E3103 | SLIMMABLE_SLICE_FAILED] WaveNet slimmable slice_channels rebuild failed — \
+            "[E3104 | SLIMMABLE_SLICE_FAILED] WaveNet slimmable slice_channels rebuild failed — \
              model may run in reduced state. Check that the active channel count is within the \
              model's supported slimmable range."
         );
@@ -322,7 +322,7 @@ pub fn poll_rt_status(
         .observe(slimmable_reset_failed)
     {
         log::error!(
-            "[E3104 | SLIMMABLE_RESET_FAILED] ContainerModel submodel reset failed — \
+            "[E3105 | SLIMMABLE_RESET_FAILED] ContainerModel submodel reset failed — \
              model may run in previous state. This is a transient RT signal; if persistent, \
              check model graph integrity."
         );
@@ -414,7 +414,7 @@ pub fn poll_rt_status(
     if aff_err == -1 {
         log::error!(
             "CPU {} is out of bounds (CPU_SETSIZE={}). NAM-Audio-Pipe will continue running without CPU affinity.\n\
-             [E2301 | CPU_OUT_OF_BOUNDS] cpu={} max={}",
+             [E2306 | CPU_OUT_OF_BOUNDS] cpu={} max={}",
             target_cpu,
             libc::CPU_SETSIZE,
             target_cpu,
@@ -423,7 +423,7 @@ pub fn poll_rt_status(
     } else if aff_err > 0 {
         log::error!(
             "\n  ⚡ Failed to set CPU affinity to core {} (errno={}).\n  💡 NAM-Audio-Pipe will continue running, but may suffer jitter due to Core Migration.\n\
-             [E2306 | CPU_AFFINITY_FAILED] cpu={} errno={}\n",
+             [E2301 | CPU_AFFINITY_FAILED] cpu={} errno={}\n",
             target_cpu,
             aff_err,
             target_cpu,
@@ -434,7 +434,7 @@ pub fn poll_rt_status(
     if sched_err > 0 {
         log::error!(
             "⚠️ pthread_setschedparam failed (errno={}, TID={tid}).\n\
-             [E2302 | RT_SCHED_FAILED] Check ulimit -r and rtkit permissions.\n",
+             [E2308 | RT_SCHED_FAILED] Check ulimit -r and rtkit permissions.\n",
             sched_err
         );
     }

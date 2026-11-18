@@ -172,14 +172,14 @@ impl CaptureState {
             clippy::expect_used,
             reason = "48 kHz identity resampler bypass construction is infallible in practice"
         )]
-        let resampler = NamResampler::new_simple(48_000, 48_000).unwrap_or_else(|e| {
+        let resampler = NamResampler::new_simple_typed(48_000, 48_000).unwrap_or_else(|e| {
             NamDiagnostic::new(NamErrorCode::ResamplerBuildFailed, sys)
                 .message("Failed to create initial NamResampler (using 48k bypass).")
                 .hint("The engine remains in bypass mode. The resampler will be recreated upon receiving the actual rate from PipeWire.")
                 .param("initial_rate", 48_000_u32)
-                .param("detail", &e)
+                .param("detail", e)
                 .emit_warning();
-            NamResampler::new_simple(48_000, 48_000).expect("bypass cannot fail")
+            NamResampler::new_simple_typed(48_000, 48_000).expect("bypass cannot fail")
         });
 
         #[expect(

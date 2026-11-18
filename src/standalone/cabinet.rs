@@ -10,6 +10,7 @@ use neural_amp_modeler_rs::common::spsc::{
     RT_STATUS_STRUCTURAL_SUPERSEDED, RtStatusFlags, SwapBudget,
 };
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
+use neural_amp_modeler_rs::dsp::cabsim::{compute_nam_tail_budget, validate_single_channel_model};
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::dsp::utils::DelayLine;
@@ -17,7 +18,6 @@ use neural_amp_modeler_rs::loader::nam_json::{NamModelData, parse_nam_json};
 use neural_amp_modeler_rs::loader::namb::parse_namb_typed;
 use neural_amp_modeler_rs::loader::{LoadOptions, load_and_build_model_from_bytes_named};
 use neural_amp_modeler_rs::models::{NamModel, StaticModel};
-use serde_json::Value;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -131,70 +131,6 @@ pub fn disambiguate_cab_path(path: &Path) -> String {
     }
 }
 
-fn has_non_null_head_field(value: &Value) -> bool {
-    value.as_object().is_some_and(|obj| {
-        obj.get("head")
-            .is_some_and(|head| !head.is_null() && head.is_object())
-    })
-}
-
-fn value_tree_has_head(value: &Value, depth: usize) -> bool {
-    if depth > 16 {
-        return true;
-    }
-    let Some(obj) = value.as_object() else {
-        return false;
-    };
-    let is_wavenet = obj
-        .get("architecture")
-        .and_then(Value::as_str)
-        .is_some_and(|a| a.eq_ignore_ascii_case("WaveNet"));
-    let cfg = obj.get("config").unwrap_or(value);
-    if is_wavenet && has_non_null_head_field(cfg) {
-        return true;
-    }
-    if let Some(cond) = cfg.get("condition_dsp")
-        && value_tree_has_head(cond, depth + 1)
-    {
-        return true;
-    }
-    if let Some(models) = cfg.get("models").and_then(Value::as_array) {
-        for child in models {
-            if value_tree_has_head(child, depth + 1) {
-                return true;
-            }
-        }
-    }
-    if let Some(variants) = cfg.get("models").and_then(Value::as_object) {
-        for child in variants.values() {
-            if value_tree_has_head(child, depth + 1) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Rejects `WaveNet` post-stack `head` in the cabinet slot (fail-closed until post-stack WaveNet heads are supported).
-fn has_wavenet_post_stack_head(data: &NamModelData) -> bool {
-    if data.architecture.eq_ignore_ascii_case("WaveNet") && data.config.head.is_some() {
-        return true;
-    }
-    if let Some(cond) = &data.config.condition_dsp
-        && value_tree_has_head(cond, 1)
-    {
-        return true;
-    }
-    if let Some(models) = &data.config.models {
-        for child in models {
-            if value_tree_has_head(child, 1) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 fn config_tree_is_single_channel(data: &NamModelData) -> bool {
     if data.config.in_channels.unwrap_or(1) != 1 || data.config.out_channels.unwrap_or(1) != 1 {
         return false;
@@ -211,8 +147,12 @@ fn config_tree_is_single_channel(data: &NamModelData) -> bool {
     true
 }
 
-/// Validates that a parsed neural model is a single-channel (1-in/1-out) cabinet candidate
-/// without an unsupported WaveNet post-stack `head`.
+/// Validates that a parsed neural model is a single-channel (1-in/1-out) cabinet candidate.
+///
+/// Post-stack WaveNet `config.head` (including the canonical multi-stage and
+/// legacy forms) is accepted here: the engine 3.0.0 loader builds and validates
+/// the `PostStackHead` fail-closed, so the cabinet slot only enforces the
+/// channel contract.
 pub fn validate_cab_nam_data(data: &NamModelData) -> anyhow::Result<()> {
     if !config_tree_is_single_channel(data) {
         bail!(
@@ -221,14 +161,11 @@ pub fn validate_cab_nam_data(data: &NamModelData) -> anyhow::Result<()> {
             data.config.out_channels.unwrap_or(1)
         );
     }
-    if has_wavenet_post_stack_head(data) {
-        bail!("WaveNet post-stack 'head' in cabinet slot is not yet supported.");
-    }
     Ok(())
 }
 
-/// Parses `.nam` or `.namb` cabinet bytes, enforcing 1x1 channels and post-stack `head` guards
-/// while ignoring amp `gear_*` metadata restrictions and calibration fields.
+/// Parses `.nam` or `.namb` cabinet bytes, enforcing the 1x1 channel contract while
+/// ignoring amp `gear_*` metadata restrictions and calibration fields.
 pub fn parse_and_validate_cab_nam(
     bytes: &[u8],
     kind: CabAssetKind,
@@ -292,6 +229,10 @@ pub struct CabNamSlot {
     pub model_l: Box<StaticModel>,
     #[cfg(feature = "dual-mono")]
     pub model_r: Option<Box<StaticModel>>,
+    /// Maximum tail drain budget in host-rate samples after input gate closure.
+    pub tail_budget: usize,
+    /// Remaining tail samples eligible for draining when the gate is closed.
+    pub remaining_tail: usize,
 }
 
 impl CabNamSlot {
@@ -300,6 +241,19 @@ impl CabNamSlot {
     #[inline]
     pub fn latency_samples(&self) -> u32 {
         self.resampler.latency_samples()
+    }
+
+    /// Remaining host-rate tail samples available for gate-closed draining.
+    #[must_use]
+    #[inline]
+    pub const fn remaining_tail_samples(&self) -> usize {
+        self.remaining_tail
+    }
+
+    /// Rearms the full tail budget on active audio input (called after a wet block).
+    #[inline]
+    pub fn rearm_tail(&mut self) {
+        self.remaining_tail = self.tail_budget;
     }
 
     /// Starts re-engaging from bypass: resets the resampler and arms the model prewarm
@@ -376,6 +330,39 @@ impl CabNamSlot {
         }
     }
 
+    /// Drains up to `n` tail frames with zero input into `samples_l`/`samples_r`.
+    ///
+    /// The first `min(n, remaining_tail)` frames are rendered through the model with a
+    /// zero feed (ring-out) and the rest of both buffers is filled with silence. Does
+    /// not re-arm the tail budget; returns the number of frames actually drained.
+    pub fn drain_tail(
+        &mut self,
+        samples_l: &mut [f32],
+        samples_r: &mut [f32],
+        n: usize,
+        process_mono: bool,
+        scratch_l: &mut [f32],
+        scratch_r: &mut [f32],
+    ) -> usize {
+        let frames = n.min(samples_l.len()).min(samples_r.len());
+        let count = frames.min(self.remaining_tail);
+        if count == 0 {
+            return 0;
+        }
+        samples_l[..frames].fill(0.0);
+        samples_r[..frames].fill(0.0);
+        self.process_block(
+            samples_l,
+            samples_r,
+            count,
+            process_mono,
+            scratch_l,
+            scratch_r,
+        );
+        self.remaining_tail -= count;
+        count
+    }
+
     /// Retires heap allocations directly to the GC ring without freeing on the RT thread.
     #[cold]
     pub fn retire_to_gc(self, gc: &mut GcSink<'_>) {
@@ -415,12 +402,8 @@ pub fn build_cab_nam_slot(
     let mut model_l = loaded
         .model_l
         .ok_or_else(|| anyhow::anyhow!("Cabinet model loader produced no left channel"))?;
-    if model_l.in_channels() != 1 || model_l.num_output_channels() != 1 {
-        bail!(
-            "Cabinet neural models must be strictly 1-in/1-out (built {}x{}).",
-            model_l.in_channels(),
-            model_l.num_output_channels()
-        );
+    if let Err((in_ch, out_ch)) = validate_single_channel_model(&model_l) {
+        bail!("Cabinet neural models must be strictly 1-in/1-out (built {in_ch}x{out_ch}).");
     }
     model_l
         .set_max_buffer_size(MAX_RESAMP_BUF)
@@ -431,11 +414,9 @@ pub fn build_cab_nam_slot(
     let model_r = {
         let mut mr = loaded.model_r;
         if let Some(ref mut model_r) = mr {
-            if model_r.in_channels() != 1 || model_r.num_output_channels() != 1 {
+            if let Err((in_ch, out_ch)) = validate_single_channel_model(model_r) {
                 bail!(
-                    "Cabinet right model channel must be strictly 1-in/1-out (built {}x{}).",
-                    model_r.in_channels(),
-                    model_r.num_output_channels()
+                    "Cabinet right model channel must be strictly 1-in/1-out (built {in_ch}x{out_ch})."
                 );
             }
             model_r
@@ -449,6 +430,8 @@ pub fn build_cab_nam_slot(
     let resampler = StreamingResampleBuffer::new(host_rate.max(1), source_rate, MAX_RESAMP_BUF)
         .map_err(|e| anyhow::anyhow!("Cabinet resampler init failed: {e:?}"))?;
 
+    let tail_budget = compute_nam_tail_budget(&model_l, source_rate, host_rate.max(1));
+
     Ok(CabNamSlot {
         kind,
         host_rate: host_rate.max(1),
@@ -457,6 +440,8 @@ pub fn build_cab_nam_slot(
         model_l,
         #[cfg(feature = "dual-mono")]
         model_r,
+        tail_budget,
+        remaining_tail: 0,
     })
 }
 
@@ -470,6 +455,8 @@ pub struct PipeCabNamPayload {
     pub model_l: Option<Box<StaticModel>>,
     #[cfg(feature = "dual-mono")]
     pub model_r: Option<Box<StaticModel>>,
+    /// Precomputed host-rate tail budget for gate-closed draining.
+    pub tail_budget: usize,
     /// `Some(partition)` marks a failed build: nothing is installed and the RT drain
     /// latches `(host_rate, partition)` so the same request is not rebuilt until it changes.
     pub failed_partition: Option<u32>,
@@ -488,6 +475,7 @@ impl PipeCabNamPayload {
             model_l: Some(slot.model_l),
             #[cfg(feature = "dual-mono")]
             model_r: slot.model_r,
+            tail_budget: slot.tail_budget,
             failed_partition: None,
         }
     }
@@ -504,6 +492,7 @@ impl PipeCabNamPayload {
             model_l: None,
             #[cfg(feature = "dual-mono")]
             model_r: None,
+            tail_budget: 0,
             failed_partition: Some(partition),
         }
     }
@@ -740,6 +729,7 @@ impl CabBypassState {
             pair.rearm_tail();
         } else if let Some(nam) = nam_slot {
             nam.process_block(wet_l, wet_r, n, process_mono, scratch_l, scratch_r);
+            nam.rearm_tail();
         }
 
         let target_step = if target_bypass {
@@ -891,6 +881,8 @@ pub fn drain_cab_nam_payloads(
         model_l,
         #[cfg(feature = "dual-mono")]
         model_r,
+        tail_budget: chosen.tail_budget,
+        remaining_tail: 0,
     };
     let lat = slot.latency_samples();
     *active_nam = Some(slot);

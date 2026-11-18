@@ -616,7 +616,7 @@ pub(crate) fn run_capture_dsp_pipeline(
     user_input_gain_mult: f32,
     gate_mode: crate::standalone::cli::GateMode,
     musical_gate: &mut crate::dsp::musical_gate::MusicalNoiseGate,
-    cab: PipeCabRuntime<'_>,
+    mut cab: PipeCabRuntime<'_>,
     capture_tsc: u64,
 ) -> usize {
     use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateState};
@@ -677,8 +677,10 @@ pub(crate) fn run_capture_dsp_pipeline(
             bufs.os_in_l[..n].fill(0.0);
             cab.dry_delay
                 .process_zeros(bufs.os_in_l, bufs.os_model_l, n, *ctx.process_mono);
-            let drained_wav = if !cab.target_bypass
-                && !cab.bypass_state.was_steady_bypassed()
+            // Ring out the active cabinet (WAV IR or neural .nam/.namb) while its tail
+            // budget remains; the two sources are mutually exclusive.
+            let tail_active = !cab.target_bypass && !cab.bypass_state.was_steady_bypassed();
+            let drained_wav = if tail_active
                 && let Some(ref mut pair) = wav_pair
                 && pair.remaining_tail_samples() > 0
             {
@@ -696,8 +698,25 @@ pub(crate) fn run_capture_dsp_pipeline(
             } else {
                 false
             };
+            let drained_nam = if !drained_wav
+                && tail_active
+                && let Some(nam) = cab.nam_slot.as_deref_mut()
+                && nam.remaining_tail_samples() > 0
+            {
+                let drained = nam.drain_tail(
+                    bufs.resamp_out_l,
+                    bufs.resamp_out_r,
+                    n,
+                    *ctx.process_mono,
+                    bufs.os_model_l,
+                    bufs.os_model_r,
+                );
+                drained > 0
+            } else {
+                false
+            };
 
-            if drained_wav {
+            if drained_wav || drained_nam {
                 let mut tail_gate = DynamicHysteresis::new();
                 apply_output_stage(
                     bufs.resamp_out_l,

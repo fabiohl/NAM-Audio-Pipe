@@ -49,7 +49,7 @@ fn disambiguates_parent_directory_and_detects_kind() {
 }
 
 #[test]
-fn validates_1x1_and_gear_tags_without_calibration_or_head() {
+fn validates_1x1_and_gear_tags_and_accepts_wavenet_head() {
     let sys = SystemSnapshot::capture();
     for gt in ["Amp", "Pedal", "IR", "FullRig"] {
         let json = linear_cab_json(48_000, 0.5, Some(gt));
@@ -79,19 +79,63 @@ fn validates_1x1_and_gear_tags_without_calibration_or_head() {
         }
     }
 
-    let wavenet_head = r#"{
+    // A valid 1x1 WaveNet with a canonical multi-stage `config.head` is now
+    // accepted in the cabinet slot: the engine 3.0.0 loader builds and validates
+    // the `PostStackHead`.
+    let head_fixture = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/models/wavenet_post_head_k13.nam"),
+    )
+    .expect("wavenet_post_head_k13 fixture must exist");
+    let mut head_slot = build_cab_nam_slot(
+        &head_fixture,
+        CabAssetKind::NamModel,
+        "cab_head.nam",
+        48_000,
+        &sys,
+    )
+    .expect("engine 3.0.0 must build a WaveNet 1x1 model with config.head in the cab slot");
+    let mut cab_l = [0.2f32, -0.4, 0.8, 0.0, 0.1, -0.2, 0.3, 0.0];
+    let mut cab_r = cab_l;
+    let mut scratch_l = [0.0f32; 8];
+    let mut scratch_r = [0.0f32; 8];
+    head_slot.process_block(
+        &mut cab_l,
+        &mut cab_r,
+        8,
+        false,
+        &mut scratch_l,
+        &mut scratch_r,
+    );
+    assert!(
+        cab_l.iter().chain(cab_r.iter()).all(|v| v.is_finite()),
+        "a WaveNet head cabinet must produce finite output"
+    );
+
+    // A malformed post-stack head (out_channels: 2) is still rejected fail-closed
+    // by the engine loader.
+    let malformed_head = r#"{
         "version":"0.6.0","architecture":"WaveNet","sample_rate":48000,
         "config":{
             "layers":[{"input_size":1,"condition_size":1,"channels":1,"head_size":1,"kernel_size":1,"dilations":[1],"activation":"ReLU","gated":false,"head_bias":false}],
             "head_scale":1.0,
-            "head":{"in_channels":1,"channels":1,"activation":"Tanh","out_channels":1,"kernel_sizes":[1]}
+            "head":{"in_channels":1,"channels":1,"activation":"Tanh","out_channels":2,"kernel_sizes":[1]}
         },
         "weights":[1.0,0.0,1.0,1.0,0.0,1.0,1.0,0.0]
     }"#;
-    let err = parse_and_validate_cab_nam(wavenet_head.as_bytes(), CabAssetKind::NamModel)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("post-stack 'head'"), "got {err}");
+    let head_err = build_cab_nam_slot(
+        malformed_head.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab_head_invalid.nam",
+        48_000,
+        &sys,
+    )
+    .err()
+    .expect("a malformed post-stack head must be rejected fail-closed by the engine");
+    assert!(
+        head_err.to_string().contains("Cabinet model load failed"),
+        "got {head_err}"
+    );
 
     let stereo_lin = r#"{
         "version":"0.6.0","architecture":"Linear","sample_rate":48000,
@@ -102,6 +146,42 @@ fn validates_1x1_and_gear_tags_without_calibration_or_head() {
         .unwrap_err()
         .to_string();
     assert!(ch_err.contains("1-in/1-out"), "got {ch_err}");
+}
+
+#[test]
+fn neural_cabinet_tail_budget_rearms_then_drains_to_zero() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let mut slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        48_000,
+        &sys,
+    )
+    .expect("linear cabinet builds");
+    assert!(slot.tail_budget >= 128, "budget={}", slot.tail_budget);
+    assert_eq!(slot.remaining_tail_samples(), 0);
+
+    slot.rearm_tail();
+    assert_eq!(slot.remaining_tail_samples(), slot.tail_budget);
+
+    let n = 64;
+    let mut l = [0.0f32; 64];
+    let mut r = [0.0f32; 64];
+    let mut sl = [0.0f32; 64];
+    let mut sr = [0.0f32; 64];
+    let mut total_drained = 0usize;
+    loop {
+        let drained = slot.drain_tail(&mut l, &mut r, n, false, &mut sl, &mut sr);
+        if drained == 0 {
+            break;
+        }
+        total_drained += drained;
+    }
+    assert_eq!(total_drained, slot.tail_budget);
+    assert_eq!(slot.remaining_tail_samples(), 0);
+    assert!(l.iter().chain(r.iter()).all(|v| *v == 0.0));
 }
 
 #[test]

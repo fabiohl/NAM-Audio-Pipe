@@ -187,14 +187,24 @@ fn test_latched_flag_emits_once_per_episode() {
     let bridge = create_test_bridge();
     let mut state = PollState::default();
 
+    // The engine `LogBuffer` coalesces consecutive identical records and
+    // renders them as `(repeated Nx)`, so count emissions from the rendered
+    // trace instead of raw records (two episodes still yield one record, but
+    // with `repeated 2x`).
     let e3101_count = || {
         let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
             .expect("LogBuffer must be initialized");
         log_buf
-            .snapshot()
-            .iter()
-            .filter(|r| r.message.contains("[E3101 | GC_OVERFLOW]"))
-            .count()
+            .render_trace(log_buf.len())
+            .lines()
+            .filter(|line| line.contains("[E3101 | GC_OVERFLOW]"))
+            .map(|line| {
+                line.rsplit_once(" (repeated ")
+                    .and_then(|(_, rest)| rest.strip_suffix("x)"))
+                    .and_then(|count| count.parse::<usize>().ok())
+                    .unwrap_or(1)
+            })
+            .sum::<usize>()
     };
 
     let base = e3101_count();
@@ -667,10 +677,10 @@ fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
     );
     let has_sched_error = records
         .iter()
-        .any(|r| r.message.contains("E2302") && r.message.contains("TID=12349"));
+        .any(|r| r.message.contains("E2308") && r.message.contains("TID=12349"));
     assert!(
         !has_sched_error,
-        "SCHED_OTHER must not produce false E2302 elevation errors"
+        "SCHED_OTHER must not produce false E2308 elevation errors"
     );
 }
 
@@ -700,13 +710,13 @@ fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
     let records = log_buf.snapshot();
     let has_hard_error = records.iter().any(|r| {
         r.level == "ERROR"
-            && r.message.contains("E2302")
+            && r.message.contains("E2308")
             && r.message.contains("errno=22")
             && r.message.contains("TID=12350")
     });
     assert!(
         has_hard_error,
-        "setsched failure must keep the E2302 error report"
+        "setsched failure must keep the E2308 error report"
     );
     let has_denied_diagnostic = records.iter().any(|r| {
         r.level == "WARN"
