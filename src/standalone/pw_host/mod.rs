@@ -97,6 +97,7 @@ pub use log_redirect::{
     init_pipewire_logging, is_pipewire_logging_installed, restore_pipewire_logging,
 };
 pub use output_pw::PipewireHostConfig;
+pub use rt_callback::STRUCTURAL_POPS_PER_CALLBACK;
 pub use run::{HostCabinetOptions, run_pipewire_host, run_pipewire_host_with_cabinet};
 pub use status::{
     BackendState, BackendStatusSnapshot, SharedBackendStatus, TeardownGuard, observe_rt_panic,

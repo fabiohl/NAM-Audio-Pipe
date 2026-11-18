@@ -124,6 +124,11 @@ pub struct TelemetryLatches {
     pub output_buffer_miss: LatchedSignal,
     /// Playback bridge starvation counter (`playback_bridge_starvation`).
     pub playback_starvation: LatchedSignal,
+    /// Early playback callbacks counter (`playback_early_callbacks`): no new
+    /// bridge generation because the callback fired ahead of schedule.
+    pub playback_early: LatchedSignal,
+    /// Fail-closed mute deliveries (`playback_muted_callbacks`).
+    pub playback_muted: LatchedSignal,
     /// Clock-drift dropped-frames counter (`DspBridge::dropped_frames`).
     pub drift_drops: LatchedSignal,
     /// Audio deadline exceeded (`dsp_cycle_time > quantum budget`).
@@ -144,6 +149,10 @@ pub struct PollState {
     pub latches: TelemetryLatches,
     /// Last observed cumulative starvation count.
     pub last_starvation: u32,
+    /// Last observed cumulative early-playback-callback count.
+    pub last_early: u32,
+    /// Last observed cumulative fail-closed-mute delivery count.
+    pub last_muted: u32,
     /// Last observed cumulative PW-log ring discard count
     /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
     pub pw_log_dropped_last: u64,
@@ -179,6 +188,8 @@ impl PollState {
             cpu_receipt: receipt,
             latches: TelemetryLatches::default(),
             last_starvation: 0,
+            last_early: 0,
+            last_muted: 0,
             pw_log_dropped_last: 0,
             last_bringup_quanta: 0,
             bringup_suppressed_polls: 0,
@@ -601,6 +612,32 @@ pub fn poll_rt_status(
             "{} Playback delivered {} silence block(s) under bridge starvation (no stale audio repeated).",
             "🔇".blue(),
             delta_starvation
+        );
+    }
+
+    let current_early = stream_status
+        .map(|s| s.playback_early_callbacks.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let delta_early = current_early.saturating_sub(state.last_early);
+    state.last_early = current_early;
+    if state.latches.playback_early.observe(delta_early > 0) {
+        log::info!(
+            "{} Playback callback fired ahead of the capture quantum {} time(s); classified separately from starvation.",
+            "⏱",
+            delta_early
+        );
+    }
+
+    let current_muted = stream_status
+        .map(|s| s.playback_muted_callbacks.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let delta_muted = current_muted.saturating_sub(state.last_muted);
+    state.last_muted = current_muted;
+    if state.latches.playback_muted.observe(delta_muted > 0) {
+        log::info!(
+            "{} Playback delivered {} fail-closed silence block(s) while the format contract was broken.",
+            "🔇".blue(),
+            delta_muted
         );
     }
 

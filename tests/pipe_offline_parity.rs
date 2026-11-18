@@ -87,21 +87,26 @@ const FIXTURES: [(&str, &str, f64); 3] = [
 /// comparison reaches the f64 floor, so the gate is the contract's safety
 /// envelope (`esr_gate = 0.0` selects the per-fixture native gate).
 ///
-/// 44.1 kHz exercises the active resampler, but a sample-accurate oracle gate
-/// is not meaningful there: the production **streaming** resampler and the
-/// one-shot reference differ by a *fractional*-sample phase (best integer
-/// alignment still leaves ESR ≈ 1e-1 for the WaveNet fixtures), unlike the
-/// Plug's adapter pipeline. The row therefore carries a coarse, measured
-/// **resampled-path smoke gate** that only catches gross breakage (silence,
-/// gain collapse, NaN) — it is deliberately *not* claimed as oracle parity.
+/// 44.1 kHz exercises the active resampler. The row keeps a coarse
+/// **resampled-path smoke gate** (`0.25`, untouched by T5.5) that only catches
+/// gross breakage (silence, gain collapse, NaN); it is deliberately *not*
+/// claimed as a sample-accurate oracle gate.
+///
+/// Measured (2026-11-17, `cargo test --features testing --test
+/// pipe_offline_parity -- --ignored`, debug `test` profile, NAMCore C++ oracle
+/// `ORACLE_SHA256=6f14412f…a0d6`, tail window 4_096 samples, BLOCK 128,
+/// resampler latency 11 samples at 44.1 kHz). With the current methodology the
+/// 44.1 kHz rows land on the same floor as the native rows — the earlier
+/// "ESR ≈ 1e-1" estimate in this comment was stale:
+///   A1   48 kHz: f64 1.418e-13 / C++ 1.854e-13, SNR 128.48 / 127.32 dB
+///   A2   48 kHz: f64 6.095e-14 / C++ 1.526e-13, SNR 132.15 / 128.16 dB
+///   LSTM 48 kHz: f64 1.119e-11 / C++ 1.064e-11, SNR 109.51 / 109.73 dB
+///   A1   44.1 kHz: f64 1.426e-13 / C++ 1.701e-13, SNR 128.46 / 127.69 dB
+///   A2   44.1 kHz: f64 1.023e-13 / C++ 1.853e-13, SNR 129.90 / 127.32 dB
+///   LSTM 44.1 kHz: f64 9.890e-12 / C++ 9.861e-12, SNR 110.05 / 110.06 dB
+/// So 44.1 kHz ESR ≤ 9.89e-12 and SNR ≥ 110.05 dB for both oracles at this
+/// revision, with integer alignment 0 (no fractional residual).
 const RATES: [(u32, u32, f64, f64); 2] = [(48_000, 48_000, 0.0, 0.0), (44_100, 48_000, 0.25, 0.0)];
-
-// Measured (2026-11-05, release, NAMCore C++ oracle): the C++ rows sit on the
-// same floor as f64 at both host rates and reuse the per-fixture native gates:
-//   A1   48 kHz: f64 1.418e-13 / C++ 1.854e-13
-//   A2   48 kHz: f64 6.095e-14 / C++ 1.526e-13
-//   LSTM 48 kHz: f64 1.119e-11 / C++ 1.064e-11
-//   44.1 kHz rows: ESR ≤ 9.9e-12 and SNR ≥ 110 dB for both oracles.
 
 fn fixture_model(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

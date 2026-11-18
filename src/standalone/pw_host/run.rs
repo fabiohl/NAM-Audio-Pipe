@@ -455,129 +455,134 @@ pub fn run_pipewire_host_with_cabinet(
             }
         };
 
-        let setup_res: anyhow::Result<_> = (|| {
-            let _lock = thread_loop.lock();
-
-            // PipeWire `node.latency` property contract:
-            // Expressed as a rational fraction ("quantum/rate", e.g. "128/48000").
-            // PipeWire treats this as a requested duration in seconds: tau = quantum / rate.
-            // When connecting to a graph running at a different rate R, PipeWire dynamically
-            // reschedules the quantum to round(tau * R). Thus "{buffer_size}/48000" requests
-            // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
-            let latency_str = format!("{}/48000", buffer_size);
-
-            // Compute actual initial DSP latency from the currently installed state in `state_ptr`:
-            // - At initial startup: cabsim is None (latency = 0), resampler is initialized (usually 0 if host matches nam).
-            // - After reconnect: models, IR, resampler, and cabinet (WAV or neural) in `state_ptr` survived!
-            //   We reflect the exact latency of the installed resampler and active cabinet source (or 0 if
-            //   bypassed/uninstalled), avoiding both underestimating the resampler or a neural cabinet and
-            //   overestimating an uninstalled cab-sim.
-            // SAFETY: The PipeWire main loop is stopped at this point (either pre-run
-            // or between reconnect attempts after the previous loop exited). No RT thread or
-            // audio callback is accessing `state_ptr` concurrently.
-            let (initial_resamp_lat, initial_cab_lat, initial_os_native, initial_nam_rate) = unsafe {
-                let state = &*state_ptr;
-                let resamp = state.stream.latency_samples();
-                let cab = crate::standalone::cabinet::active_cabinet_latency(
-                    state.active_cabsim.as_deref(),
-                    state.active_cab_nam.as_ref(),
-                );
-                let os = state.os_l.latency_samples() as u32;
-                (resamp, cab, os, state.current_nam_rate)
-            };
-            let initial_os_lat =
-                latency::convert_os_latency_to_host(initial_os_native, 48_000, initial_nam_rate);
-            let initial_latency_samples = initial_resamp_lat + initial_cab_lat + initial_os_lat;
-            backend_status
-                .stream_status()
-                .applied_nam_rate
-                .store(initial_nam_rate, Ordering::Release);
-            backend_status
-                .stream_status()
-                .applied_resampler_latency
-                .store(initial_resamp_lat, Ordering::Release);
-            backend_status
-                .stream_status()
-                .applied_cabsim_latency
-                .store(initial_cab_lat, Ordering::Release);
-            backend_status
-                .stream_status()
-                .applied_oversample_latency
-                .store(initial_os_native, Ordering::Release);
-            backend_status.stream_status().applied_latency_pair.store(
-                StreamStatusFlags::pack_latency_pair(initial_resamp_lat, initial_cab_lat),
-                Ordering::Release,
-            );
-
-            let (cs, cl) = capture::setup_capture_stream(
-                &core,
-                bridge_ptr,
-                buffer_size,
-                initial_latency_samples,
-                target_cpu,
-                state_ptr,
-                channels_ptr,
-                rate_for_param.clone(),
-                rt_status.clone(),
-                rec_ptr,
-                parking_lot_ptr,
-                parking_lot_dirty_ptr,
-                recording_data_available.clone(),
-                recording_failed.clone(),
-                backend_for_capture.clone(),
-            )?;
-
-            let (ps, pl) = playback::setup_playback_stream(
-                &core,
-                bridge_ptr,
-                buffer_size,
-                initial_latency_samples,
-                &latency_str,
-                rt_status.clone(),
-                backend_for_playback.clone(),
-                output_limit,
-            )?;
-
-            Ok((cs, cl, ps, pl, initial_latency_samples))
-        })();
-
         let (
             capture_stream,
             capture_listener,
             playback_stream,
             playback_listener,
             initial_latency_samples,
-        ) = match setup_res {
-            Ok(res) => res,
-            Err(e) => {
-                if reconnect.attempts_made() == 0 {
-                    emit_startup_backend_diagnostic(&sys, "stream-setup", &e);
-                    return Err(e);
-                }
-                match reconnect.begin_attempt() {
-                    Some(backoff) => {
-                        log::warn!(
-                            "{} Stream setup failed during reconnect attempt {}/{} \
-                             ({e}); retrying in {:?}.",
-                            "🔁".yellow(),
-                            reconnect.attempts_made(),
-                            reconnect.policy().max_attempts,
-                            backoff,
-                        );
-                        backend_status.begin_reconnect(
-                            reconnect.attempts_made(),
-                            reconnect.policy().max_attempts,
-                            backoff,
-                        );
-                        if sleep_interruptible(backoff) {
+        ) = {
+            let setup_res: anyhow::Result<_> = (|| {
+                let _lock = thread_loop.lock();
+
+                // PipeWire `node.latency` property contract:
+                // Expressed as a rational fraction ("quantum/rate", e.g. "128/48000").
+                // PipeWire treats this as a requested duration in seconds: tau = quantum / rate.
+                // When connecting to a graph running at a different rate R, PipeWire dynamically
+                // reschedules the quantum to round(tau * R). Thus "{buffer_size}/48000" requests
+                // exactly `buffer_size` frames of latency at 48kHz, dynamically rescaled by PipeWire.
+                let latency_str = format!("{}/48000", buffer_size);
+
+                // Compute actual initial DSP latency from the currently installed state in `state_ptr`:
+                // - At initial startup: cabsim is None (latency = 0), resampler is initialized (usually 0 if host matches nam).
+                // - After reconnect: models, IR, resampler, and cabinet (WAV or neural) in `state_ptr` survived!
+                //   We reflect the exact latency of the installed resampler and active cabinet source (or 0 if
+                //   bypassed/uninstalled), avoiding both underestimating the resampler or a neural cabinet and
+                //   overestimating an uninstalled cab-sim.
+                // SAFETY: The PipeWire main loop is stopped at this point (either pre-run
+                // or between reconnect attempts after the previous loop exited). No RT thread or
+                // audio callback is accessing `state_ptr` concurrently.
+                let (initial_resamp_lat, initial_cab_lat, initial_os_native, initial_nam_rate) = unsafe {
+                    let state = &*state_ptr;
+                    let resamp = state.stream.latency_samples();
+                    let cab = crate::standalone::cabinet::active_cabinet_latency(
+                        state.active_cabsim.as_deref(),
+                        state.active_cab_nam.as_ref(),
+                    );
+                    let os = state.os_l.latency_samples() as u32;
+                    (resamp, cab, os, state.current_nam_rate)
+                };
+                let initial_os_lat = latency::convert_os_latency_to_host(
+                    initial_os_native,
+                    48_000,
+                    initial_nam_rate,
+                );
+                let initial_latency_samples = initial_resamp_lat + initial_cab_lat + initial_os_lat;
+                backend_status
+                    .stream_status()
+                    .applied_nam_rate
+                    .store(initial_nam_rate, Ordering::Release);
+                backend_status
+                    .stream_status()
+                    .applied_resampler_latency
+                    .store(initial_resamp_lat, Ordering::Release);
+                backend_status
+                    .stream_status()
+                    .applied_cabsim_latency
+                    .store(initial_cab_lat, Ordering::Release);
+                backend_status
+                    .stream_status()
+                    .applied_oversample_latency
+                    .store(initial_os_native, Ordering::Release);
+                backend_status.stream_status().applied_latency_pair.store(
+                    StreamStatusFlags::pack_latency_pair(initial_resamp_lat, initial_cab_lat),
+                    Ordering::Release,
+                );
+
+                let (cs, cl) = capture::setup_capture_stream(
+                    &core,
+                    bridge_ptr,
+                    buffer_size,
+                    initial_latency_samples,
+                    target_cpu,
+                    state_ptr,
+                    channels_ptr,
+                    rate_for_param.clone(),
+                    rt_status.clone(),
+                    rec_ptr,
+                    parking_lot_ptr,
+                    parking_lot_dirty_ptr,
+                    recording_data_available.clone(),
+                    recording_failed.clone(),
+                    backend_for_capture.clone(),
+                )?;
+
+                let (ps, pl) = playback::setup_playback_stream(
+                    &core,
+                    bridge_ptr,
+                    buffer_size,
+                    initial_latency_samples,
+                    &latency_str,
+                    rt_status.clone(),
+                    backend_for_playback.clone(),
+                    output_limit,
+                )?;
+
+                Ok((cs, cl, ps, pl, initial_latency_samples))
+            })();
+
+            match setup_res {
+                Ok(res) => res,
+                Err(e) => {
+                    if reconnect.attempts_made() == 0 {
+                        emit_startup_backend_diagnostic(&sys, "stream-setup", &e);
+                        return Err(e);
+                    }
+                    match reconnect.begin_attempt() {
+                        Some(backoff) => {
+                            log::warn!(
+                                "{} Stream setup failed during reconnect attempt {}/{} \
+                                 ({e}); retrying in {:?}.",
+                                "🔁".yellow(),
+                                reconnect.attempts_made(),
+                                reconnect.policy().max_attempts,
+                                backoff,
+                            );
+                            backend_status.begin_reconnect(
+                                reconnect.attempts_made(),
+                                reconnect.policy().max_attempts,
+                                backoff,
+                            );
+                            if sleep_interruptible(backoff) {
+                                break 'host;
+                            }
+                            continue 'host;
+                        }
+                        None => {
+                            backend_failure =
+                                Some(("stream_setup", format!("stream setup failed: {e}")));
                             break 'host;
                         }
-                        continue 'host;
-                    }
-                    None => {
-                        backend_failure =
-                            Some(("stream_setup", format!("stream setup failed: {e}")));
-                        break 'host;
                     }
                 }
             }
@@ -617,8 +622,8 @@ pub fn run_pipewire_host_with_cabinet(
         // =========================================================
         // 5. MAIN CONTROL LOOP (Main Thread, Non-RT)
         // =========================================================
-        let mut last_published_dsp_latency = initial_latency_samples;
-        let mut last_published_rate = 48_000u32;
+        let mut latency_tracker =
+            latency::LatencyPublicationTracker::new(initial_latency_samples, 48_000);
 
         let mut was_silent = false;
         let mut was_fading = false;
@@ -702,12 +707,10 @@ pub fn run_pipewire_host_with_cabinet(
                     .store(active, Ordering::Relaxed);
             }
 
-            let host_rate = if active != 0 {
-                active
-            } else {
-                let p_rate = rate_for_param.load(Ordering::Relaxed);
-                if p_rate != 0 { p_rate } else { 48_000 }
-            };
+            let host_rate = latency::resolve_effective_host_rate(
+                active,
+                rate_for_param.load(Ordering::Relaxed),
+            );
 
             let _ = handlers::handle_resampler_rebuild(&rt_status, &sys, &mut resampler_producer);
             if let (Some((raw_bytes, kind, display_name)), Some(nam_prod)) =
@@ -755,42 +758,25 @@ pub fn run_pipewire_host_with_cabinet(
                 active_cabsim_latency + active_resampler_latency + active_os_latency;
             handlers::handle_quantum_log(&rt_status, buffer_size, current_dsp_latency, host_rate);
 
-            if current_dsp_latency != last_published_dsp_latency
-                || (active != 0 && active != last_published_rate)
-            {
+            let latency_target = latency::LatencyTarget {
+                samples: current_dsp_latency,
+                host_rate,
+            };
+            let now = std::time::Instant::now();
+            if latency_tracker.needs_sync(latency_target, now) {
                 let _lock = thread_loop.lock();
-                let (_, lat_ns) = latency::compute_dsp_latency(
-                    active_cabsim_latency,
-                    active_resampler_latency,
-                    active_os_latency,
-                    host_rate,
-                );
-                let _ = latency::update_stream_latency(
+                let mut publisher = latency::PipewireLatencyPublisher::new(
                     &app_state.capture_stream,
-                    pw::spa::sys::SPA_DIRECTION_INPUT,
-                    current_dsp_latency,
-                    lat_ns,
-                );
-                let _ = latency::update_stream_latency(
                     &app_state.playback_stream,
-                    pw::spa::sys::SPA_DIRECTION_OUTPUT,
-                    current_dsp_latency,
-                    lat_ns,
                 );
-                log::info!(
-                    "{} Published updated DSP processing latency to PipeWire graph: {} samples ({:.2} ms @{}Hz) [cabsim={}, resampler={}, oversample={}]",
-                    "⏱️".cyan(),
-                    current_dsp_latency,
-                    lat_ns as f64 / 1_000_000.0,
-                    host_rate,
+                let _ = latency_tracker.sync_at(
+                    &mut publisher,
+                    latency_target,
                     active_cabsim_latency,
                     active_resampler_latency,
                     active_os_latency,
+                    now,
                 );
-                last_published_dsp_latency = current_dsp_latency;
-                if active != 0 {
-                    last_published_rate = active;
-                }
             }
             handlers::handle_slimmable_rebuild(
                 &rt_status,
@@ -905,16 +891,32 @@ pub fn run_pipewire_host_with_cabinet(
         // Enter teardown BEFORE stopping the thread loop and destroying streams.
         teardown_guard = Some(backend_status.enter_teardown());
 
-        // Ordering invariant: stop the audio loop FIRST so the RT callback
-        // releases its `&mut` access to the recording producer (single-writer
-        // SPSC contract). Only after `thread_loop.stop()` returns — which waits for
-        // the loop thread to finish its current iteration — is the main thread the
-        // sole writer of the recording channel.
+        // Ordering invariant:
+        // 1. Stop `thread_loop` (`pw_thread_loop_stop`) so cold-path listeners and
+        //    main-loop dispatch terminate and no `thread_loop.lock()` is needed.
+        // 2. Drop `app_state` (listeners before streams via `AppState` field
+        //    order, calling `pw_stream_destroy` under `teardown_guard`), then
+        //    `core`, `context` (`pw_context_destroy` -> `pw_data_loop_stop`,
+        //    joining the RT data-loop thread that drives `RT_PROCESS` callbacks),
+        //    and `thread_loop_pin`/`thread_loop`.
+        // 3. Only once BOTH loops (`pw_thread_loop` and `pw_data_loop`) and both
+        //    streams are quiescent is the main thread the sole owner of
+        //    `bridge_ptr`, `rt_parking_lot`, and the recording producer.
         thread_loop.stop();
+        // Explicitly drop the streams under the teardown guard before stopping
+        // the context/data-loop and touching `&mut DspBridge` or `rt_parking_lot`.
+        // Listeners are dropped before streams, and any synchronous
+        // `Unconnected` transitions are discarded by `observe_stream_state`.
+        drop(app_state);
+        drop(core);
+        drop(context);
+        drop(thread_loop_pin);
+        drop(thread_loop);
 
         // Drain any remaining clock drift drops accumulated in the bridge before resetting.
-        // SAFETY: `bridge_ptr` is the live bridge allocation for this attempt and the
-        // audio loop has been stopped above, so the main thread is the sole accessor.
+        // SAFETY: `bridge_ptr` is the live bridge allocation for this attempt and both
+        // PipeWire streams and loops (`pw_thread_loop` + `pw_data_loop`) are stopped above,
+        // so the main thread is the sole accessor.
         let remaining_drops = unsafe { &*(bridge_ptr.as_ptr()) }.drain_dropped_frames();
         if remaining_drops > 0 {
             backend_status
@@ -925,19 +927,20 @@ pub fn run_pipewire_host_with_cabinet(
 
         // Invalidates/advances the DSP bridge to zero so a reconnected instance
         // begins strictly in silence.
-        // SAFETY: Sound because `thread_loop.stop()` immediately preceding this call
-        // guarantees that the PipeWire loop thread is stopped and no RT Writer/Reader
-        // is alive or accessing the bridge. The main thread is the sole owner of `bridge_ptr`.
+        // SAFETY: Sound because `app_state` (streams), `context` (`pw_data_loop_stop`),
+        // and `thread_loop` (`pw_thread_loop_stop`) have all stopped/dropped above,
+        // guaranteeing no RT Writer/Reader is alive or accessing the bridge. The main
+        // thread holds exclusive access to `bridge_ptr`.
         unsafe { &mut *bridge_ptr.as_ptr() }.reset_to_silence();
 
         // Re-arm the off-RT bring-up pre-roll for the next
         // reconnect attempt, still under the exclusive-access teardown window
-        // (`thread_loop.stop()` above guarantees no live RT Writer/Reader).
+        // (streams and both PipeWire loops stopped above).
         // SAFETY: same exclusive-access contract as `reset_to_silence` above.
         unsafe { &mut *bridge_ptr.as_ptr() }.prime_silence(buffer_size.max(1) as usize);
 
-        // Single-owner handoff — the loop thread has stopped, so the RT
-        // callback will never touch `rt_parking_lot` again. One canonical
+        // Single-owner handoff — streams and both PipeWire loops have stopped, so
+        // the RT callback will never touch `rt_parking_lot` again. One canonical
         // `drain_gc_channels` now releases SPSC + overflow + the 16 parked slots
         // on the main thread, before any RT state is dropped.
         let final_drained = neural_amp_modeler_rs::common::spsc::drain_gc_channels(
@@ -954,11 +957,6 @@ pub fn run_pipewire_host_with_cabinet(
                 "nam-audio-pipe: instance GC drain released {final_drained} item(s) off-RT"
             );
         }
-
-        // Explicitly drop the streams under the teardown guard.
-        // Listeners are dropped before streams, and any synchronous
-        // `Unconnected` transitions are discarded by `observe_stream_state`.
-        drop(app_state);
 
         // 6.1 Reconnect decision
         match instance_failure {

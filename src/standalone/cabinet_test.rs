@@ -151,8 +151,10 @@ fn failed_neural_rebuild_latches_key_and_keeps_last_safe_state() {
         parking_lot_dirty: Some(&parking_lot_dirty),
     };
 
-    drain_cab_nam_payloads(
+    let mut budget = SwapBudget::new(1);
+    let stats = drain_cab_nam_payloads(
         &mut cons,
+        &mut budget,
         &requested,
         &applied,
         &mut wav,
@@ -166,6 +168,11 @@ fn failed_neural_rebuild_latches_key_and_keeps_last_safe_state() {
     assert!(nam.is_none());
     assert!(wav.is_none());
     assert_eq!(applied.load(Ordering::Acquire), 7);
+    assert_eq!(budget.used(), 0);
+    assert_eq!(stats.pops, 1);
+    assert_eq!(stats.installed, 0);
+    assert_eq!(stats.retired, 1);
+    assert_eq!(stats.deferred, 0);
 }
 
 #[test]
@@ -200,8 +207,10 @@ fn successful_neural_install_clears_failed_latch() {
         parking_lot_dirty: Some(&parking_lot_dirty),
     };
 
-    drain_cab_nam_payloads(
+    let mut budget = SwapBudget::new(1);
+    let stats = drain_cab_nam_payloads(
         &mut cons,
+        &mut budget,
         &requested,
         &applied,
         &mut wav,
@@ -214,6 +223,11 @@ fn successful_neural_install_clears_failed_latch() {
     assert_eq!(failed, None);
     assert!(nam.is_some());
     assert_eq!(applied.load(Ordering::Acquire), 8);
+    assert_eq!(budget.used(), 1);
+    assert_eq!(stats.pops, 1);
+    assert_eq!(stats.installed, 1);
+    assert_eq!(stats.retired, 0);
+    assert_eq!(stats.deferred, 0);
 }
 
 #[test]
@@ -261,4 +275,262 @@ fn neural_reengage_drains_prewarm_then_crossfades_to_wet() {
         last = wet_l[n - 1];
     }
     assert!((last - 0.5).abs() < 1e-5, "settled at {last}");
+}
+
+#[test]
+fn budget_exhausted_defers_valid_nam_via_peek_and_closes_accounting() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let make_slot = || {
+        build_cab_nam_slot(
+            json.as_bytes(),
+            CabAssetKind::NamModel,
+            "cab.nam",
+            48_000,
+            &sys,
+        )
+        .expect("linear cabinet builds")
+    };
+
+    let (mut prod, mut cons) = rtrb::RingBuffer::<PipeCabNamPayload>::new(8);
+    // Queue 1 stale (gen 1), then 2 valid (gen 2, gen 3) with target_gen = 2.
+    prod.push(PipeCabNamPayload::from_slot(1, make_slot()))
+        .unwrap();
+    prod.push(PipeCabNamPayload::from_slot(2, make_slot()))
+        .unwrap();
+    prod.push(PipeCabNamPayload::from_slot(3, make_slot()))
+        .unwrap();
+
+    let requested = AtomicU64::new(2);
+    let applied = AtomicU64::new(0);
+    let mut wav: Option<Box<CabSimPair>> = None;
+    let mut nam: Option<CabNamSlot> = None;
+    let mut failed: Option<(u32, usize)> = None;
+    let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(16);
+    let mut parking_lot: [Option<GcItem>; 16] = [const { None }; 16];
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let mut gc = GcSink {
+        producer: &mut gc_p,
+        parking_lot: &mut parking_lot,
+        overflow: &gc_overflow,
+        rt_status: &flags,
+        parking_lot_dirty: Some(&parking_lot_dirty),
+    };
+
+    // Callback 1: shared budget already exhausted -> stale (gen 1) is popped & retired,
+    // valid gen 2 & gen 3 remain untouched in the ring via peek()!
+    let mut budget_1 = SwapBudget::new(1);
+    budget_1.consume();
+    let s1 = drain_cab_nam_payloads(
+        &mut cons,
+        &mut budget_1,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+    assert_eq!(s1.pops, 1, "only stale gen 1 popped");
+    assert_eq!(s1.installed, 0);
+    assert_eq!(s1.retired, 1);
+    assert_eq!(s1.deferred, 1);
+    assert_eq!(s1.pops, s1.installed + s1.retired);
+    assert_eq!(cons.slots(), 2, "both valid payloads must remain queued");
+    assert!(nam.is_none());
+    assert!(flags.check_flag(RT_STATUS_STRUCTURAL_DEFERRED));
+    assert_eq!(flags.structural_deferred_total.load(Ordering::Relaxed), 1);
+
+    // Callback 2: fresh budget -> pops gen 2 & gen 3, coalesces gen 2 -> GC, installs gen 3.
+    let mut budget_2 = SwapBudget::new(1);
+    let s2 = drain_cab_nam_payloads(
+        &mut cons,
+        &mut budget_2,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+    assert_eq!(s2.pops, 2);
+    assert_eq!(s2.installed, 1);
+    assert_eq!(s2.retired, 1);
+    assert_eq!(s2.deferred, 0);
+    assert_eq!(s2.pops, s2.installed + s2.retired);
+    assert_eq!(budget_2.used(), 1);
+    assert_eq!(applied.load(Ordering::Acquire), 3);
+    assert!(nam.is_some());
+    assert!(cons.is_empty());
+    assert!(flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED));
+    assert_eq!(flags.structural_superseded_total.load(Ordering::Relaxed), 1);
+
+    // Total pushed (3) == total installed (1) + total coalesced/stale payloads retired (2).
+    assert_eq!(s1.pops + s2.pops, 3);
+    assert_eq!(s1.installed + s2.installed, 1);
+    assert_eq!(s1.retired + s2.retired, 2);
+    while gc_c.pop().is_ok() {}
+}
+
+#[cfg(feature = "testing")]
+#[test]
+fn simultaneous_resampler_wav_and_nam_enforce_single_structural_swap_per_callback() {
+    use crate::standalone::pw_host::RtSwapHarness;
+    use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimAdapter;
+    use neural_amp_modeler_rs::dsp::cabsim::conv::ConvEngine;
+
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let nam_slot = build_cab_nam_slot(
+        json.as_bytes(),
+        CabAssetKind::NamModel,
+        "cab.nam",
+        48_000,
+        &sys,
+    )
+    .expect("linear cabinet builds");
+
+    let mut harness = RtSwapHarness::new(48_000, 48_000).expect("harness");
+    let mut cab_nam_prod = harness.attach_cab_nam_channel();
+
+    // Queue simultaneous resampler, WAV cabsim, and neural NAM cabsim swaps at the same generation!
+    let cab_gen = harness.bump_cab_nam_generation();
+    harness
+        .request_resampler_swap(48_000, 48_000)
+        .expect("queue resampler");
+    let ir = [1.0f32, 0.5, 0.25];
+    let make_adapter =
+        || CabSimAdapter::new(Box::new(ConvEngine::new(&ir, 64).expect("conv"))).expect("adapter");
+    harness.push_cabsim_with_gen(
+        cab_gen,
+        Some(Box::new(CabSimPair {
+            l: Box::new(make_adapter()),
+            r: Box::new(make_adapter()),
+            sample_rate: 48_000,
+        })),
+    );
+    cab_nam_prod
+        .push(PipeCabNamPayload::from_slot(cab_gen, nam_slot))
+        .expect("queue nam cab");
+
+    let (_prod, mut rt) = harness.into_parts();
+    let mut in_l = [0.2f32; 64];
+    let mut in_r = [0.2f32; 64];
+
+    // Callback 1: resampler swap applies (structural_applied == 1); WAV and NAM stay deferred.
+    let acc1 = rt.run_callback_accounted(&mut in_l, &mut in_r, 64);
+    assert_eq!(acc1.structural_applied, 1);
+    assert!(rt.active_cabsim().is_none(), "WAV deferred on cb 1");
+    assert!(rt.active_cab_nam().is_none(), "NAM deferred on cb 1");
+    assert!(rt.commands_pending());
+
+    // Callback 2: WAV cabsim applies (structural_applied == 1); NAM remains queued (not dropped!).
+    let acc2 = rt.run_callback_accounted(&mut in_l, &mut in_r, 64);
+    assert_eq!(acc2.structural_applied, 1);
+    assert!(rt.active_cabsim().is_some(), "WAV applied on cb 2");
+    assert!(rt.active_cab_nam().is_none(), "NAM deferred on cb 2");
+    assert!(rt.commands_pending());
+
+    // Callback 3: NAM cabsim applies (structural_applied == 1), retiring WAV to GC.
+    let acc3 = rt.run_callback_accounted(&mut in_l, &mut in_r, 64);
+    assert_eq!(acc3.structural_applied, 1);
+    assert!(
+        rt.active_cabsim().is_none(),
+        "WAV retired by NAM exclusivity"
+    );
+    assert!(rt.active_cab_nam().is_some(), "NAM applied on cb 3");
+    let acc4 = rt.run_callback_accounted(&mut in_l, &mut in_r, 64);
+    assert_eq!(acc4.structural_applied, 0);
+    rt.consume_gc();
+    assert!(!rt.commands_pending());
+}
+
+#[test]
+fn pop_cap_truncation_flags_and_preserves_remaining_payload() {
+    let sys = SystemSnapshot::capture();
+    let json = linear_cab_json(48_000, 0.5, None);
+    let make_slot = || {
+        build_cab_nam_slot(
+            json.as_bytes(),
+            CabAssetKind::NamModel,
+            "cab.nam",
+            48_000,
+            &sys,
+        )
+        .expect("linear cabinet builds")
+    };
+
+    // Ring capacity 12 > STRUCTURAL_POPS_PER_CALLBACK (8): enqueue 10 stale payloads
+    // followed by 1 valid payload (total 11).
+    let (mut prod, mut cons) = rtrb::RingBuffer::<PipeCabNamPayload>::new(12);
+    for g in 1..=10 {
+        prod.push(PipeCabNamPayload::from_slot(g, make_slot()))
+            .unwrap();
+    }
+    prod.push(PipeCabNamPayload::from_slot(11, make_slot()))
+        .unwrap();
+
+    let requested = AtomicU64::new(11);
+    let applied = AtomicU64::new(0);
+    let mut wav: Option<Box<CabSimPair>> = None;
+    let mut nam: Option<CabNamSlot> = None;
+    let mut failed: Option<(u32, usize)> = None;
+    let (mut gc_p, mut gc_c) = rtrb::RingBuffer::<GcItem>::new(32);
+    let mut parking_lot: [Option<GcItem>; 16] = [const { None }; 16];
+    let parking_lot_dirty = AtomicBool::new(false);
+    let gc_overflow = GcOverflowBuffer::default();
+    let flags = RtStatusFlags::new();
+    let mut gc = GcSink {
+        producer: &mut gc_p,
+        parking_lot: &mut parking_lot,
+        overflow: &gc_overflow,
+        rt_status: &flags,
+        parking_lot_dirty: Some(&parking_lot_dirty),
+    };
+
+    let mut b1 = SwapBudget::new(1);
+    let s1 = drain_cab_nam_payloads(
+        &mut cons,
+        &mut b1,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+    assert_eq!(s1.pops, 8);
+    assert_eq!(s1.retired, 8);
+    assert_eq!(s1.installed, 0);
+    assert_eq!(cons.slots(), 3);
+    assert!(flags.check_flag(RT_STATUS_SPSC_DRAIN_TRUNCATED));
+
+    let mut b2 = SwapBudget::new(1);
+    let s2 = drain_cab_nam_payloads(
+        &mut cons,
+        &mut b2,
+        &requested,
+        &applied,
+        &mut wav,
+        &mut nam,
+        &|_: u32| {},
+        Some(&mut failed),
+        &mut gc,
+    );
+    assert_eq!(s2.pops, 3);
+    assert_eq!(s2.retired, 2);
+    assert_eq!(s2.installed, 1);
+    assert_eq!(b2.used(), 1);
+    assert_eq!(applied.load(Ordering::Acquire), 11);
+    assert!(nam.is_some());
+    assert!(cons.is_empty());
+    assert_eq!(s1.pops + s2.pops, 11);
+    assert_eq!(s1.installed + s2.installed, 1);
+    assert_eq!(s1.retired + s2.retired, 10);
+    while gc_c.pop().is_ok() {}
 }

@@ -247,9 +247,7 @@ impl CaptureState {
                 MAX_RESAMP_BUF,
             )
             .max(MAX_RESAMP_BUF);
-        let alloc_os_scratch = || -> Box<[f32]> {
-            vec![0.0f32; os_scratch_len].into_boxed_slice()
-        };
+        let alloc_os_scratch = || -> Box<[f32]> { vec![0.0f32; os_scratch_len].into_boxed_slice() };
 
         #[expect(
             clippy::expect_used,
@@ -470,12 +468,16 @@ mod tests {
                 crate::standalone::cli::GateMode::Silence,
                 &mut state.musical_gate,
                 cab,
+                crate::standalone::rt_setup::rdtsc_nanos(),
             );
             if n_pw == 0 {
                 closed_observed = true;
                 break;
             }
         }
-        assert!(closed_observed, "silence gate never reached GateState::Closed");
+        assert!(
+            closed_observed,
+            "silence gate never reached GateState::Closed"
+        );
     }
 }

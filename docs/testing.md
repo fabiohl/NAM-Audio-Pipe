@@ -267,6 +267,51 @@ Every phase writes `target/logs/long-<name>.log`. Each run appends its structure
   - **Deterministic Provenance**: Each job sources [`variables.env`](../variables.env) (`ENGINE_COMMIT`), writes `target/logs/ci-provenance.log`, and uploads `target/logs/**` (including `*-status.tsv` carriers).
 - **`long.yml`:** Operator-triggered manual workflow (`workflow_dispatch`, zero inputs, `timeout-minutes: 300`). Provisions BOLT, perf counters, the C++ parity oracle (`NAM_CORE_RENDER_BIN`), a private D-Bus session, and persistent PipeWire sink/source nodes (`ci-null-sink`, `ci-null-source`). Executes hosted-safe phases (`catch-all`, `soak`, `heap-audit`, `concurrency`, `endurance`, `pw-resilience`, `pw-live`, `recording`, `offline-parity`), leaving isolated hardware phases (`rt-deadline`, `rt-jitter`) for bare-metal operator execution.
 
+### 3.4 Integrated Scenario Matrix (S5 / D5)
+
+**Status: proposed, pending D5 approval by the operator.** This is the
+daemon-side half of the integrated matrix; the plugin half lives in
+`NAM-Plug/docs/testing.md` §3.4. A cell is
+**M** (proposed mandatory for release) or **E** (experimental: evidence is
+recorded but cannot block release). Missing evidence is a `GAP`, never a PASS.
+
+Each cell records: host rate, quantum (frames), channel configuration
+(`dual-mono` vs lean `--no-default-features` build is explicit), model/IR SHA,
+binary SHA-256, warmup, measurement duration, timed callbacks, starvation/early
+counters (`playback_bridge_starvation`, `playback_early_callbacks`,
+`playback_muted_callbacks`), dropped generations and xruns.
+
+| ID  | Scenario                | Channels | Rate (kHz) | Quantum | Cabinet | Events                 | Gate                                                                 | Evidence                          | D5 |
+|:--- |:----------------------- |:-------- |:---------- |:------- |:------- |:---------------------- |:-------------------------------------------------------------------- |:--------------------------------- |:-- |
+| D1  | Native offline parity   | mono     | 48         | 128     | none    | none                   | f64 ESR <= per-fixture native gate; C++ oracle when provisioned       | `long-offline-parity.log`         | M  |
+| D2  | Resampled offline parity| mono     | 44.1->48   | 128     | none    | none                   | smoke ESR <= 0.25; f64/C++ ESR <= 9.89e-12 measured 2026-11-17       | `long-offline-parity.log`         | M  |
+| D3  | Resampled offline parity| mono     | 48->96     | 128     | none    | none                   | smoke ESR <= 0.25; C++ oracle required in `--strict`                  | `long-offline-parity.log`         | M  |
+| D4  | Deadline                | stereo   | 48         | 64      | none    | none                   | worst callback < 85% of quantum; p99 reported                        | `long-rt-deadline.log`            | M  |
+| D5  | Deadline resampled      | stereo   | 44.1       | 32      | none    | none                   | worst callback < 85% of quantum                                       | `long-rt-deadline.log`            | M  |
+| D6  | Jitter (isolated core)  | stereo   | 48         | 64      | none    | none                   | jitter p99.99 <= 75% of quantum over 10 000 callbacks                 | `long-rt-jitter.log`              | M  |
+| D7  | Concurrency             | stereo   | 48         | 64      | none    | 16 threads swap/stream | no deadlock, no torn block, zero payload loss                         | `long-concurrency.log`            | M  |
+| D8  | Live PipeWire           | stereo   | 48         | 64      | none    | reconnection           | stream resumes; starvation/early counters close                       | `long-pw-live.log`                | M  |
+| D9  | Recording (io_uring)    | stereo   | 48         | 64      | none    | start/stop, ENOSPC     | failure surfaced, no RT block; zero lost frames while healthy         | `long-recording.log`              | M  |
+| D10 | Cabinet NAM swap        | stereo   | 48         | 64      | NAM     | off-RT rebuild         | one structural install/callback; `pops = installed + retired`         | `long-soak.log` + counters        | M  |
+| D11 | Soak + heap audit       | stereo   | 48         | 64      | WAV     | none                   | stable RSS; zero heap allocs on RT paths                              | `long-soak.log`, `long-heap-audit.log` | M  |
+| D12 | Physical loopback       | stereo   | 48/44.1    | 32/64   | none    | impulse                | capture->playback vs impulse; includes interface + graph             | hardware trace (GAP if absent)    | E  |
+| D13 | 96 kHz live + cabinet   | stereo   | 96         | 128     | WAV     | automation             | deadline and starvations counters                                     | `long-rt-deadline.log`            | E  |
+| D14 | Arm/macOS native        | stereo   | 48         | 64      | none    | none                   | platform gates (experimental until native hardware)                   | CI receipt (GAP locally)          | E  |
+
+Rules for the Pipe cells:
+
+- `./utils/tests-long.sh` is operator-only. `--only` runs are `partial` and
+  cannot be certified.
+- `--strict` turns any GAP into FAIL. A missing `NAM_CORE_RENDER_BIN` is a GAP
+  and therefore fails strict mode; it is never silently skipped.
+- `utils/tests-long.sh --artifact` binds the receipt to the binary SHA-256.
+  A PASS without the SHA, or from a skipped phase, is not a PASS.
+- Plugin and Pipe gates are **not** interchangeable: this side uses worst
+  callback < 85% of the period and p99.99 jitter <= 75%; the plugin uses
+  p99 < 85% of the period. A single generic threshold is forbidden.
+- Capture→playback latency is per delivered generation (T5.2); the legacy
+  global `capture_start_tsc` is no longer the source of that metric.
+
 ---
 
 ## 4. Build & Release Chain ([`utils/build-release.sh`](../utils/build-release.sh))

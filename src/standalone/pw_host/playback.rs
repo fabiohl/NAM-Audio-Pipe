@@ -234,19 +234,16 @@ pub fn setup_playback_stream<'c>(
 
     let mut proc_storage = SpaPodStorage::new();
     let mut lat_storage = SpaPodStorage::new();
-    let (init_samples, init_ns) =
-        latency::compute_dsp_latency(initial_latency_samples, 0, 0, 48_000);
     // SAFETY: `proc_storage` and `lat_storage` remain valid and unmodified for the duration
     // of the synchronous `connect` call below.
     let proc_pod =
-        unsafe { latency::build_process_latency_pod(init_samples, init_ns, &mut proc_storage)? };
+        unsafe { latency::build_process_latency_pod(initial_latency_samples, &mut proc_storage)? };
     // SAFETY: `lat_storage` remains valid and unmodified for the duration of the
     // synchronous `connect` call below (same contract as `proc_storage`).
     let lat_pod = unsafe {
         latency::build_latency_pod(
             pw::spa::sys::SPA_DIRECTION_OUTPUT,
-            init_samples,
-            init_ns,
+            initial_latency_samples,
             &mut lat_storage,
         )?
     };

@@ -376,18 +376,11 @@ pub fn setup_capture_stream<'c>(
 
     let mut proc_storage = SpaPodStorage::new();
     let mut lat_storage = SpaPodStorage::new();
-    let (init_samples, init_ns) = crate::standalone::pw_host::latency::compute_dsp_latency(
-        initial_latency_samples,
-        0,
-        0,
-        48_000,
-    );
     // SAFETY: proc_storage and lat_storage remain valid and unmodified for the duration
     // of the synchronous `connect` call below.
     let proc_pod = unsafe {
         crate::standalone::pw_host::latency::build_process_latency_pod(
-            init_samples,
-            init_ns,
+            initial_latency_samples,
             &mut proc_storage,
         )?
     };
@@ -396,8 +389,7 @@ pub fn setup_capture_stream<'c>(
     let lat_pod = unsafe {
         crate::standalone::pw_host::latency::build_latency_pod(
             pw::spa::sys::SPA_DIRECTION_INPUT,
-            init_samples,
-            init_ns,
+            initial_latency_samples,
             &mut lat_storage,
         )?
     };

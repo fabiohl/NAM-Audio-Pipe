@@ -73,7 +73,7 @@ To expose multi-field latency updates across thread boundaries without allocator
 
 1. **Audio Writer**: Increments `latency_sequence: AtomicU64` with `Ordering::Release` before and after updating latency counters in `StreamStatusFlags`.
 2. **Control Plane Reader**: `read_applied_latencies` performs an optimistic read, verifying that `latency_sequence` is even and unchanged across the snapshot. If concurrent mutation occurs, the reader retries until a coherent snapshot is acquired.
-3. **PipeWire Notification**: Whenever the synthesized snapshot changes, the main loop calls `pw_stream_set_parameter` to notify the PipeWire scheduler.
+3. **PipeWire Notification**: Whenever the desired `(latency_samples, host_rate)` snapshot diverges from a stream's call-accepted state, the control loop calls `stream.update_params` (`SPA_PARAM_ProcessLatency` and `SPA_PARAM_Latency` with `ns = 0` for synchronous DSP stages) under the PipeWire `ThreadLoop` lock. Each stream tracks its own desired and call-accepted states independently; failed updates are diagnosed off-RT and retried on subsequent cycles with bounded backoff rather than advancing accepted state prematurely.
 
 ---
 

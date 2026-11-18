@@ -617,12 +617,13 @@ pub(crate) fn run_capture_dsp_pipeline(
     gate_mode: crate::standalone::cli::GateMode,
     musical_gate: &mut crate::dsp::musical_gate::MusicalNoiseGate,
     cab: PipeCabRuntime<'_>,
+    capture_tsc: u64,
 ) -> usize {
     use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateState};
     use neural_amp_modeler_rs::dsp::gate_flags::report_gate_flags;
     use neural_amp_modeler_rs::dsp::pipeline::{
         MAX_RESAMP_BUF, apply_input_stage, apply_output_stage, run_inference_streaming,
-        write_bridge,
+        write_bridge_stamped,
     };
 
     let n = n_samples
@@ -709,12 +710,13 @@ pub(crate) fn run_capture_dsp_pipeline(
                     ctx.adaptive,
                     current_host_rate,
                 );
-                write_bridge(
+                write_bridge_stamped(
                     bufs.resamp_out_l,
                     bufs.resamp_out_r,
                     n,
                     ctx.bridge_writer,
                     *ctx.process_mono,
+                    capture_tsc,
                 );
                 return n;
             }
@@ -783,12 +785,13 @@ pub(crate) fn run_capture_dsp_pipeline(
     );
 
     // Stage 5: Deliver output to audio bridge.
-    write_bridge(
+    write_bridge_stamped(
         bufs.resamp_out_l,
         bufs.resamp_out_r,
         n_pw,
         ctx.bridge_writer,
         *ctx.process_mono,
+        capture_tsc,
     );
 
     n_pw
@@ -1004,6 +1007,7 @@ pub fn process_dsp_buffer(
             gate_mode,
             musical_gate,
             cab_rt,
+            t_cap_start,
         );
 
         let t_dsp_end = if should_measure {
@@ -1165,6 +1169,7 @@ impl PrologueOutcome {
 /// 3. **Budgeted Drains**:
 ///    - Resampler swap drain ([`drain_resamplers`])
 ///    - Cab-sim swap drain ([`drain_cabsims`])
+///    - Neural cabinet swap drain ([`crate::standalone::cabinet::drain_cab_nam_payloads`])
 ///    - Param & model swap consumer ([`receive_commands`])
 ///    - Slimmable model rebuild trigger ([`try_slimmable_rebuild`])
 ///    - Slimmable model drain ([`drain_slimmable_models`])
@@ -1258,6 +1263,7 @@ pub fn rt_quantum_prologue(
         let stream_status_ref = state.stream_status.as_deref();
         crate::standalone::cabinet::drain_cab_nam_payloads(
             nam_cons,
+            &mut budget,
             &rt_status.requested_cabsim_generation,
             &rt_status.applied_cabsim_generation,
             &mut state.active_cabsim,

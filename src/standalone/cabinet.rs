@@ -5,7 +5,10 @@
 
 use anyhow::{Context, bail};
 use neural_amp_modeler_rs::SystemSnapshot;
-use neural_amp_modeler_rs::common::spsc::{GcItem, GcSink, RtStatusFlags};
+use neural_amp_modeler_rs::common::spsc::{
+    GcItem, GcSink, RT_STATUS_SPSC_DRAIN_TRUNCATED, RT_STATUS_STRUCTURAL_DEFERRED,
+    RT_STATUS_STRUCTURAL_SUPERSEDED, RtStatusFlags, SwapBudget,
+};
 use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -768,14 +771,29 @@ impl CabBypassState {
     }
 }
 
-/// Checks if `requested_nam_gen` exceeds `applied_gen` atomically on the RT drain.
+/// Per-callback accounting returned by [`drain_cab_nam_payloads`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CabNamDrainStats {
+    /// Payloads popped from the SPSC consumer during this callback.
+    pub pops: usize,
+    /// Neural cabinet slots installed into `active_nam` (`0` or `1`).
+    pub installed: usize,
+    /// Payloads retired to GC without becoming the active slot (stale, superseded, failed, or malformed).
+    pub retired: usize,
+    /// Valid non-stale payloads left queued because `SwapBudget` was exhausted (`0` or `1`).
+    pub deferred: usize,
+}
+
+/// Checks if `requested_nam_gen` exceeds `applied_gen` atomically on the RT drain,
+/// enforcing the callback-shared [`SwapBudget`] via `peek()` before `pop()`.
 #[inline]
 #[expect(
     clippy::too_many_arguments,
-    reason = "The drain needs both generation counters, the exclusive WAV/NAM slots, the latency sink, the failure latch and the GC sink"
+    reason = "The drain needs the budget, both generation counters, the exclusive WAV/NAM slots, the latency sink, the failure latch and the GC sink"
 )]
 pub fn drain_cab_nam_payloads(
     consumer: &mut rtrb::Consumer<PipeCabNamPayload>,
+    budget: &mut SwapBudget,
     requested_generation: &AtomicU64,
     applied_generation: &AtomicU64,
     active_wav: &mut Option<Box<CabSimPair>>,
@@ -783,25 +801,60 @@ pub fn drain_cab_nam_payloads(
     active_cabsim_latency: &dyn Fn(u32),
     failed_key: Option<&mut Option<(u32, usize)>>,
     gc: &mut GcSink<'_>,
-) {
+) -> CabNamDrainStats {
+    let max_pops = crate::standalone::pw_host::STRUCTURAL_POPS_PER_CALLBACK;
     let target_gen = requested_generation.load(Ordering::Acquire);
+    let mut stats = CabNamDrainStats::default();
     let mut latest: Option<PipeCabNamPayload> = None;
-    let mut popped = 0usize;
-    while popped < 8 {
-        let Ok(payload) = consumer.pop() else {
+
+    while stats.pops < max_pops {
+        let Ok(head) = consumer.peek() else {
             break;
         };
-        popped += 1;
-        if payload.generation < target_gen {
-            payload.retire_remainder_to_gc(gc);
+        if head.generation < target_gen {
+            if let Ok(payload) = consumer.pop() {
+                stats.pops += 1;
+                stats.retired += 1;
+                payload.retire_remainder_to_gc(gc);
+            }
             continue;
         }
-        if let Some(prev) = latest.replace(payload) {
-            prev.retire_remainder_to_gc(gc);
+        if latest.is_some() {
+            // Coalesce latest-wins inside the pop window without extra budget.
+            if let Ok(payload) = consumer.pop() {
+                stats.pops += 1;
+                stats.retired += 1;
+                gc.rt_status.set_flag(RT_STATUS_STRUCTURAL_SUPERSEDED);
+                gc.rt_status
+                    .structural_superseded_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(prev) = latest.replace(payload) {
+                    prev.retire_remainder_to_gc(gc);
+                }
+            }
+            continue;
+        }
+        if !budget.can_apply() {
+            // Keep valid payload in the ring when budget is exhausted (zero-loss, FIFO).
+            stats.deferred += 1;
+            gc.rt_status.set_flag(RT_STATUS_STRUCTURAL_DEFERRED);
+            gc.rt_status
+                .structural_deferred_total
+                .fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        if let Ok(payload) = consumer.pop() {
+            stats.pops += 1;
+            latest = Some(payload);
         }
     }
+
+    if stats.pops >= max_pops && !consumer.is_empty() {
+        gc.rt_status.set_flag(RT_STATUS_SPSC_DRAIN_TRUNCATED);
+    }
+
     let Some(mut chosen) = latest else {
-        return;
+        return stats;
     };
     if let Some(partition) = chosen.failed_partition {
         // Fail-closed: the last installed slot is kept (its host rate no longer matches,
@@ -811,11 +864,13 @@ pub fn drain_cab_nam_payloads(
         }
         applied_generation.store(chosen.generation, Ordering::Release);
         chosen.retire_remainder_to_gc(gc);
-        return;
+        stats.retired += 1;
+        return stats;
     }
     let (Some(model_l), Some(resampler)) = (chosen.model_l.take(), chosen.resampler.take()) else {
         chosen.retire_remainder_to_gc(gc);
-        return;
+        stats.retired += 1;
+        return stats;
     };
     #[cfg(feature = "dual-mono")]
     let model_r = chosen.model_r.take();
@@ -839,11 +894,14 @@ pub fn drain_cab_nam_payloads(
     };
     let lat = slot.latency_samples();
     *active_nam = Some(slot);
+    budget.consume();
+    stats.installed += 1;
     if let Some(failed) = failed_key {
         *failed = None;
     }
     active_cabsim_latency(lat);
     applied_generation.store(chosen.generation, Ordering::Release);
+    stats
 }
 
 #[cfg(test)]

@@ -67,6 +67,24 @@ pub struct StreamStatusFlags {
     /// the hardware never repeats stale audio.
     pub playback_bridge_starvation: AtomicU32,
 
+    /// Incremented by the playback callback when it asks the bridge for a new
+    /// block *before* the next capture quantum could have started (the previous
+    /// delivered generation's capture timestamp plus one quantum period is
+    /// still in the future). Kept separate from
+    /// [`Self::playback_bridge_starvation`] so an early callback is not
+    /// misreported as a lost capture (F8 / T5.2).
+    pub playback_early_callbacks: AtomicU32,
+
+    /// Capture-start timestamp (nanoseconds, TSC domain) of the last generation
+    /// actually delivered to playback. Used to classify a missing block as an
+    /// early callback versus a real starvation gap. `0` = nothing delivered yet.
+    pub playback_last_capture_tsc: AtomicU64,
+
+    /// Incremented by the playback callback when it delivers deterministic
+    /// silence because the format contract is broken (fail-closed mute), which
+    /// is neither a starvation gap nor an early callback.
+    pub playback_muted_callbacks: AtomicU32,
+
     /// Cumulative count of frames dropped by the bridge due to clock drift (capture > playback).
     pub bridge_dropped_frames: AtomicU32,
 
@@ -177,6 +195,9 @@ impl StreamStatusFlags {
             #[cfg(any(feature = "testing", feature = "heap-audit"))]
             e2e_exact: ExactLatencyReservoir::new(),
             playback_bridge_starvation: AtomicU32::new(0),
+            playback_early_callbacks: AtomicU32::new(0),
+            playback_last_capture_tsc: AtomicU64::new(0),
+            playback_muted_callbacks: AtomicU32::new(0),
             bridge_dropped_frames: AtomicU32::new(0),
             playback_quantums: AtomicU32::new(0),
             capture_negotiated_rate: AtomicU32::new(0),

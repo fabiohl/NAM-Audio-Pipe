@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Release Ceremony Strict Certification:** Enforced `--strict` flag propagation in `.agents/scripts/release-ceremony.sh` when invoking `utils/build-release.sh --strict --certify --install`, ensuring that `release-receipt.json` accurately asserts `strict_mode: true`.
+- **Release Ceremony Strict Certification:** Enforced `--strict` flag propagation in the release ceremony runner when invoking `utils/build-release.sh --strict --certify --install`, ensuring that `release-receipt.json` accurately asserts `strict_mode: true`.
 - **Hardware PMU Counters in Long Audit Suite:** Added automatic elevation (`kernel.perf_event_paranoid = 1`) and fail-safe restoration via EXIT trap in `utils/tests-long.sh`, preventing `EACCES (Permission denied)` when accessing PMU cycle and instruction counters for real-time IPC calculation.
 - **Zero Page Faults in RT Measurement Loops:** Hardened real-time deadline and jitter harnesses in `tests/rt_metrics.rs` by calling `configure_process_wide()` (`mlockall` + `disable_thp` + `mallopt` heap trimming disable), touching the RT thread stack, and pre-allocating/prefaulting sample buffers to eliminate minor page faults (`minflt`) during nanosecond timing loops.
 - **Release Chain Documentation:** Aligned `README.md`, `docs/testing.md`, and `docs/architecture.md` to consistently document `./utils/build-release.sh --strict --certify --install` as the canonical non-recompiling reconciliation step.

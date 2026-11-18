@@ -144,7 +144,7 @@ pub fn playback_dsp_cycle(
     // delivered instead, reusing the starvation silence policy — the DAC never
     // repeats stale audio and never plays garbled wrong-format data.
     if !stream_status.is_audio_unmuted() {
-        deliver_silence_block(stream, rt_status, stream_status);
+        deliver_silence_block(stream, rt_status, stream_status, SilenceReason::Muted);
         return;
     }
 
@@ -154,24 +154,40 @@ pub fn playback_dsp_cycle(
     // overflow protocol (`consumed_gen`), the writer can publish at most one
     // newer block before this callback consumes it, and that block lands in
     // the complementary buffer — the captured source regions therefore stay
-    // stable for the whole cycle (see `DspBridgeReader::read_block`).
-    let Some((src_l, n_bytes, src_r, _)) = bridge.read_block(last_bridge_gen, |buf_l, buf_r| {
-        (
-            buf_l.as_ptr() as usize,
-            std::mem::size_of_val(buf_l),
-            buf_r.as_ptr() as usize,
-            std::mem::size_of_val(buf_r),
-        )
-    }) else {
-        // Bridge starvation: the capture stream produced no
-        // new block this quantum (paused input, pending resampler rebuild,
-        // clock drift or capture quantum miss). Deterministic silence policy:
-        // still dequeue, validate fail-closed, fill 100% of the output
+    // stable for the whole cycle (see `DspBridgeReader::read_block`) provided
+    // playback `process()` is non-reentrant (single reader on `pw_data_loop`)
+    // and teardown stops streams/loops before `reset_to_silence`/`prime_silence`.
+    let Some((_generation, capture_tsc, (src_l, n_bytes, src_r, _))) =
+        bridge.read_block_stamped(last_bridge_gen, |buf_l, buf_r| {
+            (
+                buf_l.as_ptr() as usize,
+                std::mem::size_of_val(buf_l),
+                buf_r.as_ptr() as usize,
+                std::mem::size_of_val(buf_r),
+            )
+        })
+    else {
+        // Bridge starvation or an early playback callback: the capture stream
+        // produced no new block for this quantum. The delivered generation's
+        // own capture timestamp (never the last global capture timestamp)
+        // classifies the miss: if the next capture quantum could not have
+        // started yet, the callback fired ahead of schedule (early); otherwise
+        // the gap is a real starvation (paused input, pending resampler
+        // rebuild, clock drift or capture quantum miss). Deterministic silence
+        // policy: still dequeue, validate fail-closed, fill 100% of the output
         // extension with analytical silence and recycle the buffer — the
         // hardware never repeats stale audio left in the previous buffer.
-        deliver_silence_block(stream, rt_status, stream_status);
+        let reason = classify_missing_bridge_block(stream_status, pb_frame_count);
+        deliver_silence_block(stream, rt_status, stream_status, reason);
         return;
     };
+    // Remember the capture timestamp of the generation actually delivered so a
+    // later miss can be classified without the last global capture timestamp.
+    if capture_tsc != 0 {
+        stream_status
+            .playback_last_capture_tsc
+            .store(capture_tsc, Ordering::Relaxed);
+    }
 
     let Some(mut buf) = stream.dequeue_buffer() else {
         rt_status.output_buffer_miss.fetch_add(1, Ordering::Relaxed);
@@ -243,7 +259,9 @@ pub fn playback_dsp_cycle(
             .store(pb_nanos, Ordering::Relaxed);
         stream_status.playback_hist.record(pb_nanos);
 
-        let cap_start = stream_status.capture_start_tsc.load(Ordering::Relaxed);
+        // Per-generation capture→playback latency: the timestamp published with
+        // this exact generation, not the last global capture timestamp.
+        let cap_start = capture_tsc;
         if cap_start > 0 && t_pb_end > cap_start {
             let e2e_nanos = t_pb_end.saturating_sub(cap_start);
             stream_status
@@ -463,6 +481,55 @@ pub unsafe fn deliver_silence_pair_fail_closed(
     rt_status: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
 ) -> Option<usize> {
+    // SAFETY: the caller contract of this `unsafe fn` is forwarded verbatim to
+    // the untracked kernel: both channels were proven writable/aligned/
+    // disjoint and the chunks are valid for the callback duration.
+    // SAFETY: `handle_spa_pair_fail_closed` validated the same raw descriptors
+    // above; the pointers/chunks remain those of the live dequeued SPA buffer.
+    let delivered = unsafe {
+        deliver_silence_pair_fail_closed_untracked(
+            ptr_l,
+            max_l,
+            chunk_l,
+            ptr_r,
+            max_r,
+            chunk_r,
+            silence_bytes,
+            rt_status,
+        )
+    };
+    if delivered.is_some() {
+        // Telemetry: one deterministic silence block delivered to the graph.
+        stream_status
+            .playback_bridge_starvation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    delivered
+}
+
+/// Untracked core of [`deliver_silence_pair_fail_closed`]: delivers analytical
+/// silence without touching any stream counter, so the caller can attribute the
+/// delivery to the correct telemetry category (starvation, early callback, or
+/// fail-closed mute) without double counting (F8 / T5.2).
+///
+/// # Safety
+///
+/// Same contract as [`deliver_silence_pair_fail_closed`].
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Raw SPA descriptor fields plus the bounded silence window; signature is stable and shared verbatim by the RT callback and the harness tests"
+)]
+unsafe fn deliver_silence_pair_fail_closed_untracked(
+    ptr_l: usize,
+    max_l: usize,
+    chunk_l: *mut pw::spa::sys::spa_chunk,
+    ptr_r: usize,
+    max_r: usize,
+    chunk_r: *mut pw::spa::sys::spa_chunk,
+    silence_bytes: usize,
+    rt_status: &RtStatusFlags,
+) -> Option<usize> {
     let (_n_bytes, n_out) = match handle_spa_pair_fail_closed(
         ptr_l,
         max_l,
@@ -507,11 +574,6 @@ pub unsafe fn deliver_silence_pair_fail_closed(
         chunk_r_mut.stride = std::mem::size_of::<f32>() as i32;
     }
 
-    // Telemetry: one deterministic silence block delivered to the graph.
-    stream_status
-        .playback_bridge_starvation
-        .fetch_add(1, Ordering::Relaxed);
-
     Some(n_out)
 }
 
@@ -529,11 +591,49 @@ pub unsafe fn deliver_silence_pair_fail_closed(
 /// `Buffer` at the end of this function — every callback path (success,
 /// contract violation or missing buffer) recycles or counts the miss, so the
 /// output node never starves for buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SilenceReason {
+    /// Format contract broken: fail-closed mute.
+    Muted,
+    /// No new generation and the next capture quantum was already due.
+    Starvation,
+    /// No new generation because the callback fired ahead of schedule.
+    Early,
+}
+
+/// Classifies a playback cycle that found no new bridge generation using the
+/// capture timestamp of the last delivered generation plus one quantum period.
+/// RT-safe: one RDTSC read on the miss path only (no allocation, no lock).
+#[inline(always)]
+fn classify_missing_bridge_block(
+    stream_status: &StreamStatusFlags,
+    pb_frame_count: u32,
+) -> SilenceReason {
+    let now = rt_setup::rdtsc_nanos();
+    let last_capture_tsc = stream_status
+        .playback_last_capture_tsc
+        .load(Ordering::Relaxed);
+    let rate = stream_status
+        .capture_negotiated_rate
+        .load(Ordering::Relaxed);
+    let period_ns = if rate > 0 && pb_frame_count > 0 {
+        (pb_frame_count as u64).saturating_mul(1_000_000_000) / rate as u64
+    } else {
+        0
+    };
+    if last_capture_tsc > 0 && period_ns > 0 && now < last_capture_tsc.saturating_add(period_ns) {
+        SilenceReason::Early
+    } else {
+        SilenceReason::Starvation
+    }
+}
+
 #[inline(always)]
 fn deliver_silence_block(
     stream: &pw::stream::Stream,
     rt_status: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
+    reason: SilenceReason,
 ) {
     let mut buf = match stream.dequeue_buffer() {
         Some(b) => b,
@@ -596,8 +696,13 @@ fn deliver_silence_block(
     // live dequeued buffer (owned by PipeWire and stable for the callback), and
     // the kernel itself rejects null/aligned-overlapping descriptors fail-closed
     // before dereferencing any of them.
-    let _ = unsafe {
-        deliver_silence_pair_fail_closed(
+    // SAFETY: the caller contract of this `unsafe fn` is forwarded verbatim to
+    // the untracked kernel: both channels were proven writable/aligned/
+    // disjoint and the chunks are valid for the callback duration.
+    // SAFETY: `handle_spa_pair_fail_closed` validated the same raw descriptors
+    // above; the pointers/chunks remain those of the live dequeued SPA buffer.
+    let delivered = unsafe {
+        deliver_silence_pair_fail_closed_untracked(
             ptr_l,
             max_l,
             chunk_l,
@@ -606,9 +711,18 @@ fn deliver_silence_block(
             chunk_r,
             silence_bytes,
             rt_status,
-            stream_status,
         )
     };
+    if delivered.is_some() {
+        // One deterministic silence block delivered to the graph, attributed to
+        // exactly one category so the miss counters close.
+        let counter = match reason {
+            SilenceReason::Muted => &stream_status.playback_muted_callbacks,
+            SilenceReason::Starvation => &stream_status.playback_bridge_starvation,
+            SilenceReason::Early => &stream_status.playback_early_callbacks,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

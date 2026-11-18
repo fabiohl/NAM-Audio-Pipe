@@ -369,6 +369,11 @@ impl SwapRtSide {
             .slimmable_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
+        let cab_nam_before = self
+            .state
+            .cab_nam_consumer
+            .as_ref()
+            .map_or(0, rtrb::Consumer::slots);
         let os_before = self
             .state
             .os_drain
@@ -392,6 +397,11 @@ impl SwapRtSide {
             .slimmable_drain
             .as_ref()
             .map_or(0, RtSwapDrain::ring_occupied);
+        let cab_nam_after = self
+            .state
+            .cab_nam_consumer
+            .as_ref()
+            .map_or(0, rtrb::Consumer::slots);
         let os_after = self
             .state
             .os_drain
@@ -401,6 +411,7 @@ impl SwapRtSide {
         let structural_pops = resamp_before
             .saturating_sub(resamp_after)
             .saturating_add(cabsim_before.saturating_sub(cabsim_after))
+            .saturating_add(cab_nam_before.saturating_sub(cab_nam_after))
             .saturating_add(slimmable_before.saturating_sub(slimmable_after))
             .saturating_add(os_before.saturating_sub(os_after));
 
@@ -508,6 +519,7 @@ impl SwapRtSide {
             self.state.gate_mode,
             &mut self.state.musical_gate,
             cab_rt,
+            crate::standalone::rt_setup::rdtsc_nanos(),
         )
     }
 
@@ -545,6 +557,10 @@ impl SwapRtSide {
 
     pub fn active_cabsim(&self) -> Option<&CabSimPair> {
         self.state.active_cabsim.as_deref()
+    }
+
+    pub fn active_cab_nam(&self) -> Option<&crate::standalone::cabinet::CabNamSlot> {
+        self.state.active_cab_nam.as_ref()
     }
 
     pub fn process_mono(&self) -> bool {
@@ -614,6 +630,11 @@ impl SwapRtSide {
                 .slimmable_drain
                 .as_ref()
                 .is_some_and(|d| !d.is_empty())
+            || self
+                .state
+                .cab_nam_consumer
+                .as_ref()
+                .is_some_and(|c| !c.is_empty())
             || self.state.os_drain.as_ref().is_some_and(|d| !d.is_empty())
             || self.state.deferred_model.is_some()
             || self
@@ -659,6 +680,11 @@ impl SwapRtSide {
                 .slimmable_drain
                 .as_ref()
                 .map_or(0, RtSwapDrain::ring_occupied)
+            + self
+                .state
+                .cab_nam_consumer
+                .as_ref()
+                .map_or(0, rtrb::Consumer::slots)
             + self
                 .state
                 .os_drain

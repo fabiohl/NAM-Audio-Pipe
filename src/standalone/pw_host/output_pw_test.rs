@@ -1030,3 +1030,90 @@ fn app_state_drop_order_drops_listeners_before_streams() {
         "AppState drop order MUST drop listeners before their associated streams to prevent use-after-free"
     );
 }
+
+// ── T5.2: per-generation capture timestamp and miss classification ───────────
+//
+// A missing bridge block is classified from the capture timestamp of the last
+// delivered generation (plus one quantum period), never from the last global
+// capture timestamp stored by the capture callback.
+
+#[test]
+fn classify_missing_bridge_block_separates_early_from_starvation() {
+    let stream_status = StreamStatusFlags::new();
+    stream_status
+        .capture_negotiated_rate
+        .store(48_000, Ordering::Relaxed);
+
+    // Nothing delivered yet: the miss cannot be an early callback.
+    assert_eq!(
+        classify_missing_bridge_block(&stream_status, 64),
+        SilenceReason::Starvation
+    );
+
+    // A generation captured just now, with a 64-frame period at 48 kHz
+    // (1_333_333 ns): the next capture quantum cannot have started yet.
+    let now = crate::standalone::rt_setup::rdtsc_nanos();
+    stream_status
+        .playback_last_capture_tsc
+        .store(now, Ordering::Relaxed);
+    assert_eq!(
+        classify_missing_bridge_block(&stream_status, 64),
+        SilenceReason::Early
+    );
+
+    // A generation captured more than a full period ago: real starvation.
+    stream_status
+        .playback_last_capture_tsc
+        .store(now.saturating_sub(10_000_000), Ordering::Relaxed);
+    assert_eq!(
+        classify_missing_bridge_block(&stream_status, 64),
+        SilenceReason::Starvation
+    );
+}
+
+#[test]
+fn silence_delivery_counters_are_disjoint_by_reason() {
+    // The untracked kernel attributes nothing; the tracking wrapper keeps its
+    // historical starvation semantics, so every silence block lands in exactly
+    // one counter.
+    let l = [0.0f32; 8];
+    let r = [0.0f32; 8];
+    let mut chunk = chunk_of(0, 32);
+    let rt = RtStatusFlags::default();
+    let stream_status = StreamStatusFlags::new();
+    let m = l.len() * 4;
+
+    // SAFETY: disjoint aligned arrays and a local, non-null chunk.
+    let frames = unsafe {
+        deliver_silence_pair_fail_closed(
+            l.as_ptr() as usize,
+            m,
+            &mut chunk,
+            r.as_ptr() as usize,
+            m,
+            &mut chunk,
+            m,
+            &rt,
+            &stream_status,
+        )
+    };
+    assert_eq!(frames, Some(8));
+    assert_eq!(
+        stream_status
+            .playback_bridge_starvation
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        stream_status
+            .playback_early_callbacks
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        stream_status
+            .playback_muted_callbacks
+            .load(Ordering::Relaxed),
+        0
+    );
+}

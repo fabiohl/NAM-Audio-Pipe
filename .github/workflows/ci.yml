@@ -217,8 +217,7 @@ jobs:
           path: target/logs/**
           retention-days: 14
 
-  # linux-arm64 compilation is blocking; tests remain non-blocking (`continue-on-error: true`)
-  # until native ARM test execution stabilizes (D1).
+  # linux-arm64 compilation and quick tests are blocking CI gates.
   linux-arm64-lints:
     runs-on: ubuntu-26.04-arm
     timeout-minutes: 40
@@ -396,7 +395,7 @@ jobs:
         uses: ./.github/actions/qa-summary
         with:
           title: linux-arm64-quick
-          note: "ARM64 experimental: non-blocking test execution until stabilization (D1)."
+          note: "ARM64 native test execution: blocking CI gate."
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -498,8 +497,7 @@ jobs:
           STATUS_NAME=msrv
           lib_init
           trap 'trap_fail $?' ERR
-          # run_step is the repository's canonical phase runner (equivalent to
-          # the `run_phase` contract in .agents/rules/scripts.md §5.1).
+          # run_step is the repository's canonical phase runner (utils/_lib.sh).
           run_step msrv_check cargo check --locked --workspace --all-targets --all-features
           finish
       - name: Publish step summary
