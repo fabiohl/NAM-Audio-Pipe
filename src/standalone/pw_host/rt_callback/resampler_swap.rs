@@ -140,7 +140,7 @@ pub fn drain_resamplers_with_pair(
 }
 
 /// Runs one callback drain of the resampler swap ring with complete `StreamStatusFlags` seqlock snapshot support.
-#[inline(always)]
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"

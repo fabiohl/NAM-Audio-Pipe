@@ -776,7 +776,11 @@ pub struct CabNamDrainStats {
 
 /// Checks if `requested_nam_gen` exceeds `applied_gen` atomically on the RT drain,
 /// enforcing the callback-shared [`SwapBudget`] via `peek()` before `pop()`.
-#[inline]
+///
+/// Kept out of line: the callback invokes it on every quantum, but the
+/// payload-carrying code paths and their unwind cleanup belong here instead of
+/// inflating the capture closure or emitting structural drops there.
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "The drain needs the budget, both generation counters, the exclusive WAV/NAM slots, the latency sink, the failure latch and the GC sink"
@@ -835,7 +839,11 @@ pub fn drain_cab_nam_payloads(
         }
         if let Ok(payload) = consumer.pop() {
             stats.pops += 1;
-            latest = Some(payload);
+            // The `latest.is_some()` arm above handled coalescing, so this
+            // branch parks into an empty slot. Forget the replaced `None` to
+            // keep the payload destructor out of the RT callback.
+            debug_assert!(latest.is_none(), "cabinet candidate slot must be empty");
+            std::mem::forget(latest.replace(payload));
         }
     }
 
@@ -857,10 +865,24 @@ pub fn drain_cab_nam_payloads(
         stats.retired += 1;
         return stats;
     }
-    let (Some(model_l), Some(resampler)) = (chosen.model_l.take(), chosen.resampler.take()) else {
-        chosen.retire_remainder_to_gc(gc);
-        stats.retired += 1;
-        return stats;
+    let model_l = chosen.model_l.take();
+    let resampler = chosen.resampler.take();
+    let (model_l, resampler) = match (model_l, resampler) {
+        (Some(model_l), Some(resampler)) => (model_l, resampler),
+        (model_l, resampler) => {
+            // Retire every extracted component explicitly: dropping the tuple
+            // here would run `StaticModel`/`StreamingResampleBuffer` destructors
+            // on the audio thread.
+            if let Some(model) = model_l {
+                gc.retire(GcItem::Model(model));
+            }
+            if let Some(resampler) = resampler {
+                gc.retire(GcItem::Streaming(resampler));
+            }
+            chosen.retire_remainder_to_gc(gc);
+            stats.retired += 1;
+            return stats;
+        }
     };
     #[cfg(feature = "dual-mono")]
     let model_r = chosen.model_r.take();
@@ -885,7 +907,8 @@ pub fn drain_cab_nam_payloads(
         remaining_tail: 0,
     };
     let lat = slot.latency_samples();
-    *active_nam = Some(slot);
+    debug_assert!(active_nam.is_none());
+    std::mem::forget(active_nam.replace(slot));
     budget.consume();
     stats.installed += 1;
     if let Some(failed) = failed_key {
@@ -893,6 +916,9 @@ pub fn drain_cab_nam_payloads(
     }
     active_cabsim_latency(lat);
     applied_generation.store(chosen.generation, Ordering::Release);
+    // Every heap component was moved into the active slot; forget the emptied
+    // envelope so no `drop_glue::<PipeCabNamPayload>` is emitted on the RT path.
+    std::mem::forget(chosen);
     stats
 }
 

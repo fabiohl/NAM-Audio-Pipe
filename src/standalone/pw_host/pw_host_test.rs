@@ -24,8 +24,10 @@ fn test_dsp_bridge_concurrent_access() {
 
     // SAFETY: `bridge_ptr` points to the heap-immortal `DspBridge` allocated above.
     let bridge_ref = unsafe { BridgeRef::new(bridge_ptr) };
-    let writer = DspBridgeWriter::from_ref(bridge_ref).expect("valid DspBridgeWriter");
-    let reader = DspBridgeReader::from_ref(bridge_ref).expect("valid DspBridgeReader");
+    // SAFETY: `writer` and `reader` form the unique SPSC pair over `bridge_ref`.
+    let writer = unsafe { DspBridgeWriter::from_ref(bridge_ref) }.expect("valid DspBridgeWriter");
+    // SAFETY: `reader` is the unique SPSC consumer paired with `writer` above.
+    let reader = unsafe { DspBridgeReader::from_ref(bridge_ref) }.expect("valid DspBridgeReader");
 
     // SAFETY: We borrow strictly the atomic counters for spin-wait synchronization in the test.
     // This avoids creating a whole-struct `&DspBridge` reference, preserving unique provenance

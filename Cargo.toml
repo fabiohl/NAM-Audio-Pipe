@@ -131,6 +131,9 @@ rt-hardening = ["NeuralAmpModeler-rs/rt-hardening"]
 
 
 [dev-dependencies]
+NeuralAmpModeler-rs = { version = "3.0.0", default-features = false, features = [
+    "testing",
+] }
 # Criterion statistical harness for the RT regression gate (benches/rt_gate.rs).
 criterion = { version = "0.8", default-features = false }
 # Property-based testing for AlignedBlock invariants and future fuzz targets.

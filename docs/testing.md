@@ -335,7 +335,7 @@ flowchart TD
 
 The operator (or external release automation) runs exactly three sequential commands:
 
-1. `./utils/build-release.sh --strict [--package]` — builds the optimized binary and emits `build-receipt.json`. Under `--strict`, an A/B optimization ceremony proof (`target/logs/ab-opt-ceremony-receipt.json`) is evaluated if present (opt-in preflight). If present, `PGO+BOLT`, `PGO-ONLY`, and `UNOPTIMIZED` (plain fallback) verdicts are accepted.
+1. `./utils/build-release.sh --strict [--package]` — builds the optimized binary and emits `build-receipt.json`. Under `--strict`, the A/B optimization ceremony proof (`target/logs/ab-opt-ceremony-receipt.json`) is **mandatory**: `env_verify` fails before any PGO/BOLT work when the receipt is absent or rejected. `PGO+BOLT`, `PGO-ONLY`, and `UNOPTIMIZED` (plain fallback) verdicts are accepted.
 2. `./utils/tests-long.sh --strict --artifact` — audits the canonical artifact and binds every receipt line to its SHA-256.
 3. `./utils/build-release.sh --strict --certify --install` — hashes the artifact again, reconciles build and long receipts, and writes `target/dist/release-receipt.json`. If certified, installs the binary atomically to `~/.local/bin/nam-audio-pipe` and updates the Flatpak user bundle.
 
@@ -363,12 +363,12 @@ LLVM BOLT requires hardware branch sampling via Intel Last Branch Records (LBR, 
 1. `build-release.sh` detects `PGO+BOLT`, `PGO-ONLY`, or `UNOPTIMIZED` automatically via `pipe_long_receipt ceremony-proof`.
 2. **`PGO-ONLY` Fallback**: When BOLT does not beat PGO by $\ge 1.0\%$ across all topologies (`verdict_reason=bolt_margin_not_met`) or LBR is absent: `build-release.sh` emits `PHASE: bolt_optimize PASS`, sets `bolt_status=not_proven` and `bolt_proof=fallback_pgo_only` in the build receipt. Profile-use compilation proceeds with the PGO-optimized binary.
 3. **`PLAIN-ONLY` Fallback (`UNOPTIMIZED`)**: When PGO does not beat the plain baseline by $\ge 1.0\%$ across all topologies (`verdict_reason=pgo_margin_not_met`), the plain compiler release binary (`RUSTFLAGS="-C target-cpu=x86-64-v3"`) is proven to have lower latency and lower jitter (e.g. dense SIMD/AVX2 WaveNet loops without complex branching). `build-release.sh` skips PGO instrumentation/use cycles and skips BOLT, compiling directly in plain release mode. It records `bolt_status=skipped_unoptimized` and `bolt_proof=fallback_plain`.
-4. Under `--strict`, `build-release.sh` completes with `PASS` and delivers the certified binary without failure for all valid optimization verdicts (`PGO+BOLT`, `PGO-ONLY`, and `fallback_plain`).
+4. Under `--strict`, once a valid ceremony receipt passes the `env_verify` preflight, `build-release.sh` completes with `PASS` and delivers the certified binary without failure for all valid optimization verdicts (`PGO+BOLT`, `PGO-ONLY`, and `fallback_plain`).
 5. In `--certify`, `evaluate_certification` accepts proven `PGO-ONLY` (recording `verdict="PGO-ONLY"`) and proven plain fallback (recording `verdict="PLAIN-ONLY"`, `status="CERTIFIED"`), verifying that the release binary matches the proven optimal configuration.
 
 ### 4.3 PGO Workload Coverage Matrix
 
-During Phase 2, `src/bin/pgo_workload.rs` executes a comprehensive training matrix across all DSP kernels:
+During Phase 2, `src/bin/pgo_workload.rs` executes a comprehensive training matrix across all DSP kernels. Each cell drives the production streaming entry point (`capture_dsp_pipeline_streaming` with a `StreamingResampleBuffer` and a `signal_offset` that advances continuously across blocks), never the retired block-wise `capture_dsp_pipeline`:
 
 | Matrix Dimension     | Evaluated Values                   | Weight Distribution                  |
 |:-------------------- |:---------------------------------- |:------------------------------------ |
@@ -380,16 +380,19 @@ During Phase 2, `src/bin/pgo_workload.rs` executes a comprehensive training matr
 | **Noise Gate**       | Enabled, Disabled                  | 50% / 50%                            |
 | **Recording Pool**   | Enabled, Disabled                  | 50% / 50%                            |
 
-The workload generates `target/logs/pgo-workload-receipt.json`, verifying that every model topology processes at least 1,000 blocks and no DSP stage is skipped.
+The workload generates `target/logs/pgo-workload-receipt.json`, verifying that every model topology processes at least 1,000 blocks and no DSP stage is skipped. Under `--strict`, this phase only starts after the ceremony preflight accepts the A/B receipt; an `UNOPTIMIZED` verdict bypasses PGO instrumentation and profile-use compilation (plain fallback).
 
 ### 4.4 Static Assembly & Microarchitectural Gates
 
 After BOLT layout optimization, `utils/dsp-hotpath-filter.py` analyzes the disassembled hot-path (`target/logs/codegen/dsp_hotpath.asm`, mirrored to `target/dsp_hotpath.asm`), enforcing strict static architectural rules with target-by-target coverage ([`utils/codegen-profile.json`](../utils/codegen-profile.json)):
 
-- **Target Coverage**: Tracks mandatory presence for `capture_dsp_pipeline`, `playback_dsp_cycle`, `process_dsp_buffer`, `process_block_internal`, `tanh_and_accumulate`, `cabsim_adapter`, `conv_engine`, and `resampler`.
+- **Target Coverage**: Tracks mandatory presence for `capture_dsp_pipeline`, `playback_dsp_cycle`, `process_dsp_buffer`, `process_block_internal`, `tanh_and_accumulate`, `cabsim_adapter`, `conv_engine`, and `resampler`, plus the eight out-of-line RT drains (`receive_commands`, `install_load_model`, `discard_load_model`, `drain_cab_nam_payloads`, `drain_cabsims_with_slot_status`, `drain_os_engines_with_status`, `drain_resamplers_with_status`, `drain_slimmable_models`), each gated at `alloc: 0` with no exceptions.
 - **Fail-Closed Disassembly**: Rejects empty or partial disassembly before running filter gates; non-zero exits abort the build immediately.
 - **Zero AVX-512 Vectors on x86-64-v3 Baseline**: Prohibits `zmm` registers, EVEX vector extensions (`xmm16-31`, `ymm16-31`), and opmasks (`%k0-%k7`) in baseline artifacts.
-- **Zero `libm` and Allocations in RT Hotpaths**: Strictly forbids runtime heap allocation symbols (`alloc`, `__rust_alloc`) and scalar math library calls in DSP loops.
+- **Zero `libm` and Allocations in RT Hotpaths**: Strictly forbids runtime heap allocation symbols (`alloc`, `__rust_alloc`) and scalar math library calls in DSP loops. Unwind landing pads are the only exclusion: an allocation call is discarded from the gate only when no path from it returns and at least one path ends in `_Unwind_Resume` or `panic_in_cleanup` (fail-closed; reported as `unwind-cold landing-pad call(s) excluded`). No `free@GLIBC`/`malloc@GLIBC` exception is added by name.
+- **Stack Spill Budget (`spills_lt`)**: The `capture_dsp_pipeline` target caps the number of `(%rsp)` stack references across its matched symbols at a strict `< 1950` (`gates.spills_lt`), keeping the RT capture callback frame under the `2000` ceiling. The per-symbol spill count is reported in `dsp_hotpath_summary.txt`.
+- **No Double Counting**: `conv_engine` matches only `ConvEngine::process`; `CabSimAdapter::process_block` is accounted exclusively under `cabsim_adapter`.
+- **PID-Scoped BOLT Readiness**: the live profiling driver collects every PipeWire `client.id` whose `pipewire.sec.pid` equals the freshly launched `nam-audio-pipe` PID, resolves the `node.id` of the `NAM-Audio-Pipe-input` node owned by one of those clients, and routes `pw-play` with `--target=<node.id>`. A residual or desktop instance can neither satisfy the readiness probe nor capture the profiling signal.
 
 ---
 
@@ -471,7 +474,8 @@ The following contractual rules are enforced across test suites and CI checks:
 | **Target CPU Baseline**     | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                     | `.cargo/config.toml`                                         |
 | **AppStream XML Validity**  | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`.                          | `tests/distribution_qa.rs`, `utils/lints.sh`                 |
 | **Release Provenance**      | `target/dist/build-receipt.json` records artifact SHA-256, git provenance, locked engine provenance, and PGO/BOLT optimization evidence; reconciled fail-closed via `pipe_long_receipt build-status`. | `src/receipt/build.rs`, `utils/build-release.sh`             |
-| **Metrology Tail Precision**| E2E latency gate enforces conservative histogram upper bounds (`p99_source=histogram`), while exact reservoir samples are labeled for coverage (`p99_exact_coverage=full\|partial`). | `tests/pw_integration.rs`                                    |
+| **Strict Release Preflight**| `--strict` fails in `env_verify` when the A/B ceremony receipt is absent/invalid (before PGO/BOLT); BOLT live profiling requires the launch PID's capture node `node.id` (resolved through its PipeWire clients) and plays the signal to that exact node. | `utils/build-release.sh`                                     |
+| **Metrology Tail Precision**| E2E latency gate enforces conservative histogram bounds (`p99_source=histogram`) with monotonic percentiles (`p50 <= p99 <= p999 <= max`, clamped to the exact maximum at the consumer); exact reservoir samples are labeled for coverage (`p99_exact_coverage=full\|partial`). | `tests/pw_integration.rs`, `src/standalone/rt_setup/telemetry.rs` |
 
 ---
 

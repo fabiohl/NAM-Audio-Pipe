@@ -79,7 +79,11 @@ fn main() -> anyhow::Result<()> {
     // PipeWire socket is not available and a full `pw_init()` would abort or return an error.
     if args.diagnose || args.diagnose_full {
         pipewire::init();
-        pw_host::init_pipewire_logging(level_filter);
+        // PipeWire logging is deliberately NOT installed here: `--diagnose`
+        // must emit a clean structured bundle. Installing the RT log ring
+        // would allocate ~344 KiB, spawn the `nam-pw-log-drain` thread and
+        // inject asynchronous `libpipewire` messages into the diagnostic
+        // output before the CLI resolves. The main audio path installs it below.
         neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
             "nam-audio-pipe {} / {}",
             env!("CARGO_PKG_VERSION"),
@@ -90,7 +94,6 @@ fn main() -> anyhow::Result<()> {
         // `write_stdout` tolerates a closed pipe (e.g. `--diagnose | head`) instead
         // of panicking like `println!`.
         cli::write_stdout(&format!("{}\n", bundle.render()));
-        pw_host::restore_pipewire_logging();
         // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
         // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
         // `exit(0)` and is mutually exclusive with the main audio host run loop below.

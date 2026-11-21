@@ -8,8 +8,8 @@ use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::identity;
 use crate::standalone::pw_host::latency;
 use crate::standalone::pw_host::output_pw::{
-    SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch, playback_dsp_cycle,
-    reject_negotiated_format_violation, validate_audio_raw_format,
+    SpaPodStorage, build_stereo_f32p_format_pod, check_negotiated_rate_mismatch,
+    playback_dsp_cycle, reject_negotiated_format_violation, validate_audio_raw_format,
 };
 use crate::standalone::pw_host::rt_callback;
 use crate::standalone::pw_host::{SharedBackendStatus, observe_stream_state};
@@ -120,7 +120,8 @@ pub fn setup_playback_stream<'c>(
     backend_status: Arc<SharedBackendStatus>,
     output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
-    let bridge_ptr_playback = DspBridgeReader::from_ref(bridge_ptr)
+    // SAFETY: the PipeWire playback callback is the sole SPSC consumer on `bridge_ptr`.
+    let bridge_ptr_playback = unsafe { DspBridgeReader::from_ref(bridge_ptr) }
         .context("BridgeRef cannot be null when setting up playback stream")?;
     let rt_status_playback = rt_status;
     let stream_status_playback = backend_status.stream_status().clone();
@@ -151,7 +152,7 @@ pub fn setup_playback_stream<'c>(
         pw::stream::StreamBox::new(core, identity::PW_PLAYBACK_STREAM_NAME, playback_props)?;
 
     let mut last_bridge_gen: u64 = 0;
-    let mut pb_frame_count: u32 = 0;
+    let mut pb_callback_count: u32 = 0;
 
     let rt_status_for_params = rt_status_playback.clone();
     let backend_for_state = backend_status.clone();
@@ -180,7 +181,7 @@ pub fn setup_playback_stream<'c>(
             rt_callback::run_rt_callback_body(
                 &rt_status_playback,
                 std::panic::AssertUnwindSafe(|| {
-                    if (pb_frame_count & 0x3F) == 0
+                    if (pb_callback_count & 0x3F) == 0
                         && let Ok(pw_time) = stream.time()
                     {
                         stream_status_playback
@@ -193,7 +194,7 @@ pub fn setup_playback_stream<'c>(
                             .playback_host_delay
                             .store(pw_time.delay(), Ordering::Relaxed);
                     }
-                    pb_frame_count = pb_frame_count.wrapping_add(1);
+                    pb_callback_count = pb_callback_count.wrapping_add(1);
                     // Quantum counter for the bring-up window.
                     // Saturate at the window size (no wrap) so a long-running
                     // stream can never re-open the suppression window; the
@@ -210,11 +211,11 @@ pub fn setup_playback_stream<'c>(
 
                     playback_dsp_cycle(
                         stream,
-                        bridge_ptr_playback,
+                        &bridge_ptr_playback,
                         &mut last_bridge_gen,
                         &rt_status_playback,
                         &stream_status_playback,
-                        pb_frame_count,
+                        pb_callback_count,
                         output_limit,
                     );
                 }),
@@ -222,15 +223,11 @@ pub fn setup_playback_stream<'c>(
         })
         .register()?;
 
-    let mut playback_audio_info = pw::spa::param::audio::AudioInfoRaw::new();
-    playback_audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
-    playback_audio_info.set_channels(2);
-
     let mut playback_format_storage = SpaPodStorage::new();
-    // SAFETY: `playback_format_storage` guarantees 8-byte alignment required by libspa
-    // and remains valid and unmodified for the duration of the synchronous `connect` call below.
-    let playback_format_pod =
-        unsafe { build_spa_format_pod(&playback_audio_info, &mut playback_format_storage)? };
+    // Canonical stereo F32P pod with explicit FL/FR positions, shared with the
+    // capture stream: an anonymous stereo pod would let a strict PipeWire graph
+    // echo [0, 0] positions and trip the host's own E2304 contract validator.
+    let playback_format_pod = build_stereo_f32p_format_pod(&mut playback_format_storage)?;
 
     let mut proc_storage = SpaPodStorage::new();
     let mut lat_storage = SpaPodStorage::new();

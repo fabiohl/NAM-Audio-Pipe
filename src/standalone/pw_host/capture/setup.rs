@@ -10,7 +10,7 @@ use crate::recording::transport::RecordingSender;
 use crate::standalone::cli::BUFFER_SIZE_MIN;
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::SharedBackendStatus;
-use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_spa_format_pod};
+use crate::standalone::pw_host::output_pw::{SpaPodStorage, build_stereo_f32p_format_pod};
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{
@@ -55,22 +55,47 @@ pub fn create_capture_properties(buffer_size: u32) -> pw::properties::Properties
     capture_props
 }
 
-/// Builds the SPA format specification POD for planar 2-channel F32 audio.
-pub fn build_capture_format_pod(
-    storage: &mut SpaPodStorage<1024>,
-) -> anyhow::Result<&pw::spa::pod::Pod> {
-    let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
-    audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
-    audio_info.set_channels(2);
-    let mut pos = [0u32; 64];
-    pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
-    pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
-    audio_info.set_position(pos);
+/// Returns `true` when the adaptive FSM may consume a fresh latency sample.
+///
+/// `process_dsp_buffer` measures and stores `dsp_cycle_time` when the pre-call
+/// `frame_count` is a multiple of 16 (then increments it), so the post-call
+/// counter satisfies `(frame_count - 1) & 0xF == 0`. Requiring a changed
+/// counter prevents a skipped/paused callback from feeding the same stale
+/// `dsp_cycle_time` back into the FSM (which would falsely satisfy the
+/// consecutive-overload/recovery counters).
+#[inline]
+fn adaptive_update_due(frame_count: u32, prev_frame_count: u32) -> bool {
+    frame_count != prev_frame_count && (frame_count.wrapping_sub(1) & 0xF) == 0
+}
 
-    // SAFETY: `SpaPodStorage` guarantees the 8-byte alignment required by the
-    // libspa pod builder, and the returned pod borrows `storage`, which outlives
-    // the negotiation call below.
-    unsafe { build_spa_format_pod(&audio_info, storage) }
+#[cold]
+#[inline(never)]
+fn configure_rt_thread_once(
+    state: &mut CaptureState,
+    target_cpu: usize,
+    rt_status: &Arc<RtStatusFlags>,
+) {
+    rt_setup::configure_realtime_thread(target_cpu, Arc::clone(rt_status), state.activation);
+    state.thread_configured = true;
+}
+
+#[cold]
+#[inline(never)]
+fn request_cabsim_rebuild(
+    rt_status: &RtStatusFlags,
+    partition_to_request: usize,
+    current_host_rate: u32,
+) {
+    rt_status
+        .requested_cabsim_partition_size
+        .store(partition_to_request as u32, Ordering::Relaxed);
+    rt_status
+        .requested_cabsim_host_rate
+        .store(current_host_rate, Ordering::Relaxed);
+    rt_status
+        .requested_cabsim_generation
+        .fetch_add(1, Ordering::Release);
+    rt_status.set_flag_release(neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD);
 }
 
 /// Configures the capture stream (Virtual Sink) and its RT listener.
@@ -121,6 +146,10 @@ pub fn setup_capture_stream<'c>(
     let backend_for_params = backend_status;
 
     let lut = neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut();
+
+    // Last callback counter observed by the adaptive cadence guard. Lives per
+    // stream instance; a reconnect starts a fresh measurement window.
+    let mut adaptive_prev_frame_count: u32 = 0;
 
     let capture_listener = capture_stream
         .add_local_listener::<()>()
@@ -185,12 +214,7 @@ pub fn setup_capture_stream<'c>(
                     // actual PipeWire data-loop thread. Sets DAZ/FTZ, thread naming, core affinity,
                     // and scheduler inspection directly on the audio thread.
                     if !state.thread_configured {
-                        rt_setup::configure_realtime_thread(
-                            target_cpu,
-                            rt_status_for_process.clone(),
-                            state.activation,
-                        );
-                        state.thread_configured = true;
+                        configure_rt_thread_once(state, target_cpu, &rt_status_for_process);
                     }
 
                     let outcome = rt_callback::rt_quantum_prologue(
@@ -232,7 +256,8 @@ pub fn setup_capture_stream<'c>(
                             process_mono: &mut state.process_mono,
                             rt_status: &rt_status_for_process,
                             adaptive: &mut state.adaptive_compute,
-                            bridge_writer: DspBridgeWriter::from_ref(bridge_ptr),
+                            // SAFETY: the PipeWire capture callback is the sole SPSC producer on `bridge_ptr`.
+                            bridge_writer: unsafe { DspBridgeWriter::from_ref(bridge_ptr) },
                             conv: None,
                             conv_pair,
                         },
@@ -289,7 +314,7 @@ pub fn setup_capture_stream<'c>(
                             .store(pw_time.delay(), Ordering::Relaxed);
                     }
 
-                    if (state.frame_count.wrapping_sub(1) & 0xF) == 0 {
+                    if adaptive_update_due(state.frame_count, adaptive_prev_frame_count) {
                         let elapsed_nanos =
                             rt_status_for_process.dsp_cycle_time.load(Ordering::Relaxed);
                         if elapsed_nanos > 0 {
@@ -309,6 +334,7 @@ pub fn setup_capture_stream<'c>(
                             }
                         }
                     }
+                    adaptive_prev_frame_count = state.frame_count;
 
                     // Detect cabsim rate mismatch and signal rebuild:
                     // the IR must match the applied host output rate only.
@@ -345,25 +371,10 @@ pub fn setup_capture_stream<'c>(
                         ),
                     );
                     if wav_needs_rebuild || nam_needs_rebuild {
-                        // Write data BEFORE raising the flag (Release barrier must cover
-                        // the preceding stores so the consumer sees the correct values).
-                        // The `--cabsim-partition` policy sizes EVERY install (initial
-                        // load, first RT install and rate recalibration): the quantum
-                        // never sizes the pair — it only gates the first install below
-                        // (a real quantum proves the host rate was negotiated, which
-                        // the rebuild needs). Rate-only rebuilds preserve the active
-                        // partition.
-                        rt_status_for_process
-                            .requested_cabsim_partition_size
-                            .store(partition_to_request as u32, Ordering::Relaxed);
-                        rt_status_for_process
-                            .requested_cabsim_host_rate
-                            .store(current_host_rate, Ordering::Relaxed);
-                        rt_status_for_process
-                            .requested_cabsim_generation
-                            .fetch_add(1, Ordering::Release);
-                        rt_status_for_process.set_flag_release(
-                            neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_CABSIM_REBUILD,
+                        request_cabsim_rebuild(
+                            &rt_status_for_process,
+                            partition_to_request,
+                            current_host_rate,
                         );
                     }
                 }),
@@ -372,7 +383,7 @@ pub fn setup_capture_stream<'c>(
         .register()?;
 
     let mut format_storage = SpaPodStorage::new();
-    let format_pod = build_capture_format_pod(&mut format_storage)?;
+    let format_pod = build_stereo_f32p_format_pod(&mut format_storage)?;
 
     let mut proc_storage = SpaPodStorage::new();
     let mut lat_storage = SpaPodStorage::new();

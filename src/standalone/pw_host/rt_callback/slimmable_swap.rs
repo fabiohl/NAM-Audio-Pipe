@@ -21,10 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// and the RT drain can discard stale in-flight pairs.
 #[inline(always)]
 pub fn try_slimmable_rebuild(adaptive: &mut AdaptiveCompute, rt_status: &RtStatusFlags) {
-    let Some(targets) = adaptive.take_slimmable_rebuild() else {
+    let Some(target_ch) = adaptive.take_slimmable_ch_rebuild() else {
         return;
     };
-    let target_ch = targets.first().copied().unwrap_or(0);
     rt_status
         .requested_slimmable_ch
         .store(target_ch as u32, Ordering::Relaxed);
@@ -94,7 +93,7 @@ impl RtSwapHandler for SlimmableSwapHandler<'_> {
 
 /// Drains slimmable-rebuilt model pairs delivered by the main thread via SPSC
 /// (engine canonical 3-phase protocol).
-#[inline(always)]
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"

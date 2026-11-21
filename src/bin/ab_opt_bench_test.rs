@@ -20,6 +20,23 @@ fn stats_empty_is_default() {
 }
 
 #[test]
+fn gate_threshold_rejects_non_finite_inputs() {
+    assert!(gate_threshold_sq(f32::NAN).is_err());
+    assert!(gate_threshold_sq(f32::INFINITY).is_err());
+    assert!(gate_threshold_sq(f32::NEG_INFINITY).is_err());
+}
+
+#[test]
+fn gate_threshold_is_finite_squared_linear_amplitude() {
+    let open = gate_threshold_sq(-70.0).expect("finite open threshold");
+    let close = gate_threshold_sq(-80.0).expect("finite close threshold");
+    assert!(open.is_finite() && close.is_finite());
+    assert!(open > close && close > 0.0);
+    assert!((open - 1e-7).abs() < 1e-12, "open={open}");
+    assert!((close - 1e-8).abs() < 1e-13, "close={close}");
+}
+
+#[test]
 fn json_emitter_escapes_and_sorts_keys() {
     let v = obj(vec![
         kv("a", JsonValue::Int(1)),

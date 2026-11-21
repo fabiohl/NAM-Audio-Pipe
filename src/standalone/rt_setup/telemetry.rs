@@ -18,8 +18,93 @@ use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::StreamStatusFlags;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
 use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
+use neural_amp_modeler_rs::dsp::telemetry::{AtomicHistogram, LatencyHistogram};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+
+/// Read-only view of the engine latency-histogram surface.
+pub trait LatencyHistogramView {
+    fn percentile(&self, p: f32) -> u64;
+    fn mean(&self) -> u64;
+    fn exact_min(&self) -> u64;
+    fn exact_max(&self) -> u64;
+}
+
+impl LatencyHistogramView for AtomicHistogram {
+    fn percentile(&self, p: f32) -> u64 {
+        self.get_percentile(p)
+    }
+
+    fn mean(&self) -> u64 {
+        self.get_mean()
+    }
+
+    fn exact_min(&self) -> u64 {
+        self.get_exact_min()
+    }
+
+    fn exact_max(&self) -> u64 {
+        self.get_exact_max()
+    }
+}
+
+impl LatencyHistogramView for LatencyHistogram {
+    fn percentile(&self, p: f32) -> u64 {
+        self.get_percentile(p)
+    }
+
+    fn mean(&self) -> u64 {
+        self.get_mean()
+    }
+
+    fn exact_min(&self) -> u64 {
+        self.get_exact_min()
+    }
+
+    fn exact_max(&self) -> u64 {
+        self.get_exact_max()
+    }
+}
+
+/// Latency summary emitted by the RT telemetry dashboard.
+///
+/// Engine percentiles report the upper edge of the matched bucket (≤ 12.5 %
+/// error for the log-linear histogram), which can numerically exceed the exact
+/// maximum when the tail sample sits inside that bucket. Consumers therefore
+/// clamp every percentile to `max_ns` without touching the engine histogram's
+/// bucket resolution, preserving `p50 <= p99 <= p999 <= max_ns`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LatencySummary {
+    /// Exact minimum latency (ns).
+    pub min_ns: u64,
+    /// Mean latency (ns).
+    pub mean_ns: u64,
+    /// Median latency (ns), clamped to `max_ns`.
+    pub p50_ns: u64,
+    /// 99th percentile latency (ns), clamped to `max_ns`.
+    pub p99_ns: u64,
+    /// 99.9th percentile latency (ns), clamped to `max_ns`.
+    pub p999_ns: u64,
+    /// Exact maximum latency observed (ns).
+    pub max_ns: u64,
+}
+
+/// Summarises a latency histogram with monotonic percentiles clamped to the
+/// exact maximum: `p50 <= p99 <= p999 <= max`.
+pub fn latency_summary(hist: &impl LatencyHistogramView) -> LatencySummary {
+    let max_ns = hist.exact_max();
+    let p50_ns = hist.percentile(0.50).min(max_ns);
+    let p99_ns = hist.percentile(0.99).min(max_ns).max(p50_ns);
+    let p999_ns = hist.percentile(0.999).min(max_ns).max(p99_ns);
+    LatencySummary {
+        min_ns: hist.exact_min(),
+        mean_ns: hist.mean(),
+        p50_ns,
+        p99_ns,
+        p999_ns,
+        max_ns,
+    }
+}
 
 /// Minimum spacing between gate-transition `info` lines.
 ///
@@ -217,7 +302,7 @@ pub fn poll_rt_status(
     _sys: &SystemSnapshot,
     was_silent: bool,
     was_fading: bool,
-    bridge: &neural_amp_modeler_rs::dsp::pipeline::DspBridge,
+    dropped_frames: u32,
     state: &mut PollState,
 ) -> (bool, bool) {
     let current_bits = rt_status.status_bits.load(Ordering::Relaxed);
@@ -699,7 +784,7 @@ pub fn poll_rt_status(
     if bringing_up {
         state.bringup_suppressed_polls = state.bringup_suppressed_polls.saturating_add(1);
     }
-    let drops = bridge.drain_dropped_frames();
+    let drops = dropped_frames;
     if bringing_up && drops > 0 {
         state.startup_drops_drained = true;
     }
@@ -726,92 +811,61 @@ pub fn poll_rt_status(
         let duration = Duration::from_nanos(nanos);
         state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
         if state.telemetry_throttle.wrapping_rem(100) == 0 {
-            let (cap_min, cap_mean, cap_p50, cap_p99, cap_max) = match stream_status {
-                Some(ss) => (
-                    ss.capture_hist.get_exact_min() / 1000,
-                    ss.capture_hist.get_mean() / 1000,
-                    ss.capture_hist.get_percentile(0.50) / 1000,
-                    ss.capture_hist.get_percentile(0.99) / 1000,
-                    ss.capture_hist.take_exact_max() / 1000,
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-
-            let dsp_min = rt_status.latency_hist.get_exact_min() / 1000;
-            let dsp_mean = rt_status.latency_hist.get_mean() / 1000;
-            let dsp_p50 = rt_status.latency_hist.get_percentile(0.50) / 1000;
-            let dsp_p99 = rt_status.latency_hist.get_percentile(0.99) / 1000;
-            let dsp_max = rt_status.latency_hist.take_exact_max() / 1000;
-
-            let (rec_min, rec_mean, rec_p50, rec_p99, rec_max) = match stream_status {
-                Some(ss) => (
-                    ss.record_hist.get_exact_min() / 1000,
-                    ss.record_hist.get_mean() / 1000,
-                    ss.record_hist.get_percentile(0.50) / 1000,
-                    ss.record_hist.get_percentile(0.99) / 1000,
-                    ss.record_hist.take_exact_max() / 1000,
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-
-            let (pb_min, pb_mean, pb_p50, pb_p99, pb_max) = match stream_status {
-                Some(ss) => (
-                    ss.playback_hist.get_exact_min() / 1000,
-                    ss.playback_hist.get_mean() / 1000,
-                    ss.playback_hist.get_percentile(0.50) / 1000,
-                    ss.playback_hist.get_percentile(0.99) / 1000,
-                    ss.playback_hist.take_exact_max() / 1000,
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-
-            let (e2e_min, e2e_mean, e2e_p50, e2e_p99, e2e_max) = match stream_status {
-                Some(ss) => (
-                    ss.e2e_hist.get_exact_min() / 1000,
-                    ss.e2e_hist.get_mean() / 1000,
-                    ss.e2e_hist.get_percentile(0.50) / 1000,
-                    ss.e2e_hist.get_percentile(0.99) / 1000,
-                    ss.e2e_hist.take_exact_max() / 1000,
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
+            let cap = stream_status
+                .map(|ss| latency_summary(&ss.capture_hist))
+                .unwrap_or_default();
+            let dsp = latency_summary(&rt_status.latency_hist);
+            let rec = stream_status
+                .map(|ss| latency_summary(&ss.record_hist))
+                .unwrap_or_default();
+            let pb = stream_status
+                .map(|ss| latency_summary(&ss.playback_hist))
+                .unwrap_or_default();
+            let e2e = stream_status
+                .map(|ss| latency_summary(&ss.e2e_hist))
+                .unwrap_or_default();
 
             let total_calls = rt_status.latency_hist.total_count();
 
             log::info!(
                 "{} RT Latency Breakdown (10s) [{} blocks]:\n\
-                 ├─ 1. Capture Total:        min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
-                 ├─ 2. DSP Core:             min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
-                 ├─ 3. Record Enqueue:       min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
-                 ├─ 4. Playback Total:       min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs\n\
-                 └─ 5. Capture↦Playback E2E: min={}µs | mean={}µs | p50={}µs | p99={}µs | max={}µs",
+                 ├─ 1. Capture Total:        min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+                 ├─ 2. DSP Core:             min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+                 ├─ 3. Record Enqueue:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+                 ├─ 4. Playback Total:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+                 └─ 5. Capture↦Playback E2E: min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs",
                 "📊".bright_blue(),
                 total_calls,
-                cap_min,
-                cap_mean,
-                cap_p50,
-                cap_p99,
-                cap_max,
-                dsp_min,
-                dsp_mean,
-                dsp_p50,
-                dsp_p99,
-                dsp_max,
-                rec_min,
-                rec_mean,
-                rec_p50,
-                rec_p99,
-                rec_max,
-                pb_min,
-                pb_mean,
-                pb_p50,
-                pb_p99,
-                pb_max,
-                e2e_min,
-                e2e_mean,
-                e2e_p50,
-                e2e_p99,
-                e2e_max,
+                cap.min_ns / 1000,
+                cap.mean_ns / 1000,
+                cap.p50_ns / 1000,
+                cap.p99_ns / 1000,
+                cap.p999_ns / 1000,
+                cap.max_ns / 1000,
+                dsp.min_ns / 1000,
+                dsp.mean_ns / 1000,
+                dsp.p50_ns / 1000,
+                dsp.p99_ns / 1000,
+                dsp.p999_ns / 1000,
+                dsp.max_ns / 1000,
+                rec.min_ns / 1000,
+                rec.mean_ns / 1000,
+                rec.p50_ns / 1000,
+                rec.p99_ns / 1000,
+                rec.p999_ns / 1000,
+                rec.max_ns / 1000,
+                pb.min_ns / 1000,
+                pb.mean_ns / 1000,
+                pb.p50_ns / 1000,
+                pb.p99_ns / 1000,
+                pb.p999_ns / 1000,
+                pb.max_ns / 1000,
+                e2e.min_ns / 1000,
+                e2e.mean_ns / 1000,
+                e2e.p50_ns / 1000,
+                e2e.p99_ns / 1000,
+                e2e.p999_ns / 1000,
+                e2e.max_ns / 1000,
             );
 
             if let Some(ss) = stream_status {

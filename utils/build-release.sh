@@ -76,7 +76,7 @@ Usage:
   utils/build-release.sh [flags]
 
 Canonical flags:
-  --strict     Fail-closed: PGO is mandatory; BOLT requires ceremony proof; any unproven gap aborts.
+  --strict     Fail-closed: PGO is mandatory; the A/B ceremony proof is required at preflight (env_verify) before PGO/BOLT; any unproven gap aborts.
   --package    Also produce the .tar.zst and Flatpak bundle in target/dist/.
   --certify    Do not build: reconcile the artifact, build receipt and long audit.
   --install    Only with --certify: install the certified binary (and the bundle, if declared).
@@ -321,6 +321,11 @@ if [ "$DO_STRICT" = 1 ]; then
                 exit 1
                 ;;
         esac
+    else
+        echo "ERROR: --strict requires $CEREMONY_RECEIPT (operator A/B ceremony); run utils/ab-opt-ceremony.sh on the isolated host or omit --strict for a QA build" | tee "$CEREMONY_PREFLIGHT_LOG" >&2
+        fail_phase env_verify 1 "$CEREMONY_PREFLIGHT_LOG"
+        finish || true
+        exit 1
     fi
 fi
 ok "environment ready (rustflags: $CONFIG_RUSTFLAGS)"
@@ -478,7 +483,7 @@ if [ -z "$BOLT_CAUSE" ]; then
 #!/usr/bin/env bash
 set -u
 bin="$1"; wav="$2"; shift 2
-node_ready() { pw-cli ls Node 2>/dev/null | grep -q 'node.name = "NAM-Audio-Pipe-input"'; }
+pw_node_id() { local cs; cs=$(pw-cli ls Client 2>/dev/null | awk -v p="$1" '/^[[:space:]]*id [0-9]+, type /{c=$2;sub(/,/,"",c)} $1=="pipewire.sec.pid"{v=$3;gsub(/"/,"",v);if(v==p)print c}' | tr '\n' ' '); [ -n "$cs" ] || return 1; pw-cli ls Node 2>/dev/null | awk -v cs="$cs" 'function chk(){if(!f&&nm=="NAM-Audio-Pipe-input"&&(cl in ok)){print nid;f=1}} BEGIN{split(cs,a," ");for(k in a)ok[a[k]]=1} /^[[:space:]]*id [0-9]+, type /{chk();nid=$2;sub(/,/,"",nid);nm="";cl=""} $1=="client.id"{cl=$3;gsub(/"/,"",cl)} $1=="node.name"{nm=$3;gsub(/"/,"",nm)} END{chk()}'; }
 ticks() {
     local p="$1" s
     s=$(awk '{s+=$1} END {print (s+0)}' /proc/"$p"/task/*/schedstat 2>/dev/null)
@@ -493,14 +498,14 @@ for model in "$@"; do
     ready=0
     for _ in $(seq 1 40); do
         kill -0 "$pid" 2>/dev/null || break
-        if node_ready; then ready=1; break; fi
+        node_id=$(pw_node_id "$pid" || true); if [ -n "$node_id" ]; then ready=1; break; fi
         sleep .25
     done
     if [ "$ready" != 1 ]; then
         echo "capture node not registered for $model" >&2
         kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1
     fi
-    pw-play --target="NAM-Audio-Pipe-input" "$wav" >/dev/null 2>&1 & play=$!
+    pw-play --target="$node_id" "$wav" >/dev/null 2>&1 & play=$!
     sleep .3
     t1=$(ticks "$pid"); sleep .8; t2=$(ticks "$pid")
     if [ "$t2" -le "$t1" ]; then

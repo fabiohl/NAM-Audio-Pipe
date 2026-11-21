@@ -63,6 +63,7 @@ use neural_amp_modeler_rs::math::dsp::gain_lut::{GainLUT, get_gain_lut};
 use neural_amp_modeler_rs::models::StaticModel;
 
 use rtrb::{Consumer, Producer};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -283,7 +284,15 @@ pub struct SwapRtSide {
     pub parking_lot_dirty: AtomicBool,
     pub rt_status: Arc<RtStatusFlags>,
     pub stream_status: Arc<crate::standalone::pw_host::StreamStatusFlags>,
-    pub bridge: Box<DspBridge>,
+    /// Raw pointer to the harness-owned `DspBridge` allocation.
+    ///
+    /// Stored as `NonNull` (not `Box`) so the RT writer and the playback reader
+    /// both derive their pointers from the same place without ever
+    /// materializing `&mut DspBridge` — which would invalidate the reader's
+    /// provenance under Stacked/Tree Borrows. Ownership is reclaimed exactly
+    /// once by [`Drop`]; callers must join/stop the RT thread before dropping
+    /// this side (see the `RtSwapHarness` constructors).
+    pub bridge: NonNull<DspBridge>,
     pub lut: &'static GainLUT,
     /// Last host rate applied by `run_callback`.
     current_host_rate: u32,
@@ -291,17 +300,36 @@ pub struct SwapRtSide {
     last_n_pw: usize,
 }
 
+// SAFETY: `SwapRtSide` is the exclusive RT owner of the bridge allocation.
+// `NonNull<DspBridge>` is `!Send` only because raw pointers have no automatic
+// thread-safety story; the allocation itself has no thread affinity and every
+// other field was already `Send` when the bridge was a `Box<DspBridge>`.
+// Moving the side to the audio thread (or into a `Mutex` split harness) keeps
+// the single-writer/single-reader contract, and `Drop` reclaims the allocation
+// on whichever thread ends up owning it.
+unsafe impl Send for SwapRtSide {}
+
+impl Drop for SwapRtSide {
+    fn drop(&mut self) {
+        // SAFETY: `self.bridge` was produced by `Box::into_raw(DspBridge::new_boxed())`
+        // in `RtSwapHarness::new_with_gate_config` and is reclaimed exactly
+        // once here. The harness contract requires the RT thread to be joined
+        // before this side is dropped; after that no writer/reader aliases the
+        // allocation.
+        unsafe { drop(Box::from_raw(self.bridge.as_ptr())) };
+    }
+}
+
 impl SwapRtSide {
     /// Executes the canonical real-time prologue directly, returning the outcome.
     #[inline(always)]
     pub fn run_prologue(&mut self) -> PrologueOutcome {
-        let rt_status = self.rt_status.clone();
         rt_quantum_prologue(
             &mut self.state,
             &mut self.channels,
             &mut self.parking_lot,
             &self.parking_lot_dirty,
-            &rt_status,
+            &self.rt_status,
             self.lut,
         )
     }
@@ -450,10 +478,12 @@ impl SwapRtSide {
     /// Runs `capture_dsp_pipeline` with the exact context/buffers the real
     /// capture callback builds (see `capture/setup.rs` lines 301-334).
     fn process_dsp(&mut self, in_l: &mut [f32], in_r: &mut [f32], n: usize, rate: u32) -> usize {
-        // SAFETY: `self.bridge` is owned by the RT side and outlives this call;
-        // the writer is used only within `capture_dsp_pipeline` below.
-        let bridge_ref = unsafe { BridgeRef::new(&raw mut *self.bridge) };
-        let Some(writer) = DspBridgeWriter::from_ref(bridge_ref) else {
+        // SAFETY: `self.bridge` points to the harness-owned allocation, which
+        // outlives this call; no whole-struct reference is materialized, so the
+        // playback reader's provenance stays valid.
+        let bridge_ref = unsafe { BridgeRef::new(self.bridge.as_ptr()) };
+        // SAFETY: `harness` drives a single sequential writer on `self.bridge`.
+        let Some(writer) = (unsafe { DspBridgeWriter::from_ref(bridge_ref) }) else {
             return 0;
         };
 
@@ -734,11 +764,11 @@ impl SwapRtSide {
     /// (capture writes → playback reads) without a live PipeWire graph.
     /// The reader only performs atomic reads; the bridge outlives the harness.
     pub fn bridge_reader(&self) -> DspBridgeReader {
-        // SAFETY: `self.bridge` is a heap-immortal boxed `DspBridge` that
-        // outlives the RT side. `DspBridgeReader` only performs read accesses
-        // synchronized by the bridge atomics, so forming a raw pointer from a
-        // shared reference is sound.
-        unsafe { DspBridgeReader::new(self.bridge.as_ref() as *const DspBridge as *mut DspBridge) }
+        // SAFETY: `self.bridge` points to the harness-owned allocation that
+        // outlives this reader. `DspBridgeReader` only performs read accesses
+        // synchronized by the bridge atomics, and the raw pointer never comes
+        // from a shared reference (no `&DspBridge` provenance to invalidate).
+        unsafe { DspBridgeReader::new(self.bridge.as_ptr()) }
     }
 
     /// Changes the model's active NAM rate (drives `current_nam_rate`).
@@ -854,7 +884,8 @@ impl RtSwapHarness {
         state.slimmable_drain = Some(slimmable_swap_drain(spsc.slimmable_consumer));
         state.os_drain = Some(os_swap_drain(spsc.os_consumer));
 
-        let bridge = DspBridge::new_boxed();
+        let bridge = NonNull::new(Box::into_raw(DspBridge::new_boxed()))
+            .expect("DspBridge::new_boxed must return a non-null allocation");
 
         let producer = SwapProducer {
             param_producer: spsc.param_producer,

@@ -634,8 +634,14 @@ fn run_measured(
 
     let (mut os_l, mut os_r) = (new_os(os_factor), new_os(os_factor));
 
-    let threshold_open_sq = (-70.0f32).powf(10.0 / 20.0);
-    let threshold_close_sq = (-80.0f32).powf(10.0 / 20.0);
+    let threshold_open_sq = gate_threshold_sq(-70.0).unwrap_or_else(|e| {
+        eprintln!("ab_opt_bench: FATAL: {e}");
+        std::process::exit(1);
+    });
+    let threshold_close_sq = gate_threshold_sq(-80.0).unwrap_or_else(|e| {
+        eprintln!("ab_opt_bench: FATAL: {e}");
+        std::process::exit(1);
+    });
 
     let stress_signal = generate_stress_signal_v2_default(model_sr);
     let stereo_offset = if (model_sr as usize).is_multiple_of(stress_signal.len()) {
@@ -729,6 +735,20 @@ fn run_measured(
 
     black_box(&bridge);
     (cycle_samples, total_frames)
+}
+
+fn gate_threshold_sq(db: f32) -> Result<f32, String> {
+    if !db.is_finite() {
+        return Err(format!("gate threshold {db} dBFS is not finite"));
+    }
+    let sq = 10.0_f32.powf(db / 10.0);
+    if sq.is_finite() {
+        Ok(sq)
+    } else {
+        Err(format!(
+            "gate threshold {db} dBFS squared to a non-finite value"
+        ))
+    }
 }
 
 fn new_os(factor: OversampleFactor) -> OversampleEngine {

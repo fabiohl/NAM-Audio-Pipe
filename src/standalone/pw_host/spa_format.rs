@@ -103,6 +103,35 @@ pub unsafe fn build_spa_format_pod<'a>(
     }
 }
 
+/// Builds the canonical stereo `F32P` format POD with explicit `FL`/`FR`
+/// channel positions, shared by the capture and playback streams.
+///
+/// Both streams must announce the same channel map: the fail-closed
+/// [`validate_audio_raw_format`] validator rejects any negotiated layout whose
+/// first two positions are not `FL`/`FR` (`E2304`). Announcing an anonymous
+/// stereo pod on playback let a strict PipeWire session manager echo the
+/// client's own `[0, 0]` positions back, tripping the contract against the
+/// format the host itself had advertised.
+///
+/// The returned pod borrows `storage`; the caller must keep `storage` alive and
+/// unmodified for the duration of the negotiation call.
+pub fn build_stereo_f32p_format_pod(
+    storage: &mut SpaPodStorage<1024>,
+) -> anyhow::Result<&pw::spa::pod::Pod> {
+    let mut audio_info = pw::spa::param::audio::AudioInfoRaw::new();
+    audio_info.set_format(pw::spa::param::audio::AudioFormat::F32P);
+    audio_info.set_channels(2);
+    let mut pos = [0u32; 64];
+    pos[0] = pw::spa::sys::SPA_AUDIO_CHANNEL_FL;
+    pos[1] = pw::spa::sys::SPA_AUDIO_CHANNEL_FR;
+    audio_info.set_position(pos);
+
+    // SAFETY: `SpaPodStorage` guarantees the 8-byte alignment required by the
+    // libspa pod builder, and the returned pod borrows `storage`, which outlives
+    // the negotiation call.
+    unsafe { build_spa_format_pod(&audio_info, storage) }
+}
+
 /// Typed violation of the strict negotiated SPA audio format contract.
 ///
 /// Produced by [`validate_audio_raw_format`] when the audio server renegotiates

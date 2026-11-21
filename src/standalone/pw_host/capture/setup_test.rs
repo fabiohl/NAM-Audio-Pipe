@@ -22,10 +22,10 @@ fn test_create_capture_properties_zero_buffer_size() {
 }
 
 #[test]
-fn test_build_capture_format_pod() {
+fn test_build_stereo_f32p_format_pod() {
     pw::init();
     let mut storage = SpaPodStorage::new();
-    let res = build_capture_format_pod(&mut storage);
+    let res = build_stereo_f32p_format_pod(&mut storage);
     assert!(res.is_ok());
 }
 
@@ -458,4 +458,105 @@ fn neural_rebuild_suppressed_for_mismatched_slot_when_failed_key_matches() {
         Some((44100, 64)),
         false
     ));
+}
+
+// ── Adaptive cadence guard (T2.2) ───────────────────────────────────────────
+
+#[test]
+fn adaptive_update_only_on_advanced_measurement_quantum() {
+    // The DSP measurement stores `dsp_cycle_time` when the pre-call counter is
+    // a multiple of 16; the post-call counter is then 1 (mod 16).
+    for cycle in 0..8u32 {
+        let measured = 1 + cycle * 16;
+        assert!(adaptive_update_due(measured, measured - 1));
+        // A skipped/paused callback that did not advance the counter must not
+        // re-feed the same sample.
+        assert!(!adaptive_update_due(measured, measured));
+        // Non-measurement quanta never feed the FSM.
+        assert!(!adaptive_update_due(measured + 1, measured));
+    }
+}
+
+#[test]
+fn conservative_adaptive_degrades_and_recovers_with_consecutive_samples() {
+    use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
+    use neural_amp_modeler_rs::dsp::adaptive::{AdaptiveCompute, AdaptiveState};
+
+    let flags = neural_amp_modeler_rs::common::spsc::RtStatusFlags::new();
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Conservative);
+    assert_eq!(adaptive.state(), AdaptiveState::Full);
+
+    // Conservative full→reduced threshold is 0.70 and needs 3 consecutive hits.
+    adaptive.update(80, 100, 48_000, &flags);
+    adaptive.update(80, 100, 48_000, &flags);
+    assert_eq!(adaptive.state(), AdaptiveState::Full);
+    adaptive.update(80, 100, 48_000, &flags);
+    assert_eq!(adaptive.state(), AdaptiveState::Reduced);
+
+    // Reduced→minimal threshold is 0.85, also 3 consecutive hits.
+    adaptive.update(90, 100, 48_000, &flags);
+    adaptive.update(90, 100, 48_000, &flags);
+    assert_eq!(adaptive.state(), AdaptiveState::Reduced);
+    adaptive.update(90, 100, 48_000, &flags);
+    assert_eq!(adaptive.state(), AdaptiveState::Minimal);
+
+    // Recovery uses 50% hysteresis and needs 5 consecutive clean samples.
+    for _ in 0..4 {
+        adaptive.update(30, 100, 48_000, &flags);
+    }
+    assert_eq!(adaptive.state(), AdaptiveState::Minimal);
+    adaptive.update(30, 100, 48_000, &flags);
+    assert_eq!(adaptive.state(), AdaptiveState::Reduced);
+    for _ in 0..5 {
+        adaptive.update(20, 100, 48_000, &flags);
+    }
+    assert_eq!(adaptive.state(), AdaptiveState::Full);
+}
+
+#[test]
+fn explicit_slim_override_disables_adaptive_transitions() {
+    use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
+    use neural_amp_modeler_rs::dsp::adaptive::{AdaptiveCompute, SlimOverride};
+
+    let flags = neural_amp_modeler_rs::common::spsc::RtStatusFlags::new();
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Conservative);
+    adaptive.set_slim_override(SlimOverride::ForceLite);
+    for _ in 0..16 {
+        adaptive.update(200, 100, 48_000, &flags);
+    }
+    assert_eq!(
+        flags.degrade_transitions_total.load(Ordering::Relaxed),
+        0,
+        "manual override must not drive the FSM"
+    );
+}
+
+#[cfg(feature = "heap-audit")]
+#[test]
+fn adaptive_update_path_is_zero_alloc() {
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+    use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
+    use neural_amp_modeler_rs::dsp::adaptive::AdaptiveCompute;
+
+    let flags = neural_amp_modeler_rs::common::spsc::RtStatusFlags::new();
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Conservative);
+    adaptive.set_wavenet_full_ch_rt(8, true);
+
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        for cycle in 0..256u32 {
+            if adaptive_update_due(1 + cycle * 16, cycle * 16) {
+                adaptive.update(80, 100, 48_000, &flags);
+            }
+            let _ = adaptive.peek_slimmable_ch_rebuild();
+            let _ = adaptive.take_slimmable_ch_rebuild();
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+    // Measured: alloc=0, dealloc=0, realloc=0 (256 adaptive cycles)
+    assert_eq!(allocs, 0, "adaptive update allocated on RT: {allocs}");
+    assert_eq!(deallocs, 0, "adaptive update deallocated on RT: {deallocs}");
+    assert_eq!(reallocs, 0, "adaptive update reallocated on RT: {reallocs}");
 }

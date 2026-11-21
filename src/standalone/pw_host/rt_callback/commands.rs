@@ -108,6 +108,23 @@ fn flag_structural_superseded(rt_status: &RtStatusFlags) {
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Parks a structural command in the deferred slot without emitting
+/// `drop_in_place` for a previous occupant on the RT thread.
+///
+/// The 3-phase protocol only parks into an empty slot: Phase 0 resolves the
+/// deferred command with `take()` first, and Phase 2 only runs for a candidate
+/// that was never parked. `mem::forget` keeps the polymorphic `drop_glue` out
+/// of this callback in release builds; the debug assertion turns a protocol
+/// violation into a test failure instead of a silent leak.
+#[inline(always)]
+fn park_param_payload(slot: &mut Option<ParamPayload>, payload: ParamPayload) {
+    debug_assert!(
+        slot.is_none(),
+        "deferred ParamPayload slot must be empty before parking"
+    );
+    std::mem::forget(slot.replace(payload));
+}
+
 /// [`SwapTunables`] for the four dedicated structural swap drains
 /// (resampler, cab-sim, slimmable, oversample): tuning preserved
 /// (1 shared swap/callback, 8-pop coalescing window, no backlog flag —
@@ -135,7 +152,7 @@ pub(crate) const fn structural_swap_tunables() -> SwapTunables {
 ///
 /// Returns `(param_changed, pops)` — the coalesced-parameter signal plus the
 /// exact number of `ParamPayload` payloads consumed in this callback.
-#[inline(always)]
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "FFI design or complex DSP kernel signature required by construction"
@@ -206,7 +223,7 @@ pub fn receive_commands(
             param_changed = true;
         } else {
             // Budget exhausted and nothing newer queued: re-park.
-            *deferred = Some(payload);
+            park_param_payload(deferred, payload);
             flag_structural_deferred(rt_status_for_process);
         }
     }
@@ -233,10 +250,22 @@ pub fn receive_commands(
             if let Ok(payload) = consumer.pop() {
                 pops += 1;
                 match payload {
-                    ParamPayload::InputGain(mult) => pending_input_gain = Some(mult),
-                    ParamPayload::OutputGain(mult) => pending_output_gain = Some(mult),
-                    ParamPayload::GateConfig(params) => pending_gate = Some(params),
-                    ParamPayload::SlimOverride(ov) => pending_slim_override = Some(ov),
+                    ParamPayload::InputGain(mult) => {
+                        pending_input_gain = Some(mult);
+                        std::mem::forget(payload);
+                    }
+                    ParamPayload::OutputGain(mult) => {
+                        pending_output_gain = Some(mult);
+                        std::mem::forget(payload);
+                    }
+                    ParamPayload::GateConfig(params) => {
+                        pending_gate = Some(params);
+                        std::mem::forget(payload);
+                    }
+                    ParamPayload::SlimOverride(ov) => {
+                        pending_slim_override = Some(ov);
+                        std::mem::forget(payload);
+                    }
                     // Lightweight request (atomics only): the actual engine
                     // swap is budgeted when the delivered engines are drained
                     // in `drain_os_engines`. Latest value wins by overwrite.
@@ -248,6 +277,7 @@ pub fn receive_commands(
                             .requested_os_generation
                             .fetch_add(1, Ordering::Release);
                         rt_status_for_process.set_flag_release(RT_STATUS_NEEDS_OS_REBUILD);
+                        std::mem::forget(payload);
                     }
                     // Defensive guard: a `LoadModel` appearing here violates the
                     // classification invariant. Rather than panicking or dropping
@@ -313,7 +343,7 @@ pub fn receive_commands(
             budget.consume();
             param_changed = true;
         } else {
-            *deferred = Some(payload);
+            park_param_payload(deferred, payload);
             flag_structural_deferred(rt_status_for_process);
         }
     }
@@ -383,27 +413,23 @@ fn install_load_model(
         *current_nam_rate = 48_000;
     }
 
-    let mut old_models: [Option<Box<neural_amp_modeler_rs::models::StaticModel>>; 2] = [None, None];
-    if let Some(old) = std::mem::replace(active_model_l, model_l) {
-        old_models[0] = Some(old);
-    }
+    let old_l = std::mem::replace(active_model_l, model_l);
     if let Some(model) = active_model_l {
-        model.inject_rt_status(Arc::clone(rt_status_for_process));
+        model.inject_rt_status_rt(rt_status_for_process);
         if let StaticModel::WavenetDyn(w) = model.as_ref() {
-            adaptive.set_wavenet_full_ch(w.ch, model.is_slimmable_capable());
+            adaptive.set_wavenet_full_ch_rt(w.ch(), model.is_slimmable_capable());
         }
     }
-    if let Some(old) = std::mem::replace(active_model_r, model_r) {
-        old_models[1] = Some(old);
-    }
+    let old_r = std::mem::replace(active_model_r, model_r);
     if let Some(model) = active_model_r {
-        model.inject_rt_status(Arc::clone(rt_status_for_process));
+        model.inject_rt_status_rt(rt_status_for_process);
     }
 
-    for m_opt in &mut old_models {
-        if let Some(m) = m_opt.take() {
-            gc.retire(GcItem::Model(m));
-        }
+    if let Some(old) = old_l {
+        gc.retire(GcItem::Model(old));
+    }
+    if let Some(old) = old_r {
+        gc.retire(GcItem::Model(old));
     }
 }
 
@@ -424,7 +450,10 @@ fn discard_load_model(
         // returning drops nothing on RT and avoids panicking.
         return;
     };
-    for model in [model_l, model_r].into_iter().flatten() {
+    if let Some(model) = model_l {
+        gc.retire(GcItem::Model(model));
+    }
+    if let Some(model) = model_r {
         gc.retire(GcItem::Model(model));
     }
     flag_structural_superseded(rt_status_for_process);

@@ -6,10 +6,7 @@
       "pattern": "setup_capture_stream::\\{closure#2\\}::\\{closure#0\\}(>|\\.|.*call_once)?$|capture_dsp_pipeline_streaming|capture_dsp_pipeline$",
       "required": true,
       "expected_methods": ["closure#0", "call_once", "capture_dsp_pipeline"],
-      "gates": { "zmm": 0, "libm": 0, "alloc": 0 },
-      "exceptions": {
-        "alloc": ["free@GLIBC", "malloc@GLIBC", "RawVec", "handle_error", "drop_glue"]
-      }
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0, "spills_lt": 1950 }
     },
     {
       "id": "playback_dsp_cycle",
@@ -54,9 +51,9 @@
     },
     {
       "id": "conv_engine",
-      "pattern": "ConvEngine>::process(\\.cold|\\.warm|\\.part\\.[0-9]+)?$|CabSimAdapter>::process_block(\\.cold|\\.warm|\\.part\\.[0-9]+)?$",
+      "pattern": "ConvEngine>::process(\\.cold|\\.warm|\\.part\\.[0-9]+)?$",
       "required": true,
-      "expected_methods": ["process", "process_block"],
+      "expected_methods": ["process"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },
     {
@@ -76,6 +73,62 @@
       "id": "latency_histogram",
       "pattern": "LatencyHistogram.*record",
       "required": false,
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_receive_commands",
+      "pattern": "rt_callback::commands::receive_commands$",
+      "required": true,
+      "expected_methods": ["receive_commands"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_install_load_model",
+      "pattern": "rt_callback::commands::install_load_model$",
+      "required": true,
+      "expected_methods": ["install_load_model"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_discard_load_model",
+      "pattern": "rt_callback::commands::discard_load_model$",
+      "required": true,
+      "expected_methods": ["discard_load_model"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_drain_cab_nam_payloads",
+      "pattern": "cabinet::drain_cab_nam_payloads$",
+      "required": true,
+      "expected_methods": ["drain_cab_nam_payloads"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_drain_cabsims_with_slot_status",
+      "pattern": "rt_callback::cabsim_swap::drain_cabsims_with_slot_status$",
+      "required": true,
+      "expected_methods": ["drain_cabsims_with_slot_status"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_drain_os_engines_with_status",
+      "pattern": "rt_callback::os_swap::drain_os_engines_with_status$",
+      "required": true,
+      "expected_methods": ["drain_os_engines_with_status"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_drain_resamplers_with_status",
+      "pattern": "rt_callback::resampler_swap::drain_resamplers_with_status$",
+      "required": true,
+      "expected_methods": ["drain_resamplers_with_status"],
+      "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
+    },
+    {
+      "id": "rt_drain_drain_slimmable_models",
+      "pattern": "rt_callback::slimmable_swap::drain_slimmable_models$",
+      "required": true,
+      "expected_methods": ["drain_slimmable_models"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     }
   ]

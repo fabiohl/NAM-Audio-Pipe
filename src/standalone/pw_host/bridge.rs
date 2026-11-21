@@ -154,6 +154,31 @@ pub fn allocate_dsp_bridge_with_page_size(page_size: usize) -> Result<BridgeRef,
     Ok(bridge_ptr)
 }
 
+/// Releases a `DspBridge` allocation created by
+/// [`allocate_dsp_bridge_with_page_size`] with the same `page_size`.
+///
+/// Test-only companion to the production allocator: production keeps a single
+/// process-lifetime bridge, while unit tests must return the 131 KiB mapping
+/// deterministically instead of leaking one allocation per test.
+///
+/// Returns [`BridgeAllocError::InvalidPageSize`] when `page_size` cannot
+/// reproduce the layout used at allocation time (a programming error in the
+/// test); the caller must then not free the pointer with a different layout.
+#[cfg(test)]
+pub fn deallocate_dsp_bridge_with_page_size(
+    ptr: BridgeRef,
+    page_size: usize,
+) -> Result<(), BridgeAllocError> {
+    let layout = calculate_bridge_layout(page_size)?;
+    // SAFETY: `ptr` was returned by `allocate_dsp_bridge_with_page_size` with
+    // this same `page_size`, so `layout` matches the allocation exactly and the
+    // pointer is still uniquely owned by the caller. Called once per allocation.
+    unsafe {
+        std::alloc::dealloc(ptr.as_ptr() as *mut u8, layout);
+    }
+    Ok(())
+}
+
 /// Allocates `DspBridge` with double-buffering using memory aligned and padded to the real system page size.
 ///
 /// Page alignment is required for `libc::madvise` to succeed. Standard heap allocation
@@ -244,6 +269,9 @@ mod tests {
                 0,
                 "Pointer must be aligned to requested page size {page_size}"
             );
+
+            deallocate_dsp_bridge_with_page_size(bridge_ref, page_size)
+                .expect("deallocation with the allocation page size must succeed");
         }
     }
 
@@ -292,5 +320,8 @@ mod tests {
         // SAFETY: same single-owner read of the second freshly initialized buffer,
         // race-free through `UnsafeCell::get`.
         assert_eq!(unsafe { (*bridge.buffers[1].get()).n_samples }, 0);
+
+        deallocate_dsp_bridge_with_page_size(bridge_ref, sys_page_size)
+            .expect("deallocation with the system page size must succeed");
     }
 }

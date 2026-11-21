@@ -73,10 +73,11 @@ use neural_amp_modeler_rs::dsp::cabsim::loader::CabSimIr;
 use neural_amp_modeler_rs::dsp::gate::{DynamicHysteresis, GateParams};
 use neural_amp_modeler_rs::dsp::oversample::{OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    DspBridge, DspBridgeWriter, DspBuffers, DspPipelineContext, MAX_RESAMP_BUF,
-    capture_dsp_pipeline,
+    DspBridge, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF, StreamingDspBuffers,
+    capture_dsp_pipeline_streaming,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
+use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
 use neural_amp_modeler_rs::loader::dispatcher::build_model;
 use neural_amp_modeler_rs::loader::nam_json::{NamModelData, parse_nam_json};
 use neural_amp_modeler_rs::models::{NamModel, StaticModel};
@@ -143,14 +144,6 @@ const DEFAULT_TOTAL_SECONDS: f64 = 10.0;
 /// Per-cell block floor: every combination of the matrix must run at least
 /// this many blocks so its hot-path instructions are provably in the profile.
 const DEFAULT_MIN_BLOCKS_PER_CELL: u64 = 4;
-
-/// Maximum oversampled buffer size: `MAX_RESAMP_BUF × 4` (for X4 oversampling).
-const MAX_OS_BUF: usize = MAX_RESAMP_BUF * 4;
-
-/// Total working storage for the four oversampled slices plus the two
-/// crossfade scratch slices (`MAX_RESAMP_BUF` each, matching the engine's
-/// buffer guard).
-const OS_BUF_LEN: usize = MAX_OS_BUF * 4 + MAX_RESAMP_BUF * 2;
 
 /// DSP topology family classification used by the receipt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -383,6 +376,19 @@ fn run_cell(
             process::exit(1);
         }
     };
+    // Production streaming adapter, sized exactly like `CaptureState::init`
+    // (`StreamingResampleBuffer::new(host_rate, model_rate, MAX_RESAMP_BUF)`).
+    let mut stream_resample = match StreamingResampleBuffer::new(cfg.rate, model_sr, MAX_RESAMP_BUF)
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "pgo_workload: FATAL: streaming resampler {}→{model_sr} failed: {e}",
+                cfg.rate
+            );
+            process::exit(1);
+        }
+    };
 
     let target_rate = model_sr.max(cfg.rate);
     let mut conv = if cfg.cabsim_ir {
@@ -400,12 +406,8 @@ fn run_cell(
 
     let mut bridge = DspBridge::new_boxed();
 
-    let mut resamp_mid_l = vec![0.0; MAX_RESAMP_BUF];
-    let mut resamp_mid_r = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_l = vec![0.0; MAX_RESAMP_BUF];
     let mut resamp_out_r = vec![0.0; MAX_RESAMP_BUF];
-    let mut model_out_l = vec![0.0; MAX_RESAMP_BUF];
-    let mut model_out_r = vec![0.0; MAX_RESAMP_BUF];
 
     let (threshold_open_sq, threshold_close_sq) = if cfg.gate {
         gate_thresholds_sq(
@@ -416,31 +418,30 @@ fn run_cell(
         (0.0f32, 0.0f32)
     };
 
-    let signal_offset: usize = 0;
+    let mut signal_offset: usize = 0;
 
     let opt_model_l = model_l;
     let opt_model_r = model_r;
 
-    let (mut os_l, mut os_r) = match cfg.os_mode {
-        MODE_OFF => (
-            new_os_engine(OversampleFactor::Off, "Off,L"),
-            new_os_engine(OversampleFactor::Off, "Off,R"),
-        ),
-        MODE_2X => (
-            new_os_engine(OversampleFactor::X2, "2x,L"),
-            new_os_engine(OversampleFactor::X2, "2x,R"),
-        ),
-        MODE_4X => (
-            new_os_engine(OversampleFactor::X4, "4x,L"),
-            new_os_engine(OversampleFactor::X4, "4x,R"),
-        ),
+    let os_factor = match cfg.os_mode {
+        MODE_OFF => OversampleFactor::Off,
+        MODE_2X => OversampleFactor::X2,
+        MODE_4X => OversampleFactor::X4,
         other => {
             eprintln!("pgo_workload: FATAL: unknown oversampling mode {other:?}");
             process::exit(1);
         }
     };
+    let mut os_l = new_os_engine(os_factor, "L");
+    let mut os_r = new_os_engine(os_factor, "R");
 
-    let mut os_buf = vec![0.0f32; OS_BUF_LEN];
+    let os_scratch_len = OversampleEngine::required_scratch_len(os_factor, MAX_RESAMP_BUF);
+    let mut os_in_l = vec![0.0f32; os_scratch_len];
+    let mut os_in_r = vec![0.0f32; os_scratch_len];
+    let mut os_model_l = vec![0.0f32; os_scratch_len];
+    let mut os_model_r = vec![0.0f32; os_scratch_len];
+    let mut xfd_l = vec![0.0f32; MAX_RESAMP_BUF];
+    let mut xfd_r = vec![0.0f32; MAX_RESAMP_BUF];
     let mut samples_l = vec![0.0f32; quantum];
     let mut samples_r = vec![0.0f32; quantum];
 
@@ -457,6 +458,7 @@ fn run_cell(
             samples_l[j] = stress_signal[idx];
             samples_r[j] = stress_signal[(idx + stereo_offset) % stress_signal.len()];
         }
+        signal_offset = (signal_offset + quantum) % stress_signal.len();
         // SAFETY: `bridge` is exclusively owned by this benchmarking thread; `bridge_writer`
         // narrows writes strictly to the inactive back-buffer without concurrent reader conflicts.
         let bridge_writer = unsafe { Some(DspBridgeWriter::new(&raw mut *bridge)) };
@@ -482,30 +484,26 @@ fn run_cell(
             conv_pair: conv.as_mut(),
         };
 
-        let os_buf = os_buf.as_mut_slice();
-        let (os_in_l_slice, rest) = os_buf.split_at_mut(MAX_OS_BUF);
-        let (os_in_r_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
-        let (os_model_l_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
-        let (os_model_r_slice, rest) = rest.split_at_mut(MAX_OS_BUF);
-        let (xfd_scratch_l_slice, xfd_scratch_r_slice) = rest.split_at_mut(MAX_RESAMP_BUF);
-
-        let bufs = DspBuffers {
-            resamp_mid_l: &mut resamp_mid_l,
-            resamp_mid_r: &mut resamp_mid_r,
+        let bufs = StreamingDspBuffers {
             resamp_out_l: &mut resamp_out_l,
             resamp_out_r: &mut resamp_out_r,
-            model_out_l: &mut model_out_l,
-            model_out_r: &mut model_out_r,
-            os_in_l: os_in_l_slice,
-            os_in_r: os_in_r_slice,
-            os_model_l: os_model_l_slice,
-            os_model_r: os_model_r_slice,
-            crossfade_scratch_l: xfd_scratch_l_slice,
-            crossfade_scratch_r: xfd_scratch_r_slice,
+            os_in_l: &mut os_in_l,
+            os_in_r: &mut os_in_r,
+            os_model_l: &mut os_model_l,
+            os_model_r: &mut os_model_r,
+            crossfade_scratch_l: &mut xfd_l,
+            crossfade_scratch_r: &mut xfd_r,
         };
 
-        let n_pw =
-            capture_dsp_pipeline(&mut samples_l, &mut samples_r, quantum, ctx, bufs, model_sr);
+        let n_pw = capture_dsp_pipeline_streaming(
+            &mut samples_l,
+            &mut samples_r,
+            quantum,
+            ctx,
+            &mut stream_resample,
+            bufs,
+            model_sr,
+        );
         progress.frames += n_pw as u64;
         if cfg.os_mode != MODE_OFF {
             progress.oversample_frames += n_pw as u64;

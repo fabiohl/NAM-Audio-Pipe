@@ -5,7 +5,6 @@ use super::super::{cabsim_swap_drain, resampler_swap_drain};
 use super::*;
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
-use neural_amp_modeler_rs::math::common::AlignedVec;
 use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::assert_matches;
 use std::sync::Arc;
@@ -15,23 +14,9 @@ use std::sync::atomic::AtomicBool;
 /// path only inspects `channels()` and drops models — no DSP is run, so an
 /// empty `arrays` vector is sufficient and deterministic.
 fn fake_wavenet(ch: usize) -> Box<StaticModel> {
-    Box::new(StaticModel::WavenetDyn(Box::new(WaveNetModelDyn {
-        ch,
-        k: 3,
-        head: 1,
-        arrays: vec![],
-        head_scale: 1.0,
-        receptive_field_size: 1,
-        condition_dsp: None,
-        condition_dsp_output: AlignedVec::new(1, 0.0f32).expect("alloc"),
-        post_stack_head: None,
-        head_output_scratch: AlignedVec::new(1, 0.0f32).expect("alloc"),
-        prewarm_on_reset: false,
-        prewarm_pending: false,
-        slimmable_capable: true,
-        allowed_channels: None,
-        pending_slim_channel: None,
-    })))
+    Box::new(StaticModel::WavenetDyn(Box::new(
+        WaveNetModelDyn::dummy_slimmable_stub(ch),
+    )))
 }
 
 fn make_pair(generation: u64, ch: usize, stereo: bool) -> Box<SlimModelPair> {

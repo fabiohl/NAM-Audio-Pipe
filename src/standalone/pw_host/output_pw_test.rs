@@ -33,6 +33,24 @@ fn build_spa_format_pod_returns_aligned_pod_within_storage() {
 }
 
 #[test]
+fn build_stereo_f32p_format_pod_announces_fl_fr_positions() {
+    pw::init();
+    let mut storage = SpaPodStorage::new();
+    let pod = build_stereo_f32p_format_pod(&mut storage).expect("stereo pod build");
+
+    let mut info = pw::spa::param::audio::AudioInfoRaw::default();
+    info.parse(pod).expect("canonical pod must parse");
+    assert_eq!(info.format(), pw::spa::param::audio::AudioFormat::F32P);
+    assert_eq!(info.channels(), 2);
+    let pos = info.position();
+    assert_eq!(pos[0], pw::spa::sys::SPA_AUDIO_CHANNEL_FL);
+    assert_eq!(pos[1], pw::spa::sys::SPA_AUDIO_CHANNEL_FR);
+
+    // The same pod must satisfy the fail-closed negotiated-format validator.
+    assert_eq!(validate_audio_raw_format(pod), Ok(0));
+}
+
+#[test]
 fn validate_built_pod_rejects_null_and_out_of_bounds_pointers() {
     let storage = SpaPodStorage::new();
     assert!(validate_built_pod(&storage, std::ptr::null()).is_none());
@@ -1069,6 +1087,85 @@ fn classify_missing_bridge_block_separates_early_from_starvation() {
         classify_missing_bridge_block(&stream_status, 64),
         SilenceReason::Starvation
     );
+}
+
+// Regression for FINDING-RES-01: the classifier used to derive the quantum
+// period from `pb_frame_count`, the monotonic playback-callback counter. After
+// ~64 s of audio (48_000 callbacks at a 64-frame quantum) the derived period
+// grew to one full second, masking every real bridge starvation as `Early`.
+// The quantum must come from the RT frame counters and stay invariant to the
+// accumulated callback magnitude.
+#[test]
+fn classify_missing_bridge_block_ignores_accumulated_pb_frame_count() {
+    let stream_status = StreamStatusFlags::new();
+    stream_status
+        .capture_negotiated_rate
+        .store(48_000, Ordering::Relaxed);
+
+    // Active stream quantum: 64 frames, independent of elapsed callbacks.
+    let rt_status = RtStatusFlags::default();
+    rt_status.last_n_samples.store(64, Ordering::Relaxed);
+    assert_eq!(active_quantum_frames(&rt_status), 64);
+
+    // Simulate 100_000 delivered playback callbacks.
+    let mut pb_frame_count: u32 = 0;
+    for _ in 0..100_000 {
+        pb_frame_count = pb_frame_count.wrapping_add(1);
+    }
+    assert_eq!(pb_frame_count, 100_000);
+
+    // A 5 ms gap exceeds 3 periods of 1.333 ms: real starvation, no matter
+    // how many callbacks the stream has already delivered. The old code
+    // derived a ~2 s period here and returned `Early`.
+    let now = 100_000_000u64;
+    stream_status
+        .playback_last_capture_tsc
+        .store(now - 5_000_000, Ordering::Relaxed);
+    assert_eq!(
+        classify_missing_bridge_block_at(&stream_status, active_quantum_frames(&rt_status), now),
+        SilenceReason::Starvation
+    );
+
+    // A fresh generation with the same 100_000-callback history is still
+    // classified as an early wakeup, with the correct 1.333 ms period.
+    stream_status
+        .playback_last_capture_tsc
+        .store(now - 500_000, Ordering::Relaxed);
+    assert_eq!(
+        classify_missing_bridge_block_at(&stream_status, active_quantum_frames(&rt_status), now),
+        SilenceReason::Early
+    );
+}
+
+#[test]
+fn classify_missing_bridge_block_tracks_quantum_multiple_variations() {
+    let stream_status = StreamStatusFlags::new();
+    stream_status
+        .capture_negotiated_rate
+        .store(48_000, Ordering::Relaxed);
+    let now = 100_000_000u64;
+
+    for quantum in [32u32, 64, 128, 256, 512] {
+        let period_ns = (quantum as u64) * 1_000_000_000 / 48_000;
+        // Half a period ago: well inside the next capture quantum window.
+        stream_status
+            .playback_last_capture_tsc
+            .store(now - period_ns / 2, Ordering::Relaxed);
+        assert_eq!(
+            classify_missing_bridge_block_at(&stream_status, quantum, now),
+            SilenceReason::Early,
+            "quantum {quantum} within its period must be Early"
+        );
+        // Past the period: starvation.
+        stream_status
+            .playback_last_capture_tsc
+            .store(now - period_ns - 200_000, Ordering::Relaxed);
+        assert_eq!(
+            classify_missing_bridge_block_at(&stream_status, quantum, now),
+            SilenceReason::Starvation,
+            "quantum {quantum} past its period must be Starvation"
+        );
+    }
 }
 
 #[test]

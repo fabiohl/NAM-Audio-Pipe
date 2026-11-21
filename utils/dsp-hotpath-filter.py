@@ -37,6 +37,11 @@ ALLOC_RE = re.compile(
 DIV_RE = re.compile(r"\b(i?div[bwdlq]?)\b")
 TLS_RE = re.compile(r"\bcall\w*\s+.*__tls_get_addr")
 
+INSN_RE_FULL = re.compile(r"^\s*([0-9a-fA-F]+):\s+(\S+)\s*(.*)$")
+TARGET_RE = re.compile(r"^([0-9a-fA-F]+)\b")
+UNWIND_SINK_RE = re.compile(r"<(_Unwind_Resume(@\S+)?|core::panicking::panic_in_cleanup)>")
+NORETURN_RE = re.compile(r"<(core::panicking::|std::process::abort|core::option::expect_failed|core::result::unwrap_failed)")
+
 DEFAULT_SECTIONS = (".text", ".text.cold")
 GATE_KEYS = ("zmm", "libm", "alloc", "div", "tls")
 SYNTHETIC_VIOLATION = "SYNTHETIC: violation injected by --test-synthetic-violation"
@@ -45,6 +50,116 @@ SYNTHETIC_VIOLATION = "SYNTHETIC: violation injected by --test-synthetic-violati
 def is_kept_section(section: str, sections: tuple[str, ...]) -> bool:
     """Accept .text and .text.cold* (reject pre-BOLT duplicates)."""
     return any(section == s or section.startswith(s + ".") for s in sections)
+
+
+def unwind_cold_indices(body: list[str]) -> set[int]:
+    """Indices of instructions whose every path ends in an unwind sink.
+
+    An instruction is a landing-pad (cold unwind) instruction when no path
+    from it reaches a `ret` and at least one path reaches `_Unwind_Resume` or
+    `panic_in_cleanup`. Indirect jumps, out-of-symbol jumps and unknown
+    fallthroughs count as returning (fail-closed): such code stays on the
+    normal path and is gated.
+    """
+    n = len(body)
+    addr_to_idx: dict[int, int] = {}
+    parsed: list[tuple[int, str, str]] = []
+    for i, line in enumerate(body):
+        m = INSN_RE_FULL.match(line)
+        if not m:
+            return set()
+        addr = int(m.group(1), 16)
+        addr_to_idx[addr] = i
+        parsed.append((addr, m.group(2), m.group(3)))
+
+    succ: list[list[int]] = [[] for _ in range(n)]
+    ret_seed = [False] * n
+    unwind_seed = [False] * n
+
+    def target_index(ops: str) -> int | None:
+        tm = TARGET_RE.match(ops)
+        if not tm:
+            return None
+        return addr_to_idx.get(int(tm.group(1), 16))
+
+    for i, (_addr, mnem, ops) in enumerate(parsed):
+        has_next = i + 1 < n
+        if mnem.startswith("ret"):
+            ret_seed[i] = True
+        elif mnem in ("ud2", "hlt"):
+            continue
+        elif UNWIND_SINK_RE.search(ops):
+            unwind_seed[i] = True
+        elif mnem.startswith("jmp"):
+            if ops.startswith("*"):
+                ret_seed[i] = True
+                continue
+            t = target_index(ops)
+            if t is None:
+                ret_seed[i] = True
+            else:
+                succ[i].append(t)
+        elif mnem.startswith("j"):
+            t = target_index(ops)
+            if t is None:
+                ret_seed[i] = True
+            else:
+                succ[i].append(t)
+            if has_next:
+                succ[i].append(i + 1)
+            else:
+                ret_seed[i] = True
+        elif mnem.startswith("call") and NORETURN_RE.search(ops):
+            continue
+        elif has_next:
+            succ[i].append(i + 1)
+        else:
+            ret_seed[i] = True
+
+    preds: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in succ[i]:
+            preds[j].append(i)
+
+    def reaches(seed: list[bool]) -> list[bool]:
+        seen = list(seed)
+        stack = [i for i in range(n) if seen[i]]
+        while stack:
+            j = stack.pop()
+            for p in preds[j]:
+                if not seen[p]:
+                    seen[p] = True
+                    stack.append(p)
+        return seen
+
+    reaches_ret = reaches(ret_seed)
+    reaches_unwind = reaches(unwind_seed)
+    return {i for i in range(n) if reaches_unwind[i] and not reaches_ret[i]}
+
+
+def classify_symbol(symbol: str, targets: list[dict], body: list[str], matched: dict) -> None:
+    """Count per-target stats for one symbol body, excluding unwind-cold alloc calls."""
+    cold = unwind_cold_indices(body) if body else set()
+    for t in targets:
+        entry = matched[(symbol, t["id"])]
+        for idx, line in enumerate(body):
+            entry["stats"]["instructions"] += 1
+            if VFMADD_RE.search(line):
+                entry["stats"]["vfmadd"] += 1
+            if CALL_RE.search(line):
+                entry["stats"]["call"] += 1
+            if SPILL_RE.search(line):
+                entry["stats"]["spills"] += 1
+            for k, regex in (("zmm", ZMM_RE), ("libm", LIBM_RE), ("alloc", ALLOC_RE),
+                             ("div", DIV_RE), ("tls", TLS_RE)):
+                if regex.search(line):
+                    excs = t["exceptions"].get(k, [])
+                    if any(e in line for e in excs):
+                        entry["exceptions"][k].append(line.strip())
+                    elif k == "alloc" and idx in cold:
+                        entry["cold_unwind"].append(line.strip())
+                    else:
+                        entry["hits"][k].append(line.strip())
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,6 +244,13 @@ def load_profile(args: argparse.Namespace) -> tuple[list[dict], tuple[str, ...]]
                 except (TypeError, ValueError):
                     print(f"[FATAL] gate {key} must be int/null", file=sys.stderr)
                     raise SystemExit(1)
+        val = gates.get("spills_lt")
+        if val is not None:
+            try:
+                gates["spills_lt"] = int(val)
+            except (TypeError, ValueError):
+                print("[FATAL] gate spills_lt must be int/null", file=sys.stderr)
+                raise SystemExit(1)
         try:
             target["_regex"] = re.compile(target["pattern"])
         except re.error as exc:
@@ -154,11 +276,15 @@ def main() -> int:
     cur_section = ""
     cur_symbol: str | None = None
     cur_targets: list[dict] = []
+    cur_body: list[str] = []
 
     for raw in lines:
         line = raw.rstrip("\n")
         sm = SECTION_RE.match(line)
         if sm:
+            if cur_symbol and cur_targets:
+                classify_symbol(cur_symbol, cur_targets, cur_body, matched)
+            cur_body = []
             cur_section = sm.group(1)
             cur_symbol = None
             cur_targets = []
@@ -169,6 +295,9 @@ def main() -> int:
             continue
         sym_m = SYMBOL_RE.match(line.strip()) or SYMBOL_RE.match(line)
         if sym_m:
+            if cur_symbol and cur_targets:
+                classify_symbol(cur_symbol, cur_targets, cur_body, matched)
+            cur_body = []
             cur_symbol = sym_m.group(2)
             cur_targets = [t for t in targets if t["_regex"].search(cur_symbol)]
             for t in cur_targets:
@@ -180,6 +309,7 @@ def main() -> int:
                     "stats": {"instructions": 0, "vfmadd": 0, "call": 0, "spills": 0},
                     "hits": {k: [] for k in GATE_KEYS},
                     "exceptions": {k: [] for k in GATE_KEYS},
+                    "cold_unwind": [],
                 })
             if cur_targets:
                 kept.append(raw)
@@ -189,23 +319,10 @@ def main() -> int:
         if not INSTR_RE.match(line):
             continue
         kept.append(raw)
-        for t in cur_targets:
-            entry = matched[(cur_symbol, t["id"])]
-            entry["stats"]["instructions"] += 1
-            if VFMADD_RE.search(line):
-                entry["stats"]["vfmadd"] += 1
-            if CALL_RE.search(line):
-                entry["stats"]["call"] += 1
-            if SPILL_RE.search(line):
-                entry["stats"]["spills"] += 1
-            for k, regex in (("zmm", ZMM_RE), ("libm", LIBM_RE), ("alloc", ALLOC_RE),
-                             ("div", DIV_RE), ("tls", TLS_RE)):
-                if regex.search(line):
-                    excs = t["exceptions"].get(k, [])
-                    if any(e in line for e in excs):
-                        entry["exceptions"][k].append(line.strip())
-                    else:
-                        entry["hits"][k].append(line.strip())
+        cur_body.append(line)
+
+    if cur_symbol and cur_targets:
+        classify_symbol(cur_symbol, cur_targets, cur_body, matched)
 
     header = (
         "# DSP hotspot report (filtered) — critical DSP loops only\n"
@@ -248,11 +365,21 @@ def main() -> int:
                 continue
             hits = [l for e in matched.values() if e["target"] is target for l in e["hits"][key]]
             excs = sum(len(e["exceptions"][key]) for e in matched.values() if e["target"] is target)
+            cold = sum(len(e["cold_unwind"]) for e in matched.values() if e["target"] is target and key == "alloc")
             status = "PASS" if len(hits) <= budget else "FAIL"
             note = f", {excs} exception(s) permitted" if excs else ""
+            if cold:
+                note += f", {cold} unwind-cold landing-pad call(s) excluded"
             gate_lines.append(f"target {tid} gate {key}: {status} ({len(hits)} <= {budget}{note})")
             if len(hits) > budget:
                 failures.append(f"target '{tid}': {len(hits)} {key} hit(s) > budget {budget}")
+        spill_budget = target["gates"].get("spills_lt")
+        if spill_budget is not None:
+            spills = sum(e["stats"]["spills"] for e in matched.values() if e["target"] is target)
+            status = "PASS" if spills < spill_budget else "FAIL"
+            gate_lines.append(f"target {tid} gate spills: {status} ({spills} < {spill_budget})")
+            if spills >= spill_budget:
+                failures.append(f"target '{tid}': {spills} stack spill(s) >= budget {spill_budget}")
 
     if args.test_synthetic_violation:
         failures.append(SYNTHETIC_VIOLATION)

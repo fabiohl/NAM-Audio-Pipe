@@ -78,7 +78,7 @@ impl RtSwapHandler for OsSwapHandler<'_> {
 /// Drains oversampling engines delivered by the main thread via SPSC
 /// (engine canonical 3-phase protocol): swaps both L and R engines and sends
 /// the obsolete envelope to the GC cascade.
-#[inline(always)]
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + GC cascade parameters"

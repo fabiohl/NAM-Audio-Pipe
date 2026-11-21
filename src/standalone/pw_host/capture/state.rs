@@ -310,7 +310,7 @@ impl CaptureState {
             silence_hysteresis: DynamicHysteresis::new(),
             mono_hysteresis: DynamicHysteresis::new(),
             process_mono: false,
-            adaptive_compute: AdaptiveCompute::new(AdaptiveComputeMode::Off),
+            adaptive_compute: AdaptiveCompute::new(AdaptiveComputeMode::Conservative),
             threshold_open_sq: open_lin * open_lin,
             threshold_close_sq: close_lin * close_lin,
             shared_target_rate: Arc::new(AtomicU32::new(0)),

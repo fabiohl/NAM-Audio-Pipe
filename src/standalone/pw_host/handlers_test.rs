@@ -5,7 +5,6 @@ use super::*;
 use crate::standalone::pw_host::rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK;
 use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, SlimModelPair, SwapBudget};
 use neural_amp_modeler_rs::loader;
-use neural_amp_modeler_rs::math::common::AlignedVec;
 use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -28,23 +27,9 @@ static SLIMMABLE_FAULT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new((
 /// Minimal structurally-invalid-but-drop-safe `WavenetDyn` used to occupy a
 /// slimmable channel slot (the drain never runs DSP on these).
 fn fake_wavenet(ch: usize) -> Box<StaticModel> {
-    Box::new(StaticModel::WavenetDyn(Box::new(WaveNetModelDyn {
-        ch,
-        k: 3,
-        head: 1,
-        arrays: vec![],
-        head_scale: 1.0,
-        receptive_field_size: 1,
-        condition_dsp: None,
-        condition_dsp_output: AlignedVec::new(1, 0.0f32).expect("alloc"),
-        post_stack_head: None,
-        head_output_scratch: AlignedVec::new(1, 0.0f32).expect("alloc"),
-        prewarm_on_reset: false,
-        prewarm_pending: false,
-        slimmable_capable: true,
-        allowed_channels: None,
-        pending_slim_channel: None,
-    })))
+    Box::new(StaticModel::WavenetDyn(Box::new(
+        WaveNetModelDyn::dummy_slimmable_stub(ch),
+    )))
 }
 
 fn fake_pair(generation: u64, ch: usize) -> Box<SlimModelPair> {

@@ -351,6 +351,46 @@ fn swap_resampler_renegotiation_install_and_process() {
 
 // ── 5. Heap audit: zero allocations across all RT paths ─────────────────────
 
+/// Runs a fresh harness through a model-family swap under the heap-audit
+/// guard. The model and every producer-side allocation are created before the
+/// guard; only the RT callback + drains are measured.
+#[cfg(feature = "heap-audit")]
+fn assert_swap_family_zero_alloc(
+    label: &str,
+    mut h: RtSwapHarness,
+    l: Box<neural_amp_modeler_rs::models::StaticModel>,
+    r: Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
+    slimmable: bool,
+) {
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    h.push_load_model(Some(l), r, 1.0, 1.0, SAMPLE_RATE);
+    if slimmable {
+        h.push_slimmable(0, 4, linear_a(), Some(linear_b()));
+    }
+
+    let (sig_l, sig_r) = test_signal_blocks(32);
+    let mut in_l = [0.0f32; BLOCK];
+    let mut in_r = [0.0f32; BLOCK];
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        for block in 0..32 {
+            in_l.copy_from_slice(&sig_l[block * BLOCK..(block + 1) * BLOCK]);
+            in_r.copy_from_slice(&sig_r[block * BLOCK..(block + 1) * BLOCK]);
+            let _ = h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+    h.consume_gc();
+
+    // Measured: alloc=0, dealloc=0, realloc=0 (32 quanta per family)
+    assert_eq!(allocs, 0, "{label}: allocations on RT: {allocs}");
+    assert_eq!(deallocs, 0, "{label}: deallocations on RT: {deallocs}");
+    assert_eq!(reallocs, 0, "{label}: reallocations on RT: {reallocs}");
+}
+
 /// Runs the full RT sequence (all drains + DSP) under the heap-audit
 /// `TrackingGuard` while a burst of every swap kind is in flight. Asserts zero
 /// allocations, deallocations, and reallocations on the RT thread. Compiled only with `feature = "heap-audit"`.
@@ -408,6 +448,312 @@ fn swap_soak_heap_audit_zero_alloc() {
     );
     assert_eq!(deallocs, 0, "dealloc no callback RT");
     assert_eq!(reallocs, 0, "realloc no callback RT");
+
+    // Per-family coverage: WaveNet dyn (plain and with a slimmable pair),
+    // WaveNet A2, LSTM and a neural cabinet (.nam) install. Each family gets a
+    // fresh harness so the audited callback sequence is isolated.
+    use common::swap::{lstm_model, wavenet_a2, wavenet_model};
+    assert_swap_family_zero_alloc(
+        "WavenetDyn",
+        RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness"),
+        wavenet_model(),
+        None,
+        false,
+    );
+    assert_swap_family_zero_alloc(
+        "WavenetDyn+slimmable",
+        RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness"),
+        wavenet_model(),
+        None,
+        true,
+    );
+    assert_swap_family_zero_alloc(
+        "WavenetA2",
+        RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness"),
+        wavenet_a2(),
+        None,
+        false,
+    );
+    assert_swap_family_zero_alloc(
+        "LSTM",
+        RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness"),
+        lstm_model(),
+        None,
+        false,
+    );
+
+    // CabNam: build the 1-in/1-out slot off-RT, publish it through the dedicated
+    // channel, then exercise the install + cabinet DSP path under the guard.
+    {
+        use nam_audio_pipe::standalone::cabinet::{
+            CabAssetKind, PipeCabNamPayload, build_cab_nam_slot,
+        };
+        use neural_amp_modeler_rs::SystemSnapshot;
+        use neural_amp_modeler_rs::common::alloc_audit::{
+            TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+        };
+
+        let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+        let mut cab_prod = h.attach_cab_nam_channel();
+        let slot = build_cab_nam_slot(
+            LINEAR_A_JSON.as_bytes(),
+            CabAssetKind::NamModel,
+            "linear-cab.nam",
+            SAMPLE_RATE,
+            &SystemSnapshot::capture(),
+        )
+        .expect("cabinet slot");
+        let generation = h.bump_cab_nam_generation();
+        cab_prod
+            .push(PipeCabNamPayload::from_slot(generation, slot))
+            .expect("cabinet push");
+
+        let mut in_l = [0.1f32; BLOCK];
+        let mut in_r = [0.2f32; BLOCK];
+        let (allocs, deallocs, reallocs) = {
+            let _guard = TrackingGuard::new();
+            for _ in 0..32 {
+                let _ = h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+            (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+        };
+        assert!(h.active_cab_nam().is_some(), "CabNam slot not installed");
+        h.consume_gc();
+        // Measured: alloc=0, dealloc=0, realloc=0 (32 CabNam install/DSP quanta)
+        assert_eq!(allocs, 0, "CabNam: allocations on RT: {allocs}");
+        assert_eq!(deallocs, 0, "CabNam: deallocations on RT: {deallocs}");
+        assert_eq!(reallocs, 0, "CabNam: reallocations on RT: {reallocs}");
+    }
+}
+
+/// Loads the engine's free-topology `WavenetDyn` fixture through the production
+/// loader (off-RT, test setup only). With `slimmable`, the metadata declares
+/// `training.slimmable = true` so the model is slimmable-capable.
+#[cfg(feature = "heap-audit")]
+fn wavenet_dyn_fixture(slimmable: bool) -> Box<neural_amp_modeler_rs::models::StaticModel> {
+    use neural_amp_modeler_rs::SystemSnapshot;
+    use neural_amp_modeler_rs::loader::{LoadOptions, load_and_build_model_from_bytes};
+
+    let raw = include_str!("fixtures/models/wavenet_dyn_free.nam");
+    let json = if slimmable {
+        raw.replacen(
+            "\"metadata\": {",
+            "\"metadata\": {\"training\": {\"slimmable\": true}, ",
+            1,
+        )
+    } else {
+        raw.to_owned()
+    };
+    let loaded = load_and_build_model_from_bytes(
+        json.as_bytes(),
+        &SystemSnapshot::capture(),
+        true,
+        LoadOptions::default(),
+    )
+    .expect("wavenet dyn fixture must load");
+    loaded.model_l.expect("mono fixture yields a left model")
+}
+
+/// `Some -> Some` heap audit for one model family: the first `LoadModel`
+/// installs off-audit (None -> Some), then the second swap replaces the live
+/// model under the `TrackingGuard`, so its retirement path to GC is measured.
+#[cfg(feature = "heap-audit")]
+fn assert_swap_some_to_some_zero_alloc(
+    label: &str,
+    first: Box<neural_amp_modeler_rs::models::StaticModel>,
+    second: Box<neural_amp_modeler_rs::models::StaticModel>,
+) {
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+    let mut in_l = [0.1f32; BLOCK];
+    let mut in_r = [0.2f32; BLOCK];
+
+    h.push_load_model(Some(first), None, 1.0, 1.0, SAMPLE_RATE);
+    for _ in 0..4 {
+        h.run_callback(&mut in_l, &mut in_r, BLOCK);
+    }
+    h.consume_gc();
+
+    h.push_load_model(Some(second), None, 1.0, 1.0, SAMPLE_RATE);
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        for _ in 0..32 {
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+    assert!(h.active_model_l().is_some(), "{label}: swap not installed");
+    h.consume_gc();
+    assert_eq!(allocs, 0, "{label} Some->Some: allocations on RT: {allocs}");
+    assert_eq!(
+        deallocs, 0,
+        "{label} Some->Some: deallocations on RT: {deallocs}"
+    );
+    assert_eq!(
+        reallocs, 0,
+        "{label} Some->Some: reallocations on RT: {reallocs}"
+    );
+}
+
+/// Covers the remaining model families under `TrackingGuard`: `WavenetDyn`
+/// (real fixture, `Some -> Some` plus the slimmable overload that schedules a
+/// rebuild through `try_slimmable_rebuild`), `WavenetA2Full` / `WavenetA2Lite`
+/// (empty engines whose RT status is injected on install) and `CabNam`
+/// `Some -> Some`.
+#[cfg(feature = "heap-audit")]
+#[test]
+fn swap_soak_heap_audit_remaining_families_some_to_some() {
+    use nam_audio_pipe::standalone::pw_host::try_slimmable_rebuild;
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+    use neural_amp_modeler_rs::common::spsc::{RT_STATUS_NEEDS_SLIMMABLE_REBUILD, RtStatusFlags};
+    use neural_amp_modeler_rs::dsp::adaptive::{AdaptiveCompute, AdaptiveComputeMode};
+    use neural_amp_modeler_rs::models::StaticModel;
+    use neural_amp_modeler_rs::models::a2::WaveNetA2;
+
+    // WavenetDyn: real slimmable-capable topology, Some -> Some.
+    assert!(
+        wavenet_dyn_fixture(true).is_slimmable_capable(),
+        "WavenetDyn fixture must be slimmable-capable"
+    );
+    assert_swap_some_to_some_zero_alloc(
+        "WavenetDyn",
+        wavenet_dyn_fixture(true),
+        wavenet_dyn_fixture(true),
+    );
+
+    // Overload on the slimmable-capable WavenetDyn schedules a rebuild through
+    // the canonical `try_slimmable_rebuild` request path (off-audit check).
+    let flags = RtStatusFlags::new();
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Aggressive);
+    adaptive.set_wavenet_full_ch_rt(7, true);
+    let mut scheduled = false;
+    for _ in 0..64 {
+        adaptive.update(10_000, 100, SAMPLE_RATE, &flags);
+        try_slimmable_rebuild(&mut adaptive, &flags);
+        if flags.check_flag(RT_STATUS_NEEDS_SLIMMABLE_REBUILD) {
+            scheduled = true;
+            break;
+        }
+    }
+    assert!(
+        scheduled,
+        "sustained overload must request a slimmable rebuild"
+    );
+
+    // WavenetDyn slimmable pair drained alongside the Some -> Some swap.
+    {
+        let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+        let mut in_l = [0.1f32; BLOCK];
+        let mut in_r = [0.2f32; BLOCK];
+        h.push_load_model(Some(wavenet_dyn_fixture(true)), None, 1.0, 1.0, SAMPLE_RATE);
+        for _ in 0..4 {
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        h.consume_gc();
+        h.push_slimmable(1, 4, linear_a(), Some(linear_b()));
+        h.push_load_model(Some(wavenet_dyn_fixture(true)), None, 1.0, 1.0, SAMPLE_RATE);
+        let (allocs, deallocs, reallocs) = {
+            let _guard = TrackingGuard::new();
+            for _ in 0..32 {
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+            (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+        };
+        h.consume_gc();
+        assert_eq!(
+            allocs, 0,
+            "WavenetDyn+slimmable: allocations on RT: {allocs}"
+        );
+        assert_eq!(
+            deallocs, 0,
+            "WavenetDyn+slimmable: deallocations on RT: {deallocs}"
+        );
+        assert_eq!(
+            reallocs, 0,
+            "WavenetDyn+slimmable: reallocations on RT: {reallocs}"
+        );
+    }
+
+    // WavenetA2 Full / Lite: empty engines with RT status injected on install.
+    let a2_full = || -> Box<StaticModel> {
+        Box::new(StaticModel::WavenetA2Full(Box::new(
+            WaveNetA2::<8>::new().expect("A2 Full"),
+        )))
+    };
+    let a2_lite = || -> Box<StaticModel> {
+        Box::new(StaticModel::WavenetA2Lite(Box::new(
+            WaveNetA2::<3>::new().expect("A2 Lite"),
+        )))
+    };
+    assert_swap_some_to_some_zero_alloc("WavenetA2Full", a2_full(), a2_full());
+    assert_swap_some_to_some_zero_alloc("WavenetA2Lite", a2_lite(), a2_lite());
+    assert_swap_some_to_some_zero_alloc("LSTM", lstm_model(), lstm_model());
+
+    // CabNam Some -> Some: the second install retires the first slot to GC.
+    {
+        use nam_audio_pipe::standalone::cabinet::{
+            CabAssetKind, PipeCabNamPayload, build_cab_nam_slot,
+        };
+        use neural_amp_modeler_rs::SystemSnapshot;
+
+        let mut h = RtSwapHarness::new(SAMPLE_RATE, SAMPLE_RATE).expect("harness");
+        let mut cab_prod = h.attach_cab_nam_channel();
+        let build = |name: &str| {
+            build_cab_nam_slot(
+                LINEAR_A_JSON.as_bytes(),
+                CabAssetKind::NamModel,
+                name,
+                SAMPLE_RATE,
+                &SystemSnapshot::capture(),
+            )
+            .expect("cabinet slot")
+        };
+        let mut in_l = [0.1f32; BLOCK];
+        let mut in_r = [0.2f32; BLOCK];
+
+        let generation = h.bump_cab_nam_generation();
+        cab_prod
+            .push(PipeCabNamPayload::from_slot(
+                generation,
+                build("linear-cab-a.nam"),
+            ))
+            .expect("cabinet push");
+        for _ in 0..4 {
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        h.consume_gc();
+
+        let generation = h.bump_cab_nam_generation();
+        cab_prod
+            .push(PipeCabNamPayload::from_slot(
+                generation,
+                build("linear-cab-b.nam"),
+            ))
+            .expect("cabinet push");
+        let (allocs, deallocs, reallocs) = {
+            let _guard = TrackingGuard::new();
+            for _ in 0..32 {
+                h.run_callback(&mut in_l, &mut in_r, BLOCK);
+            }
+            (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+        };
+        assert!(h.active_cab_nam().is_some(), "CabNam slot not installed");
+        h.consume_gc();
+        assert_eq!(allocs, 0, "CabNam Some->Some: allocations on RT: {allocs}");
+        assert_eq!(
+            deallocs, 0,
+            "CabNam Some->Some: deallocations on RT: {deallocs}"
+        );
+        assert_eq!(
+            reallocs, 0,
+            "CabNam Some->Some: reallocations on RT: {reallocs}"
+        );
+    }
 }
 
 /// Resampler swap under heap audit (uses the fail-open rollback path).

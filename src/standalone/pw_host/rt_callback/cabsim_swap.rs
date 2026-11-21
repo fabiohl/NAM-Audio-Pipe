@@ -157,7 +157,7 @@ pub fn drain_cabsims_with_pair(
 }
 
 /// Drains WAV IR swaps while enforcing strict single-slot exclusivity against any active neural cabinet.
-#[inline(always)]
+#[inline(never)]
 #[expect(
     clippy::too_many_arguments,
     reason = "RT callback drain signature: engine drain + shared budget + exclusive cab slot + GC parameters"

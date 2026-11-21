@@ -21,6 +21,7 @@ use neural_amp_modeler_rs::common::spsc::{
     GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags, SHUTDOWN,
     SlimModelPair,
 };
+use neural_amp_modeler_rs::dsp::pipeline::DspBridge;
 use rtrb::Consumer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -795,17 +796,42 @@ pub fn run_pipewire_host_with_cabinet(
                 os_scratch_len,
             );
 
+            // Off-RT diagnostic snapshot of the bridge publication counters.
+            // The raw projections touch only the atomic field places and never
+            // materialize a `&DspBridge` while the capture/playback callbacks
+            // are live. `written_gen`/`consumed_gen`/`dropped_frames` use
+            // `Relaxed` ordering: they are watchdog/diagnostic values only and
+            // never synchronize buffer contents (the writer/reader protocols keep
+            // their own Release/Acquire barriers). The two generations are
+            // sampled independently, so the lag is clamped with `saturating_sub`.
+            // SAFETY: `bridge_ptr` points to the process-lifetime `DspBridge`
+            // allocation created by `allocate_dsp_bridge()`; the raw projections
+            // only read/swap atomic fields through `&raw const`, which is sound
+            // alongside the RT producer and consumer.
+            // SAFETY: see the projection contract above; `bridge_ptr` is the
+            // live process-lifetime allocation.
+            let bridge_raw = unsafe { bridge_ptr.as_ptr() }.cast_const();
+            // SAFETY: `bridge_raw` is valid; both reads are atomic field projections.
+            let (written_gen, consumed_gen) = unsafe {
+                (
+                    DspBridge::written_gen_raw(bridge_raw),
+                    DspBridge::consumed_gen_raw(bridge_raw),
+                )
+            };
+            log::trace!(
+                "bridge generations: published={written_gen} consumed={consumed_gen} lag={}",
+                written_gen.saturating_sub(consumed_gen)
+            );
+            // SAFETY: same projection contract as the generation snapshot above.
+            let dropped_frames = unsafe { DspBridge::drain_dropped_frames_raw(bridge_raw) };
+
             (was_silent, was_fading) = rt_setup::poll_rt_status(
                 &rt_status,
                 Some(backend_status.stream_status()),
                 &sys,
                 was_silent,
                 was_fading,
-                // SAFETY: `bridge_ptr` points to the static `DspBridge` allocation created
-                // by `allocate_dsp_bridge()`, valid for the entire process duration.
-                // `poll_rt_status` only invokes `bridge.drain_dropped_frames()`, which reads and
-                // swaps an `AtomicU64` field without racing with concurrent audio buffer access.
-                unsafe { &*(bridge_ptr.as_ptr()) },
+                dropped_frames,
                 &mut poll_state,
             );
 

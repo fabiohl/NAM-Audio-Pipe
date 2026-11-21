@@ -733,7 +733,7 @@ pub(crate) fn run_capture_dsp_pipeline(
                     bufs.resamp_out_l,
                     bufs.resamp_out_r,
                     n,
-                    ctx.bridge_writer,
+                    ctx.bridge_writer.as_ref(),
                     *ctx.process_mono,
                     capture_tsc,
                 );
@@ -808,7 +808,7 @@ pub(crate) fn run_capture_dsp_pipeline(
         bufs.resamp_out_l,
         bufs.resamp_out_r,
         n_pw,
-        ctx.bridge_writer,
+        ctx.bridge_writer.as_ref(),
         *ctx.process_mono,
         capture_tsc,
     );
@@ -1212,7 +1212,11 @@ pub fn rt_quantum_prologue(
         for slot in parking_lot.iter_mut() {
             let Some(old) = slot.take() else { continue };
             if let Err(rtrb::PushError::Full(old_back)) = channels.gc_producer.push(old) {
-                *slot = Some(old_back);
+                // The slot was just emptied by `take()`, so re-parking cannot
+                // destroy an existing item. `mem::forget` keeps the polymorphic
+                // `drop_glue` for `GcItem` out of the audio callback.
+                debug_assert!(slot.is_none(), "parking-lot slot must be empty");
+                std::mem::forget(slot.replace(old_back));
                 any_remaining = true;
                 break;
             }

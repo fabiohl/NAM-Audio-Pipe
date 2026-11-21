@@ -127,7 +127,7 @@ pub use rt_callback::harness::RtSwapHarness;
 #[cfg(feature = "testing")]
 pub use rt_callback::{
     PrologueOutcome, RateSyncState, handle_spa_pair_fail_closed, resolve_capture_chunk_window,
-    send_recording_audio,
+    send_recording_audio, try_slimmable_rebuild,
 };
 
 // Re-exports for test module compatibility (pw_host_test.rs).

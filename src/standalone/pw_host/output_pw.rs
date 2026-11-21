@@ -14,9 +14,9 @@ use std::time::Duration;
 use super::rt_callback::{handle_spa_pair_fail_closed, silence_available_datas, stamp_chunk};
 pub(crate) use super::spa_format::validate_built_pod;
 pub use super::spa_format::{
-    ContractViolation, SpaPodStorage, build_spa_format_pod, check_negotiated_rate_mismatch,
-    mark_format_contract_ok, mark_stream_active, negotiated_rate_mismatch,
-    reject_negotiated_format_violation, validate_audio_raw_format,
+    ContractViolation, SpaPodStorage, build_spa_format_pod, build_stereo_f32p_format_pod,
+    check_negotiated_rate_mismatch, mark_format_contract_ok, mark_stream_active,
+    negotiated_rate_mismatch, reject_negotiated_format_violation, validate_audio_raw_format,
 };
 use super::stream_status::StreamStatusFlags;
 use crate::standalone::cli::GateConfig;
@@ -124,14 +124,14 @@ pub struct PipewireHostConfig {
 #[inline(always)]
 pub fn playback_dsp_cycle(
     stream: &pw::stream::Stream,
-    bridge: DspBridgeReader,
+    bridge: &DspBridgeReader,
     last_bridge_gen: &mut u64,
     rt_status: &RtStatusFlags,
     stream_status: &StreamStatusFlags,
-    pb_frame_count: u32,
+    pb_callback_count: u32,
     output_limit: crate::standalone::cli_domain::OutputLimitPolicy,
 ) {
-    let should_measure = (pb_frame_count & 0xF) == 0;
+    let should_measure = (pb_callback_count & 0xF) == 0;
     let t_pb_start = if should_measure {
         rt_setup::rdtsc_nanos()
     } else {
@@ -177,7 +177,13 @@ pub fn playback_dsp_cycle(
         // policy: still dequeue, validate fail-closed, fill 100% of the output
         // extension with analytical silence and recycle the buffer — the
         // hardware never repeats stale audio left in the previous buffer.
-        let reason = classify_missing_bridge_block(stream_status, pb_frame_count);
+        //
+        // `pb_callback_count` is the monotonic playback-callback counter, not
+        // a quantum length: classifying the miss from it would make the derived
+        // period grow without bound (FINDING-RES-01). The active stream quantum
+        // is resolved from the RT frame counters instead, exactly like the
+        // silence window below.
+        let reason = classify_missing_bridge_block(stream_status, active_quantum_frames(rt_status));
         deliver_silence_block(stream, rt_status, stream_status, reason);
         return;
     };
@@ -601,23 +607,50 @@ enum SilenceReason {
     Early,
 }
 
+/// Resolves the active stream quantum in frames from the RT counters.
+///
+/// Prefers the last processed frame count, falls back to the requested buffer
+/// size, and finally to the 128-frame default used by the silence window.
+/// This is the quantum the miss classifier must use; it is invariant to the
+/// accumulated playback-callback counter (`pb_frame_count`).
+#[inline(always)]
+fn active_quantum_frames(rt_status: &RtStatusFlags) -> u32 {
+    let last = rt_status.last_n_samples.load(Ordering::Relaxed);
+    if last != 0 {
+        last
+    } else {
+        let requested = rt_status.requested_buffer_frames.load(Ordering::Relaxed);
+        if requested != 0 { requested } else { 128 }
+    }
+}
+
 /// Classifies a playback cycle that found no new bridge generation using the
 /// capture timestamp of the last delivered generation plus one quantum period.
 /// RT-safe: one RDTSC read on the miss path only (no allocation, no lock).
 #[inline(always)]
 fn classify_missing_bridge_block(
     stream_status: &StreamStatusFlags,
-    pb_frame_count: u32,
+    quantum_frames: u32,
 ) -> SilenceReason {
-    let now = rt_setup::rdtsc_nanos();
+    classify_missing_bridge_block_at(stream_status, quantum_frames, rt_setup::rdtsc_nanos())
+}
+
+/// Deterministic core of [`classify_missing_bridge_block`] with an explicit
+/// monotonic nanosecond timestamp (tests inject the clock).
+#[inline(always)]
+fn classify_missing_bridge_block_at(
+    stream_status: &StreamStatusFlags,
+    quantum_frames: u32,
+    now: u64,
+) -> SilenceReason {
     let last_capture_tsc = stream_status
         .playback_last_capture_tsc
         .load(Ordering::Relaxed);
     let rate = stream_status
         .capture_negotiated_rate
         .load(Ordering::Relaxed);
-    let period_ns = if rate > 0 && pb_frame_count > 0 {
-        (pb_frame_count as u64).saturating_mul(1_000_000_000) / rate as u64
+    let period_ns = if rate > 0 && quantum_frames > 0 {
+        (quantum_frames as u64).saturating_mul(1_000_000_000) / rate as u64
     } else {
         0
     };
@@ -670,19 +703,7 @@ fn deliver_silence_block(
     // channel capacities and MAX_BRIDGE_BUF × 4. Delivering the shared-memory
     // `maxsize` here would exceed the fail-closed window cap on a 64 KiB
     // buffer and raise a false E2304 on every pause.
-    let active_frames = {
-        let last = rt_status.last_n_samples.load(Ordering::Relaxed);
-        if last != 0 {
-            last
-        } else {
-            rt_status.requested_buffer_frames.load(Ordering::Relaxed)
-        }
-    };
-    let silence_frames = if active_frames == 0 {
-        128
-    } else {
-        active_frames
-    };
+    let silence_frames = active_quantum_frames(rt_status);
     let silence_bytes = (silence_frames as usize * std::mem::size_of::<f32>())
         .min(max_l)
         .min(max_r)

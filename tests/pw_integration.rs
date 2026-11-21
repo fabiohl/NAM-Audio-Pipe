@@ -181,10 +181,17 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
     let dropped_frames = current_drops.saturating_sub(bringup_discard);
 
     let samples = stream_status.e2e_hist.total_count();
-    let p50_ns = stream_status.e2e_hist.get_percentile(0.50);
-    let p99_ns = stream_status.e2e_hist.get_percentile(0.99);
-    let p999_ns = stream_status.e2e_hist.get_percentile(0.999);
-    let max_ns = stream_status.e2e_hist.get_exact_max();
+    let latency =
+        nam_audio_pipe::standalone::rt_setup::telemetry::latency_summary(&stream_status.e2e_hist);
+    let p50_ns = latency.p50_ns;
+    let p99_ns = latency.p99_ns;
+    let p999_ns = latency.p999_ns;
+    let max_ns = latency.max_ns;
+    assert!(
+        p50_ns <= p99_ns && p99_ns <= p999_ns && p999_ns <= max_ns,
+        "E2E percentiles must be monotonic and clamped to max: \
+         p50={p50_ns} p99={p99_ns} p999={p999_ns} max={max_ns}"
+    );
 
     // Exact-sample percentiles from the testing-only reservoir. The log-linear
     // histogram quantises the tail, so on a bucket boundary `p50 == p99 == p999`;

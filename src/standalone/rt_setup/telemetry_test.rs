@@ -80,8 +80,15 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
 
     assert!(!state.hugepage_synced);
 
-    let (silent, fading) =
-        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     assert!(!silent);
     assert!(!fading);
@@ -91,7 +98,15 @@ fn test_poll_rt_status_syncs_hugepage_flag_on_first_poll() {
     );
 
     // Second poll retains true without re-syncing
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert!(state.hugepage_synced);
 }
 
@@ -104,27 +119,57 @@ fn test_poll_rt_status_silence_and_fading_transitions() {
     let mut state = PollState::default();
 
     // Initially active
-    let (silent, fading) =
-        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert!(!silent);
     assert!(!fading);
 
     // Set silent flag
     rt_status.set_flag(RT_STATUS_IS_SILENT);
-    let (silent, fading) =
-        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert!(silent);
     assert!(!fading);
 
     // Set fading flag as well
     rt_status.set_flag(RT_STATUS_IS_FADING);
-    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, true, false, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        true,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert!(silent);
     assert!(fading);
 
     // Clear silent flag
     rt_status.clear_flag(RT_STATUS_IS_SILENT);
-    let (silent, fading) = poll_rt_status(&rt_status, None, &sys, true, true, &bridge, &mut state);
+    let (silent, fading) = poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        true,
+        true,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert!(!silent);
     assert!(fading);
 }
@@ -145,7 +190,15 @@ fn test_poll_rt_status_telemetry_throttle_advances() {
     assert_eq!(state.telemetry_throttle, 0);
 
     for i in 1..=105 {
-        poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+        poll_rt_status(
+            &rt_status,
+            None,
+            &sys,
+            false,
+            false,
+            bridge.drain_dropped_frames(),
+            &mut state,
+        );
         assert_eq!(state.telemetry_throttle, i as u32);
     }
 }
@@ -167,7 +220,15 @@ fn test_poll_rt_status_clears_diagnostic_flags() {
     rt_status.set_flag(RT_STATUS_HUGEPAGE_OK);
     rt_status.set_flag(RT_STATUS_THP_ACTIVE);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     assert!(!rt_status.check_flag(RT_STATUS_GC_OVERFLOW));
     assert!(!rt_status.check_flag(RT_STATUS_GC_TIER3));
@@ -211,7 +272,15 @@ fn test_latched_flag_emits_once_per_episode() {
 
     // Episode 1: the RT producer keeps re-arming the flag across polls.
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         e3101_count() - base,
         1,
@@ -219,7 +288,15 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         e3101_count() - base,
         1,
@@ -227,7 +304,15 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         e3101_count() - base,
         1,
@@ -235,12 +320,28 @@ fn test_latched_flag_emits_once_per_episode() {
     );
 
     // Producer stops re-arming: the latch releases without emitting.
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(e3101_count() - base, 1, "no flag set -> nothing emitted");
 
     // Episode 2: a new episode after the clear emits exactly once.
     rt_status.set_flag(RT_STATUS_GC_OVERFLOW);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         e3101_count() - base,
         2,
@@ -269,11 +370,27 @@ fn test_latched_counter_emits_once_per_episode() {
     let base = overload_count();
 
     rt_status.dsp_overloads.store(3, Ordering::Relaxed);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(overload_count() - base, 1, "first overload poll must emit");
 
     rt_status.dsp_overloads.store(2, Ordering::Relaxed);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         overload_count() - base,
         1,
@@ -281,7 +398,15 @@ fn test_latched_counter_emits_once_per_episode() {
     );
 
     rt_status.dsp_overloads.store(0, Ordering::Relaxed);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         overload_count() - base,
         1,
@@ -289,7 +414,15 @@ fn test_latched_counter_emits_once_per_episode() {
     );
 
     rt_status.dsp_overloads.store(5, Ordering::Relaxed);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         overload_count() - base,
         2,
@@ -311,7 +444,15 @@ fn test_runtime_diagnostics_are_concise_without_bundle_headers() {
     rt_status.set_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
     rt_status.set_flag(RT_STATUS_HAS_CLIPPED);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -427,7 +568,7 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
 
@@ -466,6 +607,35 @@ fn test_e2e_histogram_resolves_distinct_percentiles() {
 }
 
 #[test]
+fn test_clamped_latency_summary_preserves_percentile_monotonicity() {
+    use neural_amp_modeler_rs::dsp::telemetry::LatencyHistogram;
+
+    let hist = LatencyHistogram::new();
+    // 1_300_000 ns lands in the sub-bin whose upper edge is 1_310_720 ns:
+    // the raw percentile is numerically above the exact maximum (the
+    // FINDING-RES-03 `p99 > max` anomaly).
+    hist.record(1_300_000);
+    let raw_p999 = hist.get_percentile(0.999);
+    let exact_max = hist.get_exact_max();
+    assert!(
+        raw_p999 > exact_max,
+        "edge case requires a sub-bin upper edge above the exact max: \
+         p999={raw_p999} max={exact_max}"
+    );
+
+    let summary = latency_summary(&hist);
+    assert_eq!(summary.max_ns, exact_max);
+    assert!(
+        summary.p50_ns <= summary.p99_ns
+            && summary.p99_ns <= summary.p999_ns
+            && summary.p999_ns <= summary.max_ns,
+        "clamped percentiles must satisfy p50 <= p99 <= p999 <= max: {:?}",
+        summary
+    );
+    assert_eq!(summary.p999_ns, exact_max);
+}
+
+#[test]
 fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
     let _guard = init_test_logger();
     let rt_status = RtStatusFlags::new();
@@ -500,7 +670,15 @@ fn test_poll_rt_status_logs_dedicated_core_for_isolated_receipt() {
     rt_status.rt_cpu.store(3, Ordering::Relaxed);
     rt_status.rt_tid.store(12345, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -551,7 +729,15 @@ fn test_poll_rt_status_logs_conservative_heuristic_for_smt_receipt() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12346, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -583,7 +769,15 @@ fn test_poll_rt_status_logs_conservative_heuristic_when_no_receipt() {
     rt_status.rt_cpu.store(2, Ordering::Relaxed);
     rt_status.rt_tid.store(12347, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -615,7 +809,15 @@ fn test_poll_rt_status_sched_rr_is_rt_and_suppresses_denied() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12348, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -655,7 +857,15 @@ fn test_poll_rt_status_sched_other_emits_non_rt_warn() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12349, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -703,7 +913,15 @@ fn test_poll_rt_status_non_eperm_sched_error_keeps_error() {
     rt_status.rt_cpu.store(1, Ordering::Relaxed);
     rt_status.rt_tid.store(12350, Ordering::Relaxed);
 
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
 
     let log_buf = neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         .expect("LogBuffer must be initialized");
@@ -757,12 +975,28 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
     let base = drop_warn_count();
 
     // Clean state: no delta, no warning.
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(drop_warn_count() - base, 0, "no saturation must not warn");
 
     // Saturation episode: the first delta warns once.
     rt_log_ring::bump_pw_log_dropped_for_test(3);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         drop_warn_count() - base,
         1,
@@ -771,7 +1005,15 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
 
     // Continued saturation: latched — no re-emission without a clear.
     rt_log_ring::bump_pw_log_dropped_for_test(2);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         drop_warn_count() - base,
         1,
@@ -781,11 +1023,27 @@ fn test_pw_log_ring_drop_warns_once_per_episode() {
     // Clear, then a fresh episode warns again exactly once.
     rt_log_ring::reset_pw_log_dropped_for_test();
     state.pw_log_dropped_last = rt_log_ring::pw_log_dropped();
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(drop_warn_count() - base, 1, "clear state must not warn");
 
     rt_log_ring::bump_pw_log_dropped_for_test(1);
-    poll_rt_status(&rt_status, None, &sys, false, false, &bridge, &mut state);
+    poll_rt_status(
+        &rt_status,
+        None,
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
     assert_eq!(
         drop_warn_count() - base,
         2,
@@ -842,7 +1100,7 @@ fn test_playback_bringup_preroll_suppresses_drift() {
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -863,7 +1121,7 @@ fn test_playback_bringup_preroll_suppresses_drift() {
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -898,7 +1156,7 @@ fn test_playback_bringup_delayed_poll_suppresses_startup_drops() {
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -919,7 +1177,7 @@ fn test_playback_bringup_delayed_poll_suppresses_startup_drops() {
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -947,7 +1205,7 @@ fn test_playback_bringup_early_zero_drop_poll_does_not_break_subsequent_startup_
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -970,7 +1228,7 @@ fn test_playback_bringup_early_zero_drop_poll_does_not_break_subsequent_startup_
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(
@@ -989,7 +1247,7 @@ fn test_playback_bringup_early_zero_drop_poll_does_not_break_subsequent_startup_
         &sys,
         false,
         false,
-        &bridge,
+        bridge.drain_dropped_frames(),
         &mut state,
     );
     assert_eq!(

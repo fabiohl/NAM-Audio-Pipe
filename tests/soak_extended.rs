@@ -342,6 +342,12 @@ fn test_soak_rss_memory_stability() {
                 h.run_callback(&mut in_l, &mut in_r, BLOCK);
             }
 
+            // Keep the worker alive until the main thread takes the final
+            // telemetry sample: `threads_delta` must compare the same thread
+            // topology as the warmup baseline, which includes this thread.
+            while !stop_rt.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             let rusage_after = read_thread_rusage().expect("final thread rusage");
             (rusage_before, rusage_after)
         })
@@ -391,14 +397,31 @@ fn test_soak_rss_memory_stability() {
         std::thread::yield_now();
     }
 
+    // Final telemetry sample is taken before `join`, while the RT worker still
+    // exists (it parks after TOTAL_BLOCKS until `stop` is published), so
+    // `threads_delta` compares the same thread topology as the warmup baseline
+    // instead of measuring the worker's own teardown.
+    telemetry.push(TelemetrySample::capture());
     stop.store(true, Ordering::Release);
     let (rusage_before, rusage_after) = rt_handle.join().expect("join RT thread");
-    telemetry.push(TelemetrySample::capture());
 
+    // Process-wide page faults (`TelemetrySample::minflt`/`majflt`, read from
+    // `/proc/self/stat`) include allocator-arena churn from the off-RT producer
+    // (swap batches, GC). They are diagnostic only and never a zero-fault
+    // oracle. The invariant below judges `getrusage(RUSAGE_THREAD)` of the RT
+    // callback thread (`minflt_thread_delta`/`majflt_thread_delta`), the only
+    // counters that can attribute a page fault to the audio thread.
     let minflt_thread_delta = rusage_after.minflt.saturating_sub(rusage_before.minflt);
     let nivcsw_thread_delta = rusage_after.nivcsw.saturating_sub(rusage_before.nivcsw);
     let majflt_thread_delta = rusage_after.majflt.saturating_sub(rusage_before.majflt);
 
+    assert!(
+        telemetry.len() >= 2,
+        "soak captured {} telemetry sample(s); at least two (warmup baseline + \
+         final pre-join) are required — a single sample makes the first→last \
+         deltas vacuous",
+        telemetry.len()
+    );
     let first = telemetry.first().expect("telemetry baseline");
     let last = telemetry.last().expect("telemetry final");
     let rss_delta_kb = last.rss_kb as i64 - first.rss_kb as i64;

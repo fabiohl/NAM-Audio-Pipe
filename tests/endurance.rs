@@ -184,12 +184,16 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let window_active = Arc::new(AtomicBool::new(false));
     let rt_blocked_in_window = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Shared RT-quantum counter: telemetry cadence and the final assertion are
+    // keyed to actual DSP callbacks, never to the much slower paced loop below.
+    let rt_blocks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let window_rt = std::sync::Arc::clone(&window_active);
     let rt_blocked_rt = std::sync::Arc::clone(&rt_blocked_in_window);
     let (tx_ready, rx_ready) = std::sync::mpsc::channel();
 
     let harness_rt = std::sync::Arc::clone(&harness);
     let stop_rt = std::sync::Arc::clone(&stop);
+    let rt_blocks_rt = std::sync::Arc::clone(&rt_blocks);
     let sig_l_rt = sig_l.clone();
     let sig_r_rt = sig_r.clone();
 
@@ -235,6 +239,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
                     (frames_diff, is_silent)
                 };
                 blocks += 1;
+                rt_blocks_rt.store(blocks, Ordering::Release);
                 if frames_diff {
                     skipped_blocks += 1;
                 }
@@ -258,7 +263,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     rx_ready.recv().expect("wait RT thread ready");
 
     let start = Instant::now();
-    let mut blocks = 0usize;
+    let mut pacing_blocks = 0usize;
     let mut windows_completed = 0usize;
     let mut windows_deferred = 0usize;
     let mut window_needed_retry = false;
@@ -269,7 +274,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     let mut last_telemetry_block = 0usize;
 
     while start.elapsed() < window {
-        let block = blocks;
+        let block = pacing_blocks;
         // Mandatory validation windows (fail-closed). The trigger is declared
         // BEFORE the swap-batch cadence so a boundary landing exactly on the
         // trigger block defers its batch: the window is the sole command
@@ -334,11 +339,12 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
             }
         }
 
-        if blocks >= TELEMETRY_WARMUP_BLOCKS
-            && (telemetry.is_empty() || blocks - last_telemetry_block >= TELEMETRY_INTERVAL)
+        let rt_now = rt_blocks.load(std::sync::atomic::Ordering::Acquire);
+        if rt_now >= TELEMETRY_WARMUP_BLOCKS
+            && (telemetry.is_empty() || rt_now - last_telemetry_block >= TELEMETRY_INTERVAL)
         {
             telemetry.push(TelemetrySample::capture());
-            last_telemetry_block = blocks;
+            last_telemetry_block = rt_now;
         }
 
         if block.is_multiple_of(50) {
@@ -346,7 +352,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
             h.consume_gc();
         }
 
-        blocks += 1;
+        pacing_blocks += 1;
         std::thread::yield_now();
     }
 
@@ -378,9 +384,13 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         }
     }
     let elapsed = start.elapsed();
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    let (rusage_before, rusage_after, rt_blocks, undue_silence, skipped_blocks) =
-        rt_handle.join().expect("join RT thread");
+
+    // Final quiescent sample: captured while the RT worker is still alive and
+    // parked behind the validation gate (pre-join), so `threads` observes the
+    // same thread topology as the baseline sample. The gate also keeps the
+    // canonical baseline reset (`validate_linear_window` + `consume_gc`) free
+    // of foreign callbacks before the leak delta is taken.
+    let final_gate = ValidationWindowGate::arm(&window_active);
     {
         let mut h = harness.lock().expect("harness lock");
         // Canonical baseline reset: restore harness to the exact quiescent baseline
@@ -391,18 +401,41 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         validate_linear_window(&mut h);
         h.consume_gc();
     }
-    // Record post-stop, post-GC steady-state sample
     telemetry.push(TelemetrySample::capture());
+    drop(final_gate);
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (rusage_before, rusage_after, rt_blocks_reported, undue_silence, skipped_blocks) =
+        rt_handle.join().expect("join RT thread");
+    let rt_blocks = rt_blocks.load(std::sync::atomic::Ordering::Acquire);
+    assert_eq!(
+        rt_blocks_reported, rt_blocks,
+        "RT quantum counter diverged: worker={rt_blocks_reported}, shared snapshot={rt_blocks}"
+    );
 
+    // Process-wide page faults (`TelemetrySample::minflt`/`majflt`, read from
+    // `/proc/self/stat`) include allocator-arena churn from the off-RT producer
+    // (swap batches, GC). They are diagnostic only and never a zero-fault
+    // oracle. The invariant below judges `getrusage(RUSAGE_THREAD)` of the RT
+    // callback thread (`minflt_thread_delta`/`majflt_thread_delta`), the only
+    // counters that can attribute a page fault to the audio thread.
     let minflt_thread_delta = rusage_after.minflt.saturating_sub(rusage_before.minflt);
     let majflt_thread_delta = rusage_after.majflt.saturating_sub(rusage_before.majflt);
     let nvcsw_thread_delta = rusage_after.nvcsw.saturating_sub(rusage_before.nvcsw);
     let nivcsw_thread_delta = rusage_after.nivcsw.saturating_sub(rusage_before.nivcsw);
 
-    // Windows trigger at every VALIDATION_INTERVAL boundary processed inside
-    // the wall-clock loop; the boundary at `blocks` itself is exclusive, so
-    // the expected count is the number of boundaries strictly below `blocks`.
-    let expected_windows = (blocks.saturating_sub(1)) / VALIDATION_INTERVAL;
+    // Validation windows are paced by the main loop (`pacing_blocks`, one
+    // deliberate command producer per iteration); telemetry is paced by the
+    // shared RT quantum counter. The boundary at `pacing_blocks` itself is
+    // exclusive, so the expected window count is the number of boundaries
+    // strictly below it.
+    let expected_windows = (pacing_blocks.saturating_sub(1)) / VALIDATION_INTERVAL;
+    assert!(
+        telemetry.len() >= 2,
+        "endurance captured {} telemetry sample(s); at least two (steady-state \
+         baseline + final pre-join) are required — a single sample makes the \
+         first→last deltas vacuous",
+        telemetry.len()
+    );
     let first = telemetry.first().copied().expect("telemetry baseline");
     let last = telemetry.last().copied().expect("telemetry final");
     let rss_delta_kb = last.rss_kb as i64 - first.rss_kb as i64;
@@ -423,8 +456,9 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
     // `windows_completed == expected_windows` (each reached boundary must
     // complete within the bounded retry budget or the suite fails).
     assert!(
-        blocks > 0,
-        "endurance processed no audio blocks — vacuous pass"
+        rt_blocks > 0 && pacing_blocks > 0,
+        "endurance processed no audio quantums ({rt_blocks}) or paced no windows \
+         ({pacing_blocks}) — vacuous pass"
     );
     assert!(
         windows_completed == expected_windows,
@@ -476,7 +510,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
         ) {
             eprintln!(
                 "TEST_RESULT[endurance_real]=GAP:rt_thread_page_faults profile=release+testing window_secs={window_secs} \
-                 elapsed_ms={} dsp_quantums={rt_blocks} blocks={blocks} windows_completed={windows_completed} \
+                 elapsed_ms={} dsp_quantums={rt_blocks} pacing_blocks={pacing_blocks} windows_completed={windows_completed} \
                  windows_deferred={windows_deferred} rss_first_kb={} rss_last_kb={} rss_delta_kb={rss_delta_kb} \
                  mlockall_ok={} minflt_delta={minflt_delta} majflt_delta={majflt_delta} \
                  minflt_thread={minflt_thread_delta} majflt_thread={majflt_thread_delta} \
@@ -508,7 +542,7 @@ fn test_endurance_real_wall_clock_windows_fail_closed() {
 
     eprintln!(
         "TEST_RESULT[endurance_real]=PASS profile=release+testing window_secs={window_secs} \
-         elapsed_ms={} dsp_quantums={rt_blocks} blocks={blocks} windows_completed={windows_completed} \
+         elapsed_ms={} dsp_quantums={rt_blocks} pacing_blocks={pacing_blocks} windows_completed={windows_completed} \
          windows_deferred={windows_deferred} rss_first_kb={} rss_last_kb={} rss_delta_kb={rss_delta_kb} \
          minflt_delta={minflt_delta} majflt_delta={majflt_delta} \
          minflt_thread={minflt_thread_delta} majflt_thread={majflt_thread_delta} \
