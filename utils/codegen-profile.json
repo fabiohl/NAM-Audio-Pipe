@@ -98,7 +98,7 @@
     },
     {
       "id": "rt_drain_drain_cab_nam_payloads",
-      "pattern": "cabinet::drain_cab_nam_payloads$",
+      "pattern": "cabinet::drain::drain_cab_nam_payloads$",
       "required": true,
       "expected_methods": ["drain_cab_nam_payloads"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }

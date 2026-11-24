@@ -310,6 +310,8 @@ if [ "$DO_STRICT" = 1 ]; then
         finish || true
         exit 1
     fi
+elif [ -f "$CEREMONY_RECEIPT" ]; then
+    CEREMONY_PREFLIGHT_VERDICT=$("$RECEIPT_BIN" ceremony-proof --receipt "$CEREMONY_RECEIPT" --git-sha "$GIT_COMMIT" 2>/dev/null || true)
 fi
 ok "environment ready (rustflags: $CONFIG_RUSTFLAGS)"
 if [ ${#GAPS[@]} -eq "$ENV_GAPS" ]; then
