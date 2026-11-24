@@ -20,8 +20,8 @@ body:
         - "PipeWire Stream / Node Connection"
         - "Real-Time Audio Processing Loop"
         - "Command-Line Interface (CLI) & Arguments"
-        - "Model & CabSim IR Loading / Hot-Swap"
-        - "Terminal UI / Telemetry & Meters"
+        - "Model & Cabinet (.wav / .nam / .namb) Loading / Bypass"
+        - "Startup Banner, Telemetry & Diagnostics"
         - "io_uring Worker / Asynchronous I/O"
         - "Real-Time Priority (SCHED_FIFO / rlimits / RTKit)"
         - "Other"
@@ -34,11 +34,11 @@ body:
       label: Linux Environment & Audio Stack
       description: Provide details about your Linux distribution, kernel, PipeWire version, and CPU.
       placeholder: |
-        - NAM-Audio-Pipe version / commit: 1.0.0 (or commit hash)
-        - Linux Distribution: Ubuntu 24.04 / Arch Linux / Fedora 40
-        - Kernel Version: `uname -r` (e.g. 6.8.0-lowlatency / 6.10-arch1)
-        - PipeWire Version: `pipewire --version` (e.g. 1.0.7)
-        - WirePlumber Version: `wireplumber --version` (e.g. 0.5.2)
+        - NAM-Audio-Pipe version / commit: 1.2.0 (or commit hash)
+        - Linux Distribution: Ubuntu 26.04 / Arch Linux / Fedora
+        - Kernel Version: `uname -r` (e.g. 6.14.0-lowlatency / 6.14-arch1)
+        - PipeWire Version: `pipewire --version` (e.g. 1.6.x)
+        - WirePlumber Version: `wireplumber --version` (e.g. 0.5.x)
         - CPU Model: AMD Ryzen 7 5800X / Intel Core i7-12700K
     validations:
       required: true

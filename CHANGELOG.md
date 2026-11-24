@@ -12,20 +12,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.2.0] - 2026-11-23
+## [1.2.0] - 2026-11-24
 
-Version 1.2.0 integrates the `NeuralAmpModeler-rs` v4.0.0 core DSP engine, expands cabinet and gate capabilities (`.nam`/`.namb` cabinet slots, WaveNet head support, musical noise gate, input calibration, `--ir-level-policy`, and playback-only `--output-limit`), upgrades the Flatpak runtime to Freedesktop SDK 26.08, and hardens the release certification and real-time QA pipeline.
+Version 1.2.0 integrates the `NeuralAmpModeler-rs` v4.0.0 core DSP engine, expands cabinet and gate capabilities (`.nam`/`.namb` cabinet slots, WaveNet head support, musical noise gate, input calibration, `--ir-level-policy`, and playback-only `--output-limit`), upgrades the Flatpak runtime to Freedesktop SDK 26.08, modularizes telemetry and host internals, and hardens the release certification and real-time QA pipeline.
 
 ### Added [1.2.0]
 
-- **Cabinet Slot & Level Policy Controls:** Support for WAV, `.nam`, and `.namb` cabinet payloads (`--cab-bypass`) alongside explicit `--ir-level-policy` modes (`Preserve`, `GainMatched`, `Normalized`).
+- **Cabinet Slot & Level Policy Controls:** Support for WAV, `.nam`, and `.namb` cabinet payloads (`--cab-bypass`) alongside explicit `--ir-level-policy` modes (`peak-normalized`, `preserved`, `legacy-nam-plugin`).
 - **Musical Gate, Calibration & Output Safety:** Added `--gate-mode` (musical noise gate), `--calibrate-input` / `--input-calibration-level`, `--output-mode`, and playback-only `--output-limit` clamping for PipeWire monitoring.
-- **Per-Generation Capture Timestamping & Miss Classification:** Synchronized capture-to-playback latency telemetry per delivered generation and added `build-status` plus partial-scope handling in `pipe_long_receipt`.
+- **Per-Generation Capture Timestamping & Miss Classification:** Synchronized capture-to-playback latency telemetry per delivered generation (`playback_last_capture_tsc`, `playback_early_callbacks`, `playback_muted_callbacks`) and added `build-status` plus partial-scope handling in `pipe_long_receipt`.
+- **Actionable Model Load Hints:** Mapped `NamErrorCode` loader failures in `src/standalone/setup.rs` to targeted remediation hints for invalid versions, architectures, activations, sample rates, and weight counts.
+- **Modular Telemetry, Cabinet, Handler & Writer Submodules:** Extracted `LatencyHistogramView`, `LatencySummary`, `GateTransitionThrottle`, `LatchedSignal`, `TelemetryLatches`, and `PollState` (`src/standalone/rt_setup/telemetry/state.rs`), alongside dedicated submodules under `src/standalone/cabinet/`, `src/standalone/pw_host/handlers/`, `src/recording/writer.rs`, and `src/testing/`.
 
 ### Changed [1.2.0]
 
 - **Core Engine Upgrade to `NeuralAmpModeler-rs` v4.0.0:** Updated `Cargo.toml`, `Cargo.lock`, and `variables.env` to consume `NeuralAmpModeler-rs` `4.0.0` from `crates.io`, enabling WaveNet head support and updated prewarm calibration.
 - **Flatpak Runtime Migration to Freedesktop SDK 26.08:** Upgraded `packaging/flatpak/io.github.fabiohl.NAMAudioPipe.yml` and `utils/build-release.sh` to target `org.freedesktop.Platform//26.08` and `org.freedesktop.Sdk//26.08`, leveraging glibc 2.44, PipeWire 1.6.x client IPC, and Wayland 1.26.
+- **A/B Ceremony LBR Fallback & Codegen Gates:** Added `llvm-bolt -instrument` + `merge-fdata` fallback in `utils/ab-opt-ceremony.sh` when hardware LBR is unavailable, marked `conv_engine` optional in `utils/codegen-profile.json` (inlined under PGO), added `spills_lt` stack-spill and `unwind-cold` landing-pad exclusions in `utils/dsp-hotpath-filter.py`, and calibrated the post-warmup RSS drift bound (`512 KiB`) in `tests/soak_extended.rs` and `tests/endurance.rs`.
+- **Documentation & Community Templates:** Documented deliberate DSP architectural boundaries (omission of built-in tone stack and post-cabinet DC filter), refreshed GitHub issue/PR templates, and synchronized `README.md`, `docs/`, and Flatpak AppStream metadata.
 
 ### Fixed [1.2.0]
 

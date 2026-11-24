@@ -20,12 +20,12 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <p>Key features include:</p>
     <ul>
       <li>Direct native PipeWire integration (libpipewire-0.3) at low quantum buffer sizes down to 64 samples (1.33 ms).</li>
-      <li>Embedded NeuralAmpModeler-rs DSP engine supporting WaveNet (A1/A2), LSTM, ConvNet, Linear FIR, and Sequential topologies in standard .nam and binary .namb v2 formats.</li>
+      <li>Embedded NeuralAmpModeler-rs v4.0.0 DSP engine supporting WaveNet (A1/A2), LSTM, ConvNet, Linear FIR, and Sequential topologies in standard .nam and binary .namb v2 formats.</li>
       <li>Strict real-time safety: zero heap allocations, zero mutex locks, and zero blocking calls on the audio loop.</li>
-      <li>Integrated CabSim Impulse Response (IR) loader with zero-latency partitioned UPOLS convolution and configurable partition sizes (32–256 samples).</li>
+      <li>Exclusive cabinet slot supporting partitioned UPOLS convolution for .wav IRs (32–256 sample partitions) or unity-gain .nam/.namb neural cabinets, with constant-latency --cab-bypass and configurable --ir-level-policy.</li>
       <li>PipeWire SPA latency reporting with live graph feedback and exact sample delay compensation.</li>
-      <li>Concurrent asynchronous 32-bit float stereo WAV recording powered by Linux io_uring with pre-allocated slot pools, 4 GiB auto-split, and noise-gate trimming.</li>
-      <li>Half-band polyphase anti-aliasing oversampling (2× and 4×) and adaptive compute auto-slimming under CPU pressure.</li>
+      <li>Concurrent asynchronous 32-bit float stereo WAV recording powered by Linux io_uring with pre-allocated slot pools, 4 GiB auto-split, and selectable noise gate modes (silence or musical).</li>
+      <li>Half-band polyphase anti-aliasing oversampling (2× and 4×), adaptive compute auto-slimming under CPU pressure, dBu input/output calibration, and optional playback-only output clamping.</li>
       <li>Hardware-accelerated SIMD AVX2/FMA baseline vectorization (x86-64-v3) with Profile-Guided Optimization (PGO) and LLVM BOLT code reordering.</li>
     </ul>
   </description>
@@ -71,12 +71,12 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="1.2.0" date="2026-11-23" type="stable">
+    <release version="1.2.0" date="2026-11-24" type="stable">
       <description>
         <p>NAM-Audio-Pipe 1.2.0:</p>
         <ul>
           <li>Integrated NeuralAmpModeler-rs v4.0.0 core DSP engine with WaveNet head support and updated linear prewarm calibration.</li>
-          <li>Expanded cabinet slot support for WAV, .nam, and .namb payloads with --cab-bypass and explicit --ir-level-policy modes (Preserve, GainMatched, Normalized).</li>
+          <li>Expanded cabinet slot support for WAV, .nam, and .namb payloads with --cab-bypass and explicit --ir-level-policy modes (peak-normalized, preserved, legacy-nam-plugin).</li>
           <li>Added optional musical noise gate (--gate-mode), input calibration flags (--calibrate-input, --input-calibration-level), and --output-mode selection.</li>
           <li>Playback-only --output-limit safety clamp for interactive PipeWire monitoring without altering offline captures, plus Freedesktop Platform 26.08 migration.</li>
         </ul>

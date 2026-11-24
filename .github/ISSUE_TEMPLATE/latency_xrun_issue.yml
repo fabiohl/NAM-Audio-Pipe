@@ -33,11 +33,11 @@ body:
       label: System & Kernel Configuration
       description: Detailed system tuning parameters (governor, kernel preempt, rlimits).
       placeholder: |
-        - Linux Kernel: 6.8.0-lowlatency (or PREEMPT_RT)
+        - Linux Kernel: 6.14.0-lowlatency (or PREEMPT_RT)
         - CPU Governor: performance
         - Real-Time Limits (`ulimit -r` / `rtprio`): 95
         - Memlock Limits (`ulimit -l`): unlimited
-        - PipeWire Version: 1.0.7
+        - PipeWire Version: 1.6.x
     validations:
       required: true
 

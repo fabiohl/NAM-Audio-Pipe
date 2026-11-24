@@ -20,9 +20,9 @@ body:
         - "CLI Flags & Configuration Files"
         - "PipeWire Routing & Port Management"
         - "MIDI Control & Preset Switching"
-        - "Terminal UI / Telemetry & Meters"
+        - "Startup Banner, Telemetry & Diagnostics"
         - "Embedded / Headless System Integration (systemd, headless rig)"
-        - "DSP / Model Hot-Swapping"
+        - "DSP, Calibration, Noise Gate & Cabinet Simulation"
         - "Other"
     validations:
       required: true

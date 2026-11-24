@@ -14,8 +14,8 @@ Fixes #
 <!-- Check all that apply. For documentation, CLI, or packaging PRs, RT/PipeWire checklists below may be marked N/A. -->
 - [ ] **PipeWire Host & Stream Lifecycle** (`src/standalone/pw_host/`, dual-stream setup, reconnection)
 - [ ] **Real-Time Audio Loop & DSP Bridge** (`src/standalone/pw_host/rt_callback/`, `src/standalone/pw_host/bridge.rs`, SPSC GC, panic containment)
-- [ ] **CLI & Option Parsing** (`src/standalone/cli.rs`, arguments, silence gate parsing, exit codes)
-- [ ] **Asynchronous WAV Recording** (`src/recording/`, io_uring worker, slot pool transport, 4 GiB split)
+- [ ] **CLI, Calibration & Option Parsing** (`src/standalone/cli.rs`, `cli_domain.rs`, `calibration.rs`, exit codes)
+- [ ] **Asynchronous WAV Recording** (`src/recording/`, `io_uring` worker, slot pool transport, 4 GiB split)
 - [ ] **Real-Time System Setup & Telemetry** (`src/standalone/rt_setup/`, CPU affinity, PM QoS, status polling)
 - [ ] **Documentation, Packaging & Scripts** (`docs/`, `packaging/`, `utils/`, `README.md`)
 
@@ -46,7 +46,7 @@ Fixes #
 <!--
 Responsible Verification Model:
 - Fast Local Feedback: Run cargo check and targeted tests for quick local iteration.
-- GitHub CI Automation: The full test matrix (x86_64, Linux ARM64, MSRV 1.99.0, sibling engine integration, and isolated PipeWire daemon tests) runs automatically on every push and PR.
+- GitHub CI Automation: The fast test matrix (x86_64, Linux ARM64, MSRV 1.99.0, sibling engine integration, and non-ignored PipeWire tests) runs automatically on every push and PR via `ci.yml`; the hosted long suite runs via manual dispatch (`long.yml`).
 - Friendly Tip for Contributors: If you don't have PipeWire development headers or the sibling engine configured locally, open a DRAFT PR and let GitHub Actions run the full verification matrix for you!
 -->
 
