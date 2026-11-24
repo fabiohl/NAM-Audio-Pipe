@@ -96,3 +96,11 @@ fn parse_args_accepts_valid_values() {
     let cfg = parse_args_from(vec!["--runs".to_string(), "3".to_string()]).unwrap();
     assert_eq!(cfg.runs, 3);
 }
+
+#[test]
+fn perf_hw_cache_ids_match_linux_abi() {
+    assert_eq!(PERF_COUNT_HW_CACHE_ICACHE, 1);
+    assert_eq!(PERF_COUNT_HW_CACHE_ITLB, 4);
+    assert_eq!(PERF_COUNT_HW_CACHE_OP_READ, 0);
+    assert_eq!(PERF_COUNT_HW_CACHE_RESULT_MISS, 1);
+}

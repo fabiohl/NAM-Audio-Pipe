@@ -243,54 +243,37 @@ if [ -z "$LLVM_PROFDATA" ]; then
     fi
 fi
 
-LLVM_BOLT=""
-for candidate in llvm-bolt llvm-bolt-22 llvm-bolt-21 llvm-bolt-20 llvm-bolt-19 llvm-bolt-18; do
-    if command -v "$candidate" >/dev/null 2>&1; then LLVM_BOLT="$candidate"; break; fi
-done
-if [ -z "$LLVM_BOLT" ]; then
-    for candidate in /usr/lib/llvm-*/bin/llvm-bolt; do
-        if [ -x "$candidate" ]; then LLVM_BOLT="$candidate"; break; fi
+find_llvm_tool() {
+    local tool="$1" candidate
+    for candidate in "$tool" "$tool"-22 "$tool"-21 "$tool"-20 "$tool"-19 "$tool"-18; do
+        if command -v "$candidate" >/dev/null 2>&1; then command -v "$candidate"; return 0; fi
     done
-fi
+    for candidate in /usr/lib/llvm-*/bin/"$tool"; do
+        if [ -x "$candidate" ]; then echo "$candidate"; return 0; fi
+    done
+    return 1
+}
+LLVM_BOLT=$(find_llvm_tool llvm-bolt || true)
 PERF2BOLT=""
-HAS_PERF=false
-if [ -n "$LLVM_BOLT" ]; then
-    PERF2BOLT="$(dirname "$LLVM_BOLT")/perf2bolt"
-    if [ ! -x "$PERF2BOLT" ]; then
-        for candidate in perf2bolt perf2bolt-22 perf2bolt-21 perf2bolt-20 perf2bolt-19 perf2bolt-18; do
-            if command -v "$candidate" >/dev/null 2>&1; then PERF2BOLT=$(command -v "$candidate"); break; fi
-        done
-    fi
-    if [ ! -x "$PERF2BOLT" ]; then
-        for candidate in /usr/lib/llvm-*/bin/perf2bolt; do
-            if [ -x "$candidate" ]; then PERF2BOLT="$candidate"; break; fi
-        done
-    fi
-fi
 MERGE_FDATA=""
 if [ -n "$LLVM_BOLT" ]; then
-    MERGE_FDATA="$(dirname "$LLVM_BOLT")/merge-fdata"
-    if [ ! -x "$MERGE_FDATA" ]; then
-        for candidate in merge-fdata merge-fdata-22 merge-fdata-21 merge-fdata-20 merge-fdata-19 merge-fdata-18; do
-            if command -v "$candidate" >/dev/null 2>&1; then MERGE_FDATA=$(command -v "$candidate"); break; fi
-        done
-    fi
-    if [ ! -x "$MERGE_FDATA" ]; then
-        for candidate in /usr/lib/llvm-*/bin/merge-fdata; do
-            if [ -x "$candidate" ]; then MERGE_FDATA="$candidate"; break; fi
-        done
-    fi
+    bolt_bin_dir=$(dirname "$LLVM_BOLT")
+    PERF2BOLT="$bolt_bin_dir/perf2bolt"
+    [ -x "$PERF2BOLT" ] || PERF2BOLT=$(find_llvm_tool perf2bolt || true)
+    MERGE_FDATA="$bolt_bin_dir/merge-fdata"
+    [ -x "$MERGE_FDATA" ] || MERGE_FDATA=$(find_llvm_tool merge-fdata || true)
 fi
+HAS_PERF=false
 if command -v perf >/dev/null 2>&1; then
     PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
-    if [ "$PARANOID" -gt 1 ] && sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
+    if [ "$PARANOID" -gt 1 ] && [ -f "$CEREMONY_RECEIPT" ] && sudo -n sysctl -q -w kernel.perf_event_paranoid=1 2>/dev/null; then
         PARANOID=$(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 2)
     fi
     if [ "$PARANOID" -le 1 ]; then HAS_PERF=true; fi
 fi
 BOLT_AVAILABLE=false
 if [ -n "$LLVM_BOLT" ] && { [ -n "$MERGE_FDATA" ] || { [ -n "$PERF2BOLT" ] && [ "$HAS_PERF" = true ]; }; }; then BOLT_AVAILABLE=true; fi
-if [ "$BOLT_AVAILABLE" != true ]; then
+if [ "$BOLT_AVAILABLE" != true ] && { [ -f "$CEREMONY_RECEIPT" ] || [ "$DO_STRICT" = 1 ]; }; then
     gap env_verify bolt_tools_unavailable
 fi
 
@@ -352,7 +335,7 @@ elif [ -n "$LLVM_PROFDATA" ]; then
     phase pgo_profile
     rm -rf "$PGO_DIR"
     mkdir -p "$PROFRAW_DIR"
-    PGO_GEN_RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-generate=$PROFRAW_DIR"
+    PGO_GEN_RUSTFLAGS="$BASE_RUSTFLAGS -Cprofile-generate=$PROFRAW_DIR -Cllvm-args=-vp-counters-per-site=8"
     if {
         RUSTFLAGS="$PGO_GEN_RUSTFLAGS" LLVM_PROFILE_FILE="$PROFRAW_DIR/default_%m_%p.profraw" \
             cargo run --locked --profile dist --features testing --target-dir target/pgo-build \
@@ -645,7 +628,7 @@ restore_paranoid
 phase codegen_report
 CODEGEN_LOG="$LOG_DIR/build-release-codegen_report.log"
 CODEGEN_DIR="$LOG_DIR/codegen"; mkdir -p "$CODEGEN_DIR"
-ASM_FULL="$CODEGEN_DIR/dsp_hotpath.full.asm"
+ASM_FULL="target/dsp_hotpath.full.asm"
 ASM_TARGET="$CODEGEN_DIR/dsp_hotpath.asm"
 ASM_SUMMARY="$CODEGEN_DIR/dsp_hotpath_summary.txt"
 CODEGEN_STATUS=unavailable
@@ -756,8 +739,8 @@ EOF
     chmod +x "$PKG_DIR/$ARCHIVE_NAME/install.sh"
     if ! {
         tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
-            -C "$PKG_DIR" -I "zstd -6 -T0" -cf "$TARBALL" "$ARCHIVE_NAME"
-        tar -C "$VERIFY_DIR" -I "zstd -d" -xf "$TARBALL"
+            -I "zstd -6 -T0" -cf "$TARBALL" -C "$PKG_DIR" "$ARCHIVE_NAME"
+        tar -I "zstd -d" -xf "$TARBALL" -C "$VERIFY_DIR"
         [ "$(sha256sum "$VERIFY_DIR/$ARCHIVE_NAME/nam-audio-pipe" | awk '{print $1}')" = "$DIST_SHA" ]
         "$VERIFY_DIR/$ARCHIVE_NAME/nam-audio-pipe" --diagnose > /dev/null
     } > "$PKG_LOG" 2>&1; then
@@ -829,9 +812,9 @@ EOF
         fail_phase packaging 1 "$PKG_LOG"
         die "AppStream release version/date is out of sync with Cargo.toml ($VERSION)"
     fi
-    flatpak build-finish "$FLATPAK_BUILD_DIR" --command=nam-audio-pipe --socket=pulseaudio \
+    LC_ALL=C flatpak build-finish "$FLATPAK_BUILD_DIR" --command=nam-audio-pipe --socket=pulseaudio \
         --filesystem=xdg-run/pipewire-0 --share=ipc --device=all --filesystem=home:ro \
-        --filesystem=xdg-music --socket=fallback-x11 --socket=wayland
+        --filesystem=xdg-music --socket=fallback-x11 --socket=wayland >> "$PKG_LOG" 2>&1
     if ! LC_ALL=C flatpak build-export --update-appstream "$FLATPAK_REPO_DIR" "$FLATPAK_BUILD_DIR" stable >> "$PKG_LOG" 2>&1; then
         fail_phase packaging 1 "$PKG_LOG"
         die "flatpak build-export failed"
@@ -840,7 +823,7 @@ EOF
         fail_phase packaging 1 "$PKG_LOG"
         die "Flatpak export did not synthesize the AppStream catalog"
     fi
-    flatpak build-bundle "$FLATPAK_REPO_DIR" "$FLATPAK_BUNDLE" "$APP_ID" stable
+    LC_ALL=C flatpak build-bundle "$FLATPAK_REPO_DIR" "$FLATPAK_BUNDLE" "$APP_ID" stable >> "$PKG_LOG" 2>&1
     FLATPAK_PATH="$FLATPAK_BUNDLE"
     APP_REF="app/$APP_ID/x86_64/stable"
     mkdir -p "$FLATPAK_SMOKE_DIR/objects" "$FLATPAK_SMOKE_DIR/refs/heads" "$FLATPAK_SMOKE_DIR/refs/remotes" \
@@ -909,6 +892,7 @@ if [ -f "$BUILD_RECEIPT" ]; then
     while IFS= read -r line; do
         case "$line" in
             GAP:\ *) g="${line#GAP: }"; [ -n "$g" ] && gap "$g" ;;
+            FALLBACK_GAP:\ *) g="${line#FALLBACK_GAP: }"; [ -n "$g" ] && emit "PHASE: build_receipt FALLBACK_GAP $g" ;;
         esac
     done <<< "$status_output"
 fi

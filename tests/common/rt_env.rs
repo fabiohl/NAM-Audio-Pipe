@@ -17,9 +17,17 @@
 //! (`NAM_BENCH_CORE` → first online isolated CPU → first permitted CPU);
 //! there is no host-specific core preference and no `cpuN` probe here.
 
-/// Reads the process's `Cpus_allowed_list` from `/proc/self/status`.
+/// Reads the calling thread's `Cpus_allowed_list` from `/proc/thread-self/status`
+/// (falling back to `/proc/self/status` when unavailable).
+///
+/// Using `/proc/thread-self/status` is essential inside test runners (`cargo test`
+/// spawns worker threads): `/proc/self/status` reports the process leader's
+/// (TGID) affinity mask rather than the calling thread's (`TID`) mask set by
+/// `sched_setaffinity(0, ...)`.
 pub fn cpus_allowed_list() -> Vec<u32> {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let status = std::fs::read_to_string("/proc/thread-self/status")
+        .or_else(|_| std::fs::read_to_string("/proc/self/status"))
+        .unwrap_or_default();
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("Cpus_allowed_list:") {
             return parse_cpu_ranges(rest.trim());

@@ -7,8 +7,8 @@ name: Long QA Suite
 # intentionally zero-input: the GitHub "Run workflow" button must not ask
 # questions. The hosted build is never strict (the operator A/B ceremony
 # receipt is unavailable here), the QA runs the hosted-safe phase list without
-# rt-deadline/rt-jitter, and certification remains operator-only. BOLT, perf
-# and the C++ parity oracle are provisioned below.
+# rt-deadline/rt-jitter, and certification remains operator-only. The C++ parity
+# oracle is provisioned below.
 on:
   workflow_dispatch:
 
@@ -57,10 +57,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config clang libclang-dev \
             libpipewire-0.3-dev libspa-0.2-dev pipewire pipewire-bin \
-            wireplumber dbus appstream desktop-file-utils binutils \
-            llvm-bolt linux-tools-common linux-tools-generic
-          sudo apt-get install -y "linux-tools-$(uname -r)" || true
-          sudo sysctl -w kernel.perf_event_paranoid=1 || true
+            wireplumber dbus appstream desktop-file-utils binutils
       - name: Provision C++ parity oracle
         run: |
           cd "$GITHUB_WORKSPACE/NeuralAmpModeler-rs"

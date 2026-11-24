@@ -198,7 +198,9 @@ fn cmd_append(args: &[String]) {
         .unwrap_or_else(|| DEFAULT_OUT.to_string());
     let mut gaps: Vec<String> = split_list(flags.get("gaps"));
 
-    let (status, tests_executed, fail_reason) = match flags.get("from-log") {
+    let (status, tests_executed, fail_reason, log_oracle_sha, log_fixture_sha) = match flags
+        .get("from-log")
+    {
         Some(log) => {
             let rc: i32 = match flags.get("rc") {
                 Some(v) => match v.parse() {
@@ -229,7 +231,13 @@ fn cmd_append(args: &[String]) {
                 Verdict::Skipped => LongPhaseStatus::Skipped,
                 Verdict::Failed => LongPhaseStatus::Failed,
             };
-            (status, verdict.tests_executed, verdict.fail_reason)
+            (
+                status,
+                verdict.tests_executed,
+                verdict.fail_reason,
+                verdict.oracle_sha256,
+                verdict.fixture_sha256,
+            )
         }
         None => {
             let status = match required(&flags, "status").and_then(|s| LongPhaseStatus::from_str(s))
@@ -262,7 +270,13 @@ fn cmd_append(args: &[String]) {
                     }
                 }
             }
-            (status, tests_executed, flags.get("fail-reason").cloned())
+            (
+                status,
+                tests_executed,
+                flags.get("fail-reason").cloned(),
+                None,
+                None,
+            )
         }
     };
 
@@ -292,8 +306,8 @@ fn cmd_append(args: &[String]) {
         tests_executed,
         gaps,
         timestamp: now_iso8601(),
-        oracle_sha256: flags.get("oracle-sha256").cloned(),
-        fixture_sha256: flags.get("fixture-sha256").cloned(),
+        oracle_sha256: flags.get("oracle-sha256").cloned().or(log_oracle_sha),
+        fixture_sha256: flags.get("fixture-sha256").cloned().or(log_fixture_sha),
         artifact_sha256: flags.get("artifact-sha256").cloned(),
         run_id,
         reason,
@@ -327,8 +341,8 @@ fn cmd_append(args: &[String]) {
         println!("GAP {gap}");
     }
     exit(match receipt.status {
-        LongPhaseStatus::Passed => 0,
-        LongPhaseStatus::Skipped => 10,
+        LongPhaseStatus::Passed if receipt.gaps.is_empty() => 0,
+        LongPhaseStatus::Passed | LongPhaseStatus::Skipped => 10,
         LongPhaseStatus::Failed => 11,
         _ => 12,
     });
@@ -652,27 +666,7 @@ fn cmd_build_receipt(args: &[String]) {
     gaps.sort();
     gaps.dedup();
 
-    let fatal_strict_gaps: Vec<&String> = gaps
-        .iter()
-        .filter(|g| {
-            if bolt_proof == "fallback_plain" {
-                g.as_str() != "bolt_not_proven"
-                    && g.as_str() != "pgo_not_applied"
-                    && g.as_str() != "bolt_not_applied"
-            } else {
-                g.as_str() != "bolt_not_proven"
-            }
-        })
-        .collect();
-
-    let status = if !fatal_strict_gaps.is_empty() && strict {
-        "FAILED"
-    } else if !gaps.is_empty() {
-        "PASS_WITH_GAPS"
-    } else {
-        "PASSED"
-    }
-    .to_string();
+    let (status, _fatal_strict_gaps) = compute_build_status(&gaps, &bolt_proof, strict);
 
     let receipt = BuildReceipt {
         schema_version: "1.0.0".to_string(),
@@ -787,10 +781,47 @@ fn cmd_build_status(args: &[String]) {
     if let Some(rid) = &receipt.provenance.run_id {
         println!("BUILD_RUN_ID: {rid}");
     }
+    let (_, non_fallback_gaps) = compute_build_status(
+        &receipt.gaps,
+        &receipt.optimizations.bolt_proof,
+        receipt.strict_mode,
+    );
     for gap in &receipt.gaps {
-        println!("GAP: {gap}");
+        if non_fallback_gaps.contains(gap) {
+            println!("GAP: {gap}");
+        } else {
+            println!("FALLBACK_GAP: {gap}");
+        }
     }
     exit(0);
+}
+
+fn compute_build_status(gaps: &[String], bolt_proof: &str, strict: bool) -> (String, Vec<String>) {
+    let fatal_strict_gaps: Vec<String> = gaps
+        .iter()
+        .filter(|g| {
+            if bolt_proof == "fallback_plain" {
+                g.as_str() != "bolt_not_proven"
+                    && g.as_str() != "pgo_not_applied"
+                    && g.as_str() != "bolt_not_applied"
+            } else if bolt_proof == "fallback_pgo_only" {
+                g.as_str() != "bolt_not_proven" && g.as_str() != "bolt_not_applied"
+            } else {
+                true
+            }
+        })
+        .cloned()
+        .collect();
+
+    let status = if !fatal_strict_gaps.is_empty() && strict {
+        "FAILED".to_string()
+    } else if !gaps.is_empty() {
+        "PASS_WITH_GAPS".to_string()
+    } else {
+        "PASSED".to_string()
+    };
+
+    (status, fatal_strict_gaps)
 }
 
 fn cmd_verify_artifact(args: &[String]) {
@@ -952,4 +983,71 @@ fn die_usage(subcommand: &str, message: &str) -> ! {
     eprintln!("{subcommand}: {message}");
     eprintln!("Run `pipe_long_receipt --help` for usage.");
     exit(2);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_build_status;
+
+    #[test]
+    fn test_compute_build_status_strict_fatal_gaps() {
+        let gaps = vec!["pgo_not_applied".to_string()];
+        let (status, fatal) = compute_build_status(&gaps, "skipped", true);
+        assert_eq!(status, "FAILED");
+        assert_eq!(fatal, vec!["pgo_not_applied"]);
+
+        let gaps = vec!["bolt_not_applied".to_string()];
+        let (status, fatal) = compute_build_status(&gaps, "unverified:missing", true);
+        assert_eq!(status, "FAILED");
+        assert_eq!(fatal, vec!["bolt_not_applied"]);
+    }
+
+    #[test]
+    fn test_compute_build_status_fallback_plain() {
+        let gaps = vec![
+            "bolt_not_applied".to_string(),
+            "bolt_not_proven".to_string(),
+            "pgo_not_applied".to_string(),
+        ];
+        let (status, fatal) = compute_build_status(&gaps, "fallback_plain", true);
+        assert_eq!(status, "PASS_WITH_GAPS");
+        assert!(fatal.is_empty());
+
+        let gaps = vec!["bolt_not_applied".to_string(), "tool_missing".to_string()];
+        let (status, fatal) = compute_build_status(&gaps, "fallback_plain", true);
+        assert_eq!(status, "FAILED");
+        assert_eq!(fatal, vec!["tool_missing"]);
+    }
+
+    #[test]
+    fn test_compute_build_status_fallback_pgo_only() {
+        let gaps = vec![
+            "bolt_not_applied".to_string(),
+            "bolt_not_proven".to_string(),
+        ];
+        let (status, fatal) = compute_build_status(&gaps, "fallback_pgo_only", true);
+        assert_eq!(status, "PASS_WITH_GAPS");
+        assert!(fatal.is_empty());
+
+        let gaps = vec!["bolt_not_proven".to_string(), "pgo_not_applied".to_string()];
+        let (status, fatal) = compute_build_status(&gaps, "fallback_pgo_only", true);
+        assert_eq!(status, "FAILED");
+        assert_eq!(fatal, vec!["pgo_not_applied"]);
+    }
+
+    #[test]
+    fn test_compute_build_status_non_strict() {
+        let gaps = vec!["pgo_not_applied".to_string()];
+        let (status, fatal) = compute_build_status(&gaps, "skipped", false);
+        assert_eq!(status, "PASS_WITH_GAPS");
+        assert_eq!(fatal, vec!["pgo_not_applied"]);
+    }
+
+    #[test]
+    fn test_compute_build_status_clean_pass() {
+        let gaps = Vec::new();
+        let (status, fatal) = compute_build_status(&gaps, "applied", true);
+        assert_eq!(status, "PASSED");
+        assert!(fatal.is_empty());
+    }
 }

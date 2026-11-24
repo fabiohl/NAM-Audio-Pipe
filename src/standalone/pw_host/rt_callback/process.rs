@@ -492,6 +492,35 @@ fn send_recording_metadata(
     }
 }
 
+/// Cold rollback helper for the deprecated inline ring recording transport.
+///
+/// Kept `#[inline(never)]` so the 64 KiB `AlignedBlock<MAX_BLOCK_SIZE>` move
+/// does not inflate the production `Pool` capture callback's stack frame.
+#[cold]
+#[inline(never)]
+fn send_recording_audio_inline(
+    producer: &mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
+    n_pw: usize,
+    resamp_out_l: &[f32],
+    resamp_out_r: &[f32],
+    recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
+    recording_data_available: Option<&AtomicBool>,
+) {
+    assert_inline_rollback_build();
+    let Some(producer) = producer.as_mut() else {
+        return;
+    };
+    let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
+    block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
+    if producer.push(RingPayload::Audio(block)).is_err() {
+        core::hint::cold_path();
+        OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
+        OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
+    } else if let Some(flag) = recording_data_available {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Pushes one audio block to the recording transport.
 ///
 /// `MAX_BLOCK_SIZE` (16384 samples = 8192 stereo frames) covers the largest
@@ -561,30 +590,14 @@ pub fn send_recording_audio(
             }
         }
         RecordingSender::Inline(producer) => {
-            // Inline ring path (documented rollback transport): swap out the
-            // reusable block to avoid 64 KiB of memset per quantum, fill and
-            // push into the inline ring.
-            //
-            // Rollback-only tripwire: with the pool transport compiled as the
-            // production default, an `Inline` sender can only reach this arm
-            // through hand-wired construction outside `create_recording_transport`,
-            // so debug builds accuse the path while `RECORDING_POOL_TRANSPORT`
-            // stays `true`. The deliberate rollback (const flipped to `false`)
-            // passes the guard, and release builds compile the assertion away —
-            // the inline runtime behavior itself is untouched.
-            assert_inline_rollback_build();
-            let Some(producer) = producer.as_mut() else {
-                return;
-            };
-            let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
-            block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
-            if producer.push(RingPayload::Audio(block)).is_err() {
-                core::hint::cold_path();
-                OVERRUN_COUNT.fetch_add(1, Ordering::Relaxed);
-                OVERRUN_FRAMES_COUNT.fetch_add(n_pw as u64, Ordering::Relaxed);
-            } else if let Some(flag) = recording_data_available {
-                flag.store(true, Ordering::Relaxed);
-            }
+            send_recording_audio_inline(
+                producer,
+                n_pw,
+                resamp_out_l,
+                resamp_out_r,
+                recording_block,
+                recording_data_available,
+            );
         }
     }
 }

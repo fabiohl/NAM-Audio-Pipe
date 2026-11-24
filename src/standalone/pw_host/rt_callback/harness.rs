@@ -553,11 +553,16 @@ impl SwapRtSide {
         )
     }
 
-    /// Drains and drops the GC channel (main-thread side). Returns the number
-    /// of retired items — a progress signal that swaps actually cascade.
+    /// Drains and drops the GC channel and overflow ring (main-thread side).
+    /// Returns the number of retired items — a progress signal that swaps
+    /// actually cascade.
     pub fn consume_gc(&mut self) -> usize {
         let mut count = 0;
         while self.gc_consumer.pop().is_ok() {
+            count += 1;
+        }
+        for item in self.channels.gc_overflow.drain(&self.rt_status) {
+            drop(item);
             count += 1;
         }
         count
@@ -638,7 +643,7 @@ impl SwapRtSide {
     /// Number of retired items still queued for off-RT disposal, including
     /// both the SPSC GC channel and the 16-slot parking lot.
     pub fn gc_in_flight(&self) -> usize {
-        self.gc_consumer.slots() + self.gc_pending()
+        self.gc_pending()
     }
 
     /// `true` while any structural/scalar command is still queued or parked —

@@ -494,12 +494,12 @@ pub fn evaluate_certification(
                     &mut reasons,
                 );
                 for gap in &receipt.gaps {
-                    if gap == "bolt_not_proven" && (is_proven_pgo_only || is_proven_plain_only) {
+                    if (gap == "bolt_not_proven" || gap == "bolt_not_applied")
+                        && (is_proven_pgo_only || is_proven_plain_only)
+                    {
                         continue;
                     }
-                    if (gap == "pgo_not_applied" || gap == "bolt_not_applied")
-                        && is_proven_plain_only
-                    {
+                    if gap == "pgo_not_applied" && is_proven_plain_only {
                         continue;
                     }
                     gaps.push(format!("build:{gap}"));

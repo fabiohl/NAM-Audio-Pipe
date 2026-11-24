@@ -151,6 +151,44 @@ pub fn median_cycles(runs: &[Value], field: &str) -> Option<u64> {
     median_num(runs, field).map(|value| value.round() as u64)
 }
 
+pub fn median_topology_pmu(runs: &[Value], topology: &str, key: &str) -> Option<u64> {
+    let topo_runs: Vec<&Value> = runs
+        .iter()
+        .filter(|r| r.get("topology").and_then(Value::as_str) == Some(topology))
+        .collect();
+    if topo_runs.is_empty() {
+        return None;
+    }
+    let available = topo_runs.iter().all(|run| {
+        run.get("pmu_availability")
+            .and_then(|a| a.get(key))
+            .and_then(Value::as_str)
+            == Some("ok")
+    });
+    if !available {
+        return None;
+    }
+    let mut values: Vec<u64> = topo_runs
+        .iter()
+        .filter_map(|run| run.get("pmu")?.get(key)?.as_u64())
+        .collect();
+    if values.len() != topo_runs.len() {
+        return None;
+    }
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
+}
+
+pub fn pmu_gains_topology(from: &[Value], to: &[Value], topology: &str) -> Map<String, Value> {
+    let mut map = Map::new();
+    for key in ["cycles", "instructions", "itlb_misses", "icache_misses"] {
+        let new = median_topology_pmu(to, topology, key).map(|v| v as f64);
+        let old = median_topology_pmu(from, topology, key).map(|v| v as f64);
+        map.insert(key.to_string(), json!(pct(new, old)));
+    }
+    map
+}
+
 pub fn median_pmu(runs: &[Value], key: &str) -> Option<u64> {
     if runs.is_empty() {
         return None;
@@ -464,8 +502,10 @@ pub struct TopologyEval {
     pub bolt_gain_pct_p99: Option<f64>,
     pub bolt_gain_pct_max: Option<f64>,
     pub bolt_gain_pct_mean: Option<f64>,
+    pub bolt_vs_plain_gain_pct_p99: Option<f64>,
     pub pgo_promoted: bool,
     pub bolt_promoted: bool,
+    pub bolt_vs_plain_promoted: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -576,17 +616,34 @@ pub fn evaluate_ceremony(
         let pgo_improvement_p99 = (pl_p99 - pg_p99) / pl_p99 * 100.0;
         let pgo_promoted = pgo_improvement_p99 >= (PROMOTION_MARGIN_PCT - MARGIN_EPSILON);
 
-        let (bolt_gain_pct_p99, bolt_gain_pct_max, bolt_gain_pct_mean, bolt_promoted) =
-            if let (Some(bp99), Some(bmax), Some(bmean)) = (bt_p99, bt_max, bt_mean) {
-                let gain_p99 = (bp99 - pg_p99) / pg_p99 * 100.0;
-                let gain_max = (bmax - pg_max) / pg_max * 100.0;
-                let gain_mean = (bmean - pg_mean) / pg_mean * 100.0;
-                let improvement_p99 = (pg_p99 - bp99) / pg_p99 * 100.0;
-                let promoted = improvement_p99 >= (PROMOTION_MARGIN_PCT - MARGIN_EPSILON);
-                (Some(gain_p99), Some(gain_max), Some(gain_mean), promoted)
-            } else {
-                (None, None, None, false)
-            };
+        let (
+            bolt_gain_pct_p99,
+            bolt_gain_pct_max,
+            bolt_gain_pct_mean,
+            bolt_promoted,
+            bolt_vs_plain_gain_pct_p99,
+            bolt_vs_plain_promoted,
+        ) = if let (Some(bp99), Some(bmax), Some(bmean)) = (bt_p99, bt_max, bt_mean) {
+            let gain_p99 = (bp99 - pg_p99) / pg_p99 * 100.0;
+            let gain_max = (bmax - pg_max) / pg_max * 100.0;
+            let gain_mean = (bmean - pg_mean) / pg_mean * 100.0;
+            let improvement_p99 = (pg_p99 - bp99) / pg_p99 * 100.0;
+            let promoted = improvement_p99 >= (PROMOTION_MARGIN_PCT - MARGIN_EPSILON);
+            let vs_plain_gain_p99 = (bp99 - pl_p99) / pl_p99 * 100.0;
+            let vs_plain_improvement_p99 = (pl_p99 - bp99) / pl_p99 * 100.0;
+            let vs_plain_promoted =
+                vs_plain_improvement_p99 >= (PROMOTION_MARGIN_PCT - MARGIN_EPSILON);
+            (
+                Some(gain_p99),
+                Some(gain_max),
+                Some(gain_mean),
+                promoted,
+                Some(vs_plain_gain_p99),
+                vs_plain_promoted,
+            )
+        } else {
+            (None, None, None, false, None, false)
+        };
 
         let mut topo_entry = Map::new();
         let mut topo_vars = Map::new();
@@ -625,6 +682,10 @@ pub fn evaluate_ceremony(
                 "mean": pgo_gain_pct_mean,
             }),
         );
+        topo_entry.insert(
+            "pmu_pgo_gain_pct".to_string(),
+            Value::Object(pmu_gains_topology(plain, pgo, topo)),
+        );
         if bolt_applied {
             topo_entry.insert(
                 "bolt_gain_pct".to_string(),
@@ -634,9 +695,25 @@ pub fn evaluate_ceremony(
                     "mean": bolt_gain_pct_mean,
                 }),
             );
+            topo_entry.insert(
+                "pmu_bolt_gain_pct".to_string(),
+                Value::Object(pmu_gains_topology(pgo, bolt, topo)),
+            );
+            topo_entry.insert(
+                "bolt_vs_plain_gain_pct".to_string(),
+                json!({
+                    "p99": bolt_vs_plain_gain_pct_p99,
+                }),
+            );
         }
         topo_entry.insert("pgo_promoted".to_string(), json!(pgo_promoted));
         topo_entry.insert("bolt_promoted".to_string(), json!(bolt_promoted));
+        if bolt_applied {
+            topo_entry.insert(
+                "bolt_vs_plain_promoted".to_string(),
+                json!(bolt_vs_plain_promoted),
+            );
+        }
 
         topologies_doc.insert(topo.to_string(), Value::Object(topo_entry));
         topology_evals.push(TopologyEval {
@@ -656,13 +733,17 @@ pub fn evaluate_ceremony(
             bolt_gain_pct_p99,
             bolt_gain_pct_max,
             bolt_gain_pct_mean,
+            bolt_vs_plain_gain_pct_p99,
             pgo_promoted,
             bolt_promoted,
+            bolt_vs_plain_promoted,
         });
     }
 
     let all_pgo_promoted = topology_evals.iter().all(|e| e.pgo_promoted);
     let all_bolt_promoted = bolt_applied && topology_evals.iter().all(|e| e.bolt_promoted);
+    let all_bolt_vs_plain_promoted =
+        bolt_applied && topology_evals.iter().all(|e| e.bolt_vs_plain_promoted);
 
     // Ledger records per-run diagnostic information
     let mut ledger = Vec::new();
@@ -756,17 +837,23 @@ pub fn evaluate_ceremony(
     let rollback: String;
 
     if !all_pgo_promoted {
-        verdict = "UNOPTIMIZED".to_string();
-        verdict_reason = "pgo_margin_not_met".to_string();
-        let unpromoted: Vec<String> = topology_evals
-            .iter()
-            .filter(|e| !e.pgo_promoted)
-            .map(|e| format!("{}: p99 {:+.2}%", e.topology, e.pgo_gain_pct_p99))
-            .collect();
-        rollback = format!(
-            "PGO did not achieve the 1.0% p99 margin across all topologies ({}); plain release binary is the verified optimal version.",
-            unpromoted.join(", ")
-        );
+        if all_bolt_vs_plain_promoted {
+            verdict = "PGO+BOLT".to_string();
+            verdict_reason = "bolt_promoted_over_plain".to_string();
+            rollback = String::new();
+        } else {
+            verdict = "UNOPTIMIZED".to_string();
+            verdict_reason = "pgo_margin_not_met".to_string();
+            let unpromoted: Vec<String> = topology_evals
+                .iter()
+                .filter(|e| !e.pgo_promoted)
+                .map(|e| format!("{}: p99 {:+.2}%", e.topology, e.pgo_gain_pct_p99))
+                .collect();
+            rollback = format!(
+                "PGO did not achieve the 1.0% p99 margin across all topologies ({}); plain release binary is the verified optimal version.",
+                unpromoted.join(", ")
+            );
+        }
     } else if all_bolt_promoted {
         verdict = "PGO+BOLT".to_string();
         verdict_reason = "bolt_promoted".to_string();
@@ -795,8 +882,9 @@ pub fn evaluate_ceremony(
         rollback = "BOLT not applied on this host (PGO-only fallback).".to_string();
     }
 
-    let effective_reproducible_gain = all_pgo_promoted;
-    let bolt_reproducible_gain = all_bolt_promoted;
+    let effective_reproducible_gain = all_pgo_promoted || all_bolt_vs_plain_promoted;
+    let bolt_reproducible_gain =
+        all_bolt_promoted || (!all_pgo_promoted && all_bolt_vs_plain_promoted);
 
     let mut doc = Map::new();
     doc.insert("schema_version".to_string(), json!(2));

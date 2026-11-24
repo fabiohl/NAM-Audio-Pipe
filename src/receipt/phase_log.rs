@@ -33,6 +33,8 @@ pub struct PhaseVerdict {
     pub gaps: Vec<String>,
     pub fail_reason: Option<String>,
     pub tests_executed: u64,
+    pub oracle_sha256: Option<String>,
+    pub fixture_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,14 +129,13 @@ pub fn derive(
         }
     }
     // Matrix tests may execute several subcases inside a single Cargo
-    // invocation. They emit one `TEST_RESULT[...]` line per subcase, so prefer
-    // that explicit cardinality over the per-binary `test result:` count.
+    // invocation. They emit one `TEST_RESULT[...]` line per subcase, whereas
+    // multi-target phases (e.g. `recording` + `recording_fault_injection`) may
+    // run additional Cargo tests without `TEST_RESULT[...]`. Never undercount
+    // Cargo's executed test tally.
     let subcases = lines.iter().filter(|l| l.contains("TEST_RESULT[")).count() as u64;
-    let tests_executed = if subcases > 0 {
-        subcases
-    } else {
-        count_tests_executed_from_log(log)
-    };
+    let cargo_tests = count_tests_executed_from_log(log);
+    let tests_executed = subcases.max(cargo_tests);
     if tests_executed == 0 {
         failures.push("zero_tests_executed".to_string());
     }
@@ -144,11 +145,11 @@ pub fn derive(
         }
     }
     for requirement in requirements {
-        let passes = markers
+        let typed_non_fail = markers
             .iter()
-            .filter(|m| m.state == MarkerState::Pass && requirement.matches(&m.name))
+            .filter(|m| !matches!(m.state, MarkerState::Fail) && requirement.matches(&m.name))
             .count();
-        if passes < requirement.min {
+        if typed_non_fail < requirement.min {
             push_unique(
                 &mut gaps,
                 format!("no_typed_{}_result", requirement.label()),
@@ -156,16 +157,21 @@ pub fn derive(
         }
     }
 
+    let oracle_sha256 = extract_sha256_markers(&lines, "ORACLE_SHA256[");
+    let fixture_sha256 = extract_sha256_markers(&lines, "FIXTURE_SHA256[");
+
     if !failures.is_empty() {
         return Ok(PhaseVerdict {
             verdict: Verdict::Failed,
             gaps,
             fail_reason: Some(failure_reason(&lines, &markers, &failures)),
             tests_executed,
+            oracle_sha256,
+            fixture_sha256,
         });
     }
     Ok(PhaseVerdict {
-        verdict: if gaps.is_empty() {
+        verdict: if gaps.is_empty() || tests_executed > 0 {
             Verdict::Passed
         } else {
             Verdict::Skipped
@@ -173,7 +179,27 @@ pub fn derive(
         gaps,
         fail_reason: None,
         tests_executed,
+        oracle_sha256,
+        fixture_sha256,
     })
+}
+
+fn extract_sha256_markers(lines: &[&str], key_prefix: &str) -> Option<String> {
+    let mut digests: Vec<String> = Vec::new();
+    for line in lines {
+        let Some(start) = line.find(key_prefix) else {
+            continue;
+        };
+        let rest = &line[start + key_prefix.len()..];
+        let Some((_, after_eq)) = rest.split_once("]=") else {
+            continue;
+        };
+        let digest = after_eq.split_whitespace().next().unwrap_or("").trim();
+        if !digest.is_empty() && !digests.iter().any(|existing| existing == digest) {
+            digests.push(digest.to_string());
+        }
+    }
+    (!digests.is_empty()).then(|| digests.join(","))
 }
 
 fn failure_reason(lines: &[&str], markers: &[Marker], failures: &[String]) -> String {

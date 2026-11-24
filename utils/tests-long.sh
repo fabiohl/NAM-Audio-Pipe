@@ -213,7 +213,7 @@ body_soak() {
     if [ -f tests/soak_extended.rs ]; then
         run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
             --test soak_extended -- --ignored --nocapture --test-threads=1 || rc=1
-        TGTS+=(tests/soak_extended.rs)
+        TGTS+=(tests/soak_extended.rs); REQS+=(soak_320k soak)
     else
         pre_gap soak_extended_harness_missing
     fi
@@ -228,7 +228,7 @@ body_heap_audit() {
         --lib -- --nocapture || rc=1
     run_cmd "$to" cargo test --locked --features "testing heap-audit" --release --no-fail-fast \
         --test swap_stress -- --nocapture || rc=1
-    TGTS+=(tests/swap_stress.rs)
+    TGTS+=("unittests src/lib.rs" tests/swap_stress.rs)
     return "$rc"
 }
 body_rt_deadline() {
@@ -258,7 +258,7 @@ body_endurance() {
     if [ ! -f tests/endurance.rs ]; then NOT_RUN=1; pre_gap endurance_harness_missing; return 0; fi
     run_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test endurance -- --ignored --nocapture --test-threads=1 || return 1
-    TGTS+=(tests/endurance.rs)
+    TGTS+=(tests/endurance.rs); REQS+=(endurance_real)
 }
 body_pw_resilience() {
     local to="$1"
@@ -267,13 +267,7 @@ body_pw_resilience() {
     REQS+=("daemon_bounce_reconnect|daemon_bounce_exhaustion|daemon_bounce_failfast|pw_private_daemon")
 }
 body_pw_live() {
-    local to="$1" launcher=run_cmd
-    # The release certificate requires a calibrated host (pinned isolated CPU +
-    # SCHED_FIFO) for the E2E tight gate to certify instead of declaring a GAP.
-    # Only the strict release run changes the launcher; hosted/non-strict runs
-    # keep the natural host affinity so they never pin the whole live graph to
-    # a shared CPU.
-    [ "$STRICT" = 1 ] && launcher=run_rt_cmd
+    local to="$1"
     if ! command -v pw-cli >/dev/null 2>&1 || ! timeout 5 pw-cli info 0 >/dev/null 2>&1; then
         NOT_RUN=1; pre_gap pw_integration_daemon_unavailable; return 0
     fi
@@ -283,7 +277,7 @@ body_pw_live() {
     probe_io_uring_capability "$to"; local probe_rc=$?
     if [ "$probe_rc" -eq 1 ]; then NOT_RUN=1; pre_gap io_uring_kernel_unsupported; return 0; fi
     [ "$probe_rc" -eq 0 ] || return 1
-    "$launcher" "$to" cargo test --locked --features testing --release --no-fail-fast \
+    run_rt_cmd "$to" cargo test --locked --features testing --release --no-fail-fast \
         --test pw_integration --test service_resilience -- --ignored --test-threads=1 --nocapture || return 1
     TGTS+=(tests/pw_integration.rs tests/service_resilience.rs)
     REQS+=("sigterm_acceptance:2" double_signal)
@@ -341,17 +335,17 @@ run_phase 9 recording 1200 body_recording
 run_phase 10 offline-parity 900 body_offline_parity
 if [ "$LONG_RECEIPT_FAILED" -eq 0 ] && [ "$USE_ARTIFACT" = 1 ]; then
     if ! "$RECEIPT_BIN" verify-artifact --out "$RECEIPT" --artifact "$ARTIFACT_PATH" \
-        >>"$LOG_DIR/tests-long-verify-artifact.log" 2>&1; then
+        >"$LOG_DIR/tests-long-verify-artifact.log" 2>&1; then
         GAPS+=("artifact:sha_mismatch"); FAILS+=(artifact_binding)
     fi
 fi
-if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ] && [ ${#FAILS[@]} -eq 0 ]; then
+if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ]; then
     "$RECEIPT_BIN" summary --out "$RECEIPT" >/dev/null 2>&1 || FAILS+=(summary)
 fi
 val_args=(--out "$RECEIPT")
 [ "$STRICT" = 1 ] && val_args+=(--strict)
 if [ ${#ONLY_PHASES[@]} -eq 0 ] && [ "$LONG_RECEIPT_FAILED" -eq 0 ]; then
-    "$RECEIPT_BIN" validate "${val_args[@]}" >>"$LOG_DIR/tests-long-validate.log" 2>&1 \
+    "$RECEIPT_BIN" validate "${val_args[@]}" >"$LOG_DIR/tests-long-validate.log" 2>&1 \
         || FAILS+=(receipt_validation)
 fi
 if [ ${#ONLY_PHASES[@]} -gt 0 ]; then SCOPE=partial; subset_tag=$(IFS=+; printf '%s' "${ONLY_PHASES[*]}"); emit "PHASE: phase-selection PASS only-subset:$subset_tag"; fi

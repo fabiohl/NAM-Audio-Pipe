@@ -283,8 +283,7 @@ use common::rt_env::try_promote_sched_fifo;
 /// page faults (`minflt`) during real-time timing loops.
 fn prefault_rt_memory() {
     configure_process_wide();
-    let mut stack_probe = [0u8; 64 * 1024];
-    std::hint::black_box(&mut stack_probe);
+    prefault_rt_stack();
 }
 
 /// Builds the harness with the task-spec real load: WaveNet A1 on L, WaveNet
@@ -325,6 +324,7 @@ fn rt_deadline_gate_10k_quantums() {
         return;
     }
     prefault_rt_memory();
+    let _pm_qos = nam_audio_pipe::standalone::rt_setup::pm_qos::lock_cpu_c_states();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.sched_fifo {
@@ -353,12 +353,16 @@ fn rt_deadline_gate_10k_quantums() {
         h.run_callback(&mut in_l, &mut in_r, BLOCK);
     }
 
-    // Pre-allocate and commit sample buffers to physical RAM before taking rusage baseline,
-    // eliminating demand paging (minor page faults) and reallocation inside the timed loop.
+    // Pre-allocate and commit sample buffers to physical RAM before warming caches
+    // and taking rusage baseline, eliminating demand paging inside the timed loop.
     let mut samples = vec![0u64; DEADLINE_QUANTUMS];
     for s in samples.iter_mut() {
         *s = 1;
     }
+
+    // Replenish the kernel RT bandwidth window (5% reserve per 1s period) before
+    // entering the timed loop so a preceding test cannot trigger RT throttling.
+    rt_cooperative_microsleep(100_000_000);
 
     let rusage_before = read_thread_rusage().ok();
     let pmu = PmuCounters::open();
@@ -386,8 +390,8 @@ fn rt_deadline_gate_10k_quantums() {
         }
         sum_ns += dur as u128;
 
-        // Yield briefly every 250 quantums outside the timed window to replenish
-        // the kernel's RT budget (`sched_rt_runtime_us`) and prevent throttling preemption.
+        // Keep intra-loop cooperative yield brief (10 µs) so C-state/cache stays hot
+        // while still offering a kernel preemption point every 250 quantums.
         if (block + 1) % 250 == 0 {
             rt_cooperative_microsleep(10_000);
         }
@@ -472,6 +476,7 @@ fn rt_deadline_full() {
         return;
     }
     prefault_rt_memory();
+    let _pm_qos = nam_audio_pipe::standalone::rt_setup::pm_qos::lock_cpu_c_states();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.sched_fifo {
@@ -625,6 +630,11 @@ fn rt_deadline_full() {
         *s = 1;
     }
 
+    // Replenish the kernel RT bandwidth window and re-warm instruction/data caches
+    // after buffer setup so block 0 does not absorb cold setup eviction.
+    rt_cooperative_microsleep(100_000_000);
+    h.run_callback(&mut cap_l, &mut cap_r, BLOCK);
+
     let rusage_before = read_thread_rusage().ok();
     let pmu = PmuCounters::open();
     pmu.start();
@@ -747,8 +757,8 @@ fn rt_deadline_full() {
         }
         sum_total_ns += dur_total as u128;
 
-        // Yield briefly every 250 quantums outside the timed window to replenish
-        // the kernel's RT budget (`sched_rt_runtime_us`) and prevent throttling preemption.
+        // Keep intra-loop cooperative yield brief (10 µs) so C-state/cache stays hot
+        // while still offering a kernel preemption point every 250 quantums.
         if (block + 1) % 250 == 0 {
             rt_cooperative_microsleep(10_000);
         }
@@ -844,6 +854,7 @@ fn rt_jitter_gate_10k_callbacks() {
         return;
     }
     prefault_rt_memory();
+    let _pm_qos = nam_audio_pipe::standalone::rt_setup::pm_qos::lock_cpu_c_states();
     let _ = try_promote_sched_fifo(80);
     let env = RtEnvironment::probe();
     if !env.pinned_single_cpu {

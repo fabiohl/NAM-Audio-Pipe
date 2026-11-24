@@ -68,7 +68,18 @@ fn linear_data(json: &str) -> NamModelData {
 
 fn model_from(data: &NamModelData) -> Box<StaticModel> {
     let mut model = build_model(data).expect("build model");
-    model.prewarm(64);
+    // Swap batches rotate through OversampleFactor::X2 and X4 (up to BLOCK*4
+    // samples per quantum), so prewarm for the largest oversampled block.
+    model.prewarm(BLOCK * 4);
+    // `WaveNet::prewarm()` advances only 1 sample, leaving `MirroredBuffer`
+    // cursors and delay-line pages across the dual-mapped ring largely untouched;
+    // cycle 8,192 silent frames off-RT so every layer ring page (both halves)
+    // is faulted cleanly on the producer thread.
+    let zeros = [0.0f32; BLOCK * 4];
+    let mut sink = [0.0f32; BLOCK * 4];
+    for _ in 0..32 {
+        model.process(&zeros, &mut sink);
+    }
     model
 }
 
@@ -155,7 +166,11 @@ pub fn cabsim_pair() -> Box<CabSimPair> {
     let partition = pair.partition_size();
     let mut scratch_l = vec![0.0f32; partition];
     let mut scratch_r = vec![0.0f32; partition];
-    pair.process_block_stereo(&mut scratch_l, &mut scratch_r, None);
+    for _ in 0..(IR_LEN / partition).max(1) {
+        scratch_l.fill(0.0);
+        scratch_r.fill(0.0);
+        pair.process_block_stereo(&mut scratch_l, &mut scratch_r, None);
+    }
     pair.l.reset();
     pair.r.reset();
     pair
@@ -178,6 +193,138 @@ pub fn test_signal_blocks(total_blocks: usize) -> (Vec<f32>, Vec<f32>) {
     let l: Vec<f32> = (0..n).map(|_| 0.35 * next(&mut seed_l)).collect();
     let r: Vec<f32> = (0..n).map(|_| 0.35 * next(&mut seed_r)).collect();
     (l, r)
+}
+
+/// Pre-faults a generous 256 KiB stack window (page-by-page) on the calling
+/// RT thread so deep DSP frames (`WaveNet`, `CabSim` FFT, `OS X4`, capture
+/// prologue) never trigger lazy stack demand faults inside strict zero-fault
+/// windows.
+#[cfg(feature = "testing")]
+pub fn prefault_rt_stack() {
+    let mut stack_probe = [0u8; 256 * 1024];
+    for i in (0..stack_probe.len()).step_by(4096) {
+        stack_probe[i] = 1;
+    }
+    stack_probe[stack_probe.len() - 1] = 1;
+    std::hint::black_box(&mut stack_probe);
+}
+
+/// Pre-faults a generous 256 KiB stack window and every 4 KiB page of the
+/// stereo signal buffers from the calling RT worker thread before taking
+/// `getrusage(RUSAGE_THREAD)` baselines.
+///
+/// Mirrors `tests/rt_metrics.rs::prefault_rt_memory()` so deep DSP frames
+/// (`WaveNet`, `CabSim` FFT, `OS X4`) and large multi-megabyte signal arrays
+/// never trigger lazy demand-zero or PTE minor page faults inside strict
+/// zero-fault windows.
+#[cfg(feature = "testing")]
+pub fn prefault_rt_thread_and_signals(sig_l: &[f32], sig_r: &[f32]) {
+    prefault_rt_stack();
+
+    let mut acc = 0.0f32;
+    for &s in sig_l.iter().step_by(1024) {
+        acc += s;
+    }
+    for &s in sig_r.iter().step_by(1024) {
+        acc += s;
+    }
+    if let Some(&last) = sig_l.last() {
+        acc += last;
+    }
+    if let Some(&last) = sig_r.last() {
+        acc += last;
+    }
+    std::hint::black_box(acc);
+}
+
+/// Exercises every model/CabSim/OS topology directly on the RT thread before
+/// taking `rusage_before`, then restores the canonical quiescent Linear A/B
+/// baseline and drains GC. Ensures code, `.rodata`, TLS, and deep stack
+/// frames for `WaveNet`, `LSTM`, `CabSim`, and `X2`/`X4` oversampling are all
+/// paged in and warmed prior to strict zero-fault measurement.
+#[cfg(feature = "testing")]
+pub fn warm_rt_callback_paths(h: &mut RtSwapHarness, sig_l: &[f32], sig_r: &[f32]) {
+    let mut in_l = [0.0f32; BLOCK];
+    let mut in_r = [0.0f32; BLOCK];
+    for step in 0..24usize {
+        apply_swap_batch(h, step * SWAP_INTERVAL);
+        for block in 0..8usize {
+            let off = (block * BLOCK).min(sig_l.len().saturating_sub(BLOCK));
+            in_l.copy_from_slice(&sig_l[off..off + BLOCK]);
+            in_r.copy_from_slice(&sig_r[off..off + BLOCK]);
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        if step.is_multiple_of(3) {
+            h.consume_gc();
+        }
+    }
+    assert!(
+        validate_linear_window(h),
+        "RT warmup failed to restore Linear A/B quiescent baseline: {}",
+        validation_state_debug(h)
+    );
+    h.consume_gc();
+}
+
+/// Pre-warms every model/CabSim/OS topology across two full LCM periods (48
+/// swap batches, draining GC every 8 steps) on the producer thread so glibc's
+/// non-main heap arena reaches its concurrent overlap high-water mark before
+/// baseline telemetry is captured.
+#[cfg(feature = "testing")]
+pub fn warm_producer_arena(h: &mut RtSwapHarness) {
+    let (warm_l, warm_r) = test_signal_blocks(8);
+    let mut in_l = [0f32; BLOCK];
+    let mut in_r = [0f32; BLOCK];
+    for step in 0..48usize {
+        apply_swap_batch(h, step * SWAP_INTERVAL);
+        for block in 0..8usize {
+            in_l.copy_from_slice(&warm_l[block * BLOCK..(block + 1) * BLOCK]);
+            in_r.copy_from_slice(&warm_r[block * BLOCK..(block + 1) * BLOCK]);
+            h.run_callback(&mut in_l, &mut in_r, BLOCK);
+        }
+        if step % 8 == 7 {
+            h.consume_gc();
+        }
+    }
+    h.consume_gc();
+}
+
+/// Maximum minor page faults tolerated on the RT callback thread **only** when
+/// `mlockall` succeeded AND Linux `vm.compact_unevictable_allowed == 1`
+/// (kernel default on Ubuntu/mainline), which permits `kcompactd` to migrate
+/// locked pages under heavy off-RT `mmap`/`munmap` churn (`migration_entry_wait`).
+/// Any un-prewarmed `WaveNet` swap faults 1,720+ pages and any un-prefaulted
+/// stack/signal buffer faults dozens to hundreds of pages, so 64 absorbs
+/// transient compaction waits while remaining fail-closed against real RT faults.
+///
+/// Measured: endurance `minflt_thread=9` (30s, `mlockall_ok=true`,
+/// `compact_unevictable_allowed=1`), soak `minflt_thread_delta=0`; single
+/// un-prewarmed WaveNet swap = 1,720 pages.
+#[cfg(feature = "testing")]
+pub const MAX_COMPACTION_MINOR_FAULTS: u64 = 64;
+
+/// Computes the allowed RT-thread minor fault budget for the current host
+/// memory-locking and kernel compaction state.
+#[cfg(feature = "testing")]
+pub fn rt_minor_fault_budget(mlock_ok: bool, compact_unevictable: &str) -> u64 {
+    if mlock_ok && compact_unevictable == "1" {
+        MAX_COMPACTION_MINOR_FAULTS
+    } else {
+        0
+    }
+}
+
+/// Reads `/proc/sys/vm/compact_unevictable_allowed` off-RT for diagnostics:
+/// when set to `1` (Linux default), `kcompactd` is permitted to migrate even
+/// `mlockall`-locked pages, causing transient `migration_entry_wait` minor faults
+/// under heavy off-RT allocation churn.
+#[cfg(feature = "testing")]
+pub fn read_compact_unevictable_allowed() -> String {
+    std::fs::read_to_string("/proc/sys/vm/compact_unevictable_allowed")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Drain budget for a validation window: the command burst must be fully

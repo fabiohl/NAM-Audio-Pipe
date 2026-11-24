@@ -23,17 +23,19 @@ use std::time::{Duration, Instant};
 
 mod common;
 
-/// Minimum number of E2E samples in the measurement window so the log-linear
-/// histogram carries a meaningful tail (the previous 8-sample window made
-/// "p99" collapse onto the maximum).
-const E2E_MEASURE_SAMPLES: u64 = 2000;
+/// Minimum number of sampled E2E observations in the measurement window
+/// (playback samples 1 in 16 callbacks, so 64 sampled observations = 1024
+/// real audio quantums) so the reservoir and histogram carry a meaningful tail.
+const E2E_MEASURE_SAMPLES: u64 = 64;
 
 /// Minimum wall-clock measurement window (whichever is longer with the sample
 /// target, so a coarse quantum still yields a real time series).
-const E2E_MIN_WINDOW: Duration = Duration::from_secs(4);
+const E2E_MIN_WINDOW: Duration = Duration::from_secs(3);
 
-/// Hard ceiling for the measurement window (covers 2000 samples at q=256).
-const E2E_MAX_WINDOW: Duration = Duration::from_secs(15);
+/// Hard ceiling for the measurement window: 6 seconds (strictly below the
+/// 10-second periodic telemetry reset in `poll_rt_status`, which resets
+/// `e2e_hist` and `e2e_exact` every 100 polls × 100 ms = 10 s).
+const E2E_MAX_WINDOW: Duration = Duration::from_secs(6);
 
 /// The script (`utils/tests-long.sh` PHASE8) only executes
 /// this test after `pw-cli info 0` succeeded. A `pw-cli` failure INSIDE the
@@ -267,23 +269,29 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
          (bring-up was {bringup_discard})"
     );
 
+    let effective_p99_ns = if p99_exact_ns > 0 {
+        p99_exact_ns
+    } else {
+        p99_ns
+    };
     let env = common::rt_env::RtCalibration::probe();
     if env.calibrated() {
         // Tight gate relative to the host quantum: the bridge is one quantum
         // deep, so p99 must stay under 1.25·q + 100 µs and the maximum under
-        // 1.5·q.
+        // 1.5·q. Prefer the exact reservoir p99 when available so log-linear
+        // histogram bucket clamping (`p99_ns == max_ns`) does not skew the p99 check.
         let p99_limit = quantum_ns + quantum_ns / 4 + 100_000;
         let max_limit = quantum_ns + quantum_ns / 2;
         assert!(
-            p99_ns <= p99_limit,
-            "p99 E2E ({p99_ns} ns) exceeded 1.25·q + 100 µs ({p99_limit} ns) for buffer_size={buffer_size}"
+            effective_p99_ns <= p99_limit,
+            "p99 E2E ({effective_p99_ns} ns) exceeded 1.25·q + 100 µs ({p99_limit} ns) for buffer_size={buffer_size}"
         );
         assert!(
             max_ns <= max_limit,
             "max E2E ({max_ns} ns) exceeded 1.5·q ({max_limit} ns) for buffer_size={buffer_size}"
         );
         println!(
-            "TEST_RESULT[e2e_tight_gate]=PASS buffer_size={buffer_size} p99_ns={p99_ns} \
+            "TEST_RESULT[e2e_tight_gate]=PASS buffer_size={buffer_size} p99_ns={effective_p99_ns} \
              max_ns={max_ns} quantum_ns={quantum_ns} {}",
             env.format_env()
         );
@@ -291,24 +299,107 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
         // Legacy permissive threshold as an explicit fallback on uncertified hosts.
         let max_allowed_p99 = 2 * quantum_ns + 15_000_000;
         assert!(
-            p99_ns <= max_allowed_p99,
-            "p99 e2e ({p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
+            effective_p99_ns <= max_allowed_p99,
+            "p99 e2e ({effective_p99_ns} ns) exceeded 2 quantums + hw overhead ({max_allowed_p99} ns) for buffer_size={buffer_size}"
         );
         println!(
-            "TEST_RESULT[e2e_tight_gate]=GAP:non_isolated_env buffer_size={buffer_size} p99_ns={p99_ns} \
+            "TEST_RESULT[e2e_tight_gate]=GAP:non_isolated_env buffer_size={buffer_size} p99_ns={effective_p99_ns} \
              max_ns={max_ns} quantum_ns={quantum_ns}"
         );
     }
 
     (
         p50_ns,
-        p99_ns,
+        effective_p99_ns,
         max_ns,
         starvation,
         dropped_frames,
         quantum,
         rate,
     )
+}
+
+/// Restores the calling thread's CPU affinity and scheduler policy after
+/// opportunistic isolated-CPU calibration in [`test_pipewire_integration`].
+struct RtThreadCalibrateGuard {
+    orig_cpuset: Option<libc::cpu_set_t>,
+    orig_sched: Option<(i32, libc::sched_param)>,
+}
+
+impl RtThreadCalibrateGuard {
+    fn arm_if_isolated_available() -> Self {
+        let isolated = common::rt_env::isolated_cpus();
+        let target_cpu = isolated.into_iter().find(|&cpu| {
+            let online_path = format!("/sys/devices/system/cpu/cpu{cpu}/online");
+            match std::fs::read_to_string(&online_path) {
+                Ok(v) => v.trim() == "1",
+                Err(_) => {
+                    std::path::Path::new(&format!("/sys/devices/system/cpu/cpu{cpu}")).is_dir()
+                }
+            }
+        });
+        let Some(cpu) = target_cpu else {
+            return Self {
+                orig_cpuset: None,
+                orig_sched: None,
+            };
+        };
+
+        let env = common::rt_env::RtCalibration::probe();
+        if env.calibrated() {
+            return Self {
+                orig_cpuset: None,
+                orig_sched: None,
+            };
+        }
+
+        let orig_cpuset = if !env.pinned_single_cpu || !env.cpu_isolated {
+            // SAFETY: `cpu_set_t` is a C bitmask initialized immediately by `sched_getaffinity`.
+            let mut prev: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `pid = 0` queries the calling thread into the valid `cpu_set_t` buffer.
+            let rc = unsafe {
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut prev)
+            };
+            let _ = neural_amp_modeler_rs::rt_hardening::pin_current_thread(Some(cpu as usize));
+            (rc == 0).then_some(prev)
+        } else {
+            None
+        };
+
+        let orig_sched = if !env.sched_fifo {
+            // SAFETY: `sched_getscheduler(0)` queries the calling thread without pointers.
+            let prev_policy = unsafe { libc::sched_getscheduler(0) };
+            let mut prev_param = libc::sched_param { sched_priority: 0 };
+            // SAFETY: `sched_getparam(0, &mut prev_param)` writes into the stack `sched_param`.
+            let rc = unsafe { libc::sched_getparam(0, &mut prev_param) };
+            let _ = common::rt_env::try_promote_sched_fifo(80);
+            (prev_policy >= 0 && rc == 0).then_some((prev_policy, prev_param))
+        } else {
+            None
+        };
+
+        Self {
+            orig_cpuset,
+            orig_sched,
+        }
+    }
+}
+
+impl Drop for RtThreadCalibrateGuard {
+    fn drop(&mut self) {
+        if let Some((policy, ref param)) = self.orig_sched {
+            // SAFETY: restoring the caller's original scheduler policy and priority (`pid = 0`).
+            unsafe {
+                libc::sched_setscheduler(0, policy, param);
+            }
+        }
+        if let Some(ref cpuset) = self.orig_cpuset {
+            // SAFETY: restoring the caller's original CPU affinity mask (`pid = 0`).
+            unsafe {
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), cpuset);
+            }
+        }
+    }
 }
 
 /// Tests the basic initialization and communication of the PipeWire pipeline across
@@ -326,6 +417,7 @@ fn test_pipewire_integration() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _shutdown = common::ShutdownGuard::new();
+    let _rt_calibrate = RtThreadCalibrateGuard::arm_if_isolated_available();
 
     pipewire::init();
     println!("PipeWire initialized successfully.");
@@ -337,15 +429,74 @@ fn test_pipewire_integration() {
     }
 }
 
+/// Builds a `cpu_set_t` covering online non-isolated (housekeeping) CPUs so
+/// auxiliary test drivers (`pw-play`) never contend with the RT thread on an
+/// isolated core under `SCHED_FIFO`.
+#[cfg(target_os = "linux")]
+fn housekeeping_cpuset() -> Option<libc::cpu_set_t> {
+    let online_raw = std::fs::read_to_string("/sys/devices/system/cpu/online").ok()?;
+    let online = common::rt_env::parse_cpu_ranges(online_raw.trim());
+    let isolated = common::rt_env::isolated_cpus();
+    let housekeeping: Vec<u32> = online
+        .iter()
+        .copied()
+        .filter(|cpu| !isolated.contains(cpu))
+        .collect();
+    let target = if housekeeping.is_empty() {
+        online
+    } else {
+        housekeeping
+    };
+    if target.is_empty() {
+        return None;
+    }
+    // SAFETY: `cpu_set_t` is an opaque C bitmask initialized via `CPU_ZERO` / `CPU_SET`.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is stack-allocated and each `cpu` comes from `/sys/devices/system/cpu/online`.
+    unsafe {
+        libc::CPU_ZERO(&mut set);
+        for cpu in target {
+            libc::CPU_SET(cpu as usize, &mut set);
+        }
+    }
+    Some(set)
+}
+
+/// Configures a `pw-play` child process to run on housekeeping CPUs with
+/// `SCHED_OTHER`, preventing it from inheriting `SCHED_FIFO` and single-core
+/// isolated affinity from `pipe_perf_gate pin -- chrt -f 80`.
+fn demote_child_to_housekeeping(cmd: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let cpuset = housekeeping_cpuset();
+        // SAFETY: `pre_exec` runs between `fork` and `exec` and only invokes
+        // async-signal-safe `sched_setscheduler` and `sched_setaffinity` syscalls
+        // on `pid = 0` using pre-computed stack values.
+        unsafe {
+            cmd.pre_exec(move || {
+                let param = libc::sched_param { sched_priority: 0 };
+                let _ = libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+                if let Some(ref set) = cpuset {
+                    let _ = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), set);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cmd;
+}
+
 /// Helper to spawn a silent tone against the system daemon.
 fn spawn_silent_tone(wav: &std::path::Path) -> Option<std::process::Child> {
-    std::process::Command::new("pw-play")
-        .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
+    let mut cmd = std::process::Command::new("pw-play");
+    cmd.args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
         .arg(wav)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()
+        .stderr(std::process::Stdio::null());
+    demote_child_to_housekeeping(&mut cmd);
+    cmd.spawn().ok()
 }
 
 /// Best-effort termination of the tone process.
@@ -460,13 +611,12 @@ impl PrivateToneDriver {
         if self.child.is_none() {
             let mut cmd = std::process::Command::new("pw-play");
             self.apply_envs(&mut cmd);
-            self.child = cmd
-                .args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
+            cmd.args(["--target", "NAM-Audio-Pipe-input", "--volume", "0"])
                 .arg(&self.wav_path)
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .ok();
+                .stderr(std::process::Stdio::null());
+            demote_child_to_housekeeping(&mut cmd);
+            self.child = cmd.spawn().ok();
         }
     }
 

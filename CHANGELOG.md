@@ -12,16 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+## [1.2.0] - 2026-11-23
 
+Version 1.2.0 integrates the `NeuralAmpModeler-rs` v4.0.0 core DSP engine, expands cabinet and gate capabilities (`.nam`/`.namb` cabinet slots, WaveNet head support, musical noise gate, input calibration, `--ir-level-policy`, and playback-only `--output-limit`), upgrades the Flatpak runtime to Freedesktop SDK 26.08, and hardens the release certification and real-time QA pipeline.
+
+### Added [1.2.0]
+
+- **Cabinet Slot & Level Policy Controls:** Support for WAV, `.nam`, and `.namb` cabinet payloads (`--cab-bypass`) alongside explicit `--ir-level-policy` modes (`Preserve`, `GainMatched`, `Normalized`).
+- **Musical Gate, Calibration & Output Safety:** Added `--gate-mode` (musical noise gate), `--calibrate-input` / `--input-calibration-level`, `--output-mode`, and playback-only `--output-limit` clamping for PipeWire monitoring.
+- **Per-Generation Capture Timestamping & Miss Classification:** Synchronized capture-to-playback latency telemetry per delivered generation and added `build-status` plus partial-scope handling in `pipe_long_receipt`.
+
+### Changed [1.2.0]
+
+- **Core Engine Upgrade to `NeuralAmpModeler-rs` v4.0.0:** Updated `Cargo.toml`, `Cargo.lock`, and `variables.env` to consume `NeuralAmpModeler-rs` `4.0.0` from `crates.io`, enabling WaveNet head support and updated prewarm calibration.
 - **Flatpak Runtime Migration to Freedesktop SDK 26.08:** Upgraded `packaging/flatpak/io.github.fabiohl.NAMAudioPipe.yml` and `utils/build-release.sh` to target `org.freedesktop.Platform//26.08` and `org.freedesktop.Sdk//26.08`, leveraging glibc 2.44, PipeWire 1.6.x client IPC, and Wayland 1.26.
 
-### Fixed
+### Fixed [1.2.0]
 
 - **Release Ceremony Strict Certification:** Enforced `--strict` flag propagation in the release ceremony runner when invoking `utils/build-release.sh --strict --certify --install`, ensuring that `release-receipt.json` accurately asserts `strict_mode: true`.
 - **Hardware PMU Counters in Long Audit Suite:** Added automatic elevation (`kernel.perf_event_paranoid = 1`) and fail-safe restoration via EXIT trap in `utils/tests-long.sh`, preventing `EACCES (Permission denied)` when accessing PMU cycle and instruction counters for real-time IPC calculation.
-- **Zero Page Faults in RT Measurement Loops:** Hardened real-time deadline and jitter harnesses in `tests/rt_metrics.rs` by calling `configure_process_wide()` (`mlockall` + `disable_thp` + `mallopt` heap trimming disable), touching the RT thread stack, and pre-allocating/prefaulting sample buffers to eliminate minor page faults (`minflt`) during nanosecond timing loops.
-- **Release Chain Documentation:** Aligned `README.md`, `docs/testing.md`, and `docs/architecture.md` to consistently document `./utils/build-release.sh --strict --certify --install` as the canonical non-recompiling reconciliation step.
+- **Zero Page Faults & Compaction Tolerance in RT Harnesses:** Hardened real-time deadline, jitter, soak, and endurance harnesses (`tests/rt_metrics.rs`, `tests/endurance.rs`, `tests/soak_extended.rs`) with `configure_process_wide()`, 256 KiB stack prefaulting, post-warmup `rusage` alignment, clean final-gate shutdown ordering, and a calibrated `MAX_COMPACTION_MINOR_FAULTS` bound (64) when `mlockall` succeeds under Linux `compact_unevictable_allowed=1`.
+- **Release Chain & Ceremony Diagnostics:** Aligned `README.md`, `docs/testing.md`, and `docs/architecture.md` on `--strict --certify --install`, labeled BOLT probe runs as `bolt-probe` in `utils/ab-opt-ceremony.sh`, and overwrote per-run validation logs in `utils/tests-long.sh`.
 
 ## [1.1.0] - 2026-11-07
 
@@ -116,7 +127,8 @@ Version 1.1.0 integrates the `NeuralAmpModeler-rs` v2.0.0 engine core, implement
   - Scoped low-latency audio permissions (`--filesystem=xdg-run/pipewire-0`, `--socket=pulseaudio`, `--share=ipc`, `--device=all`, `--filesystem=home:ro`, `--filesystem=xdg-music`).
   - XDG desktop integration and complete hicolor icon theme hierarchy (SVG + 64x64 to 512x512 PNGs).
 
-[Unreleased]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.1.0...v1.2.0
 
 [1.1.0]: https://github.com/fabiohl/NAM-Audio-Pipe/compare/v1.0.0...v1.1.0
 

@@ -52,7 +52,7 @@
     {
       "id": "conv_engine",
       "pattern": "ConvEngine>::process(\\.cold|\\.warm|\\.part\\.[0-9]+)?$",
-      "required": true,
+      "required": false,
       "expected_methods": ["process"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 }
     },

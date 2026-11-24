@@ -173,8 +173,9 @@ const PERF_TYPE_HARDWARE: u32 = 0;
 const PERF_TYPE_HW_CACHE: u32 = 3;
 const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
 const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
-const PERF_COUNT_HW_CACHE_ITLB: u64 = 8;
-const PERF_COUNT_HW_CACHE_ICACHE: u64 = 5;
+// Linux <linux/perf_event.h> enum perf_hw_cache_id: L1I=1, ITLB=4, BPU=5.
+const PERF_COUNT_HW_CACHE_ITLB: u64 = 4;
+const PERF_COUNT_HW_CACHE_ICACHE: u64 = 1;
 const PERF_COUNT_HW_CACHE_OP_READ: u64 = 0;
 const PERF_COUNT_HW_CACHE_RESULT_MISS: u64 = 1;
 // __NR_perf_event_open on x86-64 Linux (not exported by libc).

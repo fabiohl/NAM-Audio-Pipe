@@ -124,6 +124,7 @@ if [ "$USE_PGO" = 1 ]; then
 fi
 
 LLVM_BOLT=""
+MERGE_FDATA=""
 HAS_PERF=0
 if [ "$USE_BOLT" = 1 ]; then
     for candidate in /usr/lib/llvm-{22,21,20,19,18}/bin/llvm-bolt \
@@ -133,6 +134,9 @@ if [ "$USE_BOLT" = 1 ]; then
     if [ -n "$LLVM_BOLT" ]; then
         PERF2BOLT="$(dirname "$LLVM_BOLT")/perf2bolt"
         [ -x "$PERF2BOLT" ] || PERF2BOLT="perf2bolt"
+        MERGE_FDATA="$(dirname "$LLVM_BOLT")/merge-fdata"
+        [ -x "$MERGE_FDATA" ] || MERF=$(command -v merge-fdata 2>/dev/null || true)
+        [ -x "$MERGE_FDATA" ] || MERGE_FDATA="${MERF:-}"
     else
         gap llvm_bolt_unavailable; echo "  reason: llvm-bolt not found (comparing plain → PGO only)"
     fi
@@ -178,12 +182,12 @@ if [ "$USE_PGO" = 1 ]; then
     mkdir -p "$PGO_DIR/profraw"
     echo "building variant 'pgo-gen'"
     run_timed "$VARIANT_TIMEOUT_S" env \
-        RUSTFLAGS="$CONFIG_RUSTFLAGS -Cprofile-generate=$PGO_DIR/profraw" \
+        RUSTFLAGS="$CONFIG_RUSTFLAGS -Cprofile-generate=$PGO_DIR/profraw -Cllvm-args=-vp-counters-per-site=8" \
         cargo build --locked --release --features testing --bin ab_opt_bench
     echo "running variant 'pgo-gen' (profile capture)"
     run_timed "$VARIANT_TIMEOUT_S" env \
         LLVM_PROFILE_FILE="$PGO_DIR/profraw/default_%m_%p.profraw" \
-        timeout --kill-after=30 "$VARIANT_TIMEOUT_S" ${PIN[@]+"${PIN[@]}"} \
+        ${PIN[@]+"${PIN[@]}"} \
         "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
         --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-pgo-gen.json"
     PROFRAW_COUNT=$(find "$PGO_DIR/profraw" -name '*.profraw' | wc -l)
@@ -194,42 +198,48 @@ if [ "$USE_PGO" = 1 ]; then
     run_variant pgo "$AB_BUILD_DIR/release/ab_opt_bench"
     cooldown
 
-    if [ "$USE_BOLT" = 1 ] && [ -n "$LLVM_BOLT" ] && [ "$HAS_PERF" = 1 ]; then
+    if [ "$USE_BOLT" = 1 ] && [ -n "$LLVM_BOLT" ] && { [ "$HAS_PERF" = 1 ] || [ -n "$MERGE_FDATA" ]; }; then
         echo "building & running variant 'pgo+bolt'"
-        rm -f "$PGO_DIR/perf.data"
-        PERF_ARGS=(-F 4000 -e cycles:u)
-        if run_timed 60 perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
-            PERF_ARGS=(-F 99 -e cycles:u -j any,u)
+        rm -f "$PGO_DIR/perf.data" "$PGO_DIR"/bolt.fdata.*
+        LBR=0
+        if [ "$HAS_PERF" = 1 ] && run_timed 60 perf record -e cycles:u -j any,u -F 99 -o /dev/null -- true >/dev/null 2>&1; then
             LBR=1
-        else
-            LBR=0
         fi
-        if [ "$LBR" = 0 ]; then
-            BOLT_CAUSE="BOLT_SKIPPED: hardware LBR unavailable (-j any,u unsupported on AMD/VM)"
-            gap bolt_lbr_unsupported
-            echo "  reason: $BOLT_CAUSE"
-        elif ! run_timed "$VARIANT_TIMEOUT_S" perf record "${PERF_ARGS[@]}" -o "$PGO_DIR/perf.data" -- \
-            ${PIN[@]+"${PIN[@]}"} "$AB_BUILD_DIR/release/ab_opt_bench" --variant pgo-gen --runs 1 \
-            --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
-            BOLT_CAUSE="BOLT_FAILED: perf record session failed."
-        elif [ ! -s "$PGO_DIR/perf.data" ]; then
-            BOLT_CAUSE="BOLT_FAILED: perf.data empty or missing."
-        fi
-        if [ -z "$BOLT_CAUSE" ]; then
-            chmod 644 "$PGO_DIR/perf.data" 2>/dev/null || true
-            P2B_FLAGS=()
-            if [ "$LBR" = 0 ]; then
-                if "$PERF2BOLT" --help 2>&1 | grep -q -- '--basic-events'; then
-                    P2B_FLAGS=(--basic-events)
-                else
-                    gap perf2bolt_without_basic_events
-                fi
-            fi
-            if ! run_timed "$VARIANT_TIMEOUT_S" "$PERF2BOLT" ${P2B_FLAGS[@]+"${P2B_FLAGS[@]}"} \
+        if [ "$LBR" = 1 ]; then
+            if ! run_timed "$VARIANT_TIMEOUT_S" perf record -F 99 -e cycles:u -j any,u -o "$PGO_DIR/perf.data" -- \
+                ${PIN[@]+"${PIN[@]}"} "$AB_BUILD_DIR/release/ab_opt_bench" --variant bolt-probe --runs 1 \
+                --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
+                BOLT_CAUSE="BOLT_FAILED: perf record session failed."
+            elif [ ! -s "$PGO_DIR/perf.data" ]; then
+                BOLT_CAUSE="BOLT_FAILED: perf.data empty or missing."
+            elif ! chmod 644 "$PGO_DIR/perf.data" 2>/dev/null || ! run_timed "$VARIANT_TIMEOUT_S" "$PERF2BOLT" \
                 -p "$PGO_DIR/perf.data" "$AB_BUILD_DIR/release/ab_opt_bench" \
                 -o "$PGO_DIR/perf.fdata" >"$PGO_DIR/perf2bolt.log" 2>&1; then
                 BOLT_CAUSE="BOLT_FAILED: perf2bolt conversion failed: $(tail -n1 "$PGO_DIR/perf2bolt.log" 2>/dev/null || true)"
             fi
+        elif [ -n "$MERGE_FDATA" ]; then
+            echo "  hardware LBR unavailable; using llvm-bolt -instrument fallback"
+            if ! run_timed "$VARIANT_TIMEOUT_S" "$LLVM_BOLT" "$AB_BUILD_DIR/release/ab_opt_bench" \
+                -instrument -o "$AB_BUILD_DIR/release/ab_opt_bench.instrumented" \
+                --instrumentation-file="$PGO_DIR/bolt.fdata" --instrumentation-file-append-pid \
+                >"$PGO_DIR/bolt-instrument.log" 2>&1; then
+                BOLT_CAUSE="BOLT_FAILED: llvm-bolt instrumentation failed: $(tail -n1 "$PGO_DIR/bolt-instrument.log" 2>/dev/null || true)"
+            elif ! run_timed "$VARIANT_TIMEOUT_S" ${PIN[@]+"${PIN[@]}"} \
+                "$AB_BUILD_DIR/release/ab_opt_bench.instrumented" --variant bolt-probe --runs 1 \
+                --blocks "$BLOCKS" --receipt "$AB_DIR/ab-opt-bolt-probe.json" >/dev/null 2>&1; then
+                BOLT_CAUSE="BOLT_FAILED: instrumented workload failed."
+            else
+                FDATA_FILES=()
+                while IFS= read -r -d '' f; do [ -s "$f" ] && FDATA_FILES+=("$f"); done < <(find "$PGO_DIR" -maxdepth 1 -name 'bolt.fdata.*' -print0 2>/dev/null || true)
+                if [ ${#FDATA_FILES[@]} -eq 0 ] || ! run_timed "$VARIANT_TIMEOUT_S" "$MERGE_FDATA" \
+                    "${FDATA_FILES[@]}" >"$PGO_DIR/perf.fdata" 2>"$PGO_DIR/merge-fdata.log"; then
+                    BOLT_CAUSE="BOLT_FAILED: merge-fdata produced no representative profile."
+                fi
+            fi
+        else
+            BOLT_CAUSE="BOLT_SKIPPED: hardware LBR unavailable and merge-fdata missing"
+            gap bolt_lbr_unsupported
+            echo "  reason: $BOLT_CAUSE"
         fi
         if [ -z "$BOLT_CAUSE" ] && run_timed "$VARIANT_TIMEOUT_S" "$LLVM_BOLT" \
             "$AB_BUILD_DIR/release/ab_opt_bench" -o "$AB_BUILD_DIR/release/ab_opt_bench.bolt" \
@@ -284,10 +294,14 @@ EOF
 
 if [ "$BOLT_APPLIED" = 1 ]; then
     FDATA_SHA=$(sha256sum "$PGO_DIR/perf.fdata" 2>/dev/null | awk '{print $1}' || echo "unknown")
-    LBR_SAMPLES=$(perf script -i "$PGO_DIR/perf.data" -F brstack 2>/dev/null | grep -cE '0x[0-9a-fA-F]+/0x[0-9a-fA-F]+' || true)
+    if [ "$LBR" = 1 ]; then
+        LBR_SAMPLES=$(perf script -i "$PGO_DIR/perf.data" -F brstack 2>/dev/null | grep -cE '0x[0-9a-fA-F]+/0x[0-9a-fA-F]+' || true)
+        LBR_MODE="lbr"
+    else
+        LBR_SAMPLES=$(awk 'NF {n++} END {print n+0}' "$PGO_DIR/perf.fdata" 2>/dev/null || echo 0)
+        LBR_MODE="instrumented"
+    fi
     [ -n "$LBR_SAMPLES" ] || LBR_SAMPLES=0
-    LBR_MODE="basic"
-    if [ "$LBR" = 1 ]; then LBR_MODE="lbr"; fi
     cat > "$AB_DIR/ab-opt-bolt-lbr.json" <<EOF
 {
   "samples": $LBR_SAMPLES,

@@ -20,7 +20,7 @@ emit()  {
         printf '%s\n' "$line" >> "$LOG_DIR/summary.txt" 2>/dev/null || { echo "ERROR: cannot append summary.txt" >&2; EMIT_RC=1; }
     fi
 }
-phase() { PHASE_NAME="$1"; CUR_LOG="$LOG_DIR/${SCRIPT_NAME}-${1}.log"; emit "PHASE: $1"; }
+phase() { PHASE_NAME="$1"; CUR_LOG="${2:-$LOG_DIR/${SCRIPT_NAME}-${1}.log}"; : > "$CUR_LOG" 2>/dev/null || true; emit "PHASE: $1"; }
 gap() {
     local p="${PHASE_NAME:-$1}" g="$1"
     if [ $# -ge 2 ]; then p="$1"; g="$2"; fi

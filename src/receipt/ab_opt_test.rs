@@ -226,3 +226,99 @@ fn two_topologies_fails_coverage() {
     let err = evaluate_ceremony(&plain, &pgo, &[], 3, None, None, None).unwrap_err();
     assert!(err.contains("missing topology 'lstm' run 1"));
 }
+
+#[test]
+fn bolt_promoted_over_plain_when_pgo_alone_regresses_on_one_topology() {
+    let mut plain = Vec::new();
+    let mut pgo = Vec::new();
+    let mut bolt = Vec::new();
+    for run in 1..=3 {
+        // wavenet_a1: PGO alone regresses (+0.27% p99), BOLT recovers (-1.94% vs Plain)
+        plain.push(make_run("wavenet_a1", run, 616_698.0, 679_338.0, 589_377.0));
+        pgo.push(make_run("wavenet_a1", run, 618_336.0, 840_996.0, 585_659.0));
+        bolt.push(make_run("wavenet_a1", run, 604_710.0, 788_868.0, 576_965.0));
+
+        // wavenet_a2 and lstm: both PGO and PGO+BOLT beat Plain >= 1.0%
+        plain.push(make_run("wavenet_a2", run, 317_376.0, 333_738.0, 294_510.0));
+        pgo.push(make_run("wavenet_a2", run, 311_598.0, 326_340.0, 289_914.0));
+        bolt.push(make_run("wavenet_a2", run, 308_088.0, 320_706.0, 286_199.0));
+
+        plain.push(make_run("lstm", run, 91_332.0, 99_558.0, 72_373.0));
+        pgo.push(make_run("lstm", run, 84_294.0, 96_300.0, 65_687.0));
+        bolt.push(make_run("lstm", run, 83_304.0, 94_698.0, 64_739.0));
+    }
+
+    let decision = evaluate_ceremony(&plain, &pgo, &bolt, 3, None, None, None).expect("evaluate");
+    assert_eq!(decision.verdict, "PGO+BOLT");
+    assert_eq!(decision.verdict_reason, "bolt_promoted_over_plain");
+    assert!(decision.effective_reproducible_gain);
+    assert!(decision.bolt_reproducible_gain);
+    assert!(decision.rollback.is_empty());
+
+    let a1 = decision
+        .topologies
+        .iter()
+        .find(|t| t.topology == "wavenet_a1")
+        .expect("wavenet_a1");
+    assert!(!a1.pgo_promoted);
+    assert!(a1.bolt_promoted);
+    assert!(a1.bolt_vs_plain_promoted);
+
+    // When PGO+BOLT also fails to beat Plain by >= 1.0%, fallback remains UNOPTIMIZED.
+    let mut bolt_weak = bolt.clone();
+    for r in &mut bolt_weak {
+        if r["topology"] == "wavenet_a1" {
+            r["cycles"]["p99"] = json!(615_000.0);
+        }
+    }
+    let dec_weak =
+        evaluate_ceremony(&plain, &pgo, &bolt_weak, 3, None, None, None).expect("evaluate weak");
+    assert_eq!(dec_weak.verdict, "UNOPTIMIZED");
+    assert_eq!(dec_weak.verdict_reason, "pgo_margin_not_met");
+    assert!(!dec_weak.effective_reproducible_gain);
+    assert!(!dec_weak.bolt_reproducible_gain);
+}
+
+#[test]
+fn per_topology_pmu_gains_isolate_each_topology() {
+    let mut plain = make_suite(100_000.0, 120_000.0, 95_000.0);
+    let mut pgo = make_suite(90_000.0, 110_000.0, 85_000.0);
+    for (runs, itlb_a1, itlb_a2, itlb_lstm) in
+        [(&mut plain, 2u64, 200, 40), (&mut pgo, 250u64, 200, 10)]
+    {
+        for r in runs.iter_mut() {
+            let itlb = match r["topology"].as_str().unwrap() {
+                "wavenet_a1" => itlb_a1,
+                "wavenet_a2" => itlb_a2,
+                _ => itlb_lstm,
+            };
+            r["pmu"] = json!({
+                "cycles": 1_000_000,
+                "instructions": 2_000_000,
+                "itlb_misses": itlb,
+                "icache_misses": 100,
+            });
+            r["pmu_availability"] = json!({
+                "cycles": "ok",
+                "instructions": "ok",
+                "itlb_misses": "ok",
+                "icache_misses": "ok",
+            });
+        }
+    }
+
+    let decision = evaluate_ceremony(&plain, &pgo, &[], 3, None, None, None).expect("evaluate");
+    let topos = decision.doc["topologies"].as_object().expect("topologies");
+    let a1_itlb = topos["wavenet_a1"]["pmu_pgo_gain_pct"]["itlb_misses"]
+        .as_f64()
+        .expect("a1 itlb");
+    let a2_itlb = topos["wavenet_a2"]["pmu_pgo_gain_pct"]["itlb_misses"]
+        .as_f64()
+        .expect("a2 itlb");
+    let lstm_itlb = topos["lstm"]["pmu_pgo_gain_pct"]["itlb_misses"]
+        .as_f64()
+        .expect("lstm itlb");
+    assert!((a1_itlb - 12400.0).abs() < 1e-6);
+    assert!(a2_itlb.abs() < 1e-6);
+    assert!((lstm_itlb - (-75.0)).abs() < 1e-6);
+}
