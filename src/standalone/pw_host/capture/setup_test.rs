@@ -460,7 +460,7 @@ fn neural_rebuild_suppressed_for_mismatched_slot_when_failed_key_matches() {
     ));
 }
 
-// ── Adaptive cadence guard (T2.2) ───────────────────────────────────────────
+// ── Adaptive cadence guard ───────────────────────────────────────────────────
 
 #[test]
 fn adaptive_update_only_on_advanced_measurement_quantum() {

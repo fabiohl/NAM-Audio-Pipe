@@ -1049,7 +1049,7 @@ fn app_state_drop_order_drops_listeners_before_streams() {
     );
 }
 
-// ── T5.2: per-generation capture timestamp and miss classification ───────────
+// ── Per-generation capture timestamp and miss classification ───────────────────
 //
 // A missing bridge block is classified from the capture timestamp of the last
 // delivered generation (plus one quantum period), never from the last global

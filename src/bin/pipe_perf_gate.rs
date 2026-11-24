@@ -45,7 +45,7 @@ fn main() {
         }
     }
 
-    /// Precedence policy (§9 item 33): explicit → first online isolated → first online permitted → GAP.
+    /// Precedence policy: explicit → first online isolated → first online permitted → GAP.
     fn resolve(explicit: Option<&str>) -> Option<u32> {
         if let Some(raw) = explicit
             .map(str::trim)

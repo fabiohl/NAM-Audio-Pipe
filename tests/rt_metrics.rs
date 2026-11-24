@@ -5,7 +5,7 @@
 //! Nanosecond RT metrics harness for the PipeWire host.
 //!
 //! Runs exclusively in `utils/tests-long.sh` (Phases 3/4/5), never in the
-//! default/quick loop (rules/testing.md §1). Three `#[ignore]`d gates, each
+//! default/quick loop. Three `#[ignore]`d gates, each
 //! emitting exactly one typed `TEST_RESULT[...]` marker per run:
 //!
 //! - `rt_deadline_gate_10k_quantums` (filter `deadline`, Phase 3): 10 000
@@ -95,20 +95,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
-/// Number of DSP quantums for the deadline gate (task spec: 10 000).
+/// Number of DSP quantums for the deadline gate (`10 000`).
 const DEADLINE_QUANTUMS: usize = 10_000;
 
-/// Number of callback dispatches for the jitter gate (task spec: 10 000).
+/// Number of callback dispatches for the jitter gate (`10 000`).
 const JITTER_CALLBACKS: usize = 10_000;
 
-/// Safety ceiling for the quantum budget (task spec): 85% of the nominal
+/// Safety ceiling for the quantum budget: 85% of the nominal
 /// block period, absorbing kernel/driver overheads.
 const BUDGET_FACTOR: f64 = 0.85;
 
 /// Wall-clock window for the 16-thread concurrency model-check stress.
 const STRESS_WINDOW: Duration = Duration::from_secs(3);
 
-/// Number of concurrent model-check threads (task spec: 16).
+/// Number of concurrent model-check threads (`16`).
 const MODEL_CHECK_THREADS: usize = 16;
 
 /// Host rates the rate-renegotiation workers may publish; the RT driver
@@ -143,7 +143,7 @@ fn clock_ns(clockid: libc::clockid_t) -> u64 {
 }
 
 /// Reads the current `CLOCK_MONOTONIC_RAW` time in nanoseconds — immune to
-/// NTP adjustments (task spec).
+/// NTP adjustments.
 fn now_ns() -> u64 {
     clock_ns(libc::CLOCK_MONOTONIC_RAW)
 }
@@ -286,7 +286,7 @@ fn prefault_rt_memory() {
     prefault_rt_stack();
 }
 
-/// Builds the harness with the task-spec real load: WaveNet A1 on L, WaveNet
+/// Builds the harness with the real load: WaveNet A1 on L, WaveNet
 /// A2 on R, stereo CabSim active, unity gains. Returns it warm (commands
 /// drained, GC consumed) so the measurement loop starts from steady state.
 fn real_load_harness() -> RtSwapHarness {
@@ -837,7 +837,7 @@ fn rt_deadline_full() {
 /// 10 000 callback dispatches at the nominal period under background
 /// I/O/cache/syscall stress. Measures the inter-callback interval dispersion
 /// (max / p99 / std-dev) and emits the typed PASS marker; without exclusive
-/// CPU affinity the gate reports `GAP:cpu_not_isolated` (task rollback).
+/// CPU affinity the gate reports `GAP:cpu_not_isolated`.
 /// RT jitter and deadline gate: measures absolute wakeup delay (`late_ns = t_k - next`),
 /// detects lost cycles when delay exceeds the nominal quantum period, and records
 /// inter-callback dispatch dispersion as a secondary metric under heavy background contention.
@@ -871,8 +871,7 @@ fn rt_jitter_gate_10k_callbacks() {
     let (sig_l, sig_r) = test_signal_blocks(JITTER_CALLBACKS);
 
     // Background contention: I/O churn, cache thrashing and syscall storms on
-    // the same affinity set as the callback thread (task spec §1: "sob
-    // estresse de threads de I/O em background").
+    // the same affinity set as the callback thread.
     let stop = Arc::new(AtomicBool::new(false));
     let stressers: Vec<_> = (0..6)
         .map(|i| {

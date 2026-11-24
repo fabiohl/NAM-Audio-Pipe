@@ -88,6 +88,7 @@ mod reconnect;
 mod rt_callback;
 pub mod rt_log_ring;
 mod run;
+mod run_lifecycle;
 pub mod spa_format;
 pub mod status;
 pub mod stream_status;

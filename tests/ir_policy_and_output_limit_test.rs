@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Integration tests for S03:
-//! - T03.2: Cabinet IR level policy (`peak-normalized`, `preserved`, `legacy-nam-plugin`)
-//! - T03.3: Optional hardware playback output hard-clamp (`--output-limit off|clamp`)
+//! Integration tests for cabinet IR level policy and playback output limiting:
+//! - Cabinet IR level policy (`peak-normalized`, `preserved`, `legacy-nam-plugin`)
+//! - Optional hardware playback output hard-clamp (`--output-limit off|clamp`)
 //!   preserving float WAV recording untouched.
 
 #![cfg(feature = "testing")]

@@ -14,9 +14,12 @@ mod cabsim_swap;
 mod commands;
 mod os_swap;
 mod process;
+mod prologue;
 mod rate_sync;
+mod recording_tx;
 mod resampler_swap;
 mod slimmable_swap;
+mod spa_contract;
 
 /// Offline RT swap-stress harness, available only under the `testing` feature.
 /// Reproduces the full capture-callback drain sequence with no PipeWire daemon
@@ -33,20 +36,21 @@ pub use commands::{
     drain_os_engines_with_status, drain_slimmable_models, os_swap_drain, receive_commands,
     slimmable_swap_drain, try_slimmable_rebuild,
 };
-#[cfg(not(feature = "testing"))]
-pub(crate) use process::handle_spa_pair_fail_closed;
 #[cfg(test)]
 pub(crate) use process::run_capture_dsp_pipeline;
-pub use process::{PipeCabRuntime, PrologueOutcome, process_dsp_buffer, rt_quantum_prologue};
-#[cfg(feature = "testing")]
-pub use process::{
-    handle_spa_pair_fail_closed, resolve_capture_chunk_window, send_recording_audio,
-};
-pub(crate) use process::{silence_available_datas, stamp_chunk};
+pub use process::{PipeCabRuntime, process_dsp_buffer};
+pub use prologue::{PrologueOutcome, rt_quantum_prologue};
 pub use rate_sync::{RateSyncState, sync_rate};
+#[cfg(feature = "testing")]
+pub use recording_tx::send_recording_audio;
 #[cfg(test)]
 pub use resampler_swap::drain_resamplers;
 pub use resampler_swap::{ResamplerSwapDrain, drain_resamplers_with_status, resampler_swap_drain};
+#[cfg(not(feature = "testing"))]
+pub(crate) use spa_contract::handle_spa_pair_fail_closed;
+#[cfg(feature = "testing")]
+pub use spa_contract::{handle_spa_pair_fail_closed, resolve_capture_chunk_window};
+pub(crate) use spa_contract::{silence_available_datas, stamp_chunk};
 
 /// RT fatal flag raised when a panic is captured inside an RT callback closure.
 ///

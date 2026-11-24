@@ -12,16 +12,21 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
+/// Canonical topology keys evaluated during the A/B optimization ceremony.
 pub const TOPOLOGIES: [&str; 3] = ["wavenet_a1", "wavenet_a2", "lstm"];
+/// Minimum number of interleaved benchmark runs required per variant.
 pub const MIN_RUNS: u64 = 3;
+/// Default promotion margin percentage applied when comparing variant cycles.
 pub const PROMOTION_MARGIN_PCT: f64 = 1.0;
+/// Numerical tolerance floor used for floating-point promotion comparisons.
 pub const MARGIN_EPSILON: f64 = 1e-9;
 
-/// Retained for the receipt only, never used to decide a promotion.
+/// Retained for the receipt schema only; never used to decide a promotion.
 /// A BOLT promotion requires a strict non-tie win plus complete evidence,
 /// independently of this margin.
 pub const BOLT_GAIN_THRESHOLD_PCT_PENDING_PO: f64 = 5.0;
 
+/// Per-run latency and frame count metrics extracted from a variant receipt.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RunMetrics {
     pub p99: f64,
@@ -29,6 +34,7 @@ pub struct RunMetrics {
     pub samples: u64,
 }
 
+/// Validates and extracts [`RunMetrics`] from a serialized benchmark run entry.
 pub fn run_metrics(r: &Value) -> Option<RunMetrics> {
     let cycles = r.get("cycles")?;
     let p99 = cycles.get("p99")?.as_f64()?;
@@ -47,6 +53,7 @@ pub fn run_metrics(r: &Value) -> Option<RunMetrics> {
     Some(RunMetrics { p99, max, samples })
 }
 
+/// Indexes validated run metrics by `(topology, run_index)`, rejecting duplicates or missing values.
 pub fn extract_metrics_map(
     runs: &[Value],
     name: &str,
@@ -77,6 +84,7 @@ pub fn extract_metrics_map(
     Ok(map)
 }
 
+/// Verifies every `(topology, run_index)` pair is present across `TOPOLOGIES` and `1..=runs`.
 pub fn require_full_coverage(
     map: &BTreeMap<(String, u64), RunMetrics>,
     name: &str,
@@ -106,6 +114,7 @@ pub fn require_full_coverage(
     Ok(())
 }
 
+/// Computes the median `(p99, max, mean)` cycle envelope across all run events.
 pub fn envelope(runs: &[Value], name: &str, expected: u64) -> Result<(f64, f64, f64), String> {
     let actual = runs.len() as u64;
     if actual < expected {
@@ -119,6 +128,7 @@ pub fn envelope(runs: &[Value], name: &str, expected: u64) -> Result<(f64, f64, 
     Ok((get("p99")?, get("max")?, get("mean")?))
 }
 
+/// Computes the median of `cycles.<field>` across all provided run entries.
 pub fn median_num(runs: &[Value], field: &str) -> Option<f64> {
     if runs.is_empty() {
         return None;
@@ -134,6 +144,7 @@ pub fn median_num(runs: &[Value], field: &str) -> Option<f64> {
     values.get(values.len() / 2).copied()
 }
 
+/// Computes the median of `cycles.<field>` filtered to a single `topology`.
 pub fn median_topology_num(runs: &[Value], topology: &str, field: &str) -> Option<f64> {
     let mut values: Vec<f64> = runs
         .iter()
@@ -147,10 +158,12 @@ pub fn median_topology_num(runs: &[Value], topology: &str, field: &str) -> Optio
     values.get(values.len() / 2).copied()
 }
 
+/// Returns the rounded median cycle count for `cycles.<field>`.
 pub fn median_cycles(runs: &[Value], field: &str) -> Option<u64> {
     median_num(runs, field).map(|value| value.round() as u64)
 }
 
+/// Computes the median PMU counter `key` for a single `topology` when all runs report availability `"ok"`.
 pub fn median_topology_pmu(runs: &[Value], topology: &str, key: &str) -> Option<u64> {
     let topo_runs: Vec<&Value> = runs
         .iter()
@@ -179,6 +192,7 @@ pub fn median_topology_pmu(runs: &[Value], topology: &str, key: &str) -> Option<
     values.get(values.len() / 2).copied()
 }
 
+/// Computes percentage PMU counter deltas from `from` to `to` for a single `topology`.
 pub fn pmu_gains_topology(from: &[Value], to: &[Value], topology: &str) -> Map<String, Value> {
     let mut map = Map::new();
     for key in ["cycles", "instructions", "itlb_misses", "icache_misses"] {
@@ -189,6 +203,7 @@ pub fn pmu_gains_topology(from: &[Value], to: &[Value], topology: &str) -> Map<S
     map
 }
 
+/// Computes the median PMU counter `key` across runs when all runs report availability `"ok"`.
 pub fn median_pmu(runs: &[Value], key: &str) -> Option<u64> {
     if runs.is_empty() {
         return None;
@@ -213,6 +228,7 @@ pub fn median_pmu(runs: &[Value], key: &str) -> Option<u64> {
     values.get(values.len() / 2).copied()
 }
 
+/// Computes relative percentage change `(new - old) / old * 100.0`.
 pub fn pct(new: Option<f64>, old: Option<f64>) -> Option<f64> {
     let (new, old) = (new?, old?);
     if old == 0.0 {
@@ -221,6 +237,7 @@ pub fn pct(new: Option<f64>, old: Option<f64>) -> Option<f64> {
     Some((new - old) / old * 100.0)
 }
 
+/// Builds the legacy aggregate cycle summary object for a variant's runs.
 pub fn variant_doc(runs: &[Value]) -> Value {
     json!({
         "deprecated": "aggregated across topologies; see 'topologies' for authoritative metrics",
@@ -230,6 +247,7 @@ pub fn variant_doc(runs: &[Value]) -> Value {
     })
 }
 
+/// Computes relative percentage cycle gains (`p99`, `max`, `mean`) from `from` to `to`.
 pub fn gains(from: &[Value], to: &[Value]) -> Map<String, Value> {
     let mut map = Map::new();
     for field in ["p99", "max", "mean"] {
@@ -241,6 +259,7 @@ pub fn gains(from: &[Value], to: &[Value]) -> Map<String, Value> {
     map
 }
 
+/// Computes aggregate relative percentage PMU gains from `from` to `to`.
 pub fn pmu_gains(from: &[Value], to: &[Value]) -> Map<String, Value> {
     let mut map = Map::new();
     for key in ["cycles", "instructions", "itlb_misses", "icache_misses"] {
@@ -251,10 +270,12 @@ pub fn pmu_gains(from: &[Value], to: &[Value]) -> Map<String, Value> {
     map
 }
 
+/// Formats an optional percentage value with two decimal places (or `"n/a"`).
 pub fn fmt(value: Option<f64>) -> String {
     value.map_or_else(|| "n/a".to_string(), |v| format!("{v:.2}%"))
 }
 
+/// Formats an optional numeric metric, trimming `.00` when integral (or `"n/a"`).
 pub fn fmt_num(value: Option<f64>) -> String {
     value.map_or_else(
         || "n/a".to_string(),
@@ -268,6 +289,7 @@ pub fn fmt_num(value: Option<f64>) -> String {
     )
 }
 
+/// Reads and parses JSONL run events for `variant` from `dir`.
 pub fn read_runs(dir: &Path, variant: &str) -> Result<Vec<Value>, String> {
     let mut path = dir.join(format!("ab-opt-{variant}.json"));
     if !path.exists() && variant.contains('+') {
@@ -295,6 +317,7 @@ pub fn read_runs(dir: &Path, variant: &str) -> Result<Vec<Value>, String> {
     Ok(runs)
 }
 
+/// Environment, git, toolchain, and CPU provenance captured for an A/B ceremony.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyProvenance {
     pub git_sha: String,
@@ -313,6 +336,7 @@ pub struct CeremonyProvenance {
 }
 
 impl CeremonyProvenance {
+    /// Serializes provenance metadata into the receipt JSON object schema.
     pub fn to_json(&self) -> Value {
         json!({
             "git_sha": self.git_sha,
@@ -331,6 +355,7 @@ impl CeremonyProvenance {
         })
     }
 
+    /// Parses [`CeremonyProvenance`] from a JSON value if all required fields match.
     pub fn from_json(val: &Value) -> Option<Self> {
         Some(Self {
             git_sha: val.get("git_sha")?.as_str()?.to_string(),
@@ -350,6 +375,7 @@ impl CeremonyProvenance {
     }
 }
 
+/// Hardware LBR profile evidence recorded when BOLT optimization was applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeremonyBoltLbr {
     pub samples: u64,
@@ -358,6 +384,7 @@ pub struct CeremonyBoltLbr {
 }
 
 impl CeremonyBoltLbr {
+    /// Serializes BOLT LBR evidence into JSON.
     pub fn to_json(&self) -> Value {
         json!({
             "samples": self.samples,
@@ -366,6 +393,7 @@ impl CeremonyBoltLbr {
         })
     }
 
+    /// Parses [`CeremonyBoltLbr`] from a JSON value.
     pub fn from_json(val: &Value) -> Option<Self> {
         Some(Self {
             samples: val.get("samples")?.as_u64()?,
@@ -375,6 +403,7 @@ impl CeremonyBoltLbr {
     }
 }
 
+/// Loads cached provenance from `ab-opt-provenance.json` or derives it from the current environment.
 pub fn derive_provenance(dir: &Path, bench_core: Option<&str>) -> CeremonyProvenance {
     let prov_file = dir.join("ab-opt-provenance.json");
     let cached_prov = fs::read_to_string(&prov_file)
@@ -477,6 +506,7 @@ pub fn derive_provenance(dir: &Path, bench_core: Option<&str>) -> CeremonyProven
     }
 }
 
+/// Loads optional BOLT LBR evidence from `ab-opt-bolt-lbr.json` if present.
 pub fn derive_bolt_lbr(dir: &Path) -> Option<CeremonyBoltLbr> {
     let bolt_lbr_file = dir.join("ab-opt-bolt-lbr.json");
     let content = fs::read_to_string(&bolt_lbr_file).ok()?;
@@ -484,6 +514,7 @@ pub fn derive_bolt_lbr(dir: &Path) -> Option<CeremonyBoltLbr> {
     CeremonyBoltLbr::from_json(&val)
 }
 
+/// Per-topology comparison metrics across plain, PGO, and optional PGO+BOLT variants.
 #[derive(Debug, Clone)]
 pub struct TopologyEval {
     pub topology: String,
@@ -508,6 +539,7 @@ pub struct TopologyEval {
     pub bolt_vs_plain_promoted: bool,
 }
 
+/// Final aggregated A/B ceremony verdict, topology evaluations, and serialized JSON receipt.
 #[derive(Debug, Clone)]
 pub struct AbOptDecision {
     pub doc: Map<String, Value>,
@@ -533,6 +565,7 @@ pub struct AbOptDecision {
     pub bolt_lbr: Option<CeremonyBoltLbr>,
 }
 
+/// Evaluates plain, PGO, and optional PGO+BOLT runs to compute promotion gates and the final receipt.
 pub fn evaluate_ceremony(
     plain: &[Value],
     pgo: &[Value],

@@ -25,6 +25,7 @@ pub mod status;
 pub mod summary;
 pub mod transport;
 pub mod wav_header;
+mod writer;
 
 pub use alert::{ALERT_REMINDER_INTERVAL, Alert, AlertKind, Clock, RecordingAlert, SystemClock};
 

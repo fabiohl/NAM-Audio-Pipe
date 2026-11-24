@@ -16,12 +16,13 @@
 
 use nam_audio_pipe::recording;
 use nam_audio_pipe::standalone::banner::{BannerRequest, CabStatus};
+use nam_audio_pipe::standalone::cabinet::InitialCabSetup;
 use nam_audio_pipe::standalone::colors::{self, Colorize};
 use nam_audio_pipe::standalone::{cli, exit, pw_host, rt_setup, setup, signals};
 
 use neural_amp_modeler_rs::SystemSnapshot;
 use neural_amp_modeler_rs::common::diagnostics::logger::{LoggerConfig, NamLogger};
-use neural_amp_modeler_rs::common::spsc::ParamPayload;
+use neural_amp_modeler_rs::common::spsc::{CabSimSwapPayload, ParamPayload};
 use neural_amp_modeler_rs::math::activations::set_activation_tls;
 
 use std::path::PathBuf;
@@ -29,18 +30,27 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-/// Entry point for NAM-Audio-Pipe.
-fn main() -> anyhow::Result<()> {
-    // Install panic hook to capture crash diagnostics
-    neural_amp_modeler_rs::common::panic_hook::install_panic_hook("standalone");
+struct RecordingSetup {
+    data_available: Option<Arc<std::sync::atomic::AtomicBool>>,
+    status: Option<recording::SharedRecordingStatus>,
+    worker: Option<recording::RecordingWorkerGuard>,
+    banner_dir: Option<PathBuf>,
+}
 
-    // Initialize the NamLogger backend (respects RUST_LOG/NAM_LOG_LEVEL; default: info)
+struct LoadedCabinet {
+    ir_raw_samples: Option<Vec<f32>>,
+    ir_source_rate: u32,
+    initial_nam_cab: Option<InitialCabSetup>,
+    status: CabStatus,
+}
+
+fn init_logging() -> (log::LevelFilter, &'static NamLogger) {
     let level_filter = std::env::var("RUST_LOG")
         .or_else(|_| std::env::var("NAM_LOG_LEVEL"))
         .unwrap_or_else(|_| "info".to_string())
         .parse::<log::LevelFilter>()
         .unwrap_or(log::LevelFilter::Info);
-    let _logger = match NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true)) {
+    let logger = match NamLogger::init(LoggerConfig::new(level_filter).with_stderr(true)) {
         Ok(logger) => logger,
         Err(e) => exit::exit_runtime_error(
             exit::ExitKind::Backend,
@@ -49,236 +59,117 @@ fn main() -> anyhow::Result<()> {
              (error, warn, info, debug, trace).",
         ),
     };
+    (level_filter, logger)
+}
 
-    #[cfg(feature = "testing")]
-    if std::env::var("NAM_DISABLE_GATE").as_deref() == Ok("1") {
-        neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE.store(true, Ordering::Relaxed);
-        log::info!("⚡ Noise gate disabled via NAM_DISABLE_GATE environment variable.");
-    }
-
-    // 1. READ CONFIGURATIONS: The system starts by reading what you typed in the terminal.
-    // It figures out which "amplifier" file (.nam) you want to use and the initial volumes.
-    // The color policy is resolved from the environment before any output (help,
-    // errors, logs); an explicit `--color` flag parsed below overrides it.
-    colors::init_from_env();
-    let args = cli::parse_args();
-
-    let calibration_config = args.calibration_config();
-    let output_mode_explicit = args.output_mode_explicit;
-    let model_path = args.model_path;
-    let initial_in_gain = args.input_gain;
-    let initial_out_gain = args.output_gain;
-    let buffer_size = args.buffer_size;
-
-    // 1.1. IMMEDIATE DIAGNOSTIC EXITS: If the user requested an immediate diagnostic dump,
-    // initialise PipeWire just long enough to read the library version string (a pure C
-    // symbol — no daemon socket needed), emit the bundle, deinit, and exit 0.
-    //
-    // This branch intentionally runs before the main `pipewire::init()` below so that
-    // `--diagnose` works in sandboxed environments (e.g. `flatpak build-run`) where the
-    // PipeWire socket is not available and a full `pw_init()` would abort or return an error.
-    if args.diagnose || args.diagnose_full {
-        pipewire::init();
-        // PipeWire logging is deliberately NOT installed here: `--diagnose`
-        // must emit a clean structured bundle. Installing the RT log ring
-        // would allocate ~344 KiB, spawn the `nam-pw-log-drain` thread and
-        // inject asynchronous `libpipewire` messages into the diagnostic
-        // output before the CLI resolves. The main audio path installs it below.
-        neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
-            "nam-audio-pipe {} / {}",
-            env!("CARGO_PKG_VERSION"),
-            pw_host::identity::pw_library_version()
-        ));
-        let bundle =
-            neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(args.diagnose_full);
-        // `write_stdout` tolerates a closed pipe (e.g. `--diagnose | head`) instead
-        // of panicking like `println!`.
-        cli::write_stdout(&format!("{}\n", bundle.render()));
-        // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
-        // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
-        // `exit(0)` and is mutually exclusive with the main audio host run loop below.
-        unsafe {
-            pipewire::deinit();
-        }
-        // The `.desktop` "Diagnostics" action passes `--pause` so the
-        // launcher's terminal stays open long enough to read the support block.
-        // The helper requires both stdin and stdout to be terminals, so a
-        // redirected stdin can never block automation on an unread read.
-        if args.pause {
-            nam_audio_pipe::standalone::launcher::pause_if_interactive();
-        }
-        std::process::exit(0);
-    }
-
-    // 2. PREPARE THE AUDIO: Initialize PipeWire (the Linux sound system)
-    // and calibrate internal "clocks" to ensure sound output without delays (latency).
+fn run_diagnose_and_exit(diagnose_full: bool, pause: bool) -> ! {
     pipewire::init();
-    pw_host::init_pipewire_logging(level_filter);
+    // PipeWire logging is deliberately NOT installed here: `--diagnose`
+    // must emit a clean structured bundle without asynchronous libpipewire logs.
     neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
         "nam-audio-pipe {} / {}",
         env!("CARGO_PKG_VERSION"),
         pw_host::identity::pw_library_version()
     ));
+    let bundle = neural_amp_modeler_rs::DiagnosticBundle::capture().with_full(diagnose_full);
+    cli::write_stdout(&format!("{}\n", bundle.render()));
+    // SAFETY: `pipewire::init()` was called immediately before capturing diagnostics
+    // on this early-exit branch (`diagnose_bundle`). This branch terminates the process via
+    // `exit(0)` and is mutually exclusive with the main audio host run loop below.
+    unsafe {
+        pipewire::deinit();
+    }
+    if pause {
+        nam_audio_pipe::standalone::launcher::pause_if_interactive();
+    }
+    std::process::exit(0);
+}
 
-    rt_setup::calibrate_tsc();
-
-    // 2.5 CPU AFFINITY RECEIPT (single computation, shared by every consumer).
-    // Selects the RT core (or honors `--cpu`) and derives the housekeeping set.
-    // The receipt is applied de facto from here on — the main control
-    // loop thread is pinned to the housekeeping set below, the recording
-    // worker pins itself at spawn, the PipeWire thread-loop thread pins via
-    // its event source and the RT data thread keeps `configure_realtime_thread`.
-    let Some(cpu_receipt) = rt_setup::select_optimal_cpu_with_receipt(args.cpu) else {
-        exit::exit_runtime_error(
-            exit::ExitKind::Backend,
-            "CPU selection did not produce a receipt.",
-            "Re-run with --diagnose to inspect the CPU topology; the audio host \
-             cannot start without an RT-core decision.",
-        );
+fn load_cabinet_or_exit(
+    args: &cli::CliArgs,
+    cabsim_producer: &mut rtrb::Producer<Box<CabSimSwapPayload>>,
+    cab_nam_producer: &mut rtrb::Producer<nam_audio_pipe::standalone::cabinet::PipeCabNamPayload>,
+    sys: &SystemSnapshot,
+) -> LoadedCabinet {
+    let loaded = match setup::load_initial_cabinet(
+        args.cab_path.as_deref(),
+        args.cabsim_partition,
+        args.cab_optional,
+        args.ir_level_policy,
+        cabsim_producer,
+        cab_nam_producer,
+        sys,
+    ) {
+        Ok(Some(InitialCabSetup::WavIr {
+            raw_samples,
+            source_rate,
+            ..
+        })) => LoadedCabinet {
+            ir_raw_samples: Some(raw_samples),
+            ir_source_rate: source_rate,
+            initial_nam_cab: None,
+            status: CabStatus::Asset {
+                kind: "WAV",
+                bypassed: args.cab_bypass,
+            },
+        },
+        Ok(Some(setup @ InitialCabSetup::Nam { kind, .. })) => LoadedCabinet {
+            ir_raw_samples: None,
+            ir_source_rate: 0,
+            initial_nam_cab: Some(setup),
+            status: CabStatus::Asset {
+                kind: kind.badge(),
+                bypassed: args.cab_bypass,
+            },
+        },
+        Ok(None) => LoadedCabinet {
+            ir_raw_samples: None,
+            ir_source_rate: 0,
+            initial_nam_cab: None,
+            status: if args.cab_path.is_some() {
+                CabStatus::SkippedOptional
+            } else {
+                CabStatus::Absent
+            },
+        },
+        Err(e) => exit::exit_runtime_error(
+            exit::ExitKind::CabIr,
+            format!("{e:#}"),
+            "The cabinet asset could not be loaded. Verify it is a valid .wav IR or a \
+             1-in/1-out .nam/.namb cabinet model without post-stack head, or pass \
+             --cab-optional to continue without cabinet.",
+        ),
     };
-    // The main thread runs the control loop, GC drains, handlers and
-    // telemetry — pure housekeeping work. Pin it away from the RT core so the
-    // DSP data thread stays exclusive. A kernel rejection is logged inside the
-    // helper and is a non-fatal optimization loss.
-    let _ = rt_setup::apply_housekeeping_affinity(&cpu_receipt.housekeeping_cpus);
-
-    // 3. KNOW THE COMPUTER: Captures a "snapshot" of your processor's capabilities.
-    // This helps NAM-Audio-Pipe choose the fastest way to process the audio math.
-    let sys = SystemSnapshot::capture();
-    log::info!(
-        "🎸 {}",
-        format!(
-            "NAM-Audio-Pipe v{} (engine v{}) [x86-64-v3] — Neural Amp Modeler",
-            env!("CARGO_PKG_VERSION"),
-            sys.version
-        )
-        .bright_green()
-        .bold()
-    );
-
-    // 4. EMERGENCY BUTTON: Configures "Ctrl+C" (SIGINT), service shutdown
-    // (SIGTERM), terminal hang-up (SIGHUP) and quit (SIGQUIT). The staged handler
-    // in `standalone::signals` is async-signal-safe: the first signal cooperatively
-    // sets the process-global `SHUTDOWN` flag so the main loop stops the audio
-    // cleanly (thread_loop.stop, recording drain, WAV header rewrite + fsync);
-    // further signals inside the grace window (500 ms, widened to 5 s while a
-    // recording is active) are swallowed (exactly one graceful shutdown), and
-    // only a signal after the window expires force-exits via `_exit(1)`.
-    // Installation validates every `libc::sigaction` return code.
-    signals::install_termination_signal_handlers()?;
-
-    // 5. COMMUNICATION CHANNELS: Creates ultra-fast "pipes" for communication.
-    let channels = setup::setup_communication_channels()?;
-    let mut producer = channels.param_producer;
-    let consumer = channels.param_consumer;
-    let gc_producer = channels.gc_producer;
-    let gc_consumer = channels.gc_consumer;
-    let gc_overflow = channels.gc_overflow;
-    let resampler_producer = channels.resampler_producer;
-    let resampler_consumer = channels.resampler_consumer;
-    let mut cabsim_producer = channels.cabsim_producer;
-    let cabsim_consumer = channels.cabsim_consumer;
-    let slimmable_producer = channels.slimmable_producer;
-    let slimmable_consumer = channels.slimmable_consumer;
-    let os_producer = channels.os_producer;
-    let os_consumer = channels.os_consumer;
-    let rt_status = channels.rt_status;
-
-    // 6. LOAD THE MODEL: If a model path was provided, open the .nam file,
-    // parse architecture & metadata, and push it to the audio thread.
-    let model_setup = setup::load_initial_model(
-        model_path.as_deref(),
-        &sys,
-        calibration_config,
-        output_mode_explicit,
-        &mut producer,
-    );
-    let full_wavenet_model_l = model_setup.full_wavenet_model_l;
-    let full_wavenet_model_r = model_setup.full_wavenet_model_r;
-    let has_model_r = model_setup.has_model_r;
-    let model_architecture = model_setup.architecture;
-
-    // 7. LOAD THE CABINET SLOT: accepts .wav IRs (UPOLS) or 1-in/1-out .nam/.namb
-    // neural cabinets (unity gain, zero amp calibration or IR policy leakage).
-    let (mut cab_nam_producer, cab_nam_consumer) =
-        rtrb::RingBuffer::<nam_audio_pipe::standalone::cabinet::PipeCabNamPayload>::new(8);
-    let (ir_raw_samples, ir_source_rate, initial_nam_cab, cab_status) =
-        match setup::load_initial_cabinet(
-            args.cab_path.as_deref(),
-            args.cabsim_partition,
-            args.cab_optional,
-            args.ir_level_policy,
-            &mut cabsim_producer,
-            &mut cab_nam_producer,
-            &sys,
-        ) {
-            Ok(Some(nam_audio_pipe::standalone::cabinet::InitialCabSetup::WavIr {
-                raw_samples,
-                source_rate,
-                ..
-            })) => (
-                Some(raw_samples),
-                source_rate,
-                None,
-                CabStatus::Asset {
-                    kind: "WAV",
-                    bypassed: args.cab_bypass,
-                },
-            ),
-            Ok(Some(
-                setup @ nam_audio_pipe::standalone::cabinet::InitialCabSetup::Nam { kind, .. },
-            )) => (
-                None,
-                0,
-                Some(setup),
-                CabStatus::Asset {
-                    kind: kind.badge(),
-                    bypassed: args.cab_bypass,
-                },
-            ),
-            Ok(None) => (
-                None,
-                0,
-                None,
-                if args.cab_path.is_some() {
-                    CabStatus::SkippedOptional
-                } else {
-                    CabStatus::Absent
-                },
-            ),
-            Err(e) => exit::exit_runtime_error(
-                exit::ExitKind::CabIr,
-                format!("{e:#}"),
-                "The cabinet asset could not be loaded. Verify it is a valid .wav IR or a \
-                 1-in/1-out .nam/.namb cabinet model without post-stack head, or pass \
-                 --cab-optional to continue without cabinet.",
-            ),
-        };
     if args.cab_bypass {
         log::info!(
             "{} Cabinet stage starts BYPASSED (--cab-bypass; loaded asset & constant latency preserved)",
             "⏸".yellow()
         );
     }
+    loaded
+}
 
-    // Initial gains
-    if initial_in_gain != 0.0 {
+fn push_initial_parameters(
+    producer: &mut rtrb::Producer<ParamPayload>,
+    args: &cli::CliArgs,
+    model_architecture: &str,
+) {
+    if args.input_gain != 0.0 {
         let _ = producer.push(ParamPayload::InputGain(
             neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut()
-                .db_to_linear(initial_in_gain),
+                .db_to_linear(args.input_gain),
         ));
     }
-    if initial_out_gain != 0.0 {
+    if args.output_gain != 0.0 {
         let _ = producer.push(ParamPayload::OutputGain(
             neural_amp_modeler_rs::math::dsp::gain_lut::get_gain_lut()
-                .db_to_linear(initial_out_gain),
+                .db_to_linear(args.output_gain),
         ));
     }
 
     let _ = producer.push(ParamPayload::SlimOverride(args.slim_override));
     let _ = producer.push(ParamPayload::SetOversample(args.oversample));
 
-    // Apply activation precision mode before any audio processing if explicitly overridden by the user
     if let Some(activation) = args.activation {
         set_activation_tls(activation);
         log::info!(
@@ -299,244 +190,118 @@ fn main() -> anyhow::Result<()> {
             );
         }
     }
+}
 
-    // Process-wide settings (THP disable + mlockall) before starting PipeWire.
-    // Executed here (outside the cold-path of the first DSP frame) to avoid
-    // syscalls that would cause jitter at the critical moment of the first audio delivery.
-    rt_setup::configure_process_wide();
-
-    // Create the recording transport (promoted preallocated-pool + control
-    // ring, or the inline ring behind RECORDING_POOL_TRANSPORT) and spawn
-    // the disk I/O thread (opt-in via --record). The startup handshake
-    // is a hard fail-fast gate: PipeWire is only started
-    // with `--record` after the worker confirms io_uring is up and the output
-    // directory is writable — an invalid directory or an unavailable io_uring
-    // aborts the process here instead of silently discarding all audio into
-    // the transport.
-    //
-    // The worker thread, the transport sender (the stop channel) and the RT
-    // failure flag are handed to a `RecordingWorkerGuard`:
-    // RAII custody guarantees the worker is signalled and joined with a
-    // bounded timeout even if the PipeWire host returns early via `?`, and the
-    // guard's shutdown outcome propagates recording failures into the process
-    // exit code.
-    let mut banner_recording_dir: Option<PathBuf> = None;
-    let (recording_data_available, recording_status, recording_worker) = if args.record {
-        let (sender, receiver) = recording::create_recording_transport();
-        let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_for_thread = Arc::clone(&data_available);
-
-        let recording_status: recording::SharedRecordingStatus =
-            Arc::new(Mutex::new(recording::RecordingStatus::Starting));
-        let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let failed_for_thread = Arc::clone(&failed_flag);
-        let (init_tx, init_rx) = tokio::sync::oneshot::channel();
-        // Resolve the capture directory (--record-dir → XDG music →
-        // ~/Music → CWD) and create it eagerly; the worker's probe stays the
-        // fail-fast gate that reports EROFS/EACCES with an actionable hint.
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (base_dir, cwd_fallback) = cli::resolve_record_dir(
-            args.record_dir.as_deref(),
-            std::env::var_os("XDG_MUSIC_DIR").as_deref(),
-            std::env::var_os("HOME").as_deref(),
-            &cwd,
-        );
-        if cwd_fallback {
-            log::warn!(
-                "Neither $XDG_MUSIC_DIR nor $HOME is set; recording into the \
-                 current directory: {} (use --record-dir to override).",
-                base_dir.display()
-            );
-        }
-        if let Err(e) = std::fs::create_dir_all(&base_dir) {
-            exit::exit_runtime_error(
-                exit::ExitKind::Recording,
-                format!(
-                    "Failed to create the recording directory {}: {e}",
-                    base_dir.display()
-                ),
-                "Check that the path is writable (read-only mount? permissions?) \
-                 and that its parent directory exists, or pass --record-dir <DIR>.",
-            );
-        }
-        log::info!("💾 Recording directory: {}", base_dir.display());
-        banner_recording_dir = Some(base_dir.clone());
-        let init = recording::RecordingInit::new(
-            recording_status.clone(),
-            init_tx,
-            failed_for_thread,
-            base_dir,
-        );
-
-        // The JoinHandle is retained by the guard and formally joined (bounded)
-        // during shutdown so the WAV header is finalized before PipeWire is
-        // deinitialized and recording failures surface as a non-zero exit.
-        // The worker pins itself to the housekeeping set at spawn
-        // (empty set = documented no-op for tests).
-        let housekeeping_for_worker = cpu_receipt.housekeeping_cpus.clone();
-        let io_handle = match recording::spawn_recording_worker(
-            receiver,
-            Some(flag_for_thread),
-            init,
-            housekeeping_for_worker,
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                log::error!("🛑 Failed to spawn recording worker: {e}");
-                exit::exit_runtime_error(
-                    exit::ExitKind::Recording,
-                    format!("Failed to spawn recording worker: {e}"),
-                    "The recording disk-I/O thread could not be created. Check the \
-                     process/thread limit (`ulimit -u`) and available memory, then retry.",
-                );
-            }
+fn setup_recording(args: &cli::CliArgs, housekeeping_cpus: &[usize]) -> RecordingSetup {
+    if !args.record {
+        return RecordingSetup {
+            data_available: None,
+            status: None,
+            worker: None,
+            banner_dir: None,
         };
+    }
 
-        // Fail-fast handshake: never start PipeWire with `--record` until the worker
-        // confirms readiness (io_uring + writable output dir). On failure or timeout,
-        // abort before any audio stream is connected.
-        match recording::wait_for_recording_init(init_rx, recording::RECORDING_INIT_TIMEOUT) {
-            Ok(dir) => {
-                log::info!(
-                    "🎙️  Recording worker ready — capture directory: {}",
-                    dir.display()
-                );
-                // A recording is in flight: widen the termination grace window so
-                // a second Ctrl+C arriving while the capture is drained, its
-                // header rewritten and `fsync`ed is swallowed instead of
-                // force-exiting mid-finalization. The worker guard
-                // disarms the window when shutdown completes.
-                signals::arm_recording_grace_window();
-            }
-            Err(e) => {
-                log::error!("🛑 Recording startup FAILED: {e}");
-                exit::exit_runtime_error(
-                    exit::ExitKind::Recording,
-                    format!("Recording startup FAILED: {e}"),
-                    "Verify the capture directory is writable (pass --record-dir <DIR>), \
-                     that it has free space, and that the kernel allows io_uring \
-                     (`/proc/sys/kernel/io_uring_disabled`).",
-                );
-            }
-        }
+    let (sender, receiver) = recording::create_recording_transport();
+    let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_for_thread = Arc::clone(&data_available);
 
-        (
-            Some(data_available),
-            Some(recording_status),
-            Some(recording::RecordingWorkerGuard::new(
-                io_handle,
-                Some(sender),
-                Some(failed_flag),
-            )),
-        )
-    } else {
-        (None, None, None)
-    };
+    let recording_status: recording::SharedRecordingStatus =
+        Arc::new(Mutex::new(recording::RecordingStatus::Starting));
+    let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failed_for_thread = Arc::clone(&failed_flag);
+    let (init_tx, init_rx) = tokio::sync::oneshot::channel();
 
-    // Run the PipeWire host (blocking)
-    // The static banner facts (model, cab-sim state, capture dir) are
-    // resolved here; the host loop adds the runtime facts from `rt_status` and
-    // emits one consolidated status banner after the first RT confirmations.
-    let banner_request = BannerRequest {
-        model_arch: if model_architecture.is_empty() {
-            None
-        } else {
-            Some(model_architecture)
-        },
-        cab: cab_status,
-        recording_dir: banner_recording_dir,
-    };
-    let res = pw_host::run_pipewire_host_with_cabinet(
-        consumer,
-        gc_producer,
-        gc_overflow,
-        resampler_consumer,
-        resampler_producer,
-        cabsim_consumer,
-        cabsim_producer,
-        rt_status,
-        pw_host::PipewireHostConfig {
-            buffer_size,
-            cabsim_partition: args.cabsim_partition,
-            sys,
-            ir_raw_samples,
-            ir_source_rate,
-            full_wavenet_model_l,
-            full_wavenet_model_r,
-            has_model_r,
-            slimmable_producer,
-            os_producer,
-            oversample: args.oversample,
-            cpu_receipt,
-            fail_fast: args.fail_fast,
-            reconnect_timeout: args.reconnect_timeout,
-            gate_config: args.gate,
-            gate_mode: args.gate_mode,
-            stream_status: None,
-            recording_status: recording_status.clone(),
-            banner: banner_request,
-            activation: args
-                .activation
-                .unwrap_or(neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard),
-            ir_level_policy: args.ir_level_policy,
-            output_limit: args.output_limit,
-        },
-        gc_consumer,
-        slimmable_consumer,
-        os_consumer,
-        recording_data_available,
-        recording_worker,
-        pw_host::HostCabinetOptions {
-            initial_nam_cab,
-            cab_nam_channels: Some((cab_nam_producer, cab_nam_consumer)),
-            cab_bypass: args.cab_bypass,
-        },
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (base_dir, cwd_fallback) = cli::resolve_record_dir(
+        args.record_dir.as_deref(),
+        std::env::var_os("XDG_MUSIC_DIR").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+        &cwd,
+    );
+    if cwd_fallback {
+        log::warn!(
+            "Neither $XDG_MUSIC_DIR nor $HOME is set; recording into the \
+             current directory: {} (use --record-dir to override).",
+            base_dir.display()
+        );
+    }
+    if let Err(e) = std::fs::create_dir_all(&base_dir) {
+        exit::exit_runtime_error(
+            exit::ExitKind::Recording,
+            format!(
+                "Failed to create the recording directory {}: {e}",
+                base_dir.display()
+            ),
+            "Check that the path is writable (read-only mount? permissions?) \
+             and that its parent directory exists, or pass --record-dir <DIR>.",
+        );
+    }
+    log::info!("💾 Recording directory: {}", base_dir.display());
+    let banner_dir = Some(base_dir.clone());
+    let init = recording::RecordingInit::new(
+        recording_status.clone(),
+        init_tx,
+        failed_for_thread,
+        base_dir,
     );
 
-    log::info!("{} Shutting down NAM-Audio-Pipe...", "🔌".yellow());
-
-    // Final observable state of the recording worker: Stopped
-    // on a clean drain, Failed if a fatal error suspended the recording.
-    if let Some(status) = &recording_status
-        && let Ok(guard) = status.lock()
-    {
-        log::info!("Recording status at exit: {guard:?}");
-    }
-
-    // Signal shutdown to bypass panic hook during cleanup
-    neural_amp_modeler_rs::common::panic_hook::set_shutdown_in_progress();
-
-    pw_host::restore_pipewire_logging();
-    // SAFETY: `pipewire::init()` was called during startup for the audio host run loop.
-    // The host loop, worker threads, and streams have completed teardown before this point.
-    // This `deinit` executes exactly once on the normal host shutdown path (mutually exclusive
-    // with the early-exit `diagnose_bundle` branch above).
-    unsafe {
-        pipewire::deinit();
-    }
-    let recording_outcome = match res {
-        Ok(outcome) => outcome,
-        // A fatal backend failure surfaced by the host
-        // (PipeWire daemon crash/restart, stream Error, post-streaming
-        // disconnect) becomes the classified `Backend` process exit (code 5);
-        // the process never exits 0 after losing the audio backend.
+    let io_handle = match recording::spawn_recording_worker(
+        receiver,
+        Some(flag_for_thread),
+        init,
+        housekeeping_cpus.to_vec(),
+    ) {
+        Ok(h) => h,
         Err(e) => {
-            log::error!("🛑 PipeWire backend terminated with an error: {e:#}");
+            log::error!("🛑 Failed to spawn recording worker: {e}");
             exit::exit_runtime_error(
-                exit::ExitKind::Backend,
-                format!("{e:#}"),
-                exit::BACKEND_UNREACHABLE_HINT,
+                exit::ExitKind::Recording,
+                format!("Failed to spawn recording worker: {e}"),
+                "The recording disk-I/O thread could not be created. Check the \
+                 process/thread limit (`ulimit -u`) and available memory, then retry.",
             );
         }
     };
 
-    // Propagate recording failures into the process exit code:
-    // a worker error, a panic or a join timeout must never masquerade as a
-    // successful run — scripts and automation rely on the non-zero exit.
-    // A recording that completed but lost audio blocks to ring overruns is
-    // likewise a non-zero exit: `SuccessWithLoss` never masquerades as a lossless capture.
-    match recording_outcome {
-        None | Some(recording::RecordingWorkerOutcome::Success) => {}
+    match recording::wait_for_recording_init(init_rx, recording::RECORDING_INIT_TIMEOUT) {
+        Ok(dir) => {
+            log::info!(
+                "🎙️  Recording worker ready — capture directory: {}",
+                dir.display()
+            );
+            signals::arm_recording_grace_window();
+        }
+        Err(e) => {
+            log::error!("🛑 Recording startup FAILED: {e}");
+            exit::exit_runtime_error(
+                exit::ExitKind::Recording,
+                format!("Recording startup FAILED: {e}"),
+                "Verify the capture directory is writable (pass --record-dir <DIR>), \
+                 that it has free space, and that the kernel allows io_uring \
+                 (`/proc/sys/kernel/io_uring_disabled`).",
+            );
+        }
+    }
+
+    RecordingSetup {
+        data_available: Some(data_available),
+        status: Some(recording_status),
+        worker: Some(recording::RecordingWorkerGuard::new(
+            io_handle,
+            Some(sender),
+            Some(failed_flag),
+        )),
+        banner_dir,
+    }
+}
+
+fn exit_with_recording_outcome(outcome: Option<recording::RecordingWorkerOutcome>) -> ! {
+    match outcome {
+        None | Some(recording::RecordingWorkerOutcome::Success) => {
+            log::info!("{} NAM-Audio-Pipe terminated. 🎸", "✅".green());
+            std::process::exit(0);
+        }
         Some(outcome @ recording::RecordingWorkerOutcome::SuccessWithLoss { blocks, frames }) => {
             log::error!(
                 "🛑 Recording completed with lost audio: {blocks} block(s) / \
@@ -565,6 +330,167 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(outcome.exit_code());
         }
     }
-    log::info!("{} NAM-Audio-Pipe terminated. 🎸", "✅".green());
-    std::process::exit(0);
+}
+
+/// Entry point for NAM-Audio-Pipe.
+fn main() -> anyhow::Result<()> {
+    neural_amp_modeler_rs::common::panic_hook::install_panic_hook("standalone");
+    let (level_filter, _logger) = init_logging();
+
+    #[cfg(feature = "testing")]
+    if std::env::var("NAM_DISABLE_GATE").as_deref() == Ok("1") {
+        neural_amp_modeler_rs::dsp::pipeline::DISABLE_GATE.store(true, Ordering::Relaxed);
+        log::info!("⚡ Noise gate disabled via NAM_DISABLE_GATE environment variable.");
+    }
+
+    colors::init_from_env();
+    let args = cli::parse_args();
+
+    if args.diagnose || args.diagnose_full {
+        run_diagnose_and_exit(args.diagnose_full, args.pause);
+    }
+
+    pipewire::init();
+    pw_host::init_pipewire_logging(level_filter);
+    neural_amp_modeler_rs::common::diagnostics::set_host_library_version(format!(
+        "nam-audio-pipe {} / {}",
+        env!("CARGO_PKG_VERSION"),
+        pw_host::identity::pw_library_version()
+    ));
+
+    rt_setup::calibrate_tsc();
+
+    let Some(cpu_receipt) = rt_setup::select_optimal_cpu_with_receipt(args.cpu) else {
+        exit::exit_runtime_error(
+            exit::ExitKind::Backend,
+            "CPU selection did not produce a receipt.",
+            "Re-run with --diagnose to inspect the CPU topology; the audio host \
+             cannot start without an RT-core decision.",
+        );
+    };
+    let _ = rt_setup::apply_housekeeping_affinity(&cpu_receipt.housekeeping_cpus);
+
+    let sys = SystemSnapshot::capture();
+    log::info!(
+        "🎸 {}",
+        format!(
+            "NAM-Audio-Pipe v{} (engine v{}) [x86-64-v3] — Neural Amp Modeler",
+            env!("CARGO_PKG_VERSION"),
+            sys.version
+        )
+        .bright_green()
+        .bold()
+    );
+
+    signals::install_termination_signal_handlers()?;
+
+    let channels = setup::setup_communication_channels()?;
+    let mut producer = channels.param_producer;
+    let mut cabsim_producer = channels.cabsim_producer;
+
+    let model_setup = setup::load_initial_model(
+        args.model_path.as_deref(),
+        &sys,
+        args.calibration_config(),
+        args.output_mode_explicit,
+        &mut producer,
+    );
+
+    let (mut cab_nam_producer, cab_nam_consumer) =
+        rtrb::RingBuffer::<nam_audio_pipe::standalone::cabinet::PipeCabNamPayload>::new(8);
+    let cabinet = load_cabinet_or_exit(&args, &mut cabsim_producer, &mut cab_nam_producer, &sys);
+
+    push_initial_parameters(&mut producer, &args, &model_setup.architecture);
+
+    rt_setup::configure_process_wide();
+
+    let rec = setup_recording(&args, &cpu_receipt.housekeeping_cpus);
+
+    let banner_request = BannerRequest {
+        model_arch: if model_setup.architecture.is_empty() {
+            None
+        } else {
+            Some(model_setup.architecture)
+        },
+        cab: cabinet.status,
+        recording_dir: rec.banner_dir,
+    };
+    let res = pw_host::run_pipewire_host_with_cabinet(
+        channels.param_consumer,
+        channels.gc_producer,
+        channels.gc_overflow,
+        channels.resampler_consumer,
+        channels.resampler_producer,
+        channels.cabsim_consumer,
+        cabsim_producer,
+        channels.rt_status,
+        pw_host::PipewireHostConfig {
+            buffer_size: args.buffer_size,
+            cabsim_partition: args.cabsim_partition,
+            sys,
+            ir_raw_samples: cabinet.ir_raw_samples,
+            ir_source_rate: cabinet.ir_source_rate,
+            full_wavenet_model_l: model_setup.full_wavenet_model_l,
+            full_wavenet_model_r: model_setup.full_wavenet_model_r,
+            has_model_r: model_setup.has_model_r,
+            slimmable_producer: channels.slimmable_producer,
+            os_producer: channels.os_producer,
+            oversample: args.oversample,
+            cpu_receipt,
+            fail_fast: args.fail_fast,
+            reconnect_timeout: args.reconnect_timeout,
+            gate_config: args.gate,
+            gate_mode: args.gate_mode,
+            stream_status: None,
+            recording_status: rec.status.clone(),
+            banner: banner_request,
+            activation: args
+                .activation
+                .unwrap_or(neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard),
+            ir_level_policy: args.ir_level_policy,
+            output_limit: args.output_limit,
+        },
+        channels.gc_consumer,
+        channels.slimmable_consumer,
+        channels.os_consumer,
+        rec.data_available,
+        rec.worker,
+        pw_host::HostCabinetOptions {
+            initial_nam_cab: cabinet.initial_nam_cab,
+            cab_nam_channels: Some((cab_nam_producer, cab_nam_consumer)),
+            cab_bypass: args.cab_bypass,
+        },
+    );
+
+    log::info!("{} Shutting down NAM-Audio-Pipe...", "🔌".yellow());
+
+    if let Some(status) = &rec.status
+        && let Ok(guard) = status.lock()
+    {
+        log::info!("Recording status at exit: {guard:?}");
+    }
+
+    neural_amp_modeler_rs::common::panic_hook::set_shutdown_in_progress();
+
+    pw_host::restore_pipewire_logging();
+    // SAFETY: `pipewire::init()` was called during startup for the audio host run loop.
+    // The host loop, worker threads, and streams have completed teardown before this point.
+    // This `deinit` executes exactly once on the normal host shutdown path (mutually exclusive
+    // with the early-exit `diagnose_bundle` branch above).
+    unsafe {
+        pipewire::deinit();
+    }
+    let recording_outcome = match res {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            log::error!("🛑 PipeWire backend terminated with an error: {e:#}");
+            exit::exit_runtime_error(
+                exit::ExitKind::Backend,
+                format!("{e:#}"),
+                exit::BACKEND_UNREACHABLE_HINT,
+            );
+        }
+    };
+
+    exit_with_recording_outcome(recording_outcome);
 }

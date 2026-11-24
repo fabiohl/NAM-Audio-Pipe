@@ -18,8 +18,11 @@ use std::path::{Path, PathBuf};
 //   `MAX_BRIDGE_BUF`, both 8192 in `neural_amp_modeler_rs::dsp::pipeline`),
 //   so no `--buffer-size` value can drive an out-of-bounds access or an
 //   over-allocation panic downstream (latency, CabSim partition, FFT).
+/// Auto-negotiation sentinel for `--buffer-size` (`0` omits `node.latency` so PipeWire picks the quantum).
 pub const BUFFER_SIZE_AUTO: u32 = 0;
+/// Minimum explicit PipeWire buffer size in samples (`--buffer-size`).
 pub const BUFFER_SIZE_MIN: u32 = 16;
+/// Maximum explicit PipeWire buffer size in samples (`--buffer-size`), matching engine bridge capacity.
 pub const BUFFER_SIZE_MAX: u32 = 8192;
 
 // Domain contract for `--cabsim-partition`.
@@ -36,7 +39,9 @@ pub const BUFFER_SIZE_MAX: u32 = 8192;
 // The policy is decoupled from the host quantum (`--buffer-size`): the
 // block-agnostic `process_block` driver chunks any quantum against the fixed
 // partition, so the latency no longer tracks the PipeWire buffer size.
+/// Default UPOLS cabinet partition size in samples (`--cabsim-partition`).
 pub const CABSIM_PARTITION_DEFAULT: u32 = 128;
+/// Allowed UPOLS cabinet partition sizes in samples (`--cabsim-partition`).
 pub const CABSIM_PARTITION_ALLOWED: [u32; 4] = [32, 64, 128, 256];
 
 /// Structured rejection reason for an out-of-domain `--cabsim-partition`

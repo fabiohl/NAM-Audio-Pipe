@@ -15,6 +15,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+/// Machine-readable build receipt capturing git provenance, engine pin, optimizations, and artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BuildReceipt {
@@ -33,6 +34,7 @@ pub struct BuildReceipt {
     pub artifacts: BuildArtifacts,
 }
 
+/// Package name and semantic version recorded in [`BuildReceipt`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PackageInfo {
@@ -40,6 +42,7 @@ pub struct PackageInfo {
     pub version: String,
 }
 
+/// Repository, lockfile, toolchain, and run identifier provenance for a release build.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BuildProvenance {
@@ -53,6 +56,7 @@ pub struct BuildProvenance {
     pub run_id: Option<String>,
 }
 
+/// Resolved dependency provenance for `neural-amp-modeler-rs`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EngineProvenance {
@@ -68,6 +72,7 @@ pub struct EngineProvenance {
     pub pinned_commit: Option<String>,
 }
 
+/// Optimization pipeline status (PGO, BOLT, and hot-path codegen verification) for a build.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BuildOptimizations {
@@ -81,6 +86,7 @@ pub struct BuildOptimizations {
     pub codegen_status: String,
 }
 
+/// Summary metrics from the PGO workload execution embedded in [`BuildReceipt`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PgoWorkloadInfo {
@@ -93,6 +99,7 @@ pub struct PgoWorkloadInfo {
     pub total_callbacks: Option<u64>,
 }
 
+/// Output binary and distribution package paths paired with SHA-256 digests.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct BuildArtifacts {
@@ -137,6 +144,7 @@ pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<String, std::io::Error> {
     Ok(digest_to_hex(hasher.finalize()))
 }
 
+/// Reason an A/B optimization ceremony receipt failed validation for BOLT promotion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CeremonyProofRejection {
     MissingReceipt,
@@ -151,6 +159,7 @@ pub enum CeremonyProofRejection {
 }
 
 impl CeremonyProofRejection {
+    /// Returns the machine-readable rejection reason code.
     pub fn reason_code(&self) -> &'static str {
         match self {
             Self::MissingReceipt => "ceremony_missing_receipt",
@@ -192,6 +201,7 @@ impl std::fmt::Display for CeremonyProofRejection {
     }
 }
 
+/// Validates the A/B optimization ceremony receipt against the expected repository and lockfile hashes.
 pub fn validate_ab_opt_ceremony_receipt<P: AsRef<Path>>(
     path: P,
     expected_git_sha: Option<&str>,
@@ -554,6 +564,7 @@ pub fn resolve_engine_identity(project_root: &Path) -> EngineSourceIdentity {
 }
 
 impl EngineProvenance {
+    /// Attaches resolved local/git repository identity metadata when not sourced from `crates.io`.
     pub fn with_identity(mut self, identity: EngineSourceIdentity) -> Self {
         if self.dependency_type != "crates.io" {
             self.resolved_commit = identity.resolved_commit;

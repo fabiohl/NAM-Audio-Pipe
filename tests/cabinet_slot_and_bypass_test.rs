@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 #![cfg(feature = "testing")]
 
-//! Integration tests for S08 in `NAM-Audio-Pipe` — Exclusive Cabinet Slot (`.wav`/`.nam`/`.namb`)
+//! Integration tests for `NAM-Audio-Pipe` Exclusive Cabinet Slot (`.wav`/`.nam`/`.namb`)
 //! and `--cab-bypass` constant-latency phase-aligned bypass.
 
 mod common;

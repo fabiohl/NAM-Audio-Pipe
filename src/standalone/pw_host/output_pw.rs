@@ -516,7 +516,7 @@ pub unsafe fn deliver_silence_pair_fail_closed(
 /// Untracked core of [`deliver_silence_pair_fail_closed`]: delivers analytical
 /// silence without touching any stream counter, so the caller can attribute the
 /// delivery to the correct telemetry category (starvation, early callback, or
-/// fail-closed mute) without double counting (F8 / T5.2).
+/// fail-closed mute) without double counting.
 ///
 /// # Safety
 ///

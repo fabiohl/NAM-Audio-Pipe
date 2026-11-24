@@ -9,7 +9,7 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
 
 **NAM-Audio-Pipe** is an ultra-low latency, real-time standalone PipeWire host application for [Neural Amp Modeler (NAM)](https://www.neuralampmodeler.com/) simulation on Linux.
 
-Turn your Linux machine into a world-class, instantaneous guitar amplifier or studio rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine (v2.0.0), NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
+Turn your Linux machine into a world-class, instantaneous guitar amplifier or studio rig. Powered directly by the cutting-edge [`NeuralAmpModeler-rs`](https://github.com/fabiohl/NeuralAmpModeler-rs) engine (v4.0.0), NAM-Audio-Pipe connects directly to your native PipeWire audio graph without requiring heavyweight digital audio workstations (DAWs), complex JACK bridging, or Wine emulation layers.
 
 Whether practicing at home, tracking live in the studio, or performing on stage, NAM-Audio-Pipe delivers studio-grade tone with **analog-like responsiveness**, **sub-millisecond buffer sizes**, **zero dropouts**, and **one-touch lock-free WAV recording**.
 
@@ -56,7 +56,7 @@ No external audio libraries or third-party wrappers needed:
 - **Half-Band Anti-Aliasing Oversampling**: Multi-stage half-band polyphase FIR filters (`Off`, `2x`, `4x`, $>100\text{ dB}$ stopband attenuation) attenuate non-linear high-frequency foldover distortion on screaming high-gain leads.
 - **Selectable Activation Precision**: Choose between `standard` (exact Taylor minimax, +89.5 dB SNR) and `fast` (Padé polynomial minimax approximation) to tailor math precision against CPU cycles.
 - **Selectable Noise Gate Topologies (`--gate-mode`)**: Choose between **`silence`** (default dual-threshold Schmitt gate with CPU-skipping silence shutoff) and **`musical`** (C++-reference continuous quadratic downward expander triggering pre-calibration and attenuating post-model / pre-CabSim IR to preserve natural cabinet tails).
-- **Deliberate DSP Architectural Boundaries (P06)**:
+- **Deliberate DSP Architectural Boundaries**:
   - **Omission of Integrated Tone Stack (EQ)**: Omitted by deliberate design to keep the standalone pipeline lean, deterministic, and modular. Equalization and tone shaping are best placed within the PipeWire graph via dedicated audio filter nodes or external visual patchbays (e.g. `qpwgraph` + Calf/LSP/Carla plugins).
   - **Omission of Post-Cabinet DC Filter**: Omitted by deliberate design. While symmetrical dither and floating-point denormal armoring prevent hardware microcode slowdowns, **there is no claim of absolute immunity to DC offset** (which may arise from asymmetric non-linear models). Users requiring steep sub-bass DC filtering can route the stream through a high-pass filter in the audio graph. This decision remains open and may be reevaluated in future revisions based on user requirements.
 
@@ -307,7 +307,7 @@ nam-audio-pipe --gate off
 | Architecture                 | Platform Tier           | Continuous Integration                                                            | Real-Time Hardware Certification           | Notes                                                                                                                                                             |
 |:---------------------------- |:----------------------- |:--------------------------------------------------------------------------------- |:------------------------------------------ |:----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Linux `x86_64`**           | **Tier 1 (Reference)**  | Blocking (`lints`, `quick`, `msrv`, `long`)                                       | Fully verified & certified                 | Requires `x86-64-v3` baseline (AVX2, FMA, BMI2). Supports full PGO + LLVM BOLT optimization pipeline.                                                             |
-| **Linux on ARM (`aarch64`)** | **Tier 2 (Compatible)** | Blocking compile/lint (`linux-arm64-lints`), advisory quick (`linux-arm64-quick`) | Not formally tested on bare-metal hardware | Compiles cleanly on native ARM64 runners (`ubuntu-26.04-arm`). Architecture flags are scoped in `.cargo/config.toml`, and pure-Rust SPA logging supports AAPCS64. |
+| **Linux on ARM (`aarch64`)** | **Tier 2 (Compatible)** | Blocking compile/lint (`linux-arm64-lints`) and quick test suite (`linux-arm64-quick`) | Not formally tested on bare-metal hardware | Compiles cleanly on native ARM64 runners (`ubuntu-26.04-arm`). Architecture flags are scoped in `.cargo/config.toml`, and pure-Rust SPA logging supports AAPCS64. |
 
 > [!NOTE]
 > **Linux on ARM Status**: While NAM-Audio-Pipe continuously compiles, passes static analysis, and is architecturally compatible on Linux on ARM (`aarch64`), formal validation on physical ARM audio workstations (such as real-time audio deadline certification, bare-metal ALSA/PipeWire driver testing, and hardware latency profiling) has not yet been formally conducted.
@@ -325,7 +325,7 @@ NAM-Audio-Pipe is packaged as an autonomous desktop Flatpak (`io.github.fabiohl.
 #### Install Local Bundle
 
 ```bash
-flatpak install --user --reinstall target/dist/nam-audio-pipe-v1.1.0-linux-x86_64-v3.flatpak
+flatpak install --user --reinstall target/dist/nam-audio-pipe-v1.2.0-linux-x86_64-v3.flatpak
 ```
 
 #### Run via Flatpak
@@ -425,8 +425,8 @@ nam-audio-pipe [OPTIONS]
 | `-c, --cab <FILE>`            | Filepath (`.wav`, `.nam`, `.namb`)    | *None (Bypass)*                                                         | Path to cabinet asset (`.wav` IR or 1-in/1-out neural cabinet). Invalid asset fails with code 4 unless `--cab-optional`. |
 | `--cab-optional`              | Flag                                  | `false`                                                                 | Missing or unreadable `--cab` warns and continues without cabinet simulation.                  |
 | `--cab-bypass`                | Flag                                  | `false`                                                                 | Starts with cabinet slot bypassed at constant SPA latency (crossfade & dry-delay aligned).     |
-| `-i, --input-gain <DB>`       | Float (`-20.0` to `+20.0` dB)         | `0.0`                                                                   | Input gain adjustment prior to neural inference.                                               |
-| `-o, --output-gain <DB>`      | Float (`-20.0` to `+20.0` dB)         | `0.0`                                                                   | Output gain adjustment after cabinet simulation.                                               |
+| `-i, --input-gain <DB>`       | Float (`-96.0` to `+30.0` dB)         | `0.0`                                                                   | Input gain adjustment prior to neural inference.                                               |
+| `-o, --output-gain <DB>`      | Float (`-96.0` to `+30.0` dB)         | `0.0`                                                                   | Output gain adjustment after cabinet simulation.                                               |
 | `-b, --buffer-size <SAMPLES>` | `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`      | `256`                                                                   | PipeWire quantum block size in samples (`0` for auto-negotiation).                             |
 | `--cabsim-partition <N>`      | `32`, `64`, `128`, `256` samples      | `128`                                                                   | Cab-sim UPOLS partition size. Lower values reduce algorithmic latency at slight CPU cost.      |
 | `--ir-level-policy <MODE>`    | `peak-normalized`, `preserved`, `legacy-nam-plugin` | `peak-normalized`                                         | Cabinet IR gain policy: peak normalization (default), 1:1 WAV amplitude, or C++ scaling ($10^{-18/20} \times 48000/f_s$; preserves Rust resampling and full IR length). |

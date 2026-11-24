@@ -199,6 +199,7 @@ Integration tests validate full-system behavior against real external interfaces
 | [`tests/calibration_modes_test.rs`](../tests/calibration_modes_test.rs)       | Input calibration / output modes parity, startup metadata policy, pre-nonlinearity saturation & gate isolation. | Fast Dev / `phase0`                        |
 | [`tests/musical_gate_parity_test.rs`](../tests/musical_gate_parity_test.rs) | Musical noise gate C++ `f64` oracle parity (`44.1/48/96 kHz`), pre-cal/pre-IR ordering, stereo isolation, continuous recording & RT `heap-audit`. | Fast Dev / `phase0`                        |
 | [`tests/cabinet_slot_and_bypass_test.rs`](../tests/cabinet_slot_and_bypass_test.rs) | Single exclusive cabinet slot (`.wav`/`.nam`/`.namb`), fail-closed guards, `Linear`/`Sequential` `f64` oracle parity, `--cab-bypass` constant latency/crossfade across `44.1/48/96 kHz`, `testing,heap-audit` & `--no-default-features`. | Fast Dev / `phase0` |
+| [`tests/ir_policy_and_output_limit_test.rs`](../tests/ir_policy_and_output_limit_test.rs) | Cabinet IR level policies (`peak-normalized`, `preserved`, `legacy-nam-plugin`) and optional hardware playback output hard-clamp (`--output-limit off\|clamp`), preserving float WAV recording untouched. | Fast Dev / `phase0` |
 | [`tests/fixtures_freshness.rs`](../tests/fixtures_freshness.rs)               | Cryptographic SHA-256 validation of committed test model fixtures against `.manifest.sha256`.               | Fast Dev / `phase0`                        |
 | [`tests/swap_stress.rs`](../tests/swap_stress.rs)                             | Multi-producer concurrent swap flood (models, IRs, resamplers, gains) under live audio processing.          | `phase1`, `phase2`                         |
 | [`tests/soak_extended.rs`](../tests/soak_extended.rs)                         | Accelerated timeline soak (320,000 blocks), zero minor/major page faults, and stable RSS (< 256 KiB drift). | `#[ignore]` / `phase1`                     |
@@ -214,7 +215,7 @@ Executable verification scripts in [`utils/`](../utils/) automate testing across
 
 ### 3.1 Static Quality Gate ([`utils/lints.sh`](../utils/lints.sh))
 
-Class A script. Budget: 100 lines. It runs the following steps in order and aborts on the first failure:
+Class A script. Budget: 110 lines. It runs the following steps in order and aborts on the first failure:
 
 1. **Formatting (`fmt`):** `cargo fmt --all` is applied during local development; with `CI=true` it verifies via `-- --check`.
 2. **Compilation matrix (`check`):** `cargo check --locked` for all-targets/all-features, lib/no-default-features, and all-targets/no-default-features.
@@ -240,7 +241,7 @@ Class B script, operator-only. It records every phase result instead of aborting
 
 | Receipt `phase_id` | Canonical Phase  | Harness & Invariant Evaluated                                                                                                                                                                                                               | Default Timeout | Output Log File                       |
 |:------------------ |:---------------- |:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |:---------------:|:------------------------------------- |
-| **`phase0`**       | `catch-all`      | `cargo test --locked --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `activation_fidelity`, `fixtures_freshness`, `oversampling_latency`, `cabsim_partition_latency`, `--lib`). | 900 s           | `target/logs/long-catch-all.log`      |
+| **`phase0`**       | `catch-all`      | `cargo test --locked --features testing --release --no-fail-fast` (non-ignored: `e2e_cli`, `distribution_qa`, `stereo_fidelity`, `activation_fidelity`, `fixtures_freshness`, `oversampling_latency`, `cabsim_partition_latency`, `calibration_modes_test`, `musical_gate_parity_test`, `cabinet_slot_and_bypass_test`, `ir_policy_and_output_limit_test`, `--lib`). | 900 s           | `target/logs/long-catch-all.log`      |
 | **`phase1`**       | `soak`           | `tests/soak_extended.rs` (320k blocks, compressed timeline) + `tests/swap_stress.rs`; asserts stable RSS.                                                                                                                                   | 1800 s          | `target/logs/long-soak.log`           |
 | **`phase2`**       | `heap-audit`     | `cargo test --locked --features "testing heap-audit" --release` over `--lib` and `tests/swap_stress.rs`; asserts zero heap allocations on RT paths.                                                                                         | 1800 s          | `target/logs/long-heap-audit.log`     |
 | **`phase3`**       | `rt-deadline`    | `tests/rt_metrics.rs` (`deadline`, 10k quantums, DSP load < 85% of quantum budget; `SCHED_FIFO` when available).                                                                                                                            | 900 s           | `target/logs/long-rt-deadline.log`    |
@@ -262,17 +263,15 @@ Every phase writes `target/logs/long-<name>.log`. Each run appends its structure
   - `x86_64-linux-lints`: Runs `utils/lints.sh` with strict Clippy, AppStream, and doc gates (blocking).
   - `x86_64-linux-quick`: Runs `utils/tests-quick.sh` across both `dual-mono` and lean mono profiles (blocking).
   - `linux-arm64-lints`: Validates compilation and lints on ARM64 architecture (blocking gate).
-  - `linux-arm64-quick`: Runs quick tests on ARM64 (`continue-on-error` advisory; bare-metal hardware and RT-deadline certification remain unperformed on ARM).
+  - `linux-arm64-quick`: Blocking quick test gate on ARM64 (`ubuntu-26.04-arm`; bare-metal hardware and RT-deadline certification remain unperformed on ARM).
   - `msrv`: Enforces minimum supported Rust version (`1.99.0`) using `--locked --all-targets --all-features`.
   - **Deterministic Provenance**: Each job sources [`variables.env`](../variables.env) (`ENGINE_COMMIT`), writes `target/logs/ci-provenance.log`, and uploads `target/logs/**` (including `*-status.tsv` carriers).
 - **`long.yml`:** Operator-triggered manual workflow (`workflow_dispatch`, zero inputs, `timeout-minutes: 300`). Provisions the C++ parity oracle (`NAM_CORE_RENDER_BIN`), a private D-Bus session, and persistent PipeWire sink/source nodes (`ci-null-sink`, `ci-null-source`). Executes hosted-safe phases (`catch-all`, `soak`, `heap-audit`, `concurrency`, `endurance`, `pw-resilience`, `pw-live`, `recording`, `offline-parity`), leaving isolated hardware phases (`rt-deadline`, `rt-jitter`) for bare-metal operator execution.
 
-### 3.4 Integrated Scenario Matrix (S5 / D5)
+### 3.4 Integrated Scenario Matrix
 
-**Status: proposed, pending D5 approval by the operator.** This is the
-daemon-side half of the integrated matrix; the plugin half lives in
-`NAM-Plug/docs/testing.md` §3.4. A cell is
-**M** (proposed mandatory for release) or **E** (experimental: evidence is
+This matrix defines the daemon-side end-to-end verification scenarios for `NAM-Audio-Pipe`. A cell is
+**M** (mandatory for release) or **E** (experimental: evidence is
 recorded but cannot block release). Missing evidence is a `GAP`, never a PASS.
 
 Each cell records: host rate, quantum (frames), channel configuration
@@ -281,7 +280,7 @@ binary SHA-256, warmup, measurement duration, timed callbacks, starvation/early
 counters (`playback_bridge_starvation`, `playback_early_callbacks`,
 `playback_muted_callbacks`), dropped generations and xruns.
 
-| ID  | Scenario                | Channels | Rate (kHz) | Quantum | Cabinet | Events                 | Gate                                                                 | Evidence                          | D5 |
+| ID  | Scenario                | Channels | Rate (kHz) | Quantum | Cabinet | Events                 | Gate                                                                 | Evidence                          | Gate Class |
 |:--- |:----------------------- |:-------- |:---------- |:------- |:------- |:---------------------- |:-------------------------------------------------------------------- |:--------------------------------- |:-- |
 | D1  | Native offline parity   | mono     | 48         | 128     | none    | none                   | f64 ESR <= per-fixture native gate; C++ oracle when provisioned       | `long-offline-parity.log`         | M  |
 | D2  | Resampled offline parity| mono     | 44.1->48   | 128     | none    | none                   | f64/C++ ESR <= 1.0e-9, SNR >= 90.0 dB (measured 9.89e-12 / 110.05 dB) | `long-offline-parity.log`         | M  |
@@ -309,7 +308,7 @@ Rules for the Pipe cells:
 - Plugin and Pipe gates are **not** interchangeable: this side uses worst
   callback < 85% of the period and p99.99 jitter <= 75%; the plugin uses
   p99 < 85% of the period. A single generic threshold is forbidden.
-- Capture→playback latency is per delivered generation (T5.2); the legacy
+- Capture→playback latency is per delivered generation; the legacy
   global `capture_start_tsc` is no longer the source of that metric.
 
 ---
@@ -408,6 +407,7 @@ All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repo
 | **`utils/tests-quick.sh`**   | Class A: dev-profile `cargo test` across `dual-mono` and lean mono, skipping `#[ignore]`.                      | Pre-merge / Fast testing         |
 | **`utils/tests-long.sh`**    | Class B: 11-phase comprehensive audit (catch-all, soak, zero-alloc, RT, endurance, live PipeWire, f64 parity). | Operator / Release qualification |
 | **`utils/build-release.sh`** | Class C: multi-stage PGO/BOLT compilation, packaging, artifact delivery, and certification.                    | Production releases              |
+| **`utils/ab-opt-ceremony.sh`** | Class D: plain vs PGO vs PGO+BOLT statistical A/B micro-benchmark ceremony for BOLT promotion proof.       | Operator / Pre-release BOLT gate |
 | **`utils/miri-audit.sh`**    | Class D: out-of-band formal aliasing and data-race audit for lock-free memory structures.                      | Maintenance / Unsafe code audit  |
 
 ### 5.2 Direct Command Cheat Sheet

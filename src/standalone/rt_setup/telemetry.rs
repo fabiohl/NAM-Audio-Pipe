@@ -14,310 +14,34 @@
 //! ([`TelemetryLatches`]) so a continuous condition warns at most once per
 //! episode instead of once per control-loop iteration.
 
+#[path = "telemetry/state.rs"]
+mod state;
+
+pub use state::{
+    GATE_LOG_MIN_INTERVAL, GateTransitionThrottle, LatchedSignal, LatencyHistogramView,
+    LatencySummary, PollState, TelemetryLatches, latency_summary,
+};
+
+use super::affinity::CpuSelectionReason;
 use crate::standalone::colors::Colorize;
 use crate::standalone::pw_host::StreamStatusFlags;
 use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
-use neural_amp_modeler_rs::common::spsc::{RT_STATUS_HOST_CONTRACT_VIOLATION, RtStatusFlags};
-use neural_amp_modeler_rs::dsp::telemetry::{AtomicHistogram, LatencyHistogram};
+use neural_amp_modeler_rs::common::spsc::{
+    RT_STATUS_GC_CORRUPTED, RT_STATUS_GC_OVERFLOW, RT_STATUS_GC_TIER3, RT_STATUS_HAS_CLIPPED,
+    RT_STATUS_HOST_CONTRACT_VIOLATION, RT_STATUS_HUGEPAGE_OK, RT_STATUS_IS_FADING,
+    RT_STATUS_IS_SILENT, RT_STATUS_NON_FINITE_INPUT_DETECTED, RT_STATUS_PARAM_QUEUE_BACKLOG,
+    RT_STATUS_RT_IS_FIFO, RT_STATUS_SLIMMABLE_RESET_FAILED, RT_STATUS_SLIMMABLE_SLICE_FAILED,
+    RT_STATUS_STRUCTURAL_DEFERRED, RT_STATUS_STRUCTURAL_SUPERSEDED, RT_STATUS_THP_ACTIVE,
+    RtStatusFlags,
+};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// Read-only view of the engine latency-histogram surface.
-pub trait LatencyHistogramView {
-    fn percentile(&self, p: f32) -> u64;
-    fn mean(&self) -> u64;
-    fn exact_min(&self) -> u64;
-    fn exact_max(&self) -> u64;
-}
-
-impl LatencyHistogramView for AtomicHistogram {
-    fn percentile(&self, p: f32) -> u64 {
-        self.get_percentile(p)
-    }
-
-    fn mean(&self) -> u64 {
-        self.get_mean()
-    }
-
-    fn exact_min(&self) -> u64 {
-        self.get_exact_min()
-    }
-
-    fn exact_max(&self) -> u64 {
-        self.get_exact_max()
-    }
-}
-
-impl LatencyHistogramView for LatencyHistogram {
-    fn percentile(&self, p: f32) -> u64 {
-        self.get_percentile(p)
-    }
-
-    fn mean(&self) -> u64 {
-        self.get_mean()
-    }
-
-    fn exact_min(&self) -> u64 {
-        self.get_exact_min()
-    }
-
-    fn exact_max(&self) -> u64 {
-        self.get_exact_max()
-    }
-}
-
-/// Latency summary emitted by the RT telemetry dashboard.
-///
-/// Engine percentiles report the upper edge of the matched bucket (≤ 12.5 %
-/// error for the log-linear histogram), which can numerically exceed the exact
-/// maximum when the tail sample sits inside that bucket. Consumers therefore
-/// clamp every percentile to `max_ns` without touching the engine histogram's
-/// bucket resolution, preserving `p50 <= p99 <= p999 <= max_ns`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct LatencySummary {
-    /// Exact minimum latency (ns).
-    pub min_ns: u64,
-    /// Mean latency (ns).
-    pub mean_ns: u64,
-    /// Median latency (ns), clamped to `max_ns`.
-    pub p50_ns: u64,
-    /// 99th percentile latency (ns), clamped to `max_ns`.
-    pub p99_ns: u64,
-    /// 99.9th percentile latency (ns), clamped to `max_ns`.
-    pub p999_ns: u64,
-    /// Exact maximum latency observed (ns).
-    pub max_ns: u64,
-}
-
-/// Summarises a latency histogram with monotonic percentiles clamped to the
-/// exact maximum: `p50 <= p99 <= p999 <= max`.
-pub fn latency_summary(hist: &impl LatencyHistogramView) -> LatencySummary {
-    let max_ns = hist.exact_max();
-    let p50_ns = hist.percentile(0.50).min(max_ns);
-    let p99_ns = hist.percentile(0.99).min(max_ns).max(p50_ns);
-    let p999_ns = hist.percentile(0.999).min(max_ns).max(p99_ns);
-    LatencySummary {
-        min_ns: hist.exact_min(),
-        mean_ns: hist.mean(),
-        p50_ns,
-        p99_ns,
-        p999_ns,
-        max_ns,
-    }
-}
-
-/// Minimum spacing between gate-transition `info` lines.
-///
-/// A gate threshold sitting near the guitar's noise floor can flap at the poll
-/// rate (≤ 10 Hz), burying real errors under a burst of "Silent Mode"/"Audio
-/// Signal Detected" lines. Gate transitions are therefore rate-limited to one
-/// line per second; suppressed transitions are counted and folded into the next
-/// emitted line as "(×N)".
-pub const GATE_LOG_MIN_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Rate limiter for gate-transition logs (deterministic; clock injected as the
-/// `now` argument so tests advance time without sleeping).
-#[derive(Debug, Clone, Default)]
-pub struct GateTransitionThrottle {
-    last_emit: Option<Instant>,
-    suppressed: u32,
-}
-
-impl GateTransitionThrottle {
-    /// Records a gate transition observed at `now`.
-    ///
-    /// Returns `Some(count)` when the line should be logged — `count` is the
-    /// number of transitions folded into this line (`1` = no suppression) — or
-    /// `None` when the transition is suppressed by the rate limit.
-    pub fn observe(&mut self, now: Instant) -> Option<u32> {
-        let allowed = match self.last_emit {
-            None => true,
-            Some(prev) => now.duration_since(prev) >= GATE_LOG_MIN_INTERVAL,
-        };
-        if allowed {
-            self.last_emit = Some(now);
-            let count = self.suppressed.saturating_add(1);
-            self.suppressed = 0;
-            Some(count)
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
-            None
-        }
-    }
-}
-
-/// Per-signal episode latch.
-///
-/// A condition observed continuously by the control loop (starvation, queue
-/// saturation, rate churn, clipping, …) emits **at most once per episode**:
-/// the first poll that observes it after it has cleared. The latch re-arms
-/// only when a poll observes the condition absent.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LatchedSignal {
-    active: bool,
-}
-
-impl LatchedSignal {
-    /// Records one poll observation of a signal. Returns `true` exactly on
-    /// the first observation of each episode — callers emit the log line
-    /// only when `true`.
-    #[inline]
-    pub fn observe(&mut self, active_now: bool) -> bool {
-        if active_now {
-            let first = !self.active;
-            self.active = true;
-            first
-        } else {
-            self.active = false;
-            false
-        }
-    }
-}
-
-/// Latching state for every recurrent signal translated by `poll_rt_status`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TelemetryLatches {
-    /// GC channel overflow (`RT_STATUS_GC_OVERFLOW`).
-    pub gc_overflow: LatchedSignal,
-    /// GC cascade Tier 3 (`RT_STATUS_GC_TIER3`).
-    pub gc_tier3: LatchedSignal,
-    /// GC overflow buffer corruption (`RT_STATUS_GC_CORRUPTED`).
-    pub gc_corrupted: LatchedSignal,
-    /// Scalar parameter queue backlog (`RT_STATUS_PARAM_QUEUE_BACKLOG`).
-    pub param_backlog: LatchedSignal,
-    /// Structural command deferred (`RT_STATUS_STRUCTURAL_DEFERRED`).
-    pub structural_deferred: LatchedSignal,
-    /// Deferred structural command superseded (`RT_STATUS_STRUCTURAL_SUPERSEDED`).
-    pub structural_superseded: LatchedSignal,
-    /// WaveNet slimmable slice rebuild failure (`RT_STATUS_SLIMMABLE_SLICE_FAILED`).
-    pub slimmable_slice_failed: LatchedSignal,
-    /// ContainerModel submodel reset failure (`RT_STATUS_SLIMMABLE_RESET_FAILED`).
-    pub slimmable_reset_failed: LatchedSignal,
-    /// Digital clipping (`RT_STATUS_HAS_CLIPPED`).
-    pub clipping: LatchedSignal,
-    /// Non-finite input containment (`RT_STATUS_NON_FINITE_INPUT_DETECTED`):
-    /// the engine detected NaN/Inf entering the pipeline and
-    /// sanitized both the inputs and the delivered outputs.
-    pub non_finite_input: LatchedSignal,
-    /// SPA format contract violation (`RT_STATUS_HOST_CONTRACT_VIOLATION`).
-    pub contract_violation: LatchedSignal,
-    /// DSP CPU overload counter (`dsp_overloads`).
-    pub cpu_overload: LatchedSignal,
-    /// PipeWire capture buffer miss counter (`input_buffer_miss`).
-    pub input_buffer_miss: LatchedSignal,
-    /// PipeWire playback buffer miss counter (`output_buffer_miss`).
-    pub output_buffer_miss: LatchedSignal,
-    /// Playback bridge starvation counter (`playback_bridge_starvation`).
-    pub playback_starvation: LatchedSignal,
-    /// Early playback callbacks counter (`playback_early_callbacks`): no new
-    /// bridge generation because the callback fired ahead of schedule.
-    pub playback_early: LatchedSignal,
-    /// Fail-closed mute deliveries (`playback_muted_callbacks`).
-    pub playback_muted: LatchedSignal,
-    /// Clock-drift dropped-frames counter (`DspBridge::dropped_frames`).
-    pub drift_drops: LatchedSignal,
-    /// Audio deadline exceeded (`dsp_cycle_time > quantum budget`).
-    pub deadline_exceeded: LatchedSignal,
-    /// PW log ring saturation (`pw_host::rt_log_ring::pw_log_dropped`): PW
-    /// log events discarded with the SPSC ring full (off-RT offload budget).
-    pub pw_log_dropped: LatchedSignal,
-}
-
-/// Mutable state for `poll_rt_status`, replacing function-scoped statics
-/// to make the function testable and re-entrant.
-#[derive(Debug, Clone, Default)]
-pub struct PollState {
-    pub hugepage_synced: bool,
-    pub telemetry_throttle: u32,
-    pub cpu_receipt: Option<super::affinity::CpuSelectionReceipt>,
-    /// Per-signal episode latches.
-    pub latches: TelemetryLatches,
-    /// Last observed cumulative starvation count.
-    pub last_starvation: u32,
-    /// Last observed cumulative early-playback-callback count.
-    pub last_early: u32,
-    /// Last observed cumulative fail-closed-mute delivery count.
-    pub last_muted: u32,
-    /// Last observed cumulative PW-log ring discard count
-    /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
-    pub pw_log_dropped_last: u64,
-    /// Last observed `playback_quantums` value; used to re-arm the bridge
-    /// bring-up suppression budget whenever playback makes progress.
-    pub last_bringup_quanta: u32,
-    /// Number of consecutive polls spent suppressing bridge drift drops in the
-    /// current bring-up window. Caps the window so a stalled playback stream
-    /// cannot suppress (and discard) drift drops indefinitely.
-    pub bringup_suppressed_polls: u32,
-    /// Whether the monitor loop has observed and polled during `quanta < PLAYBACK_BRINGUP_QUANTUMS`.
-    pub has_polled_in_bringup: bool,
-    /// Whether the initial startup drops (ramp / pre-roll silence skew) have been drained.
-    pub startup_drops_drained: bool,
-    /// Whether the bring-up transient has been drained and closed for the current
-    /// streaming session.
-    pub bringup_completed: bool,
-    /// Gate-transition log rate limiter.
-    pub gate_throttle: GateTransitionThrottle,
-}
-
-impl PollState {
-    /// Creates a default `PollState`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Creates a `PollState` carrying a CPU selection receipt for honest telemetry reporting.
-    pub fn with_cpu_receipt(receipt: Option<super::affinity::CpuSelectionReceipt>) -> Self {
-        Self {
-            hugepage_synced: false,
-            telemetry_throttle: 0,
-            cpu_receipt: receipt,
-            latches: TelemetryLatches::default(),
-            last_starvation: 0,
-            last_early: 0,
-            last_muted: 0,
-            pw_log_dropped_last: 0,
-            last_bringup_quanta: 0,
-            bringup_suppressed_polls: 0,
-            has_polled_in_bringup: false,
-            startup_drops_drained: false,
-            bringup_completed: false,
-            gate_throttle: GateTransitionThrottle::default(),
-        }
-    }
-}
-
-/// Reads atomic RT status flags and emits monitoring logs to the user.
-///
-/// This function acts as the "dashboard" of NAM-Audio-Pipe. It is called periodically
-/// to translate the technical signals coming from the audio thread (which is silent and ultra-fast)
-/// into understandable messages, performance warnings, and latency telemetry.
-///
-/// Returns a tuple (current_silent, current_fading) for state control in the main loop.
-///
-/// `_sys` is retained for API stability (callers/tests pass the startup snapshot);
-/// runtime telemetry is intentionally bundle-free.
-pub fn poll_rt_status(
-    rt_status: &RtStatusFlags,
-    stream_status: Option<&StreamStatusFlags>,
-    _sys: &SystemSnapshot,
-    was_silent: bool,
-    was_fading: bool,
-    dropped_frames: u32,
-    state: &mut PollState,
-) -> (bool, bool) {
-    let current_bits = rt_status.status_bits.load(Ordering::Relaxed);
-    rt_status
-        .flags_seen
-        .fetch_or(current_bits, Ordering::Relaxed);
-
-    // 1. MEMORY MANAGEMENT (Garbage Collection):
-    // If the cleanup channel is full, it means we are swapping neural models
-    // faster than the system can discard old ones. We prioritize audio
-    // "leaking" memory temporarily to avoid clicks (drops) in the sound.
-    // Sustained pressure is latched: one concise warning per episode.
-    let gc_overflow =
-        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_OVERFLOW);
-    if state.latches.gc_overflow.observe(gc_overflow) {
+fn poll_gc_and_command_flags(rt_status: &RtStatusFlags, latches: &mut TelemetryLatches) {
+    if latches
+        .gc_overflow
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_GC_OVERFLOW))
+    {
         log::warn!(
             "[E3101 | GC_OVERFLOW] Garbage Collection (GC) channel overflow detected — \
              the audio thread had to leak memory to avoid dropouts in the hot-path; \
@@ -325,9 +49,10 @@ pub fn poll_rt_status(
         );
     }
 
-    let gc_tier3 =
-        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_TIER3);
-    if state.latches.gc_tier3.observe(gc_tier3) {
+    if latches
+        .gc_tier3
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_GC_TIER3))
+    {
         log::warn!(
             "[E3101 | GC_OVERFLOW] GC cascade reached Tier 3 (SPSC channel and parking lot \
              both full) — items are being parked in the overflow buffer; \
@@ -335,9 +60,10 @@ pub fn poll_rt_status(
         );
     }
 
-    let gc_corrupted =
-        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_GC_CORRUPTED);
-    if state.latches.gc_corrupted.observe(gc_corrupted) {
+    if latches
+        .gc_corrupted
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_GC_CORRUPTED))
+    {
         log::error!(
             "[E3102 | GC_CORRUPTED] Garbage Collection overflow buffer corruption detected — \
              a GC slot had inconsistent type/pointer data; the pointer was leaked to avoid \
@@ -345,12 +71,10 @@ pub fn poll_rt_status(
         );
     }
 
-    // Command Budgeting telemetry: the RT callback drains
-    // under fixed per-quantum budgets. These flags make saturation explicit —
-    // no command is ever lost; the excess is deferred to the next callback.
-    let param_backlog = rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_PARAM_QUEUE_BACKLOG);
-    if state.latches.param_backlog.observe(param_backlog) {
+    if latches
+        .param_backlog
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_PARAM_QUEUE_BACKLOG))
+    {
         log::warn!(
             "[E3100 | PARAM_CHANNEL_FULL] Command queue backlog: the scalar parameter drain \
              budget (16/callback) was exhausted — a producer (CLI/UI/automation) filled the \
@@ -359,37 +83,27 @@ pub fn poll_rt_status(
         );
     }
 
-    let structural_deferred = rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_DEFERRED);
-    if state
-        .latches
+    if latches
         .structural_deferred
-        .observe(structural_deferred)
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_STRUCTURAL_DEFERRED))
     {
         log::info!(
             "Structural command deferred to the next callback (structural budget 1/callback) — FIFO order preserved."
         );
     }
 
-    let structural_superseded = rt_status
-        .check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_STRUCTURAL_SUPERSEDED);
-    if state
-        .latches
+    if latches
         .structural_superseded
-        .observe(structural_superseded)
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_STRUCTURAL_SUPERSEDED))
     {
         log::info!(
             "Deferred structural command superseded by a newer same-kind command; obsolete resources discarded off-RT (coalescing)."
         );
     }
 
-    let slimmable_slice_failed = rt_status.check_and_clear_flag(
-        neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_SLICE_FAILED,
-    );
-    if state
-        .latches
+    if latches
         .slimmable_slice_failed
-        .observe(slimmable_slice_failed)
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_SLIMMABLE_SLICE_FAILED))
     {
         log::error!(
             "[E3104 | SLIMMABLE_SLICE_FAILED] WaveNet slimmable slice_channels rebuild failed — \
@@ -398,13 +112,9 @@ pub fn poll_rt_status(
         );
     }
 
-    let slimmable_reset_failed = rt_status.check_and_clear_flag(
-        neural_amp_modeler_rs::common::spsc::RT_STATUS_SLIMMABLE_RESET_FAILED,
-    );
-    if state
-        .latches
+    if latches
         .slimmable_reset_failed
-        .observe(slimmable_reset_failed)
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_SLIMMABLE_RESET_FAILED))
     {
         log::error!(
             "[E3105 | SLIMMABLE_RESET_FAILED] ContainerModel submodel reset failed — \
@@ -412,10 +122,9 @@ pub fn poll_rt_status(
              check model graph integrity."
         );
     }
+}
 
-    // 2. RATE CHANGE (Sample Rate):
-    // Warns when the audio server (PipeWire) changes the sampling frequency
-    // (e.g. changed from 44.100 to 48.000 beats per second).
+fn poll_rate_clip_and_hugepages(rt_status: &RtStatusFlags, state: &mut PollState) {
     let rate_notif = rt_status.active_rate_changed.swap(0, Ordering::Relaxed);
     if rate_notif != 0 {
         log::info!(
@@ -425,16 +134,11 @@ pub fn poll_rt_status(
         );
     }
 
-    // 3. DIGITAL DISTORTION (Clipping):
-    // The equivalent of the "red LED" on mixing consoles. Indicates that a
-    // delivered sample exceeded full-scale (±1.0). Latched: a continuously
-    // hot signal warns once per episode instead of on every control-loop
-    // iteration. A model carrying a large constant offset can trigger this at
-    // neutral gain even on silence — the delivered sample really exceeds FS,
-    // so check the model as well as the gains.
-    let has_clipped =
-        rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HAS_CLIPPED);
-    if state.latches.clipping.observe(has_clipped) {
+    if state
+        .latches
+        .clipping
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_HAS_CLIPPED))
+    {
         log::warn!(
             "{} Clipping detected! Consider reducing the input and/or output gain, \
              or checking whether the model itself carries a large DC offset.",
@@ -442,17 +146,11 @@ pub fn poll_rt_status(
         );
     }
 
-    // 3.25 NON-FINITE INPUT CONTAINMENT:
-    // The engine's energy/gain passes detected a NaN/Inf entering the
-    // pipeline (e.g. a buggy or malicious PipeWire client feeding corrupt
-    // floats) and sanitized the inputs in place; the output stage keeps
-    // sanitizing the delivered buffers while the flag is set, so no corrupted
-    // float escapes to the DAC or downstream mixer. Surfaced here because the
-    // RT callback is silent — the flag is sticky (never cleared by the
-    // engine), so the latch warns exactly once per session.
-    let non_finite_input = rt_status
-        .check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_NON_FINITE_INPUT_DETECTED);
-    if state.latches.non_finite_input.observe(non_finite_input) {
+    if state
+        .latches
+        .non_finite_input
+        .observe(rt_status.check_flag(RT_STATUS_NON_FINITE_INPUT_DETECTED))
+    {
         log::error!(
             "[E2305 | NON_FINITE_INPUT_CONTAINED] Non-finite audio (NaN/Inf) detected on the \
              capture path — inputs were sanitized and the output is being sanitized until the \
@@ -461,35 +159,25 @@ pub fn poll_rt_status(
         );
     }
 
-    // 3.5 HUGE PAGE STATUS:
-    // Sync from mirror buffer global and log once.
     if !state.hugepage_synced {
         neural_amp_modeler_rs::dsp::mirror_buf::sync_huge_page_flag(rt_status);
         state.hugepage_synced = true;
     }
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_HUGEPAGE_OK) {
+    if rt_status.check_and_clear_flag(RT_STATUS_HUGEPAGE_OK) {
         log::info!(
             "{} HugeTLB explicit 2 MB pages active — reduced TLB pressure on DSP thread.",
             "✅".green()
         );
     }
-    if rt_status.check_and_clear_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_THP_ACTIVE) {
+    if rt_status.check_and_clear_flag(RT_STATUS_THP_ACTIVE) {
         log::info!(
             "{} Transparent Huge Pages (THP) advice active — kernel may promote to 2 MB.",
             "ℹ️".green()
         );
     }
+}
 
-    // 4. REAL-TIME PRIORITY & ATOMIC ERRORS:
-    // Reads error flags set atomically by configure_realtime_thread during the
-    // first quantum of the fresh RT data thread (see
-    // `rt_setup/thread.rs::configure_realtime_thread`:
-    // PipeWire listeners dispatch on the thread-loop thread, so the first
-    // `process()` invocation is the only consumer-owned hook on the data
-    // thread) and emits the corresponding
-    // diagnostic messages from the main thread. On full success, prints the classic
-    // thread optimization confirmation.
-
+fn poll_rt_thread_setup(rt_status: &RtStatusFlags, state: &PollState) {
     let aff_err = rt_status.rt_affinity_err.swap(0, Ordering::Relaxed);
     let sched_err = rt_status.rt_sched_err.swap(0, Ordering::Relaxed);
     let getsched_err = rt_status.rt_getsched_err.swap(0, Ordering::Relaxed);
@@ -533,8 +221,7 @@ pub fn poll_rt_status(
 
     let prio = rt_status.rt_priority.load(Ordering::Relaxed);
     if prio != -1 {
-        let is_fifo =
-            rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_RT_IS_FIFO);
+        let is_fifo = rt_status.check_flag(RT_STATUS_RT_IS_FIFO);
         let policy = rt_status.rt_policy.load(Ordering::Relaxed);
         let cpu = rt_status.rt_cpu.load(Ordering::Relaxed);
 
@@ -562,16 +249,13 @@ pub fn poll_rt_status(
                 let reason_str = state.cpu_receipt.as_ref().map_or(
                     "Conservative heuristic / unverified topology",
                     |r| match &r.reason {
-                        super::affinity::CpuSelectionReason::ConservativeHeuristic {
-                            explanation,
-                            ..
-                        } => *explanation,
-                        super::affinity::CpuSelectionReason::ExplicitCli { .. } => {
+                        CpuSelectionReason::ConservativeHeuristic { explanation, .. } => {
+                            *explanation
+                        }
+                        CpuSelectionReason::ExplicitCli { .. } => {
                             "Explicit CLI pinning (non-isolated)"
                         }
-                        super::affinity::CpuSelectionReason::FullyIsolated { .. } => {
-                            "Fully isolated core"
-                        }
+                        CpuSelectionReason::FullyIsolated { .. } => "Fully isolated core",
                         _ => "Unclassified CPU selection reason",
                     },
                 );
@@ -600,11 +284,13 @@ pub fn poll_rt_status(
             );
         }
     }
+}
 
-    // 5. PROCESSING OVERLOAD (Overloads):
-    // Warns if the processor (CPU) is not fast enough to compute
-    // the neural network before the next audio block is needed.
-    // Latched: a sustained overload episode warns once.
+fn poll_xruns_and_playback_health(
+    rt_status: &RtStatusFlags,
+    stream_status: Option<&StreamStatusFlags>,
+    state: &mut PollState,
+) {
     let overloads = rt_status.dsp_overloads.swap(0, Ordering::Relaxed);
     if overloads > 0 {
         rt_status.xruns.fetch_add(overloads, Ordering::Relaxed);
@@ -617,8 +303,6 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.5 BUFFER MISS (PipeWire):
-    // PipeWire failed to provide a buffer — either on the capture or playback side.
     let input_buffer_miss = rt_status.input_buffer_miss.swap(0, Ordering::Relaxed);
     if state
         .latches
@@ -631,6 +315,7 @@ pub fn poll_rt_status(
             input_buffer_miss
         );
     }
+
     let output_buffer_miss = rt_status.output_buffer_miss.swap(0, Ordering::Relaxed);
     if state
         .latches
@@ -644,15 +329,11 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.55 HOST SPA FORMAT CONTRACT VIOLATION:
-    // The audio host handed buffers or negotiated a format diverging from the
-    // strict F32P planar stereo contract (raised by the RT harness or by the
-    // param_changed listeners). The backend state machine acknowledges the
-    // degraded/error state here with a concise error. The source-side listeners
-    // already name the offending stream/violation (see output_pw.rs); this
-    // loop covers the RT-raised path and is latched to warn once per episode.
-    let contract_violation = rt_status.check_and_clear_flag(RT_STATUS_HOST_CONTRACT_VIOLATION);
-    if state.latches.contract_violation.observe(contract_violation) {
+    if state
+        .latches
+        .contract_violation
+        .observe(rt_status.check_and_clear_flag(RT_STATUS_HOST_CONTRACT_VIOLATION))
+    {
         log::error!(
             "[E2304 | SPA_FORMAT_CONTRACT_VIOLATION] Audio host violated the strict SPA format \
              contract (F32P planar stereo, 2 channels FL/FR) — check that the PipeWire graph is \
@@ -661,12 +342,6 @@ pub fn poll_rt_status(
         );
     }
 
-    // 5.57 PW LOG RING SATURATION:
-    // PW log events offloaded to the SPSC ring were DISCARDED with the ring
-    // full. The marked RT thread never blocks and never falls back to the
-    // synchronous dispatch — the diagnostic stream is instead SAMPLED, and
-    // the loss is made visible to the operator here.
-    // Latched: one warning per saturation episode.
     let pw_log_dropped_now = crate::standalone::pw_host::rt_log_ring::pw_log_dropped();
     let pw_log_dropped_delta = pw_log_dropped_now.saturating_sub(state.pw_log_dropped_last);
     state.pw_log_dropped_last = pw_log_dropped_now;
@@ -725,33 +400,17 @@ pub fn poll_rt_status(
             delta_muted
         );
     }
+}
 
-    // 6. CLOCK DRIFTING:
-    // Occurs when you use different devices for input and output (e.g. USB Microphone
-    // and P2 Headphones). If one is slightly faster than the other, the system needs to discard
-    // some small audio chunks to maintain synchronization.
-    // Latched: a sustained drift episode warns once.
-    //
-    // During the first few playback quanta after entering
-    // `Streaming`, the bridge legitimately reports drops while the off-RT
-    // pre-rolled silence block is consumed and the capture producer's first
-    // blocks land (startup ramp, not drift). Those drops are suppressed here —
-    // neither accounted in `bridge_dropped_frames` nor warned — until the
-    // bring-up window closes; afterwards a real drift episode warns normally.
-    // The window is bounded two ways so it can never mask drift indefinitely:
-    // by the quantum count and by a poll budget that resets whenever playback
-    // advances (a stalled playback lets suppression expire).
-    //
-    // Latency note: In a live PipeWire graph, the 4 bring-up quantums take ~5.3 ms
-    // (@48kHz/64), whereas the monitor loop polls at 100 ms. Thus the very first
-    // poll often arrives with `quanta >= PLAYBACK_BRINGUP_QUANTUMS`. If no poll
-    // has yet drained the bring-up ramp (`!state.bringup_completed` with zero prior
-    // suppressed polls), that initial drain is recognized as the startup ramp.
+fn poll_clock_drift(
+    stream_status: Option<&StreamStatusFlags>,
+    dropped_frames: u32,
+    state: &mut PollState,
+) {
     let quanta = stream_status
         .map(|s| s.playback_quantums.load(Ordering::Relaxed))
         .unwrap_or(u32::MAX);
     if quanta < state.last_bringup_quanta {
-        // Stream restarted / reconnected: re-arm bring-up suppression.
         state.last_bringup_quanta = quanta;
         state.bringup_suppressed_polls = 0;
         state.has_polled_in_bringup = false;
@@ -769,14 +428,10 @@ pub fn poll_rt_status(
                 < crate::standalone::pw_host::MAX_BRINGUP_SUPPRESSED_POLLS;
             state.has_polled_in_bringup = true;
         } else if !state.startup_drops_drained {
-            // First poll arrived after the bring-up quantums elapsed (~5.3ms @48k/64 vs 100ms poll),
-            // or an early poll occurred before the audio thread incurred the startup ramp drop.
-            // Drain and suppress the startup ramp drop without reporting false clock drift.
             bringing_up = true;
             state.startup_drops_drained = true;
             state.bringup_completed = true;
         } else {
-            // Bring-up had already been drained in a prior poll; steady streaming reached.
             state.bringup_completed = true;
         }
     }
@@ -800,172 +455,177 @@ pub fn poll_rt_status(
             );
         }
     }
+}
 
-    // 7. PERFORMANCE TELEMETRY (Latency):
-    // Shows statistics of how long the CPU takes to process each block.
-    // - Median (P50): The "common" processing time.
-    // - P99: The worst case 99% of the time (indicates stability).
-    // - Max: The highest delay peak ever recorded.
-    let nanos = rt_status.dsp_cycle_time.load(Ordering::Relaxed);
-    if nanos > 0 {
-        let duration = Duration::from_nanos(nanos);
-        state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
-        if state.telemetry_throttle.wrapping_rem(100) == 0 {
-            let cap = stream_status
-                .map(|ss| latency_summary(&ss.capture_hist))
-                .unwrap_or_default();
-            let dsp = latency_summary(&rt_status.latency_hist);
-            let rec = stream_status
-                .map(|ss| latency_summary(&ss.record_hist))
-                .unwrap_or_default();
-            let pb = stream_status
-                .map(|ss| latency_summary(&ss.playback_hist))
-                .unwrap_or_default();
-            let e2e = stream_status
-                .map(|ss| latency_summary(&ss.e2e_hist))
-                .unwrap_or_default();
-
-            let total_calls = rt_status.latency_hist.total_count();
-
-            log::info!(
-                "{} RT Latency Breakdown (10s) [{} blocks]:\n\
-                 ├─ 1. Capture Total:        min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
-                 ├─ 2. DSP Core:             min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
-                 ├─ 3. Record Enqueue:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
-                 ├─ 4. Playback Total:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
-                 └─ 5. Capture↦Playback E2E: min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs",
-                "📊".bright_blue(),
-                total_calls,
-                cap.min_ns / 1000,
-                cap.mean_ns / 1000,
-                cap.p50_ns / 1000,
-                cap.p99_ns / 1000,
-                cap.p999_ns / 1000,
-                cap.max_ns / 1000,
-                dsp.min_ns / 1000,
-                dsp.mean_ns / 1000,
-                dsp.p50_ns / 1000,
-                dsp.p99_ns / 1000,
-                dsp.p999_ns / 1000,
-                dsp.max_ns / 1000,
-                rec.min_ns / 1000,
-                rec.mean_ns / 1000,
-                rec.p50_ns / 1000,
-                rec.p99_ns / 1000,
-                rec.p999_ns / 1000,
-                rec.max_ns / 1000,
-                pb.min_ns / 1000,
-                pb.mean_ns / 1000,
-                pb.p50_ns / 1000,
-                pb.p99_ns / 1000,
-                pb.p999_ns / 1000,
-                pb.max_ns / 1000,
-                e2e.min_ns / 1000,
-                e2e.mean_ns / 1000,
-                e2e.p50_ns / 1000,
-                e2e.p99_ns / 1000,
-                e2e.p999_ns / 1000,
-                e2e.max_ns / 1000,
-            );
-
-            if let Some(ss) = stream_status {
-                ss.capture_hist.reset();
-                ss.record_hist.reset();
-                ss.playback_hist.reset();
-                ss.e2e_hist.reset();
-                #[cfg(any(feature = "testing", feature = "heap-audit"))]
-                ss.e2e_exact.reset();
-            }
-            rt_status.latency_hist.reset();
-
-            let (cap_ticks, pb_ticks, cap_now, pb_now, cap_delay, pb_delay) = match stream_status {
-                Some(ss) => (
-                    ss.capture_host_ticks.load(Ordering::Relaxed),
-                    ss.playback_host_ticks.load(Ordering::Relaxed),
-                    ss.capture_host_now.load(Ordering::Relaxed),
-                    ss.playback_host_now.load(Ordering::Relaxed),
-                    ss.capture_host_delay.load(Ordering::Relaxed),
-                    ss.playback_host_delay.load(Ordering::Relaxed),
-                ),
-                None => (0, 0, 0, 0, 0, 0),
-            };
-
-            if cap_ticks > 0 && pb_ticks > 0 {
-                let tick_delta = pb_ticks.wrapping_sub(cap_ticks);
-                let time_delta_us = if pb_now > 0 && cap_now > 0 && pb_now > cap_now {
-                    ((pb_now - cap_now) / 1000) as u64
-                } else {
-                    0
-                };
-
-                let rate = rt_status.active_rate.load(Ordering::Relaxed);
-                let samples = rt_status.last_n_samples.load(Ordering::Relaxed);
-                let quantum_us = if rate > 0 && samples > 0 {
-                    (samples as u64 * 1_000_000) / rate as u64
-                } else {
-                    0
-                };
-
-                let cap_delay_us = if rate > 0 {
-                    (cap_delay.max(0) as u64 * 1_000_000) / rate as u64
-                } else {
-                    0
-                };
-                let pb_delay_us = if rate > 0 {
-                    (pb_delay.max(0) as u64 * 1_000_000) / rate as u64
-                } else {
-                    0
-                };
-
-                log::info!(
-                    "{} PW Stream Timing: cap↦pb gap={} µs | tick_delta={} | cap_ticks={} pb_ticks={} | cap_delay={} µs pb_delay={} µs | quantum={} µs",
-                    "⏱️".bright_blue(),
-                    time_delta_us,
-                    tick_delta,
-                    cap_ticks,
-                    pb_ticks,
-                    cap_delay_us,
-                    pb_delay_us,
-                    quantum_us,
-                );
-            }
-        }
-
-        // 8. DEADLINE CHECK:
-        // If execution time exceeds the "budget" given by the audio system,
-        // we generate a diagnostic error explaining what failed.
-        let rate_val = rt_status.active_rate.load(Ordering::Relaxed);
-        let samples_val = rt_status.last_n_samples.load(Ordering::Relaxed);
-
-        if rate_val > 0 && samples_val > 0 {
-            let budget_us = (samples_val as f64 / rate_val as f64) * 1_000_000.0;
-            let elapsed_us = duration.as_micros() as f64;
-
-            // Latched: sustained deadline overruns report once per
-            // episode instead of once per telemetry window. The observation
-            // runs on every throttle window so the latch releases as soon as
-            // the DSP stays within budget.
-            let deadline_exceeded = elapsed_us > budget_us;
-            if state.latches.deadline_exceeded.observe(deadline_exceeded) {
-                log::error!(
-                    "[E2001 | PROCESSING_OVERLOAD] Audio deadline exceeded (possible xrun): \
-                     exec_time_us={} budget_us={} n_samples={} rate={} — verify model \
-                     topology or reduce system load.",
-                    elapsed_us as u64,
-                    budget_us as u64,
-                    samples_val,
-                    rate_val
-                );
-            }
-        }
+fn emit_throttled_latency_and_timing(
+    rt_status: &RtStatusFlags,
+    stream_status: Option<&StreamStatusFlags>,
+    state: &mut PollState,
+) {
+    state.telemetry_throttle = state.telemetry_throttle.wrapping_add(1);
+    if state.telemetry_throttle.wrapping_rem(100) != 0 {
+        return;
     }
 
-    // Silence transition detection: gate chatter is rate-limited to at
-    // most one `info` line per second (suppressed transitions fold into the next
-    // line as "(×N)") so a threshold near the noise floor cannot bury real
-    // errors under a burst of silent/active lines.
-    let current_silent =
-        rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_IS_SILENT);
+    let cap = stream_status
+        .map(|ss| latency_summary(&ss.capture_hist))
+        .unwrap_or_default();
+    let dsp = latency_summary(&rt_status.latency_hist);
+    let rec = stream_status
+        .map(|ss| latency_summary(&ss.record_hist))
+        .unwrap_or_default();
+    let pb = stream_status
+        .map(|ss| latency_summary(&ss.playback_hist))
+        .unwrap_or_default();
+    let e2e = stream_status
+        .map(|ss| latency_summary(&ss.e2e_hist))
+        .unwrap_or_default();
+
+    let total_calls = rt_status.latency_hist.total_count();
+
+    log::info!(
+        "{} RT Latency Breakdown (10s) [{} blocks]:\n\
+         ├─ 1. Capture Total:        min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+         ├─ 2. DSP Core:             min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+         ├─ 3. Record Enqueue:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+         ├─ 4. Playback Total:       min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs\n\
+         └─ 5. Capture↦Playback E2E: min={}µs | mean={}µs | p50={}µs | p99={}µs | p999={}µs | max={}µs",
+        "📊".bright_blue(),
+        total_calls,
+        cap.min_ns / 1000,
+        cap.mean_ns / 1000,
+        cap.p50_ns / 1000,
+        cap.p99_ns / 1000,
+        cap.p999_ns / 1000,
+        cap.max_ns / 1000,
+        dsp.min_ns / 1000,
+        dsp.mean_ns / 1000,
+        dsp.p50_ns / 1000,
+        dsp.p99_ns / 1000,
+        dsp.p999_ns / 1000,
+        dsp.max_ns / 1000,
+        rec.min_ns / 1000,
+        rec.mean_ns / 1000,
+        rec.p50_ns / 1000,
+        rec.p99_ns / 1000,
+        rec.p999_ns / 1000,
+        rec.max_ns / 1000,
+        pb.min_ns / 1000,
+        pb.mean_ns / 1000,
+        pb.p50_ns / 1000,
+        pb.p99_ns / 1000,
+        pb.p999_ns / 1000,
+        pb.max_ns / 1000,
+        e2e.min_ns / 1000,
+        e2e.mean_ns / 1000,
+        e2e.p50_ns / 1000,
+        e2e.p99_ns / 1000,
+        e2e.p999_ns / 1000,
+        e2e.max_ns / 1000,
+    );
+
+    if let Some(ss) = stream_status {
+        ss.capture_hist.reset();
+        ss.record_hist.reset();
+        ss.playback_hist.reset();
+        ss.e2e_hist.reset();
+        #[cfg(any(feature = "testing", feature = "heap-audit"))]
+        ss.e2e_exact.reset();
+    }
+    rt_status.latency_hist.reset();
+
+    let Some(ss) = stream_status else {
+        return;
+    };
+    let cap_ticks = ss.capture_host_ticks.load(Ordering::Relaxed);
+    let pb_ticks = ss.playback_host_ticks.load(Ordering::Relaxed);
+    if cap_ticks == 0 || pb_ticks == 0 {
+        return;
+    }
+
+    let cap_now = ss.capture_host_now.load(Ordering::Relaxed);
+    let pb_now = ss.playback_host_now.load(Ordering::Relaxed);
+    let cap_delay = ss.capture_host_delay.load(Ordering::Relaxed);
+    let pb_delay = ss.playback_host_delay.load(Ordering::Relaxed);
+
+    let tick_delta = pb_ticks.wrapping_sub(cap_ticks);
+    let time_delta_us = if pb_now > 0 && cap_now > 0 && pb_now > cap_now {
+        ((pb_now - cap_now) / 1000) as u64
+    } else {
+        0
+    };
+
+    let rate = rt_status.active_rate.load(Ordering::Relaxed);
+    let samples = rt_status.last_n_samples.load(Ordering::Relaxed);
+    let quantum_us = if rate > 0 && samples > 0 {
+        (samples as u64 * 1_000_000) / rate as u64
+    } else {
+        0
+    };
+    let cap_delay_us = if rate > 0 {
+        (cap_delay.max(0) as u64 * 1_000_000) / rate as u64
+    } else {
+        0
+    };
+    let pb_delay_us = if rate > 0 {
+        (pb_delay.max(0) as u64 * 1_000_000) / rate as u64
+    } else {
+        0
+    };
+
+    log::info!(
+        "{} PW Stream Timing: cap↦pb gap={} µs | tick_delta={} | cap_ticks={} pb_ticks={} | cap_delay={} µs pb_delay={} µs | quantum={} µs",
+        "⏱️".bright_blue(),
+        time_delta_us,
+        tick_delta,
+        cap_ticks,
+        pb_ticks,
+        cap_delay_us,
+        pb_delay_us,
+        quantum_us,
+    );
+}
+
+fn check_audio_deadline(rt_status: &RtStatusFlags, duration: Duration, state: &mut PollState) {
+    let rate_val = rt_status.active_rate.load(Ordering::Relaxed);
+    let samples_val = rt_status.last_n_samples.load(Ordering::Relaxed);
+
+    if rate_val > 0 && samples_val > 0 {
+        let budget_us = (samples_val as f64 / rate_val as f64) * 1_000_000.0;
+        let elapsed_us = duration.as_micros() as f64;
+
+        let deadline_exceeded = elapsed_us > budget_us;
+        if state.latches.deadline_exceeded.observe(deadline_exceeded) {
+            log::error!(
+                "[E2001 | PROCESSING_OVERLOAD] Audio deadline exceeded (possible xrun): \
+                 exec_time_us={} budget_us={} n_samples={} rate={} — verify model \
+                 topology or reduce system load.",
+                elapsed_us as u64,
+                budget_us as u64,
+                samples_val,
+                rate_val
+            );
+        }
+    }
+}
+
+fn log_gate_transition(throttle: &mut GateTransitionThrottle, message: &str) {
+    if let Some(count) = throttle.observe(Instant::now()) {
+        if count > 1 {
+            log::info!("{message} (×{count})");
+        } else {
+            log::info!("{message}");
+        }
+    }
+}
+
+fn poll_gate_transitions(
+    rt_status: &RtStatusFlags,
+    was_silent: bool,
+    was_fading: bool,
+    state: &mut PollState,
+) -> (bool, bool) {
+    let current_silent = rt_status.check_flag(RT_STATUS_IS_SILENT);
 
     if current_silent != was_silent {
         let message = if current_silent {
@@ -979,31 +639,56 @@ pub fn poll_rt_status(
                 "🔊".green()
             )
         };
-        if let Some(count) = state.gate_throttle.observe(Instant::now()) {
-            if count > 1 {
-                log::info!("{message} (×{count})");
-            } else {
-                log::info!("{message}");
-            }
-        }
+        log_gate_transition(&mut state.gate_throttle, &message);
     }
 
-    // Fading transition detection
-    let current_fading =
-        rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_IS_FADING);
+    let current_fading = rt_status.check_flag(RT_STATUS_IS_FADING);
 
     if current_fading != was_fading && current_fading {
         let message = format!("{} Signal Transition: Gate in Fade-In/Out.", "🌓".yellow());
-        if let Some(count) = state.gate_throttle.observe(Instant::now()) {
-            if count > 1 {
-                log::info!("{message} (×{count})");
-            } else {
-                log::info!("{message}");
-            }
-        }
+        log_gate_transition(&mut state.gate_throttle, &message);
     }
 
     (current_silent, current_fading)
+}
+
+/// Reads atomic RT status flags and emits monitoring logs to the user.
+///
+/// This function acts as the "dashboard" of NAM-Audio-Pipe. It is called periodically
+/// to translate the technical signals coming from the audio thread (which is silent and ultra-fast)
+/// into understandable messages, performance warnings, and latency telemetry.
+///
+/// Returns a tuple (current_silent, current_fading) for state control in the main loop.
+///
+/// `_sys` is retained for API stability (callers/tests pass the startup snapshot);
+/// runtime telemetry is intentionally bundle-free.
+pub fn poll_rt_status(
+    rt_status: &RtStatusFlags,
+    stream_status: Option<&StreamStatusFlags>,
+    _sys: &SystemSnapshot,
+    was_silent: bool,
+    was_fading: bool,
+    dropped_frames: u32,
+    state: &mut PollState,
+) -> (bool, bool) {
+    let current_bits = rt_status.status_bits.load(Ordering::Relaxed);
+    rt_status
+        .flags_seen
+        .fetch_or(current_bits, Ordering::Relaxed);
+
+    poll_gc_and_command_flags(rt_status, &mut state.latches);
+    poll_rate_clip_and_hugepages(rt_status, state);
+    poll_rt_thread_setup(rt_status, state);
+    poll_xruns_and_playback_health(rt_status, stream_status, state);
+    poll_clock_drift(stream_status, dropped_frames, state);
+
+    let nanos = rt_status.dsp_cycle_time.load(Ordering::Relaxed);
+    if nanos > 0 {
+        emit_throttled_latency_and_timing(rt_status, stream_status, state);
+        check_audio_deadline(rt_status, Duration::from_nanos(nanos), state);
+    }
+
+    poll_gate_transitions(rt_status, was_silent, was_fading, state)
 }
 
 #[cfg(test)]

@@ -20,20 +20,31 @@ use neural_amp_modeler_rs::testing::receipt::{
 const MARKER_KEY: &str = "TEST_RESULT[";
 const FAIL_REASON_MAX_CHARS: usize = 512;
 
+/// Machine-derived status of a single long-audit phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
+    /// Phase exited cleanly and met all required `TEST_RESULT` markers.
     Passed,
+    /// Phase reported a non-strict `GAP` or skipped execution.
     Skipped,
+    /// Phase exited non-zero, timed out, or failed a required marker check.
     Failed,
 }
 
+/// Complete parsed verdict and metadata extracted from a phase execution log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhaseVerdict {
+    /// Derived outcome of the phase.
     pub verdict: Verdict,
+    /// Detected `GAP` markers emitted during execution.
     pub gaps: Vec<String>,
+    /// Concise failure summary when `verdict == Verdict::Failed`.
     pub fail_reason: Option<String>,
+    /// Total executed tests parsed from Cargo summaries.
     pub tests_executed: u64,
+    /// SHA-256 digest of the reference C++ oracle binary, if logged.
     pub oracle_sha256: Option<String>,
+    /// SHA-256 digest of verified test fixtures, if logged.
     pub fixture_sha256: Option<String>,
 }
 
@@ -61,6 +72,7 @@ pub struct Requirement {
 }
 
 impl Requirement {
+    /// Parses a `--require` specification string (`name[|alt…][:min]`).
     pub fn parse(spec: &str) -> Result<Self, String> {
         let (names, min) = match spec.rsplit_once(':') {
             Some((names, count)) => (
@@ -97,6 +109,7 @@ impl Requirement {
     }
 }
 
+/// Derives the typed [`PhaseVerdict`] from a phase log file, exit status, and required markers.
 pub fn derive(
     log: &Path,
     rc: i32,

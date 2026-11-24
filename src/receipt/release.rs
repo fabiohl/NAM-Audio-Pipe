@@ -58,6 +58,7 @@ pub struct ReleaseReceipt {
     pub verdict: Option<String>,
 }
 
+/// Reconciled release artifact paths, SHA-256 digests, and cross-receipt consistency state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseArtifacts {
@@ -78,6 +79,7 @@ pub struct ReleaseArtifacts {
     pub installed_sha256: Option<String>,
 }
 
+/// Summary of the long-audit run included inside a release receipt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseLongAudit {
@@ -93,6 +95,7 @@ pub struct ReleaseLongAudit {
     pub strict_evidence: String,
 }
 
+/// Per-phase summary embedded in [`ReleaseLongAudit`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseLongPhaseSummary {
@@ -107,15 +110,21 @@ pub struct ReleaseLongPhaseSummary {
     pub artifact_exercised: Option<bool>,
 }
 
+/// Cross-check status between the built artifact SHA-256 and the audited phase receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactConsistency {
+    /// All audited artifact-exercising phases agree on the same SHA-256 digest.
     Match { declared: String },
+    /// Phases report conflicting SHA-256 digests.
     Mismatch { reason: String },
+    /// No artifact-exercising phase declared a digest.
     Absent { reason: String },
+    /// Only a subset of artifact-exercising phases declared a digest.
     Incomplete { reason: String },
 }
 
 impl ArtifactConsistency {
+    /// Returns the canonical serialized label (`match`, `mismatch`, `absent`, or `incomplete`).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Match { .. } => "match",
@@ -125,6 +134,7 @@ impl ArtifactConsistency {
         }
     }
 
+    /// Returns a descriptive failure reason when consistency is not [`ArtifactConsistency::Match`].
     pub fn problem(&self) -> Option<String> {
         match self {
             Self::Match { .. } => None,

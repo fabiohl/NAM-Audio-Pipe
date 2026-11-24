@@ -3,11 +3,21 @@
 
 use super::*;
 use crate::standalone::pw_host::rt_callback::STRUCTURAL_SWAPS_PER_CALLBACK;
-use neural_amp_modeler_rs::common::spsc::{GcItem, GcOverflowBuffer, SlimModelPair, SwapBudget};
+use neural_amp_modeler_rs::common::diagnostics::SystemSnapshot;
+use neural_amp_modeler_rs::common::spsc::{
+    self, CabSimSwapPayload, GcItem, GcOverflowBuffer, ResamplerSwapPayload, RtStatusFlags,
+    SlimModelPair, SwapBudget,
+};
+use neural_amp_modeler_rs::dsp::cabsim::adapter::{CabSimAdapter, CabSimPair};
+use neural_amp_modeler_rs::dsp::cabsim::conv::ConvEngine;
+use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
+use neural_amp_modeler_rs::dsp::pipeline::MAX_RESAMP_BUF;
+use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::loader;
+use neural_amp_modeler_rs::models::StaticModel;
 use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Serializes the resampler fault-injection tests: the armed fault is a single
 /// global inside `handlers.rs`, so tests that arm it must not run concurrently.

@@ -40,16 +40,15 @@
 //!
 //! Receipt: `target/logs/ab-opt-receipt-<variant>.json` (+ `.txt`).
 //!
-//! > **Dev-environment caveat (per project guidance):** micro-benchmarks on a
+//! > **Dev-environment caveat:** micro-benchmarks on a
 //! > shared host are noisy. The harness truncates a warmup prefix of every run
 //! > and pins to the optimal CPU (best-effort); the promotion rule still
 //! > requires a reproducible gain across all runs before BOLT is announced.
 
-use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
 use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
@@ -71,7 +70,18 @@ use neural_amp_modeler_rs::models::{NamModel, StaticModel};
 use neural_amp_modeler_rs::testing::stress::generate_stress_signal_v2_default;
 
 use nam_audio_pipe::standalone::rt_setup::affinity::select_optimal_cpu;
-use nam_audio_pipe::standalone::rt_setup::{PinThreadError, pin_current_thread};
+use nam_audio_pipe::testing::bench::{Stats, measure_freq_ghz_x1000, pin_thread, rdtsc_cycles};
+use nam_audio_pipe::testing::json::{JsonValue, kv, obj};
+
+#[path = "ab_opt_bench/pmu.rs"]
+mod pmu;
+
+use pmu::PmcSet;
+#[cfg(test)]
+use pmu::{
+    PERF_COUNT_HW_CACHE_ICACHE, PERF_COUNT_HW_CACHE_ITLB, PERF_COUNT_HW_CACHE_OP_READ,
+    PERF_COUNT_HW_CACHE_RESULT_MISS,
+};
 
 const IR_FILENAME: &str = "cabsim_ir_pgo.wav";
 
@@ -161,335 +171,6 @@ fn resolve_ir_path() -> PathBuf {
     }
     eprintln!("ab_opt_bench: FATAL: mandatory CabSim IR fixture {IR_FILENAME} not found.");
     std::process::exit(1);
-}
-
-// ── Perf-event counters (raw syscall; libc lacks the perf binding) ──────────
-
-const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
-const PERF_EVENT_IOC_DISABLE: libc::c_ulong = 0x2401;
-const PERF_EVENT_IOC_RESET: libc::c_ulong = 0x2403;
-const PERF_FLAG_FD_CLOEXEC: u64 = 0x8;
-const PERF_TYPE_HARDWARE: u32 = 0;
-const PERF_TYPE_HW_CACHE: u32 = 3;
-const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
-const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
-// Linux <linux/perf_event.h> enum perf_hw_cache_id: L1I=1, ITLB=4, BPU=5.
-const PERF_COUNT_HW_CACHE_ITLB: u64 = 4;
-const PERF_COUNT_HW_CACHE_ICACHE: u64 = 1;
-const PERF_COUNT_HW_CACHE_OP_READ: u64 = 0;
-const PERF_COUNT_HW_CACHE_RESULT_MISS: u64 = 1;
-// __NR_perf_event_open on x86-64 Linux (not exported by libc).
-const NR_PERF_EVENT_OPEN: libc::c_long = 298;
-
-/// Linux `perf_event_attr` (first 112 bytes — enough for type/size/config and
-/// the `disabled`/`exclude_kernel`/`exclude_hv` control flags).
-#[repr(C)]
-struct PerfEventAttr {
-    type_: u32,
-    size: u32,
-    config: u64,
-    sample_period: u64,
-    sample_type: u64,
-    read_format: u64,
-    flags: u64,
-    wakeup_events: u32,
-    bp_type: u32,
-    config1: u64,
-    config2: u64,
-    branch_sample_type: u64,
-    sample_regs_user: u64,
-    sample_stack_user: u32,
-    clockid: i32,
-}
-
-impl PerfEventAttr {
-    fn hardware(config: u64) -> Self {
-        Self {
-            type_: PERF_TYPE_HARDWARE,
-            size: std::mem::size_of::<Self>() as u32,
-            config,
-            sample_period: 0,
-            sample_type: 0,
-            read_format: 0,
-            // disabled=1 (bit 0), exclude_kernel=1 (bit 5), exclude_hv=1 (bit 6).
-            flags: 1 | (1 << 5) | (1 << 6),
-            wakeup_events: 0,
-            bp_type: 0,
-            config1: 0,
-            config2: 0,
-            branch_sample_type: 0,
-            sample_regs_user: 0,
-            sample_stack_user: 0,
-            clockid: 0,
-        }
-    }
-
-    fn cache(config: u64) -> Self {
-        Self {
-            type_: PERF_TYPE_HW_CACHE,
-            ..Self::hardware(config)
-        }
-    }
-}
-
-/// One best-effort PMU counter. The fd is `None` when the event could not be
-/// opened (typed: `unavailable` + reason).
-struct Pmc {
-    name: &'static str,
-    fd: Option<i32>,
-    reason: Option<String>,
-}
-
-impl Pmc {
-    fn open(name: &'static str, attr: PerfEventAttr) -> Self {
-        // SAFETY: `attr` is a fully initialized value of the correct layout;
-        // the syscall only reads it and returns an fd (or -1). No memory is
-        // retained beyond the copy the kernel makes.
-        let fd = unsafe {
-            libc::syscall(
-                NR_PERF_EVENT_OPEN,
-                &raw const attr,
-                0,  // pid: current thread
-                -1, // cpu: any (pinned to one CPU by the harness)
-                -1, // group_fd: none
-                PERF_FLAG_FD_CLOEXEC,
-            )
-        };
-        if fd >= 0 {
-            Self {
-                name,
-                fd: Some(fd as i32),
-                reason: None,
-            }
-        } else {
-            Self {
-                name,
-                fd: None,
-                reason: Some(std::io::Error::last_os_error().to_string()),
-            }
-        }
-    }
-
-    fn ioctl(&self, request: libc::c_ulong) {
-        if let Some(fd) = self.fd {
-            // SAFETY: `fd` is a valid perf fd owned by this counter.
-            unsafe {
-                libc::ioctl(fd, request, 0);
-            }
-        }
-    }
-
-    fn read(&self) -> u64 {
-        let Some(fd) = self.fd else {
-            return 0;
-        };
-        let mut val: u64 = 0;
-        // SAFETY: `fd` is a valid perf fd and `val` is a writable u64 large
-        // enough for a single counter value.
-        let n = unsafe {
-            libc::read(
-                fd,
-                &raw mut val as *mut libc::c_void,
-                std::mem::size_of::<u64>(),
-            )
-        };
-        if n != std::mem::size_of::<u64>() as isize {
-            return 0;
-        }
-        val
-    }
-}
-
-impl Drop for Pmc {
-    fn drop(&mut self) {
-        if let Some(fd) = self.fd {
-            // SAFETY: `fd` is a valid fd owned by this counter.
-            unsafe {
-                libc::close(fd);
-            }
-        }
-    }
-}
-
-/// The PMU counter set retained in the receipt: cycles, instructions, iTLB
-/// misses and I-cache misses, each with typed availability.
-struct PmcSet {
-    cycles: Pmc,
-    instructions: Pmc,
-    itlb_misses: Pmc,
-    icache_misses: Pmc,
-}
-
-impl PmcSet {
-    fn open() -> Self {
-        Self {
-            cycles: Pmc::open("cycles", PerfEventAttr::hardware(PERF_COUNT_HW_CPU_CYCLES)),
-            instructions: Pmc::open(
-                "instructions",
-                PerfEventAttr::hardware(PERF_COUNT_HW_INSTRUCTIONS),
-            ),
-            itlb_misses: Pmc::open(
-                "itlb_misses",
-                PerfEventAttr::cache(
-                    PERF_COUNT_HW_CACHE_ITLB
-                        | (PERF_COUNT_HW_CACHE_OP_READ << 8)
-                        | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
-                ),
-            ),
-            icache_misses: Pmc::open(
-                "icache_misses",
-                PerfEventAttr::cache(
-                    PERF_COUNT_HW_CACHE_ICACHE
-                        | (PERF_COUNT_HW_CACHE_OP_READ << 8)
-                        | (PERF_COUNT_HW_CACHE_RESULT_MISS << 16),
-                ),
-            ),
-        }
-    }
-
-    fn reset(&self) {
-        for pmc in [
-            &self.cycles,
-            &self.instructions,
-            &self.itlb_misses,
-            &self.icache_misses,
-        ] {
-            pmc.ioctl(PERF_EVENT_IOC_RESET);
-        }
-    }
-
-    fn enable(&self) {
-        for pmc in [
-            &self.cycles,
-            &self.instructions,
-            &self.itlb_misses,
-            &self.icache_misses,
-        ] {
-            pmc.ioctl(PERF_EVENT_IOC_ENABLE);
-        }
-    }
-
-    fn disable(&self) {
-        for pmc in [
-            &self.cycles,
-            &self.instructions,
-            &self.itlb_misses,
-            &self.icache_misses,
-        ] {
-            pmc.ioctl(PERF_EVENT_IOC_DISABLE);
-        }
-    }
-
-    fn counts(&self) -> BTreeMap<&'static str, u64> {
-        let mut m = BTreeMap::new();
-        for pmc in [
-            &self.cycles,
-            &self.instructions,
-            &self.itlb_misses,
-            &self.icache_misses,
-        ] {
-            m.insert(pmc.name, pmc.read());
-        }
-        m
-    }
-
-    fn availability(&self) -> Vec<(String, Option<String>)> {
-        let mut v = Vec::new();
-        for pmc in [
-            &self.cycles,
-            &self.instructions,
-            &self.itlb_misses,
-            &self.icache_misses,
-        ] {
-            v.push((pmc.name.to_string(), pmc.reason.clone()));
-        }
-        v
-    }
-}
-
-// ── Statistics ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct Stats {
-    n: usize,
-    min: u64,
-    mean: f64,
-    p50: u64,
-    p99: u64,
-    p999: u64,
-    max: u64,
-}
-
-impl Stats {
-    fn of(mut samples: Vec<u64>) -> Self {
-        let n = samples.len();
-        if n == 0 {
-            return Self::default();
-        }
-        samples.sort_unstable();
-        let idx = |p: f64| {
-            let i = ((n as f64) * p).ceil() as usize;
-            samples[i.min(n).saturating_sub(1)]
-        };
-        let sum: u128 = samples.iter().map(|&c| c as u128).sum();
-        Self {
-            n,
-            min: samples[0],
-            mean: sum as f64 / n as f64,
-            p50: idx(0.50),
-            p99: idx(0.99),
-            p999: idx(0.999),
-            max: *samples.last().expect("n > 0"),
-        }
-    }
-}
-
-// ── TSC helpers ─────────────────────────────────────────────────────────────
-
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-fn rdtsc_cycles() -> u64 {
-    // SAFETY: `_mm_lfence` + `_rdtsc` are available on all x86-64 CPUs; they
-    // perform no memory access and have no side effects beyond reading TSC.
-    unsafe {
-        core::arch::x86_64::_mm_lfence();
-        core::arch::x86_64::_rdtsc()
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[inline(always)]
-fn rdtsc_cycles() -> u64 {
-    0
-}
-
-fn measure_freq_ghz_x1000() -> u64 {
-    let _ = rdtsc_cycles();
-    std::thread::sleep(Duration::from_millis(5));
-    let t0 = rdtsc_cycles();
-    let wall = Instant::now();
-    std::thread::sleep(Duration::from_millis(120));
-    let t1 = rdtsc_cycles();
-    let ns = wall.elapsed().as_nanos().max(1) as u64;
-    let cyc = t1.saturating_sub(t0);
-    (cyc * 1000) / ns
-}
-
-fn pin_thread(cpu: Option<usize>) -> Result<(), PinThreadError> {
-    match pin_current_thread(cpu) {
-        Ok(()) => Ok(()),
-        Err(PinThreadError::SyscallFailed { cpu, .. }) => {
-            eprintln!("  warn: could not pin thread to cpu {cpu}");
-            Ok(())
-        }
-        Err(e @ PinThreadError::CpuOutOfBounds { .. }) => Err(e),
-        // `PinThreadError` is `#[non_exhaustive]`; an unknown future variant is
-        // best-effort treated like a syscall failure (warn and continue).
-        Err(e) => {
-            eprintln!("  warn: could not pin thread: {e}");
-            Ok(())
-        }
-    }
 }
 
 // ── DSP machinery ────────────────────────────────────────────────────────────
@@ -757,64 +438,6 @@ fn new_os(factor: OversampleFactor) -> OversampleEngine {
         eprintln!("ab_opt_bench: FATAL: OversampleEngine init failed: {e}");
         std::process::exit(1);
     })
-}
-
-// ── Dependency-free JSON ─────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-enum JsonValue {
-    Int(u64),
-    Num(f64),
-    Str(String),
-    Obj(BTreeMap<String, JsonValue>),
-}
-
-impl JsonValue {
-    fn render(&self, out: &mut String) {
-        match self {
-            Self::Int(n) => out.push_str(&n.to_string()),
-            Self::Num(n) => out.push_str(&format!("{n:.2}")),
-            Self::Str(s) => {
-                out.push('"');
-                for c in s.chars() {
-                    match c {
-                        '"' => out.push_str("\\\""),
-                        '\\' => out.push_str("\\\\"),
-                        '\n' => out.push_str("\\n"),
-                        '\r' => out.push_str("\\r"),
-                        '\t' => out.push_str("\\t"),
-                        c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                        c => out.push(c),
-                    }
-                }
-                out.push('"');
-            }
-            Self::Obj(map) => {
-                out.push('{');
-                for (i, (key, value)) in map.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    Self::Str(key.clone()).render(out);
-                    out.push(':');
-                    value.render(out);
-                }
-                out.push('}');
-            }
-        }
-    }
-    fn to_json_string(&self) -> String {
-        let mut out = String::new();
-        self.render(&mut out);
-        out
-    }
-}
-
-fn kv(key: &str, value: JsonValue) -> (String, JsonValue) {
-    (key.to_string(), value)
-}
-fn obj(items: Vec<(String, JsonValue)>) -> JsonValue {
-    JsonValue::Obj(items.into_iter().collect())
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────

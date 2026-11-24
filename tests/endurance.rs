@@ -26,9 +26,8 @@
 //! `validate_linear_window` additionally requires a stationarity-confirmed
 //! repeat before its gain/polarity checks).
 //!
-//! Measured: soak 320k blocks in <elapsed> s, RSS delta=<delta> MB, faults=0
-//! (filled by the operator after a calibrated run; the marker carries the live
-//! numbers every run).
+//! Telemetry (`elapsed_s`, `rss_delta_kb`, `majflt`, and compaction faults) is
+//! emitted live inside the `TEST_RESULT[...]` PASS marker on every run.
 
 mod common;
 

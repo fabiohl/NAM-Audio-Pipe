@@ -623,7 +623,7 @@ fn spa_chunk(offset: u32, size: u32, stride: i32) -> pw::spa::sys::spa_chunk {
 /// (`playback_dsp_cycle` → [`deliver_silence_pair_fail_closed`]) must:
 ///
 /// * emit `0.0f32` analytical-silence sequences over the **quantum-sized
-///   window** (S5 / E2304: `silence_bytes` bounded by the active frame count,
+///   window** (E2304 contract guard: `silence_bytes` bounded by the active frame count,
 ///   not the shared-memory `maxsize`);
 /// * stamp the SPA chunks deterministically (`offset = 0`, `size = frames × 4`,
 ///   `stride = 4`) — the buffer is recycled back to the graph coherently;
@@ -733,7 +733,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
         "starvation soak must not stall: {CYCLES} quantums took {elapsed:?}"
     );
 
-    // S5 / E2304 regression: a large maxsize buffer (64 KiB per channel, well
+    // E2304 contract regression: a large maxsize buffer (64 KiB per channel, well
     // beyond MAX_BRIDGE_BUF × 4 = 32 KiB) must NOT raise the fail-closed
     // contract flag during sustained starvation. The kernel delivers exactly
     // the quantum-sized window (FRAMES × 4 bytes) and never touches the
@@ -819,7 +819,7 @@ fn bridge_starvation_emits_analytical_silence_and_recycles_buffers() {
     );
     assert!(
         !rt_big.check_flag(RT_STATUS_HOST_CONTRACT_VIOLATION),
-        "64 KiB maxsize must NOT raise E2304 during sustained starvation (S5 regression)"
+        "64 KiB maxsize must NOT raise E2304 during sustained starvation"
     );
 }
 

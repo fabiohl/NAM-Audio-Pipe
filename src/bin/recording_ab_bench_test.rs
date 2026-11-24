@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use nam_audio_pipe::standalone::rt_setup::PinThreadError;
 
 #[test]
 fn stats_percentiles_are_correct() {

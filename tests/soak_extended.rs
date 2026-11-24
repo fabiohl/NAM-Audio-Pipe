@@ -31,9 +31,8 @@
 //!   soak and asserts the post-warmup drift is below the OS page-margin
 //!   threshold (zero memory leak; RSS shrinkage is never a failure).
 //!
-//! Measured: soak 320k blocks in <elapsed> s, RSS delta=<delta> MB, faults=0
-//! (filled by the operator after a calibrated run; the markers carry the live
-//! numbers every run).
+//! Telemetry (`elapsed_s`, `rss_delta_kb`, and `majflt`) is emitted live inside
+//! the `TEST_RESULT[...]` PASS marker on every run.
 
 mod common;
 

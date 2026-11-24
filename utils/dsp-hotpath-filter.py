@@ -410,8 +410,6 @@ def main() -> int:
         print(f"[FATAL] RT codegen gate FAILED ({args.full}):", file=sys.stderr)
         for f in failures:
             print(f"  ❌ {f}", file=sys.stderr)
-            if f == SYNTHETIC_VIOLATION:
-                continue
         shown = 0
         for entry in matched.values():
             for key in GATE_KEYS:

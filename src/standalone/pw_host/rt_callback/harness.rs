@@ -568,74 +568,91 @@ impl SwapRtSide {
         count
     }
 
+    /// Processed left output buffer from the latest callback.
     pub fn out_l(&self) -> &[f32] {
         let n = self.last_n_pw.min(MAX_RESAMP_BUF);
         &self.state.resamp_out_l[..n]
     }
 
+    /// Processed right output buffer from the latest callback.
     pub fn out_r(&self) -> &[f32] {
         let n = self.last_n_pw.min(MAX_RESAMP_BUF);
         &self.state.resamp_out_r[..n]
     }
 
+    /// Frame count produced by the latest callback (`<= MAX_RESAMP_BUF`).
     pub fn current_n_pw(&self) -> usize {
         self.last_n_pw.min(MAX_RESAMP_BUF)
     }
 
+    /// Active left-channel neural model, if loaded.
     pub fn active_model_l(&self) -> Option<&StaticModel> {
         self.state.active_model_l.as_deref()
     }
 
+    /// Active right-channel neural model, if loaded.
     pub fn active_model_r(&self) -> Option<&StaticModel> {
         self.state.active_model_r.as_deref()
     }
 
+    /// Active stereo WAV IR cabinet simulator, if loaded.
     pub fn active_cabsim(&self) -> Option<&CabSimPair> {
         self.state.active_cabsim.as_deref()
     }
 
+    /// Active neural cabinet runtime slot, if loaded.
     pub fn active_cab_nam(&self) -> Option<&crate::standalone::cabinet::CabNamSlot> {
         self.state.active_cab_nam.as_ref()
     }
 
+    /// Whether capture DSP currently runs in mono mode.
     pub fn process_mono(&self) -> bool {
         self.state.process_mono
     }
 
+    /// Effective linear input gain multiplier applied before inference.
     pub fn input_gain_mult(&self) -> f32 {
         self.state.input_gain_mult
     }
 
+    /// Effective linear output gain multiplier applied after inference.
     pub fn output_gain_mult(&self) -> f32 {
         self.state.output_gain_mult
     }
 
+    /// Shared real-time telemetry and status flags observed by this harness.
     pub fn rt_status(&self) -> &RtStatusFlags {
         &self.rt_status
     }
 
+    /// Total frames processed across callbacks since initialization.
     pub fn frame_count(&self) -> u32 {
         self.state.frame_count
     }
 
+    /// Current host sample rate in Hz configured on this harness.
     pub fn current_host_rate(&self) -> u32 {
         self.current_host_rate
     }
 
+    /// Active noise-gate topology (`Silence` or `Musical`).
     pub fn gate_mode(&self) -> crate::standalone::cli::GateMode {
         self.state.gate_mode
     }
 
+    /// Whether the musical expander is currently attenuating the active signal.
     pub fn musical_gate_attenuating(&self) -> bool {
         self.state
             .musical_gate
             .is_attenuating(self.state.process_mono)
     }
 
+    /// Updates the active noise-gate topology (`Silence` or `Musical`) and threshold state.
     pub fn configure_gate_mode(&mut self, gate_mode: crate::standalone::cli::GateMode) {
         self.state.configure_gate_mode(gate_mode);
     }
 
+    /// Number of retired items currently parked or waiting on the SPSC GC ring.
     pub fn gc_pending(&self) -> usize {
         self.parking_lot.iter().filter(|s| s.is_some()).count() + self.gc_consumer.slots()
     }
@@ -1030,30 +1047,37 @@ impl RtSwapHarness {
 
     // ── Accessors (RT state inspection for tests) ───────────────────────────
 
+    /// Processed left output buffer from the latest callback.
     pub fn out_l(&self) -> &[f32] {
         self.rt.out_l()
     }
 
+    /// Processed right output buffer from the latest callback.
     pub fn out_r(&self) -> &[f32] {
         self.rt.out_r()
     }
 
+    /// Frame count produced by the latest callback.
     pub fn current_n_pw(&self) -> usize {
         self.rt.current_n_pw()
     }
 
+    /// Active left-channel neural model, if loaded.
     pub fn active_model_l(&self) -> Option<&StaticModel> {
         self.rt.active_model_l()
     }
 
+    /// Active right-channel neural model, if loaded.
     pub fn active_model_r(&self) -> Option<&StaticModel> {
         self.rt.active_model_r()
     }
 
+    /// Active stereo WAV IR cabinet simulator, if loaded.
     pub fn active_cabsim(&self) -> Option<&CabSimPair> {
         self.rt.active_cabsim()
     }
 
+    /// Attaches a dedicated SPSC channel for neural cabinet slot installation and rebuilds.
     pub fn attach_cab_nam_channel(
         &mut self,
     ) -> rtrb::Producer<crate::standalone::cabinet::PipeCabNamPayload> {
@@ -1062,10 +1086,12 @@ impl RtSwapHarness {
         prod
     }
 
+    /// Active neural cabinet runtime slot, if loaded.
     pub fn active_cab_nam(&self) -> Option<&crate::standalone::cabinet::CabNamSlot> {
         self.rt.state.active_cab_nam.as_ref()
     }
 
+    /// Updates the lock-free cabinet bypass flag observed by the RT callback.
     pub fn set_cab_bypass(&self, bypassed: bool) {
         self.rt
             .state
@@ -1073,6 +1099,7 @@ impl RtSwapHarness {
             .store(bypassed, std::sync::atomic::Ordering::Release);
     }
 
+    /// Returns the currently applied cabinet algorithmic latency in samples.
     pub fn applied_cab_latency(&self) -> u32 {
         self.rt
             .stream_status
@@ -1080,6 +1107,7 @@ impl RtSwapHarness {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Increments and returns the requested cabinet generation counter for rate/slot rebuild tests.
     pub fn bump_cab_nam_generation(&self) -> u64 {
         self.rt
             .rt_status
@@ -1088,26 +1116,32 @@ impl RtSwapHarness {
             + 1
     }
 
+    /// Whether capture DSP currently runs in mono mode.
     pub fn process_mono(&self) -> bool {
         self.rt.process_mono()
     }
 
+    /// Effective linear input gain multiplier applied before inference.
     pub fn input_gain_mult(&self) -> f32 {
         self.rt.input_gain_mult()
     }
 
+    /// Effective linear output gain multiplier applied after inference.
     pub fn output_gain_mult(&self) -> f32 {
         self.rt.output_gain_mult()
     }
 
+    /// Shared real-time telemetry and status flags observed by this harness.
     pub fn rt_status(&self) -> &RtStatusFlags {
         self.rt.rt_status()
     }
 
+    /// Total frames processed across callbacks since initialization.
     pub fn frame_count(&self) -> u32 {
         self.rt.frame_count()
     }
 
+    /// Current host sample rate in Hz configured on this harness.
     pub fn current_host_rate(&self) -> u32 {
         self.rt.current_host_rate()
     }
@@ -1117,6 +1151,7 @@ impl RtSwapHarness {
         self.rt.run_prologue()
     }
 
+    /// Number of retired items currently parked or waiting on the SPSC GC ring.
     pub fn gc_pending(&self) -> usize {
         self.rt.gc_pending()
     }

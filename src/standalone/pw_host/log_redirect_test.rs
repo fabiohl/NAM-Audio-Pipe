@@ -207,7 +207,7 @@ fn non_utf8_payload_falls_back_without_allocation() {
             neural_amp_modeler_rs::common::diagnostics::logger::NamLogger::log_buffer()
         {
             let entries = buf.snapshot();
-            // The fallback replaces the whole message (task spec), so the probe
+            // The fallback replaces the whole message, so the probe
             // is identified by the static fallback token itself (no other test
             // produces an intercepted PW event with this shape).
             let entry = entries

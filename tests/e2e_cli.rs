@@ -661,7 +661,7 @@ fn pipewire_first_connection_failure_exits_backend_with_hint() {
     let _ = std::fs::remove_dir_all(&rt);
 }
 
-// --recording startup failures (R-1) ---------------------------------------
+// --recording startup failures ----------------------------------------------
 // A `--record` startup that cannot bring the disk worker up (unusable output
 // directory, unavailable io_uring, ...) must exit with the documented recording
 // code (6), never the legacy generic 1. Regression guard for the exit-code

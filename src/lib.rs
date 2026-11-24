@@ -19,6 +19,8 @@ pub mod dsp;
 pub mod receipt;
 pub mod recording;
 pub mod standalone;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 /// Real-time heap-allocation audit allocator (feature `heap-audit`).
 ///

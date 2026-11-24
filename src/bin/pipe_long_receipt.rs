@@ -26,11 +26,7 @@ use std::process::exit;
 use std::str::FromStr;
 
 use nam_audio_pipe::receipt::LONG_ROSTER;
-use nam_audio_pipe::receipt::build::{
-    BuildArtifacts, BuildOptimizations, BuildProvenance, BuildReceipt, PackageInfo,
-    extract_engine_provenance, hash_file, parse_pgo_workload_receipt, resolve_engine_identity,
-    validate_ab_opt_ceremony_receipt, validate_pgo_matrix,
-};
+use nam_audio_pipe::receipt::build::{validate_ab_opt_ceremony_receipt, validate_pgo_matrix};
 use nam_audio_pipe::receipt::fail_reasons::{self, FailReasonRecord};
 use nam_audio_pipe::receipt::jsonl::{verify_long_jsonl, verify_long_jsonl_strict};
 use nam_audio_pipe::receipt::phase_log::{self, Requirement, Verdict};
@@ -41,6 +37,13 @@ use neural_amp_modeler_rs::testing::receipt::{
     LongAuditReceipt, LongPhaseReceipt, LongPhaseStatus, LongReason, count_tests_executed_from_log,
     detect_gap_markers, now_iso8601,
 };
+
+#[path = "pipe_long_receipt/build_receipt.rs"]
+mod build_receipt;
+
+#[cfg(test)]
+use build_receipt::compute_build_status;
+use build_receipt::{cmd_build_receipt, cmd_build_status};
 
 const DEFAULT_OUT: &str = "target/logs/long-audit-receipt.jsonl";
 
@@ -504,326 +507,6 @@ fn cmd_ceremony_proof(args: &[String]) {
     }
 }
 
-fn cmd_build_receipt(args: &[String]) {
-    let flags = match parse_flags(args) {
-        Ok(f) => f,
-        Err(e) => die_usage("build-receipt", &e),
-    };
-    let out = flags
-        .get("out")
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_BUILD_RECEIPT.to_string());
-    let artifact_path = flags
-        .get("artifact")
-        .cloned()
-        .unwrap_or_else(|| DEFAULT_ARTIFACT.to_string());
-    let package_name = flags
-        .get("package-name")
-        .cloned()
-        .unwrap_or_else(|| "nam-audio-pipe".to_string());
-    let package_version = flags
-        .get("package-version")
-        .cloned()
-        .unwrap_or_else(|| "1.0.0".to_string());
-    let git_commit = flags
-        .get("git-commit")
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-    let git_branch = flags
-        .get("git-branch")
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-    let git_dirty = flags
-        .get("git-dirty")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
-    let cargo_lock = flags
-        .get("cargo-lock")
-        .cloned()
-        .unwrap_or_else(|| "Cargo.lock".to_string());
-    let rustc_version = flags
-        .get("rustc-version")
-        .cloned()
-        .unwrap_or_else(|| "unknown".to_string());
-    let rustflags = flags.get("rustflags").cloned().unwrap_or_default();
-    let pgo_status = flags
-        .get("pgo-status")
-        .cloned()
-        .unwrap_or_else(|| "skipped".to_string());
-    let bolt_status = flags
-        .get("bolt-status")
-        .cloned()
-        .unwrap_or_else(|| "skipped".to_string());
-    let bolt_version = flags.get("bolt-version").cloned();
-    let bolt_profile = flags.get("bolt-profile").cloned();
-    let ceremony_receipt = flags.get("ceremony-receipt").cloned();
-    let pgo_workload_receipt = flags.get("pgo-workload-receipt").cloned();
-    let codegen_status = flags
-        .get("codegen-status")
-        .cloned()
-        .unwrap_or_else(|| "unavailable".to_string());
-    let tarball_path = flags.get("tarball-path").cloned();
-    let flatpak_path = flags.get("flatpak-path").cloned();
-    let installed_path = flags.get("installed-path").cloned();
-    let strict = flags.contains_key("strict");
-    let run_id = flags
-        .get("run-id")
-        .cloned()
-        .or_else(|| env::var("NAM_RUN_ID").ok());
-
-    let mut gaps: Vec<String> = Vec::new();
-    if let Some(list) = flags.get("gaps") {
-        for item in list.split(',') {
-            let item = item.trim();
-            if !item.is_empty() {
-                gaps.push(item.to_string());
-            }
-        }
-    }
-
-    let artifact = Path::new(&artifact_path);
-    if !artifact.exists() {
-        eprintln!("build-receipt: artifact not found: {artifact_path}");
-        exit(1);
-    }
-    let artifact_sha256 = match hash_file(artifact) {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("build-receipt: failed to hash artifact {artifact_path}: {e}");
-            exit(1);
-        }
-    };
-
-    let cargo_lock_path = Path::new(&cargo_lock);
-    let cargo_lock_sha256 = hash_file(cargo_lock_path).unwrap_or_else(|_| "absent".to_string());
-    let project_root = cargo_lock_path.parent().unwrap_or(Path::new("."));
-    let engine_provenance = extract_engine_provenance(cargo_lock_path)
-        .with_identity(resolve_engine_identity(project_root));
-
-    let tarball_sha256 = tarball_path
-        .as_ref()
-        .and_then(|p| hash_file(Path::new(p)).ok());
-    let flatpak_sha256 = flatpak_path
-        .as_ref()
-        .and_then(|p| hash_file(Path::new(p)).ok());
-    let installed_sha256 = installed_path
-        .as_ref()
-        .and_then(|p| hash_file(Path::new(p)).ok());
-
-    let bolt_proof_flag = flags.get("bolt-proof").cloned();
-    let bolt_proof = if let Some(flag_proof) = bolt_proof_flag {
-        flag_proof
-    } else if let Some(path) = ceremony_receipt.as_deref() {
-        match validate_ab_opt_ceremony_receipt(path, Some(&git_commit), Some(&cargo_lock_sha256)) {
-            Ok((proof_id, _, _, verdict)) => {
-                if verdict == "UNOPTIMIZED" {
-                    "fallback_plain".to_string()
-                } else if verdict == "PGO-ONLY" || bolt_status == "not_proven" {
-                    "fallback_pgo_only".to_string()
-                } else {
-                    proof_id
-                }
-            }
-            Err(e) => {
-                if bolt_status == "applied" {
-                    gaps.push("bolt_proof_unverified".to_string());
-                }
-                format!("unverified:{}", e.reason_code())
-            }
-        }
-    } else if bolt_status == "not_proven" {
-        "fallback_pgo_only".to_string()
-    } else {
-        if bolt_status == "applied" {
-            gaps.push("bolt_proof_unverified".to_string());
-        }
-        "skipped".to_string()
-    };
-
-    let bolt_profile_sha256 = bolt_profile
-        .as_ref()
-        .and_then(|p| hash_file(Path::new(p)).ok());
-    let pgo_workload = pgo_workload_receipt
-        .as_deref()
-        .and_then(parse_pgo_workload_receipt);
-
-    let pgo_applied = pgo_status == "applied";
-    let bolt_applied = bolt_status == "applied";
-    if !pgo_applied {
-        gaps.push("pgo_not_applied".to_string());
-    }
-    if bolt_status == "not_proven" {
-        gaps.push("bolt_not_proven".to_string());
-    } else if !bolt_applied {
-        gaps.push("bolt_not_applied".to_string());
-    }
-    if codegen_status != "pass" {
-        gaps.push(format!("codegen_gate_{codegen_status}"));
-    }
-    if !engine_provenance.is_pinned() {
-        gaps.push("engine_unpinned".to_string());
-    }
-    gaps.sort();
-    gaps.dedup();
-
-    let (status, _fatal_strict_gaps) = compute_build_status(&gaps, &bolt_proof, strict);
-
-    let receipt = BuildReceipt {
-        schema_version: "1.0.0".to_string(),
-        timestamp_utc: now_iso8601(),
-        status: status.clone(),
-        strict_mode: strict,
-        gaps,
-        package: PackageInfo {
-            name: package_name,
-            version: package_version,
-        },
-        provenance: BuildProvenance {
-            git_commit,
-            git_branch,
-            git_dirty,
-            cargo_lock_sha256,
-            rustc_version,
-            rustflags,
-            run_id,
-        },
-        engine_provenance,
-        optimizations: BuildOptimizations {
-            pgo_applied,
-            bolt_applied,
-            bolt_proof,
-            bolt_profile_sha256,
-            bolt_version,
-            codegen_status,
-        },
-        pgo_workload,
-        artifacts: BuildArtifacts {
-            artifact_path,
-            artifact_sha256: artifact_sha256.clone(),
-            tarball_path,
-            tarball_sha256,
-            flatpak_path,
-            flatpak_sha256,
-            installed_path,
-            installed_sha256,
-        },
-    };
-
-    let json = match serde_json::to_string_pretty(&receipt) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("build-receipt: failed to serialize json: {e}");
-            exit(1);
-        }
-    };
-    if let Err(e) = write_file(&out, &json) {
-        eprintln!("build-receipt: failed to write {out}: {e}");
-        exit(1);
-    }
-    if status == "FAILED" {
-        eprintln!("BUILD_RECEIPT: FAIL log={out}");
-        exit(1);
-    }
-    println!("BUILD_RECEIPT: {status} log={out} sha256={artifact_sha256}");
-    exit(0);
-}
-
-fn cmd_build_status(args: &[String]) {
-    let flags = match parse_flags(args) {
-        Ok(f) => f,
-        Err(e) => die_usage("build-status", &e),
-    };
-    let receipt_path_str = match required(&flags, "receipt") {
-        Ok(v) => v.clone(),
-        Err(e) => die_usage("build-status", &e),
-    };
-    let receipt_path = Path::new(&receipt_path_str);
-    if !receipt_path.exists() {
-        eprintln!("build-status: receipt file not found: {receipt_path_str}");
-        exit(1);
-    }
-    let content = match fs::read_to_string(receipt_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("build-status: failed to read {receipt_path_str}: {e}");
-            exit(1);
-        }
-    };
-    let receipt: BuildReceipt = match serde_json::from_str(&content) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("build-status: invalid build receipt schema: {e}");
-            exit(1);
-        }
-    };
-
-    let expected_run_id = flags
-        .get("run-id")
-        .cloned()
-        .or_else(|| env::var("NAM_RUN_ID").ok())
-        .filter(|s| !s.is_empty());
-
-    if let Some(expected) = expected_run_id {
-        match &receipt.provenance.run_id {
-            Some(rid) if rid == &expected => {}
-            Some(rid) => {
-                eprintln!("build-status: run_id mismatch: receipt={rid} != expected={expected}");
-                exit(1);
-            }
-            None => {
-                eprintln!("build-status: receipt missing run_id, expected={expected}");
-                exit(1);
-            }
-        }
-    }
-
-    println!("BUILD_STATUS: {}", receipt.status);
-    if let Some(rid) = &receipt.provenance.run_id {
-        println!("BUILD_RUN_ID: {rid}");
-    }
-    let (_, non_fallback_gaps) = compute_build_status(
-        &receipt.gaps,
-        &receipt.optimizations.bolt_proof,
-        receipt.strict_mode,
-    );
-    for gap in &receipt.gaps {
-        if non_fallback_gaps.contains(gap) {
-            println!("GAP: {gap}");
-        } else {
-            println!("FALLBACK_GAP: {gap}");
-        }
-    }
-    exit(0);
-}
-
-fn compute_build_status(gaps: &[String], bolt_proof: &str, strict: bool) -> (String, Vec<String>) {
-    let fatal_strict_gaps: Vec<String> = gaps
-        .iter()
-        .filter(|g| {
-            if bolt_proof == "fallback_plain" {
-                g.as_str() != "bolt_not_proven"
-                    && g.as_str() != "pgo_not_applied"
-                    && g.as_str() != "bolt_not_applied"
-            } else if bolt_proof == "fallback_pgo_only" {
-                g.as_str() != "bolt_not_proven" && g.as_str() != "bolt_not_applied"
-            } else {
-                true
-            }
-        })
-        .cloned()
-        .collect();
-
-    let status = if !fatal_strict_gaps.is_empty() && strict {
-        "FAILED".to_string()
-    } else if !gaps.is_empty() {
-        "PASS_WITH_GAPS".to_string()
-    } else {
-        "PASSED".to_string()
-    };
-
-    (status, fatal_strict_gaps)
-}
-
 fn cmd_verify_artifact(args: &[String]) {
     let flags = match parse_flags(args) {
         Ok(f) => f,
@@ -959,23 +642,24 @@ fn cmd_certify(args: &[String]) {
     exit(1);
 }
 
-fn append_line(out: &str, line: &str) -> std::io::Result<()> {
+fn ensure_parent_dir(out: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(out).parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
+    Ok(())
+}
+
+fn append_line(out: &str, line: &str) -> std::io::Result<()> {
+    ensure_parent_dir(out)?;
     let mut file = OpenOptions::new().create(true).append(true).open(out)?;
     file.write_all(line.as_bytes())?;
     file.write_all(b"\n")
 }
 
 fn write_file(out: &str, content: &str) -> std::io::Result<()> {
-    if let Some(parent) = Path::new(out).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
-    }
+    ensure_parent_dir(out)?;
     fs::write(out, content)
 }
 
@@ -986,68 +670,5 @@ fn die_usage(subcommand: &str, message: &str) -> ! {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::compute_build_status;
-
-    #[test]
-    fn test_compute_build_status_strict_fatal_gaps() {
-        let gaps = vec!["pgo_not_applied".to_string()];
-        let (status, fatal) = compute_build_status(&gaps, "skipped", true);
-        assert_eq!(status, "FAILED");
-        assert_eq!(fatal, vec!["pgo_not_applied"]);
-
-        let gaps = vec!["bolt_not_applied".to_string()];
-        let (status, fatal) = compute_build_status(&gaps, "unverified:missing", true);
-        assert_eq!(status, "FAILED");
-        assert_eq!(fatal, vec!["bolt_not_applied"]);
-    }
-
-    #[test]
-    fn test_compute_build_status_fallback_plain() {
-        let gaps = vec![
-            "bolt_not_applied".to_string(),
-            "bolt_not_proven".to_string(),
-            "pgo_not_applied".to_string(),
-        ];
-        let (status, fatal) = compute_build_status(&gaps, "fallback_plain", true);
-        assert_eq!(status, "PASS_WITH_GAPS");
-        assert!(fatal.is_empty());
-
-        let gaps = vec!["bolt_not_applied".to_string(), "tool_missing".to_string()];
-        let (status, fatal) = compute_build_status(&gaps, "fallback_plain", true);
-        assert_eq!(status, "FAILED");
-        assert_eq!(fatal, vec!["tool_missing"]);
-    }
-
-    #[test]
-    fn test_compute_build_status_fallback_pgo_only() {
-        let gaps = vec![
-            "bolt_not_applied".to_string(),
-            "bolt_not_proven".to_string(),
-        ];
-        let (status, fatal) = compute_build_status(&gaps, "fallback_pgo_only", true);
-        assert_eq!(status, "PASS_WITH_GAPS");
-        assert!(fatal.is_empty());
-
-        let gaps = vec!["bolt_not_proven".to_string(), "pgo_not_applied".to_string()];
-        let (status, fatal) = compute_build_status(&gaps, "fallback_pgo_only", true);
-        assert_eq!(status, "FAILED");
-        assert_eq!(fatal, vec!["pgo_not_applied"]);
-    }
-
-    #[test]
-    fn test_compute_build_status_non_strict() {
-        let gaps = vec!["pgo_not_applied".to_string()];
-        let (status, fatal) = compute_build_status(&gaps, "skipped", false);
-        assert_eq!(status, "PASS_WITH_GAPS");
-        assert_eq!(fatal, vec!["pgo_not_applied"]);
-    }
-
-    #[test]
-    fn test_compute_build_status_clean_pass() {
-        let gaps = Vec::new();
-        let (status, fatal) = compute_build_status(&gaps, "applied", true);
-        assert_eq!(status, "PASSED");
-        assert!(fatal.is_empty());
-    }
-}
+#[path = "pipe_long_receipt_test.rs"]
+mod tests;

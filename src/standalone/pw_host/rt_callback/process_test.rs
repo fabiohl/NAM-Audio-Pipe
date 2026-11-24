@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
+#[cfg(feature = "testing")]
+use super::super::prologue::PrologueOutcome;
+use super::super::recording_tx::send_recording_audio;
+use super::super::spa_contract::{
+    ChunkWindow, check_ffi_contract, check_spa_buffer_pair, handle_spa_pair_fail_closed,
+    read_chunk_meta, resolve_capture_chunk_window, silence_available_descriptors,
+    silence_spa_channels,
+};
 use super::*;
-use crate::recording::buffer::{AlignedBlock, AudioMetadata, CONTROL_CAPACITY, ControlPayload};
+use crate::recording::buffer::{
+    AlignedBlock, AudioMetadata, CONTROL_CAPACITY, ControlPayload, OVERRUN_COUNT,
+    OVERRUN_FRAMES_COUNT,
+};
 use crate::recording::pool::{POOL_CAPACITY, PoolConsumer, RecordingPool};
 use crate::recording::transport::RecordingSender;
+use crate::standalone::pw_host::capture::state::CaptureState;
+use neural_amp_modeler_rs::dsp::pipeline::MAX_BRIDGE_BUF;
 
 /// Builds a pool-transport sender plus the two consumer halves a test needs to
 /// observe the pushes (control ring + pool descriptors).
@@ -2125,7 +2138,7 @@ fn prologue_outcome_accessors() {
 /// When the Silence Gate closes while a neural cabinet slot is active, the
 /// cabinet must ring out for `remaining_tail` host-rate samples (zero input)
 /// instead of being cut to silence on the first closed block, mirroring the
-/// WAV IR path and the NAM-Plug behavior.
+/// WAV IR path.
 #[test]
 fn test_silence_gate_closed_drains_neural_cabinet_tail() {
     use crate::standalone::cabinet::{CabAssetKind, build_cab_nam_slot};

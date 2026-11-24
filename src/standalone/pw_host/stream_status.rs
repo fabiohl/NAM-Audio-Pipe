@@ -72,7 +72,7 @@ pub struct StreamStatusFlags {
     /// delivered generation's capture timestamp plus one quantum period is
     /// still in the future). Kept separate from
     /// [`Self::playback_bridge_starvation`] so an early callback is not
-    /// misreported as a lost capture (F8 / T5.2).
+    /// misreported as a lost capture.
     pub playback_early_callbacks: AtomicU32,
 
     /// Capture-start timestamp (nanoseconds, TSC domain) of the last generation
