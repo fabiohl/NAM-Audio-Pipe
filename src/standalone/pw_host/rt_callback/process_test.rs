@@ -457,6 +457,8 @@ fn inline_sender_reaching_the_rt_send_path_is_accused_outside_rollback_build() {
 #[cfg(not(debug_assertions))]
 #[test]
 fn inline_sender_still_routes_into_the_inline_ring_once_the_tripwire_is_compiled_out() {
+    use crate::recording::buffer::RingPayload;
+
     let (producer, mut consumer) = crate::recording::buffer::create_audio_ring_buffer::<
         MAX_BLOCK_SIZE,
     >(crate::recording::buffer::RING_CAPACITY);
