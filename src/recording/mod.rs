@@ -7,8 +7,8 @@
 //! to an asynchronous background disk-I/O worker powered by Linux `io_uring`:
 //!
 //! - **RT Producer**: Writes stereo audio frames into a lock-free preallocated
-//!   ring/pool ([`pool::RecordingPool`] or inline [`buffer::AlignedBlock`]),
-//!   guaranteeing zero heap allocations, zero blocking syscalls, and zero locks.
+//!   pool ([`pool::RecordingPool`]), guaranteeing zero heap allocations, zero
+//!   blocking syscalls, and zero locks.
 //! - **Async Disk Worker**: Consumes captured audio chunks off the RT path,
 //!   formats PCM WAV headers, checkpoints file lengths periodically to prevent data loss
 //!   on unexpected termination, and splits files at 4 GiB boundaries.
@@ -31,8 +31,7 @@ pub use alert::{ALERT_REMINDER_INTERVAL, Alert, AlertKind, Clock, RecordingAlert
 
 pub use buffer::{
     AlignedBlock, AudioMetadata, CONTROL_CAPACITY, ControlPayload, MAX_BLOCK_SIZE, OVERRUN_COUNT,
-    OVERRUN_FRAMES_COUNT, RING_CAPACITY, RingPayload, create_audio_ring_buffer,
-    create_control_ring_buffer,
+    OVERRUN_FRAMES_COUNT, create_control_ring_buffer,
 };
 pub use disk::{disk_writer_loop, spawn_recording_worker};
 pub use guard::{
@@ -52,7 +51,5 @@ pub use status::{
 pub use summary::{
     CaptureSegment, CaptureSummary, format_bytes, format_capture_size, format_duration,
 };
-pub use transport::{
-    RECORDING_POOL_TRANSPORT, RecordingReceiver, RecordingSender, create_recording_transport,
-};
+pub use transport::{RecordingReceiver, RecordingSender, create_recording_transport};
 pub use wav_header::{build_wav_header, capture_filename, current_capture_timestamp};

@@ -564,7 +564,6 @@ async fn checkpoint_failure_transitions_status_to_failed() {
                 let res = disk_writer_loop_inner(
                     &FailingCheckpointSink,
                     &mut receiver,
-                    None,
                     &status_for_worker,
                 )
                 .await;
@@ -680,8 +679,7 @@ fn spawn_recording_worker_fails_fast_when_io_uring_unavailable() {
 
     // Empty housekeeping set = documented no-op (no affinity syscall under
     // the test runner).
-    let handle =
-        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn must succeed");
+    let handle = spawn_recording_worker(receiver, init, Vec::new()).expect("spawn must succeed");
 
     let err = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect_err("unavailable io_uring must fail the startup handshake");
@@ -739,13 +737,24 @@ struct SharedDisk {
 /// Positioned-write backend writing into a [`SharedDisk`] — no io_uring.
 struct SharedDiskWriter {
     disk: SharedDisk,
+    /// Count of `write_at` submissions (header + data), shared with tests that
+    /// need to prove a periodic free-space probe ran while writes were still
+    /// in progress (continuous-load disk monitoring).
+    write_calls: Arc<AtomicUsize>,
     /// Optional artificial delay applied on `sync_all`, modelling a slow
     /// `fsync` (HDD/USB/NFS) during finalization/checkpoint.
     finalize_delay: Option<std::time::Duration>,
+    /// Optional artificial delay applied to every positioned write, modelling a
+    /// slow disk so tests can observe the live `RecordingStatus` mid-capture.
+    write_delay: Option<std::time::Duration>,
 }
 
 impl WriteAt for SharedDiskWriter {
     async fn write_at(&mut self, buf: Vec<u8>, offset: u64) -> (io::Result<usize>, Vec<u8>) {
+        self.write_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(delay) = self.write_delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut disk = self.disk.bytes.lock().unwrap();
         let start = offset as usize;
         let end = start + buf.len();
@@ -781,7 +790,9 @@ impl WavSink for MockWavSink {
         let writer = AsyncWavWriter::<SharedDiskWriter>::open(
             SharedDiskWriter {
                 disk: disk.clone(),
+                write_calls: Arc::new(AtomicUsize::new(0)),
                 finalize_delay: self.finalize_delay,
+                write_delay: None,
             },
             metadata,
         )
@@ -844,7 +855,7 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
             let sink = MockWavSink::default();
             let disks_handle = Arc::clone(&sink.disks);
             let worker = tokio::task::spawn_local(async move {
-                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+                disk_writer_loop_inner(&sink, &mut receiver, &status).await
             });
 
             // Barrier: push Metadata, then wait until the worker consumed it
@@ -856,13 +867,9 @@ async fn shutdown_with_empty_ring_never_truncates_subsequent_blocks() {
             {
                 // Scope the producer borrows so they are released before the
                 // pushes below re-borrow `sender`.
-                let (control_prod, pool_prod) = match &mut sender {
-                    crate::recording::transport::RecordingSender::Pool {
-                        control, pool, ..
-                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
-                    crate::recording::transport::RecordingSender::Inline(_) => {
-                        panic!("pool transport expected")
-                    }
+                let (control_prod, pool_prod) = {
+                    let (control, pool) = sender.parts_mut();
+                    (control.unwrap(), pool.unwrap())
                 };
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
@@ -982,19 +989,15 @@ async fn sigterm_sigint_burst_keeps_finalized_wav_consistent() {
             let sink = MockWavSink::default();
             let disks_handle = Arc::clone(&sink.disks);
             let worker = tokio::task::spawn_local(async move {
-                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+                disk_writer_loop_inner(&sink, &mut receiver, &status).await
             });
 
             // Metadata barrier: the worker consumed it, channels are empty.
             assert!(sender.try_push_metadata(META), "metadata push must succeed");
             {
-                let (control_prod, pool_prod) = match &mut sender {
-                    crate::recording::transport::RecordingSender::Pool {
-                        control, pool, ..
-                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
-                    crate::recording::transport::RecordingSender::Inline(_) => {
-                        panic!("pool transport expected")
-                    }
+                let (control_prod, pool_prod) = {
+                    let (control, pool) = sender.parts_mut();
+                    (control.unwrap(), pool.unwrap())
                 };
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
@@ -1110,17 +1113,13 @@ async fn barrier_pairing_discards_superseded_metadata() {
             let sink = MockWavSink::default();
             let disks_handle = Arc::clone(&sink.disks);
             let worker = tokio::task::spawn_local(async move {
-                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+                disk_writer_loop_inner(&sink, &mut receiver, &status).await
             });
 
             {
-                let (control_prod, pool_prod) = match &mut sender {
-                    crate::recording::transport::RecordingSender::Pool {
-                        control, pool, ..
-                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
-                    crate::recording::transport::RecordingSender::Inline(_) => {
-                        panic!("pool expected")
-                    }
+                let (control_prod, pool_prod) = {
+                    let (control, pool) = sender.parts_mut();
+                    (control.unwrap(), pool.unwrap())
                 };
                 let meta1 = AudioMetadata {
                     sample_rate: 44100.0,
@@ -1210,19 +1209,15 @@ async fn recording_grace_window_keeps_slow_finalize_cooperative_and_wav_intact()
             };
             let disks_handle = Arc::clone(&sink.disks);
             let worker = tokio::task::spawn_local(async move {
-                disk_writer_loop_inner(&sink, &mut receiver, None, &status).await
+                disk_writer_loop_inner(&sink, &mut receiver, &status).await
             });
 
             // Metadata barrier: the worker consumed it, channels are empty.
             assert!(sender.try_push_metadata(META), "metadata push must succeed");
             {
-                let (control_prod, pool_prod) = match &mut sender {
-                    crate::recording::transport::RecordingSender::Pool {
-                        control, pool, ..
-                    } => (control.as_mut().unwrap(), pool.as_mut().unwrap()),
-                    crate::recording::transport::RecordingSender::Inline(_) => {
-                        panic!("pool transport expected")
-                    }
+                let (control_prod, pool_prod) = {
+                    let (control, pool) = sender.parts_mut();
+                    (control.unwrap(), pool.unwrap())
                 };
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
                 while control_prod.slots() != crate::recording::buffer::CONTROL_CAPACITY
@@ -1300,6 +1295,261 @@ async fn recording_grace_window_keeps_slow_finalize_cooperative_and_wav_intact()
                 &expected_wav[..],
                 "the capture must be finalized intact despite the two signals"
             );
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// S6 — continuous capture (intentional silence) and disk resilience
+// ---------------------------------------------------------------------------
+
+/// Test sink that records when the periodic free-space probe runs relative to
+/// the number of disk writes, and advertises a zero re-check interval so the
+/// drain-loop cadence is exercised without a real minute.
+#[derive(Clone)]
+struct SpaceProbeSink {
+    disks: Arc<Mutex<Vec<SharedDisk>>>,
+    probe_calls: Arc<AtomicUsize>,
+    write_calls: Arc<AtomicUsize>,
+    /// Smallest `write_calls` observed by a periodic probe (the first probe —
+    /// the segment-opening estimate — returns `None` and is not recorded).
+    snapshot: Arc<Mutex<Option<usize>>>,
+}
+
+impl Default for SpaceProbeSink {
+    fn default() -> Self {
+        Self {
+            disks: Arc::new(Mutex::new(Vec::new())),
+            probe_calls: Arc::new(AtomicUsize::new(0)),
+            write_calls: Arc::new(AtomicUsize::new(0)),
+            snapshot: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl WavSink for SpaceProbeSink {
+    type Writer = AsyncWavWriter<SharedDiskWriter>;
+
+    async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)> {
+        let disk = SharedDisk::default();
+        let writer = AsyncWavWriter::<SharedDiskWriter>::open(
+            SharedDiskWriter {
+                disk: disk.clone(),
+                write_calls: Arc::clone(&self.write_calls),
+                finalize_delay: None,
+                write_delay: Some(std::time::Duration::from_millis(2)),
+            },
+            metadata,
+        )
+        .await?;
+        self.disks.lock().unwrap().push(disk);
+        Ok((
+            writer,
+            std::env::temp_dir().join(format!("mock_space_part{part}.wav")),
+        ))
+    }
+
+    fn free_bytes(&self, _metadata: &AudioMetadata) -> Option<u64> {
+        if self.probe_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            // Segment-opening estimate: not the periodic re-check.
+            return None;
+        }
+        let writes = self.write_calls.load(Ordering::Relaxed);
+        let mut snapshot = self.snapshot.lock().unwrap();
+        *snapshot = Some(snapshot.map_or(writes, |s| s.min(writes)));
+        Some(0)
+    }
+
+    fn space_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+}
+
+/// Acceptance (T6.2): the `Silence` gate suppression is recorded as exactly
+/// the suppressed frame count of zeros, preserving the WAV duration without
+/// the RT thread ever copying zeros.
+#[tokio::test(flavor = "current_thread")]
+async fn intentional_silence_markers_preserve_wav_duration() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let sink = MockWavSink::default();
+            let disks_handle = Arc::clone(&sink.disks);
+
+            const AUDIO_FRAMES: usize = 256;
+            const SILENCE_FRAMES: usize = 1000;
+            let left: Vec<f32> = (0..AUDIO_FRAMES).map(|i| i as f32 * 0.001).collect();
+            let right: Vec<f32> = left.iter().map(|v| -v).collect();
+
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            assert!(
+                sender.try_push_audio(&left, &right),
+                "audio push must succeed"
+            );
+            assert!(
+                sender.try_push_silence(SILENCE_FRAMES),
+                "silence accumulation must be accepted"
+            );
+            assert!(
+                sender.try_push_stream_stop(),
+                "StreamStop must flush and land the pending silence"
+            );
+
+            disk_writer_loop_inner(&sink, &mut receiver, &status)
+                .await
+                .expect("drain must finalize the capture");
+
+            let disks = disks_handle.lock().unwrap();
+            assert_eq!(disks.len(), 1, "a single capture file must be produced");
+
+            let mut expected_payload = interleave(&left, &right);
+            expected_payload.extend(std::iter::repeat_n(0u8, SILENCE_FRAMES * 2 * 4));
+            let mut expected_wav = build_wav_header(&META, expected_payload.len() as u32)
+                .expect("expected header build");
+            expected_wav.extend_from_slice(&expected_payload);
+
+            assert_eq!(
+                &*disks[0].bytes.lock().unwrap(),
+                &expected_wav[..],
+                "intentional silence must be written as exactly {SILENCE_FRAMES} zero frames"
+            );
+        })
+        .await;
+}
+
+/// Test sink whose writers fail the first data write (after the header):
+/// drives the post-error `in_flight.release()` guarantee (T6.3).
+struct FailingWriteSink;
+
+impl WavSink for FailingWriteSink {
+    type Writer = AsyncWavWriter<FaultInjectingWriter>;
+
+    async fn create(&self, part: u32, metadata: AudioMetadata) -> Result<(Self::Writer, PathBuf)> {
+        let mock = FaultInjectingWriter::new().fail_after(1, io::ErrorKind::StorageFull);
+        let writer = AsyncWavWriter::<FaultInjectingWriter>::open(mock, metadata).await?;
+        Ok((
+            writer,
+            std::env::temp_dir().join(format!("mock_fail_write_part{part}.wav")),
+        ))
+    }
+}
+
+/// Acceptance (T6.3): a write error must not leak the in-flight pool slot —
+/// the RAII lease releases it before the error propagates.
+#[tokio::test(flavor = "current_thread")]
+async fn write_error_releases_in_flight_pool_slot() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let sink = FailingWriteSink;
+
+            let left = vec![0.25f32; 64];
+            let right = vec![-0.25f32; 64];
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            assert!(
+                sender.try_push_audio(&left, &right),
+                "audio push must succeed"
+            );
+
+            let result = disk_writer_loop_inner(&sink, &mut receiver, &status).await;
+            assert!(
+                result.is_err(),
+                "the injected write fault must abort the drain"
+            );
+            assert_eq!(
+                receiver.leaked_slots(),
+                0,
+                "a failed write must release the in-flight slot, not leak it"
+            );
+        })
+        .await;
+}
+
+/// Acceptance (T6.3): a filling disk is probed periodically even while the
+/// work ring stays continuously busy (the old code only checked on the idle
+/// path).
+#[tokio::test(flavor = "current_thread")]
+async fn low_space_checked_under_continuous_load() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            const BLOCKS: usize = 32;
+            let (mut sender, mut receiver) = create_recording_transport();
+            let status: SharedRecordingStatus = Arc::new(Mutex::new(RecordingStatus::Starting));
+            let status_task = Arc::clone(&status);
+            let sink = SpaceProbeSink::default();
+            let sink_task = sink.clone();
+            let snapshot_handle = Arc::clone(&sink.snapshot);
+
+            assert!(sender.try_push_metadata(META), "metadata push must succeed");
+            let block = vec![0.1f32; 128];
+            for _ in 0..BLOCKS {
+                assert!(
+                    sender.try_push_audio(&block, &block),
+                    "pre-queued audio push must succeed"
+                );
+            }
+            assert!(
+                sender.try_push_stream_stop(),
+                "StreamStop push must succeed"
+            );
+
+            let worker = tokio::task::spawn_local(async move {
+                disk_writer_loop_inner(&sink_task, &mut receiver, &status_task).await
+            });
+
+            // The slow mock disk keeps the backlog live while we poll the
+            // observable status: a low-space warning must appear mid-capture,
+            // not only after the rings drain.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut warning_seen = false;
+            while std::time::Instant::now() < deadline {
+                if let RecordingStatus::Active {
+                    space_warning: Some(_),
+                    ..
+                } = &*status.lock().unwrap()
+                {
+                    warning_seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            assert!(
+                warning_seen,
+                "a filling disk must be detected under continuous load"
+            );
+
+            let writes_at_probe = snapshot_handle
+                .lock()
+                .unwrap()
+                .expect("the periodic free-space probe must have run");
+            // One header write + BLOCKS data writes: a probe observed before
+            // all of them completed proves the check is not gated on an empty
+            // ring.
+            assert!(
+                writes_at_probe < BLOCKS + 1,
+                "free-space probe only ran after the continuous backlog drained \
+                 (writes={writes_at_probe})"
+            );
+
+            worker
+                .await
+                .expect("worker task must not panic")
+                .expect("drain must finalize the capture");
+            assert!(
+                matches!(
+                    &*status.lock().unwrap(),
+                    RecordingStatus::Active { .. } | RecordingStatus::Stopped
+                ),
+                "the worker must finalize without failing"
+            );
+
+            let disks = sink.disks.lock().unwrap();
+            assert_eq!(disks.len(), 1, "a single capture file must be produced");
         })
         .await;
 }

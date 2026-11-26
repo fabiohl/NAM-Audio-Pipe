@@ -117,7 +117,6 @@ fn run_smoke_session(buffer_size: u32) -> (u64, u64, u64, u32, u32, u32, u32) {
             sl_cons,
             os_cons,
             None,
-            None,
         )
     });
 

@@ -161,21 +161,8 @@ impl RecordingPipe {
     /// Drains exactly one published block (or control barrier) so the pool
     /// stays available. The worker's exactly-once release path is exercised.
     fn drain_one(&mut self) {
-        match &mut self.receiver {
-            RecordingReceiver::Pool { pool, .. } => {
-                if let Some(in_flight) = pool.try_pop() {
-                    let _ = in_flight.release();
-                }
-            }
-            RecordingReceiver::Inline(consumer) => {
-                if let Ok(payload) = consumer.pop() {
-                    match payload {
-                        nam_audio_pipe::recording::buffer::RingPayload::Audio(_)
-                        | nam_audio_pipe::recording::buffer::RingPayload::Metadata(_)
-                        | nam_audio_pipe::recording::buffer::RingPayload::StreamStop => {}
-                    }
-                }
-            }
+        if let Some(in_flight) = self.receiver.pool_consumer_mut().try_pop() {
+            let _ = in_flight.release();
         }
     }
 
@@ -186,21 +173,12 @@ impl RecordingPipe {
         let _ = self.sender.try_push_stream_stop();
         self.sender = RecordingSender::none();
         loop {
-            match &mut self.receiver {
-                RecordingReceiver::Pool { control, pool } => {
-                    if control.pop().is_ok() {
-                        continue;
-                    }
-                    if let Some(in_flight) = pool.try_pop() {
-                        let _ = in_flight.release();
-                        continue;
-                    }
-                }
-                RecordingReceiver::Inline(consumer) => {
-                    if consumer.pop().is_ok() {
-                        continue;
-                    }
-                }
+            if self.receiver.control_consumer_mut().pop().is_ok() {
+                continue;
+            }
+            if let Some(in_flight) = self.receiver.pool_consumer_mut().try_pop() {
+                let _ = in_flight.release();
+                continue;
             }
             if self.receiver.is_fully_drained() {
                 break;

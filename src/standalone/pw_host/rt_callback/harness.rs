@@ -54,8 +54,7 @@ use neural_amp_modeler_rs::dsp::cabsim::adapter::CabSimPair;
 use neural_amp_modeler_rs::dsp::gate::GateParams;
 use neural_amp_modeler_rs::dsp::oversample::{OsEnginePair, OversampleEngine, OversampleFactor};
 use neural_amp_modeler_rs::dsp::pipeline::{
-    BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, DspPipelineContext, MAX_RESAMP_BUF,
-    StreamingDspBuffers,
+    BridgeRef, DspBridge, DspBridgeReader, DspBridgeWriter, MAX_RESAMP_BUF,
 };
 use neural_amp_modeler_rs::dsp::resampler::NamResampler;
 use neural_amp_modeler_rs::dsp::resampling::StreamingResampleBuffer;
@@ -487,70 +486,33 @@ impl SwapRtSide {
             return 0;
         };
 
-        let conv_pair = self
-            .state
-            .active_cabsim
-            .as_deref_mut()
-            .filter(|pair| pair.sample_rate == rate);
-
-        let ctx = DspPipelineContext {
-            resampler: &mut self.state.resampler,
-            os_l: &mut self.state.os_l,
-            os_r: &mut self.state.os_r,
-            active_model_l: &mut self.state.active_model_l,
-            active_model_r: &mut self.state.active_model_r,
-            input_gain_mult: self.state.input_gain_mult,
-            output_gain_mult: self.state.output_gain_mult,
-            gate_params: &self.state.gate_params,
-            silence_hysteresis: &mut self.state.silence_hysteresis,
-            mono_hysteresis: &mut self.state.mono_hysteresis,
-            threshold_open_sq: self.state.threshold_open_sq,
-            threshold_close_sq: self.state.threshold_close_sq,
-            process_mono: &mut self.state.process_mono,
-            rt_status: &self.rt_status,
-            adaptive: &mut self.state.adaptive_compute,
-            bridge_writer: Some(writer),
-            conv: None,
-            conv_pair,
-        };
-        let bufs = StreamingDspBuffers {
-            resamp_out_l: &mut *self.state.resamp_out_l,
-            resamp_out_r: &mut *self.state.resamp_out_r,
-            os_in_l: &mut self.state.os_in_l,
-            os_in_r: &mut self.state.os_in_r,
-            os_model_l: &mut self.state.os_model_l,
-            os_model_r: &mut self.state.os_model_r,
-            crossfade_scratch_l: &mut *self.state.xfd_scratch_l,
-            crossfade_scratch_r: &mut *self.state.xfd_scratch_r,
-        };
-        let target_cab_bypass = self
-            .state
-            .cab_bypass
-            .load(std::sync::atomic::Ordering::Acquire);
-        let cab_rt = super::PipeCabRuntime {
-            nam_slot: self
-                .state
-                .active_cab_nam
-                .as_mut()
-                .filter(|slot| slot.host_rate == rate),
-            target_bypass: target_cab_bypass,
-            dry_delay: &mut self.state.cab_dry_delay,
-            bypass_state: &mut self.state.cab_bypass_state,
-        };
-        super::process::run_capture_dsp_pipeline(
+        let rt_view = self.state.split_rt();
+        let plan = super::assemble_rt_dsp(rt_view, &self.rt_status, Some(writer), rate);
+        let super::RtDspParts {
+            context,
+            buffers,
+            cab,
+            stream_resample,
+            user_input_gain_mult,
+            gate_mode,
+            musical_gate,
+            ..
+        } = plan;
+        super::pipeline::run_capture_dsp_pipeline(
             in_l,
             in_r,
             n,
-            ctx,
-            &mut self.state.stream,
-            bufs,
+            context,
+            stream_resample,
+            buffers,
             rate,
-            self.state.user_input_gain_mult,
-            self.state.gate_mode,
-            &mut self.state.musical_gate,
-            cab_rt,
+            user_input_gain_mult,
+            gate_mode,
+            musical_gate,
+            cab,
             crate::standalone::rt_setup::rdtsc_nanos(),
         )
+        .n_pw
     }
 
     /// Drains and drops the GC channel and overflow ring (main-thread side).

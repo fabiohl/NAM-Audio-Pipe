@@ -11,7 +11,7 @@
 #[cfg(any(feature = "testing", feature = "heap-audit"))]
 use neural_amp_modeler_rs::dsp::telemetry::ExactLatencyReservoir;
 use neural_amp_modeler_rs::dsp::telemetry::{AtomicHistogram, LatencyHistogram};
-use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Host audio streaming telemetry, format latches, and clock synchronization.
 ///
@@ -19,21 +19,6 @@ use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 /// between real-time streaming audio threads and the main telemetry/diagnostics loop.
 #[repr(align(128))]
 pub struct StreamStatusFlags {
-    /// Duration of the last capture stage (callback start to end of host format validation) in nanoseconds.
-    pub capture_cycle_time: AtomicU64,
-
-    /// Duration of the last audio recording enqueue stage in nanoseconds.
-    pub record_cycle_time: AtomicU64,
-
-    /// Duration of the last playback stage (callback start to host buffer write completion) in nanoseconds.
-    pub playback_cycle_time: AtomicU64,
-
-    /// Duration of the last end-to-end cycle (capture start to playback output) in nanoseconds.
-    pub e2e_cycle_time: AtomicU64,
-
-    /// Starting timestamp of current capture block in nanoseconds (serialized RDTSC).
-    pub capture_start_tsc: AtomicU64,
-
     /// Latency histogram for capture stage (callback start → end of host format validation/dequeue).
     pub capture_hist: AtomicHistogram,
 
@@ -88,6 +73,21 @@ pub struct StreamStatusFlags {
     /// Cumulative count of frames dropped by the bridge due to clock drift (capture > playback).
     pub bridge_dropped_frames: AtomicU32,
 
+    /// Incremented by the playback callback when the thread running it is not
+    /// the PipeWire RT data thread marked by the capture callback. With
+    /// multiple data loops (PipeWire ≥ 1.2) the playback callback may run on a
+    /// distinct, unmarked thread: it then lacks SCHED_FIFO/affinity and its
+    /// PipeWire logs follow the synchronous path. Diagnostic only — the
+    /// playback thread is deliberately not promoted here, preserving the
+    /// single-producer invariant of `RtProducer`.
+    pub playback_thread_divergence: AtomicU64,
+
+    /// `true` when at least one cab-sim slot (IR pair or NAM cabinet) is
+    /// installed at a rate that differs from the host quantum rate, so the
+    /// callback is currently bypassing it. The Pipe-local signal for the
+    /// otherwise silent "cabinet ignored on rate mismatch" path.
+    pub cab_rate_stale: AtomicBool,
+
     /// Playback quanta delivered since the playback stream last entered
     /// `Streaming` (reset to `0` by the state handler on that transition).
     ///
@@ -113,6 +113,15 @@ pub struct StreamStatusFlags {
     /// diagnostics.
     pub playback_negotiated_rate: AtomicU32,
 
+    /// Last host sample rate observed on a valid capture format negotiation.
+    ///
+    /// Diagnostic-only companion to the RT rate inbox: the callback consumes
+    /// that inbox with `swap(0)`, so after the first quantum it no longer
+    /// reports the running rate. This cell is only ever stored (never swapped
+    /// or cleared) and therefore keeps the last known rate available to
+    /// control-loop diagnostics and the terminal backend-failure report.
+    pub last_known_rate: AtomicU32,
+
     /// Sticky latch guarding the capture stream format contract negotiated with the host.
     pub capture_format_ok: AtomicU32,
 
@@ -125,10 +134,14 @@ pub struct StreamStatusFlags {
     /// Active state of the playback stream (1 = Streaming, 0 = Paused/Unconnected/Error).
     pub playback_active: AtomicU32,
 
-    /// Aggregate sticky latch guarding the strict format contract negotiated with the host.
+    /// Aggregate sticky latch guarding the strict format contract negotiated
+    /// with the host.
     ///
-    /// `1` = both stream formats are valid (`F32P` planar stereo); `0` = a divergent format
-    /// was negotiated on either stream.
+    /// `1` = both stream formats are valid (`F32P` planar stereo); `0` = a
+    /// divergent format was negotiated on either stream. This derived value is
+    /// diagnostic: each RT path gates on its own per-stream latch
+    /// (`capture_format_ok` in the capture callback, `is_audio_unmuted` for
+    /// playback), so a briefly stale aggregate cannot fail open.
     pub format_contract_ok: AtomicU32,
 
     /// Algorithmic latency in samples of the resampler stage currently applied on the RT audio thread.
@@ -183,11 +196,6 @@ impl StreamStatusFlags {
     #[cold]
     pub fn new() -> Self {
         Self {
-            capture_cycle_time: AtomicU64::new(0),
-            record_cycle_time: AtomicU64::new(0),
-            playback_cycle_time: AtomicU64::new(0),
-            e2e_cycle_time: AtomicU64::new(0),
-            capture_start_tsc: AtomicU64::new(0),
             capture_hist: AtomicHistogram::new(),
             record_hist: AtomicHistogram::new(),
             playback_hist: AtomicHistogram::new(),
@@ -199,9 +207,12 @@ impl StreamStatusFlags {
             playback_last_capture_tsc: AtomicU64::new(0),
             playback_muted_callbacks: AtomicU32::new(0),
             bridge_dropped_frames: AtomicU32::new(0),
+            playback_thread_divergence: AtomicU64::new(0),
+            cab_rate_stale: AtomicBool::new(false),
             playback_quantums: AtomicU32::new(0),
             capture_negotiated_rate: AtomicU32::new(0),
             playback_negotiated_rate: AtomicU32::new(0),
+            last_known_rate: AtomicU32::new(0),
             capture_format_ok: AtomicU32::new(1),
             playback_format_ok: AtomicU32::new(1),
             capture_active: AtomicU32::new(1),
@@ -314,6 +325,76 @@ impl StreamStatusFlags {
                 Err(actual) => cur = actual,
             }
         }
+    }
+
+    /// Advances the playback bring-up quantum counter without a
+    /// load-then-store (which would lose updates against concurrent bumps).
+    ///
+    /// Saturates at `limit` so a long-running stream can never re-open the
+    /// suppression window.
+    #[inline]
+    pub fn bump_playback_quantums(&self, limit: u32) {
+        let _ = self
+            .playback_quantums
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |quanta| {
+                (quanta < limit).then_some(quanta + 1)
+            });
+    }
+
+    /// Publishes whether the installed cabinet slots are at a stale rate.
+    ///
+    /// Written once per capture quantum with `Relaxed` (diagnostic only); the
+    /// telemetry loop reports the episode off-RT.
+    #[inline]
+    pub fn note_cab_rate_stale(&self, stale: bool) {
+        self.cab_rate_stale.store(stale, Ordering::Relaxed);
+    }
+
+    /// Whether the installed cabinet slots are currently rate-stale.
+    #[must_use]
+    #[inline]
+    pub fn is_cab_rate_stale(&self) -> bool {
+        self.cab_rate_stale.load(Ordering::Relaxed)
+    }
+
+    /// Records whether the playback callback ran on the marked RT data thread.
+    ///
+    /// The check itself is a TLS read performed by the caller (no syscall, no
+    /// lock); this method only advances a `Relaxed` telemetry counter when the
+    /// playback thread differs from the capture-marked data thread.
+    #[inline]
+    pub fn note_playback_thread_divergence(&self, on_rt_thread: bool) {
+        if !on_rt_thread {
+            self.playback_thread_divergence
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Atomically restarts the playback bring-up window.
+    #[inline]
+    pub fn reset_playback_quantums(&self) {
+        self.playback_quantums.swap(0, Ordering::Relaxed);
+    }
+
+    /// Restarts the playback-thread divergence window for a fresh stream
+    /// instance.
+    #[inline]
+    pub fn reset_playback_thread_divergence(&self) {
+        self.playback_thread_divergence.store(0, Ordering::Relaxed);
+    }
+
+    /// Re-arms the format-contract latches for a fresh stream instance.
+    ///
+    /// The latches live on the process-wide backend status, so a violation
+    /// observed on a previous instance would otherwise keep the RT mute guard
+    /// closed forever when the new graph never re-emits a `Format` event.
+    /// A fresh graph starts fail-open: the streams re-latch their own contract
+    /// when (and if) they negotiate a format.
+    #[inline]
+    pub fn reset_format_contract(&self) {
+        self.capture_format_ok.store(1, Ordering::Relaxed);
+        self.playback_format_ok.store(1, Ordering::Relaxed);
+        self.format_contract_ok.store(1, Ordering::Relaxed);
     }
 
     /// Whether audio is unmuted across both streams (capture and playback format contracts

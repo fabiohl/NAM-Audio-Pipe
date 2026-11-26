@@ -225,9 +225,10 @@ pub fn validate_audio_raw_format(param: &pw::spa::pod::Pod) -> Result<u32, Contr
 /// Called from the `param_changed` listeners (PipeWire ThreadLoop thread,
 /// non-RT): raises `RT_STATUS_HOST_CONTRACT_VIOLATION` on `rt_status` so the
 /// backend state machine (main control loop) observes the degraded/error
-/// state, latches the audio-level mute guard ([`StreamStatusFlags::format_contract_ok`])
-/// and emits a structured diagnostic error naming the offending stream and the
-/// exact violation.
+/// state, latches the offending stream's audio-level guard
+/// ([`StreamStatusFlags::capture_format_ok`] or
+/// [`StreamStatusFlags::playback_format_ok`]) and emits a structured diagnostic
+/// error naming the offending stream and the exact violation.
 #[cold]
 pub fn reject_negotiated_format_violation(
     rt_status: &RtStatusFlags,
@@ -253,6 +254,18 @@ pub fn reject_negotiated_format_violation(
 ///
 /// Called by the `param_changed` listeners on the successful path; re-arms the
 /// RT mute guard so audio processing resumes automatically.
+///
+/// # Concurrency invariant
+///
+/// Each per-stream latch (`capture_format_ok` / `playback_format_ok`) has a
+/// single writer: its own stream's negotiation listener. The aggregate
+/// `format_contract_ok` is *derived* by both listeners from atomically loaded
+/// per-stream latches, so concurrent recomputations may briefly publish a
+/// stale combined value. Each stream is therefore gated by its own latch on
+/// the RT paths (`capture_format_ok` in the capture callback,
+/// `is_audio_unmuted` for playback), never by the aggregate. The aggregate is
+/// retained for diagnostics and the contract tests. No lock is taken on the
+/// negotiation path.
 #[inline]
 pub fn mark_format_contract_ok(stream_status: &StreamStatusFlags, stream_name: &str) {
     if stream_name == "capture" {

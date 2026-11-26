@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use std::sync::Arc;
 
 #[test]
 fn e2e_exact_reservoir_resolves_distinct_percentiles() {
@@ -74,4 +75,52 @@ fn applied_latencies_coherent_seqlock_snapshot() {
 
     status.update_cabsim_latency(0);
     assert_eq!(status.read_applied_latencies(), (0, 0, 0));
+}
+
+#[test]
+fn reset_format_contract_rearms_a_fresh_instance() {
+    let status = StreamStatusFlags::new();
+    status.capture_format_ok.store(0, Ordering::Relaxed);
+    status.playback_format_ok.store(0, Ordering::Relaxed);
+    status.format_contract_ok.store(0, Ordering::Relaxed);
+    assert!(!status.is_audio_unmuted());
+
+    status.reset_format_contract();
+
+    assert_eq!(status.capture_format_ok.load(Ordering::Relaxed), 1);
+    assert_eq!(status.playback_format_ok.load(Ordering::Relaxed), 1);
+    assert_eq!(status.format_contract_ok.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn playback_quantum_bumps_are_not_lost_under_contention() {
+    let status = Arc::new(StreamStatusFlags::new());
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let status = Arc::clone(&status);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                status.bump_playback_quantums(u32::MAX);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().expect("playback quantum writer panicked");
+    }
+    assert_eq!(
+        status.playback_quantums.load(Ordering::Relaxed),
+        40_000,
+        "fetch_update must not lose concurrent increments"
+    );
+}
+
+#[test]
+fn playback_quantum_bump_saturates_and_resets() {
+    let status = StreamStatusFlags::new();
+    for _ in 0..8 {
+        status.bump_playback_quantums(4);
+    }
+    assert_eq!(status.playback_quantums.load(Ordering::Relaxed), 4);
+    status.reset_playback_quantums();
+    assert_eq!(status.playback_quantums.load(Ordering::Relaxed), 0);
 }

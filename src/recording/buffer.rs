@@ -22,12 +22,6 @@ pub const MAX_BLOCK_SIZE: usize = 16384;
 // largest legal audio word keeps clear of the sentinel.
 const _: () = assert!(MAX_BLOCK_SIZE < u16::MAX as usize);
 
-/// Number of slots in the SPSC ring buffer.
-/// Each slot holds a `RingPayload<MAX_BLOCK_SIZE>` (~64 KiB).
-/// Total memory: 256 slots × 64 KiB = 16 MiB (same footprint as the previous
-/// 1024 × 16 KiB layout, but with 4× deeper frame buffering).
-pub const RING_CAPACITY: usize = 256;
-
 /// Atomic counter for ring buffer overruns (push failures on the DSP producer side).
 /// Reported to the user at shutdown to indicate potential audio data loss.
 pub static OVERRUN_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -199,20 +193,6 @@ pub struct AudioMetadata {
     pub channels: u16,
 }
 
-/// Main payload exchanged via the SPSC ring buffer.
-/// Aligned to 128 bytes to ensure each slot occupies distinct cache lines,
-/// preventing false sharing between the producer (DSP) and consumer (I/O) cores.
-#[repr(align(128))]
-#[derive(Debug)]
-pub enum RingPayload<const SIZE: usize> {
-    /// Audio block containing interleaved f32 samples ready for writing.
-    Audio(AlignedBlock<SIZE>),
-    /// Stream metadata (sample rate, bit depth, channels) to configure the WAV file.
-    Metadata(AudioMetadata),
-    /// Stream stop signal — instructs the I/O thread to close the current WAV file.
-    StreamStop,
-}
-
 /// Control messages exchanged through the **dedicated control channel** of the
 /// recording pool transport.
 ///
@@ -254,20 +234,6 @@ pub const CONTROL_CAPACITY: usize = 4;
 pub fn create_control_ring_buffer(
     capacity: usize,
 ) -> (Producer<ControlPayload>, Consumer<ControlPayload>) {
-    RingBuffer::new(capacity)
-}
-
-/// Creates an SPSC (single-producer/single-consumer) ring buffer strictly dimensioned
-/// for `RingPayload` structures. The `capacity` parameter defines the number of slots.
-///
-/// This is the legacy inline ring transport constructor maintained as an alternative
-/// rollback path. Production wiring uses [`crate::recording::transport::create_recording_transport`].
-pub fn create_audio_ring_buffer<const BLOCK_SIZE: usize>(
-    capacity: usize,
-) -> (
-    Producer<RingPayload<BLOCK_SIZE>>,
-    Consumer<RingPayload<BLOCK_SIZE>>,
-) {
     RingBuffer::new(capacity)
 }
 

@@ -146,8 +146,9 @@ The audio processing callback executes under strict real-time determinism:
 
 1. **Zero Heap Allocations**: All scratch buffers, resamplers, layer weights, and convolution engines are pre-allocated during startup or swapped via single-producer single-consumer (SPSC) pointers.
 2. **Zero Mutex Locks**: Inter-thread coordination uses wait-free SPSC channels (`rtrb`) and atomic memory primitives.
-3. **Zero Blocking I/O**: Filesystem access, standard output printing, and direct logging macros (`log::*`) are prohibited in the audio callback.
-4. **Panic Containment**: Callback bodies are wrapped in `catch_unwind(AssertUnwindSafe)`. Unhandled panics latch the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` (bit 31) and mute output, allowing the main control loop to initiate a graceful shutdown and flush pending WAV files instead of aborting the process.
+3. **Zero Blocking I/O**: Filesystem access, standard output printing, and direct logging macros (`log::*`) are prohibited in the audio callback. Intercepted PipeWire logs from the marked data thread are queued unformatted (raw format literal, variadic arguments dropped and flagged `[rt-unformatted]`) into a pre-allocated SPSC ring; the drainer thread formats and replays them off-RT.
+4. **Panic Containment**: Callback bodies are wrapped in `catch_unwind(AssertUnwindSafe)`. Unhandled panics latch the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` (bit 31) and mute output, allowing the main control loop to initiate a graceful shutdown and flush pending WAV files instead of aborting the process. The panic hook is wrapped so that a panic on the marked RT thread only copies the payload into a pre-allocated slot; the diagnostic bundle and crash-file write run on the control thread after the latch is observed.
+5. **Playback Thread Observability**: The playback callback checks the RT thread-local mark every quantum and increments `playback_thread_divergence` when it runs elsewhere (multiple PipeWire data loops). The count is reported off-RT; the playback thread is deliberately not promoted, preserving the single-producer log-ring invariant.
 
 ---
 
@@ -174,7 +175,8 @@ stateDiagram-v2
 
 - **State Representation**: The FSM defines explicit variants: `Starting`, `Running`, `Degraded { reason: String }`, `Reconnecting { attempt: u32, total_attempts: u32, next_backoff: Duration }`, `Failed { stream: &'static str, reason: String }`, and `Terminated`.
 - **Sticky Failure**: Once marked `Failed`, the state cannot revert to `Running` except through a formal reconnection handshake (`begin_reconnect`). The main control loop polls this status via an atomic fast-path and `ControlPlaneWakeup`, initiating teardown immediately (fail-fast SLA $< 200\text{ ms}$, with $\le 100\text{ ms}$ fallback timeout).
-- **DSP State Preservation**: `CaptureState` (neural models, resamplers, cabinet IRs, gains) and RT-side SPSC channels reside in heap `Box` allocations reached via raw pointers outside stream closures. Re-instantiating PipeWire streams after a daemon restart preserves all internal processing state.
+- **DSP State Preservation**: `CaptureState` (neural models, resamplers, cabinet IRs, gains) and RT-side SPSC channels reside in heap `Box` allocations reached via raw pointers outside stream closures. Re-instantiating PipeWire streams after a daemon restart preserves all internal processing state. The pointer lifecycle is pinned by `tests/aliasing_harness.rs` and audited under Miri (Stacked and Tree Borrows): every raw pointer is **re-derived per `'host` iteration**, only after the owner's pre-stream writes and only once the previous stream/loop were stopped and destroyed (so the teardown's `&mut` over the parking lot has exclusive access again). No raw pointer survives a teardown, which avoids the Stacked Borrows invalidation that the previous derive-once/reuse pattern produced.
+- **Fresh-Instance Format Latches**: each new stream instance re-arms the SPA format-contract latches. A violation observed on a previous graph can therefore never keep the RT mute guard closed forever when the new graph does not re-emit a `Format` event.
 - **Bounded Reconnect Budget** ([`src/standalone/pw_host/reconnect.rs`](../src/standalone/pw_host/reconnect.rs)):
   - Production default: 6 attempts (`PRODUCTION_MAX_ATTEMPTS`) with progressive exponential backoff (250 → 500 → 1000 → 2000 → 4000 → 4000 ms), capped at an 11.75-second ceiling per recovery episode.
   - When `--fail-fast` is passed, reconnection is disabled entirely (`max_attempts = 0`).
@@ -210,6 +212,8 @@ Failures are categorized into distinct exit codes ([`src/standalone/exit.rs`](..
 | **4**     | Cabinet IR Error | `ExitKind::CabIr`     | Unreadable or malformed cabinet impulse response `.wav` file.              | Check IR file format or pass `--cab-optional`.      |
 | **5**     | Backend Error    | `ExitKind::Backend`   | Unreachable PipeWire daemon or stream negotiation failure.                 | Verify PipeWire daemon status (`systemctl --user`). |
 | **6**     | Recording Error  | `ExitKind::Recording` | Unwritable directory, `io_uring` failure, or overruns (`SuccessWithLoss`). | Check disk permissions and space availability.      |
+
+> A shutdown signal that interrupts a reconnect backoff does **not** turn a pending backend failure into a clean exit: the failure is recorded before teardown and the process preserves the backend exit code (`5`).
 
 ---
 
@@ -259,7 +263,7 @@ NAM-Audio-Pipe is engineered natively for the Linux multimedia ecosystem, with e
 #### Architectural Provisions for Linux on ARM
 
 1. **Target-Scoped Compiler Flags**: In [`.cargo/config.toml`](../.cargo/config.toml), architecture-specific flags (such as `-Ctarget-cpu=x86-64-v3`) are strictly gated under `[target.'cfg(target_arch = "x86_64")']`. Linker hardening flags (`-Wl,-z,now`, `-Wl,--gc-sections`, `-Wl,--as-needed`) apply uniformly to all Linux targets, preventing undefined CPU flags during ARM compilation.
-2. **C-ABI Variadic Log Interception (AAPCS64)**: PipeWire's SPA logging functions use C variadics. Under AAPCS64 (`aarch64`), `va_list` arguments are passed by value, whereas SysV (`x86_64`) passes them via register-save area pointers. Pure-Rust logging in [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs) conditionally binds `SpaVaList` to `pipewire::spa::sys::va_list` on `aarch64` and handles direct `vsnprintf` formatting without external C bridges.
+2. **C-ABI Variadic Log Interception (AAPCS64)**: PipeWire's SPA logging functions use C variadics. Under AAPCS64 (`aarch64`), `va_list` arguments are passed by value, whereas SysV (`x86_64`) passes them via register-save area pointers. Pure-Rust logging in [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs) conditionally binds `SpaVaList` to `pipewire::spa::sys::va_list` on `aarch64` and handles direct `vsnprintf` formatting without external C bridges. On the marked RT thread the formatter is bypassed entirely: the raw literal is copied with a bounded loop so no libc formatting/allocation runs on the audio thread.
 3. **Continuous Integration on Native ARM Runners**: GitHub Actions executes `linux-arm64-lints` on native `ubuntu-26.04-arm` runners as a blocking gate (validating `cargo check`, `cargo clippy`, and code formatting), alongside the blocking `linux-arm64-quick` quick test suite.
 4. **Formal Testing Scope**: While the codebase is architecturally sound, compiles cleanly, and is theoretically compatible on Linux ARM64 platforms, formal real-time hardware validation (such as `tests-long.sh` RT-jitter and deadline phases on bare-metal ARM audio interfaces) has not yet been formally conducted.
 
@@ -309,7 +313,10 @@ RT Thread (Replaced Asset)
 
 ## 6. DSP Pipeline, Latency Accounting & SPA Semantics
 
-The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`run_capture_dsp_pipeline`](../src/standalone/pw_host/rt_callback/process.rs), branching on `GateMode`: in `Silence` mode (default), `apply_input_stage` evaluates block-RMS `DynamicHysteresis` with CPU-skipping, causal cabinet tail draining, and `--record` silence trimming; in `Musical` mode, [`MusicalNoiseGate`](../src/dsp/musical_gate.rs) evaluates triggers post user input gain / pre model calibration (`cal_in`), keeps neural inference continuous, and applies quadratic expansion post-model / pre-cabinet stage so decay tails ring naturally.
+The callback state is split into disjoint borrows by `CaptureState::split_rt` (`src/standalone/pw_host/capture/state.rs`), then assembled into the shared DSP context, buffers, and cabinet runtime for both the PipeWire callback and harness. After DSP processing, `rt_callback::capture_epilogue` performs clock sampling, adaptive cadence updates, and cabinet rebuild detection. `GateConfig` remains an initialization input; the active state keeps resolved parameters and thresholds without reconstructing the original configuration.
+
+The core processing pipeline executes neural simulation and cabinet filtering across incoming audio blocks in [`run_capture_dsp_pipeline`](../src/standalone/pw_host/rt_callback/pipeline.rs), branching on `GateMode`: in `Silence` mode (default), `apply_input_stage` evaluates block-RMS `DynamicHysteresis` with CPU-skipping, causal cabinet tail draining, and `--record` intentional-silence markers (continuous take duration); in `Musical` mode, [`MusicalNoiseGate`](../src/dsp/musical_gate.rs) evaluates triggers post user input gain / pre model calibration (`cal_in`), keeps neural inference continuous, and applies quadratic expansion post-model / pre-cabinet stage so decay tails ring naturally.
+
 
 ```text
 Audio Input (PipeWire Host Buffer)
@@ -437,15 +444,19 @@ When launched with `--record`, NAM-Audio-Pipe captures 32-bit float stereo WAV f
 │    - Checks gate state (pass-through when gate is off)                      │
 │    - Audio: try_acquire() slot → fill_planar in place → publish()           │
 │      (preallocated pool, 4-byte descriptor; zero allocation on RT)          │
+│    - Gate-closed quantum: accumulate frame count → silence marker           │
+│      descriptor (no zero copy, no pool slot)                               │
 │    - Control: Metadata / StreamStop on a dedicated small control ring       │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  Recording Worker Thread ("nam-recording-io")                               │
 │    - tokio-uring async event loop (Linux io_uring engine)                   │
 │    - Consumes descriptors → writes 64 KiB blocks IN PLACE → release()       │
+│    - Silence markers → writes exactly N zero frames (off-RT)                │
 │    - Applies metadata barriers at exact FIFO positions                      │
 │    - Reuses internal I/O buffers to eliminate runtime heap allocations      │
 │    - Automatically splits files at 4 GiB RIFF limits (_partN.wav)           │
 │    - Checkpoints WAV headers every 3 seconds to prevent data loss on crash  │
+│    - Probes free space periodically, independent of ring occupancy          │
 │    - Finalizes header byte count and issues fsync on clean shutdown         │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -461,9 +472,23 @@ Audio blocks travel through a preallocated memory pool ([`src/recording/pool.rs`
 ### 7.2 Recording Reliability Invariants
 
 - **Full Quantum Capacity**: The recording block supports up to `MAX_BLOCK_SIZE = 16384` samples (8192 stereo frames), persisting the largest host quantum without drops.
-- **Accurate Overrun Accounting**: When buffer pool starvation occurs, `OVERRUN_COUNT` (blocks) and `OVERRUN_FRAMES_COUNT` (frames) increment atomically. The process exits with code 6 (`SuccessWithLoss`) if loss occurred, preserving the reconciliation invariant: `captured_frames == enqueued_frames + lost_frames`.
+- **Continuous Take Duration**: In `Silence` gate mode a suppressed quantum is published as an intentional-silence marker carrying its frame count; the disk worker writes exactly that many zero frames. The WAV duration therefore equals every frame the gate processed while closed, without copying zeros on the RT thread. Markers hold no pool slot and are coalesced (at most one descriptor per `MAX_SILENCE_FRAMES`), so they never displace audio in the work ring.
+- **Silence Is Not Loss**: Genuine transport loss (pool starvation or full ring) is never padded. It increments `OVERRUN_COUNT` (blocks) and `OVERRUN_FRAMES_COUNT` (frames) atomically off the RT path. The process exits with code 6 (`SuccessWithLoss`) when loss occurred, preserving `captured_frames == enqueued_frames + lost_frames`; real gaps remain visible.
+- **Accurate Overrun Accounting**: The in-flight pool slot is released through an RAII lease on every drain-loop exit path, including a failed write or header barrier, so an I/O error can never leak a slot.
 - **Periodic Header Checkpoints**: The disk worker rewrites the WAV header and invokes `fsync` every 3 seconds (`CHECKPOINT_INTERVAL_SECS`). An ungraceful system termination loses at most 3 seconds of audio rather than rendering the entire recording unreadable.
-- **Proactive Disk Monitoring**: Queries filesystem capacity via `statvfs`, logging remaining recording time and emitting alerts if free space falls below 1 GiB or 5 minutes of audio.
+- **Proactive Disk Monitoring**: Queries filesystem capacity via `statvfs` at the top of every drain-loop iteration (rate-limited by `SPACE_CHECK_INTERVAL`), independent of whether the rings are empty, logging remaining recording time and emitting alerts if free space falls below 1 GiB or 5 minutes of audio.
+
+### 7.3 Recording Contract (S6)
+
+This section is the authoritative contract for new captures; it supersedes the
+older "silence trimming" description.
+
+- **Output format**: 32-bit IEEE float stereo WAV, planar-to-interleaved conversion off-RT, RIFF-valid `data`/`fact` chunk sizes finalized on graceful stop, `_partN` rollover before the 4 GiB payload limit.
+- **Timeline**: the file timeline is the DSP timeline. Audio blocks contribute their frames unchanged; gate-closed `Silence` frames contribute zeros of equal duration; cabinet-tail frames contribute their real samples. A capture therefore starts at the first open segment and has no artificially removed pauses.
+- **Loss semantics**: frames lost to a real transport overrun are absent and counted; they are never zero-filled or otherwise fabricated. Intentional silence is the only synthesized audio, and it is always bounded by the gate-closed frame count reported by the RT pipeline.
+- **Durability**: periodic header checkpointing plus `fsync` every 3 s of audio; graceful termination drains everything and finalizes; fatal I/O errors transition to `Failed`, preserve the partial file and raise the RT-observable failure flag.
+- **Compatibility**: this contract applies to new captures. Existing WAV files are not rewritten, re-interpreted or migrated; captures produced by previous versions keep their trimmed-duration semantics on disk.
+- **Rollback**: the intentional-silence path is additive. Restoring the previous trimmed behavior means not calling `try_push_silence` from the RT capture path; the writer/transport code remains backward-compatible.
 
 ---
 
@@ -540,7 +565,7 @@ To prevent this:
 
 #### Platform ABI Variadics (`x86_64` vs `aarch64`)
 
-PipeWire's `spa_log_methods.logv` and `logtv` dispatch platform-specific `va_list` types. In [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs), the type alias `SpaVaList` is conditioned per target:
+PipeWire's `spa_log_methods.logv` and `logtv` dispatch platform-specific `va_list` types. In [`src/standalone/pw_host/log_redirect/install.rs`](../src/standalone/pw_host/log_redirect/install.rs), the type alias `SpaVaList` is conditioned per target:
 
 - On `x86_64` (System V ABI): Passed as a pointer (`*mut pipewire::spa::sys::__va_list_tag`).
 - On `aarch64` (AAPCS64 ABI): Passed by value (`pipewire::spa::sys::va_list`).

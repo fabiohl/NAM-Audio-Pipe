@@ -4,9 +4,9 @@
 //! Real-time recording transport enqueueing (zero-alloc, lock-free).
 
 use crate::recording::buffer::{
-    AlignedBlock, AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT, RingPayload,
+    AudioMetadata, MAX_BLOCK_SIZE, OVERRUN_COUNT, OVERRUN_FRAMES_COUNT,
 };
-use crate::recording::transport::{RecordingSender, assert_inline_rollback_build};
+use crate::recording::transport::RecordingSender;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Records one dropped recording block (`frames` stereo frames) in the atomic
@@ -21,10 +21,9 @@ pub(crate) fn record_overrun(frames: usize) {
 /// Attempts to send recording metadata for `current_host_rate`.
 ///
 /// The sticky `recording_meta_sent` flag is confirmed only after a successful
-/// push into the transport's control channel (pool transport) or the
-/// inline ring (rollback); a failed push (or an absent channel) leaves it
-/// false so the next callback retries. A host sample-rate change invalidates
-/// the flag so a new header is emitted for the new rate.
+/// push into the transport's control channel; a failed push (or an absent
+/// channel) leaves it false so the next callback retries. A host sample-rate
+/// change invalidates the flag so a new header is emitted for the new rate.
 ///
 /// `recording_failed` is the RT-observable failure flag: once
 /// the disk worker reports a fatal error it is set and enqueueing is suspended —
@@ -36,13 +35,9 @@ pub(crate) fn send_recording_metadata(
     current_host_rate: u32,
     recording_meta_sent: &mut bool,
     recording_meta_rate: &mut u32,
-    recording_data_available: Option<&AtomicBool>,
     recording_failed: Option<&AtomicBool>,
 ) {
     if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
-        if let Some(flag) = recording_data_available {
-            flag.store(false, Ordering::Relaxed);
-        }
         return;
     }
     if *recording_meta_rate != current_host_rate {
@@ -59,37 +54,29 @@ pub(crate) fn send_recording_metadata(
     if recording_sender.try_push_metadata(meta) {
         *recording_meta_sent = true;
         *recording_meta_rate = current_host_rate;
-        if let Some(flag) = recording_data_available {
-            flag.store(true, Ordering::Relaxed);
-        }
     }
 }
 
-/// Cold rollback helper for the deprecated inline ring recording transport.
+/// Registers `frames` stereo frames intentionally suppressed by the `Silence`
+/// noise gate.
 ///
-/// Kept `#[inline(never)]` so the 64 KiB `AlignedBlock<MAX_BLOCK_SIZE>` move
-/// does not inflate the production `Pool` capture callback's stack frame.
-#[cold]
-#[inline(never)]
-fn send_recording_audio_inline(
-    producer: &mut Option<rtrb::Producer<RingPayload<MAX_BLOCK_SIZE>>>,
-    n_pw: usize,
-    resamp_out_l: &[f32],
-    resamp_out_r: &[f32],
-    recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
-    recording_data_available: Option<&AtomicBool>,
+/// The transport only accumulates the count (no zero copy on the RT thread);
+/// the I/O thread writes the zeros. Frames lost to a real transport overrun are
+/// deliberately **not** routed here — they go through [`record_overrun`] so
+/// intentional silence and loss stay distinguishable.
+#[inline(always)]
+pub fn send_recording_silence(
+    recording_sender: &mut RecordingSender,
+    frames: usize,
+    recording_failed: Option<&AtomicBool>,
 ) {
-    assert_inline_rollback_build();
-    let Some(producer) = producer.as_mut() else {
+    if frames == 0 {
         return;
-    };
-    let mut block = std::mem::replace(recording_block, AlignedBlock::new_uninit());
-    block.fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
-    if producer.push(RingPayload::Audio(block)).is_err() {
-        record_overrun(n_pw);
-    } else if let Some(flag) = recording_data_available {
-        flag.store(true, Ordering::Relaxed);
     }
+    if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
+        return;
+    }
+    recording_sender.try_push_silence(frames);
 }
 
 /// Pushes one audio block to the recording transport.
@@ -99,10 +86,7 @@ fn send_recording_audio_inline(
 /// persisted integrally. Blocks whose interleaved length exceeds
 /// `MAX_BLOCK_SIZE` are dropped and counted in `OVERRUN_COUNT` +
 /// `OVERRUN_FRAMES_COUNT` (fail-closed telemetry) instead of silently
-/// vanishing. On the promoted pool transport the block is written into
-/// a preallocated slot via `try_acquire` → `fill_planar` → `publish`; a pool
-/// exhaustion (`try_acquire() == None`) also increments both counters,
-/// mirroring a full inline ring.
+/// vanishing. Pool exhaustion also increments both counters.
 ///
 /// `recording_failed` suspends enqueueing as soon as the disk
 /// worker reports a fatal error — no panics, no pointless pushes.
@@ -112,57 +96,24 @@ pub fn send_recording_audio(
     n_pw: usize,
     resamp_out_l: &[f32],
     resamp_out_r: &[f32],
-    recording_block: &mut AlignedBlock<MAX_BLOCK_SIZE>,
-    recording_data_available: Option<&AtomicBool>,
     recording_failed: Option<&AtomicBool>,
 ) {
     if n_pw == 0 {
         return;
     }
     if recording_failed.is_some_and(|f| f.load(Ordering::Acquire)) {
-        if let Some(flag) = recording_data_available {
-            flag.store(false, Ordering::Relaxed);
-        }
         return;
     }
-    let interleaved_len = n_pw * 2;
-    if interleaved_len > MAX_BLOCK_SIZE {
+    // Recording disabled: no channel to account against (a missing producer is
+    // not an overrun — the caller dereferences the dummy sender unconditionally).
+    if !recording_sender.has_producer() {
+        return;
+    }
+    if n_pw * 2 > MAX_BLOCK_SIZE {
         record_overrun(n_pw);
         return;
     }
-    match recording_sender {
-        RecordingSender::Pool { pool, .. } => {
-            // Zero-copy pool path: acquire a preallocated slot, fill it in
-            // place and publish the descriptor — zero allocations, the
-            // 64 KiB payload never moves.
-            let Some(producer) = pool.as_mut() else {
-                return;
-            };
-            let Some(mut slot) = producer.try_acquire() else {
-                // Pool exhausted (all slots in flight) — the pool's overrun
-                // condition, accounted exactly like a full inline ring.
-                record_overrun(n_pw);
-                return;
-            };
-            slot.block_mut()
-                .fill_planar(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]);
-            if slot.publish() {
-                if let Some(flag) = recording_data_available {
-                    flag.store(true, Ordering::Relaxed);
-                }
-            } else {
-                record_overrun(n_pw);
-            }
-        }
-        RecordingSender::Inline(producer) => {
-            send_recording_audio_inline(
-                producer,
-                n_pw,
-                resamp_out_l,
-                resamp_out_r,
-                recording_block,
-                recording_data_available,
-            );
-        }
+    if !recording_sender.try_push_audio(&resamp_out_l[..n_pw], &resamp_out_r[..n_pw]) {
+        record_overrun(n_pw);
     }
 }

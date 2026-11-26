@@ -9,18 +9,17 @@ use super::capture::state::{CaptureState, RtHostChannels};
 use super::handlers;
 use super::observe_rt_panic;
 use super::output_pw::AppState;
-use super::reconnect::{ReconnectCycle, ReconnectPolicy, STABLE_RESET, StabilityEvent};
+use super::reconnect::{ReconnectCycle, ReconnectPolicy};
 use super::run_lifecycle::{
     RetryDecision, finalize_host_shutdown, handle_attempt_error, reset_bridge_and_drain_gc,
-    run_control_housekeeping, sleep_interruptible, snapshot_and_publish_initial_latencies,
+    run_control_housekeeping,
 };
 use super::wakeup::ControlPlaneWakeup;
 use super::{PipewireHostConfig, SharedBackendStatus};
-use super::{bridge, capture, identity, latency, playback};
+use super::{bridge, identity, latency};
 use crate::recording::alert::RecordingAlert;
 use crate::recording::guard::{RecordingWorkerGuard, RecordingWorkerOutcome};
 use crate::recording::transport::RecordingSender;
-use crate::standalone::colors::Colorize;
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{
     GcItem, GcOverflowBuffer, ParamPayload, ResamplerSwapPayload, RtStatusFlags, SHUTDOWN,
@@ -31,6 +30,10 @@ use rtrb::Consumer;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+mod control;
+mod setup;
+mod teardown;
 
 /// Optional neural cabinet and bypass configuration passed to [`run_pipewire_host_with_cabinet`].
 #[derive(Default)]
@@ -64,7 +67,6 @@ pub fn run_pipewire_host(
     gc_consumer: Consumer<GcItem>,
     slimmable_consumer: Consumer<Box<SlimModelPair>>,
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
-    recording_data_available: Option<Arc<AtomicBool>>,
     recording_worker: Option<RecordingWorkerGuard>,
 ) -> anyhow::Result<Option<RecordingWorkerOutcome>> {
     run_pipewire_host_with_cabinet(
@@ -80,7 +82,6 @@ pub fn run_pipewire_host(
         gc_consumer,
         slimmable_consumer,
         os_consumer,
-        recording_data_available,
         recording_worker,
         HostCabinetOptions::default(),
     )
@@ -111,7 +112,6 @@ pub fn run_pipewire_host_with_cabinet(
     mut gc_consumer: Consumer<GcItem>,
     slimmable_consumer: Consumer<Box<SlimModelPair>>,
     os_consumer: Consumer<Box<neural_amp_modeler_rs::dsp::oversample::OsEnginePair>>,
-    recording_data_available: Option<Arc<AtomicBool>>,
     mut recording_worker: Option<RecordingWorkerGuard>,
     mut cabinet: HostCabinetOptions,
 ) -> anyhow::Result<Option<RecordingWorkerOutcome>> {
@@ -199,26 +199,17 @@ pub fn run_pipewire_host_with_cabinet(
     rt_state.slimmable_drain = Some(super::rt_callback::slimmable_swap_drain(slimmable_consumer));
     rt_state.os_drain = Some(super::rt_callback::os_swap_drain(os_consumer));
     let os_scratch_len = rt_state.os_in_l.len();
-    let state_ptr: *mut CaptureState = &raw mut *rt_state;
 
     let mut rt_channels = Box::new(RtHostChannels {
         param_consumer: consumer,
         gc_producer,
         gc_overflow: gc_overflow.clone(),
     });
-    let channels_ptr: *mut RtHostChannels = &raw mut *rt_channels;
     let rate_for_param = rt_state.shared_target_rate.clone();
 
     let mut dummy_recording_sender = RecordingSender::none();
-    let rec_ptr: *mut RecordingSender = match &mut recording_worker {
-        Some(guard) => &raw mut *guard.sender_slot(),
-        None => &raw mut dummy_recording_sender,
-    };
-
     let mut rt_parking_lot: [Option<GcItem>; 16] = Default::default();
-    let parking_lot_ptr: *mut [Option<GcItem>; 16] = &raw mut rt_parking_lot;
     let rt_parking_lot_dirty = AtomicBool::new(false);
-    let parking_lot_dirty_ptr: *const AtomicBool = &raw const rt_parking_lot_dirty;
 
     let target_cpu = cpu_receipt.selected_cpu;
     let _cpu_dma_lock = rt_setup::lock_cpu_c_states();
@@ -238,13 +229,41 @@ pub fn run_pipewire_host_with_cabinet(
         .cloned();
 
     let mut reconnect = ReconnectCycle::new(reconnect_policy);
-    let mut backend_failure: Option<(&'static str, String)> = None;
+    let mut backend_failure: Option<(&'static str, String)>;
     let mut rebuild_failures = handlers::RebuildFailureTracker::default();
     let mut teardown_guard: Option<super::status::TeardownGuard<'_>> = None;
     let mut banner_emitted = false;
+    // Control-loop GC drains reuse this slot array; only the RT callback owns
+    // the separate `rt_parking_lot` while the stream is live.
+    let mut control_parking_lot: [Option<GcItem>; 16] = Default::default();
 
     'host: loop {
         rt_state.thread_configured = false;
+        // A fresh stream instance must not inherit a format-violation mute from
+        // the previous graph if the new one never re-emits a `Format` event.
+        backend_status.stream_status().reset_format_contract();
+        // Playback-thread divergence is a per-instance measurement window; a
+        // cumulative counter from the previous graph would otherwise be
+        // reported as if it happened in the new episode.
+        backend_status
+            .stream_status()
+            .reset_playback_thread_divergence();
+
+        // Derive every raw pointer to host-owned state afresh per instance,
+        // only after the owner's pre-stream writes above are complete and
+        // before the streams can touch them. No residual raw pointer survives
+        // the ordered teardown below (streams/loop dropped, then
+        // `reset_bridge_and_drain_gc` re-takes `&mut rt_parking_lot`), so the
+        // next iteration re-derives from exclusive ownership. This keeps the
+        // Stacked/Tree Borrows provenance clean across bounded reconnects.
+        let state_ptr: *mut CaptureState = &raw mut *rt_state;
+        let channels_ptr: *mut RtHostChannels = &raw mut *rt_channels;
+        let rec_ptr: *mut RecordingSender = match &mut recording_worker {
+            Some(guard) => &raw mut *guard.sender_slot(),
+            None => &raw mut dummy_recording_sender,
+        };
+        let parking_lot_ptr: *mut [Option<GcItem>; 16] = &raw mut rt_parking_lot;
+        let parking_lot_dirty_ptr: *const AtomicBool = &raw const rt_parking_lot_dirty;
 
         // SAFETY: `pipewire::init()` was called in `main()`, `PW_THREAD_LOOP_NAME` is
         // static null-terminated, and the loop is stopped & dropped at instance teardown.
@@ -279,63 +298,40 @@ pub fn run_pipewire_host_with_cabinet(
             playback_stream,
             playback_listener,
             initial_latency_samples,
-        ) = {
-            let setup_res: anyhow::Result<_> = (|| {
-                let _lock = thread_loop.lock();
-                let latency_str = format!("{}/48000", buffer_size);
-                // SAFETY: both PipeWire loops are stopped here, so `state_ptr` is exclusive.
-                let initial_latency_samples =
-                    unsafe { snapshot_and_publish_initial_latencies(state_ptr, &backend_status) };
-
-                let (cs, cl) = capture::setup_capture_stream(
-                    &core,
-                    bridge_ptr,
-                    buffer_size,
-                    initial_latency_samples,
-                    target_cpu,
-                    state_ptr,
-                    channels_ptr,
-                    rate_for_param.clone(),
-                    rt_status.clone(),
-                    rec_ptr,
-                    parking_lot_ptr,
-                    parking_lot_dirty_ptr,
-                    recording_data_available.clone(),
-                    recording_failed.clone(),
-                    backend_for_capture.clone(),
-                )?;
-
-                let (ps, pl) = playback::setup_playback_stream(
-                    &core,
-                    bridge_ptr,
-                    buffer_size,
-                    initial_latency_samples,
-                    &latency_str,
-                    rt_status.clone(),
-                    backend_for_playback.clone(),
-                    output_limit,
-                )?;
-
-                Ok((cs, cl, ps, pl, initial_latency_samples))
-            })();
-
-            match setup_res {
-                Ok(res) => res,
-                Err(e) => match handle_attempt_error(
-                    e,
-                    "stream-setup",
-                    "stream_setup",
-                    &sys,
-                    &mut reconnect,
-                    &backend_status,
-                )? {
-                    RetryDecision::Retry => continue 'host,
-                    RetryDecision::BreakHost(failure) => {
-                        backend_failure = failure;
-                        break 'host;
-                    }
-                },
-            }
+        ) = match setup::create_streams(
+            &core,
+            bridge_ptr,
+            buffer_size,
+            target_cpu,
+            state_ptr,
+            channels_ptr,
+            rate_for_param.clone(),
+            rt_status.clone(),
+            rec_ptr,
+            parking_lot_ptr,
+            parking_lot_dirty_ptr,
+            recording_failed.clone(),
+            backend_for_capture.clone(),
+            backend_for_playback.clone(),
+            &backend_status,
+            &thread_loop,
+            output_limit,
+        ) {
+            Ok(res) => res,
+            Err(e) => match handle_attempt_error(
+                e,
+                "stream-setup",
+                "stream_setup",
+                &sys,
+                &mut reconnect,
+                &backend_status,
+            )? {
+                RetryDecision::Retry => continue 'host,
+                RetryDecision::BreakHost(failure) => {
+                    backend_failure = failure;
+                    break 'host;
+                }
+            },
         };
 
         let app_state = AppState {
@@ -363,11 +359,7 @@ pub fn run_pipewire_host_with_cabinet(
         let mut panic_is_terminal = false;
 
         while !SHUTDOWN.load(Ordering::Acquire) {
-            if let (Some(alert), Some(status)) = (&mut recording_alert, &recording_status)
-                && let Some(emitted) = alert.poll(status)
-            {
-                log::error!("{}", emitted.render());
-            }
+            control::poll_recording_alert(&mut recording_alert, &recording_status);
 
             if let Some((stream, reason)) = backend_status.failure() {
                 instance_failure = Some((stream, reason));
@@ -375,6 +367,9 @@ pub fn run_pipewire_host_with_cabinet(
             }
 
             if observe_rt_panic(&rt_status, &backend_status) {
+                // The RT hook deferred its payload; the bundle/file work runs
+                // here, off the audio thread.
+                super::rt_panic::flush_deferred_panic();
                 panic_is_terminal = true;
                 instance_failure = Some((
                     "rt_callback",
@@ -384,25 +379,10 @@ pub fn run_pipewire_host_with_cabinet(
                 break;
             }
 
-            if backend_status.is_running() {
-                match reconnect.note_stable() {
-                    StabilityEvent::Restored { attempts } => {
-                        log::info!("🎸 Audio restored after {attempts} attempt(s)");
-                    }
-                    StabilityEvent::Replenished => {
-                        log::debug!(
-                            "Reconnect budget replenished after {STABLE_RESET:?} of stable streaming"
-                        );
-                    }
-                    StabilityEvent::None => {}
-                }
-            } else {
-                reconnect.note_unstable();
-            }
+            control::note_stream_stability(&backend_status, &mut reconnect);
 
             run_control_housekeeping(
                 &rt_status,
-                &rate_for_param,
                 &sys,
                 &mut resampler_producer,
                 nam_cab_source.as_ref(),
@@ -431,22 +411,14 @@ pub fn run_pipewire_host_with_cabinet(
                 &banner,
                 &mut gc_consumer,
                 &gc_overflow,
+                &mut control_parking_lot,
             );
 
             wakeup.wait_timeout(Duration::from_millis(100));
         }
 
-        if instance_failure.is_none()
-            && rt_status
-                .check_flag(crate::standalone::pw_host::rt_callback::RT_STATUS_PANIC_CAPTURED)
-        {
-            panic_is_terminal = true;
-            instance_failure = Some((
-                "rt_callback",
-                "panic captured in an RT callback closure (observed at shutdown — never a clean exit)"
-                    .to_owned(),
-            ));
-        }
+        let mut panic_is_terminal =
+            teardown::observe_late_panic(&rt_status, &mut instance_failure) || panic_is_terminal;
 
         teardown_guard = Some(backend_status.enter_teardown());
         thread_loop.stop();
@@ -455,6 +427,12 @@ pub fn run_pipewire_host_with_cabinet(
         drop(context);
         drop(thread_loop_pin);
         drop(thread_loop);
+        // A panic may have been deferred in the final instants before the RT
+        // thread stopped; observe and flush it once more off-RT (the first
+        // observe ran before `stop()`) so it is neither lost nor reported as a
+        // clean exit.
+        panic_is_terminal =
+            teardown::observe_late_panic(&rt_status, &mut instance_failure) || panic_is_terminal;
         reset_bridge_and_drain_gc(
             &backend_status,
             bridge_ptr,
@@ -465,37 +443,16 @@ pub fn run_pipewire_host_with_cabinet(
             &rt_status,
         );
 
-        match instance_failure {
-            None => break 'host,
-            Some((stream, reason)) => {
-                if panic_is_terminal {
-                    backend_failure = Some((stream, reason));
-                    break 'host;
-                }
-                if let Some(backoff) = reconnect.begin_attempt() {
-                    log::warn!(
-                        "{} PipeWire backend lost the '{stream}' stream ({reason}). \
-                         Reconnect attempt {}/{} in {:?} (total backoff budget {:?}) — \
-                         DSP state (models/IRs/recording) is preserved.",
-                        "🔁".yellow(),
-                        reconnect.attempts_made(),
-                        reconnect.policy().max_attempts,
-                        backoff,
-                        reconnect.policy().total_backoff_budget(),
-                    );
-                    backend_status.begin_reconnect(
-                        reconnect.attempts_made(),
-                        reconnect.policy().max_attempts,
-                        backoff,
-                    );
-                    if sleep_interruptible(backoff) {
-                        break 'host;
-                    }
-                    continue 'host;
-                }
-                backend_failure = Some((stream, reason));
-                break 'host;
-            }
+        let (after_teardown, failure) = teardown::decide_after_teardown(
+            instance_failure,
+            panic_is_terminal,
+            &mut reconnect,
+            &backend_status,
+        );
+        backend_failure = failure;
+        match after_teardown {
+            teardown::AfterTeardown::Exit => break 'host,
+            teardown::AfterTeardown::Reconnect => continue 'host,
         }
     }
 
@@ -504,7 +461,6 @@ pub fn run_pipewire_host_with_cabinet(
         recording_enabled,
         recording_worker.take(),
         &backend_status,
-        &rt_state,
         &rt_status,
         buffer_size,
         &sys,

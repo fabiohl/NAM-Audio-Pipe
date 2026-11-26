@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 struct RecordingSetup {
-    data_available: Option<Arc<std::sync::atomic::AtomicBool>>,
     status: Option<recording::SharedRecordingStatus>,
     worker: Option<recording::RecordingWorkerGuard>,
     banner_dir: Option<PathBuf>,
@@ -195,7 +194,6 @@ fn push_initial_parameters(
 fn setup_recording(args: &cli::CliArgs, housekeeping_cpus: &[usize]) -> RecordingSetup {
     if !args.record {
         return RecordingSetup {
-            data_available: None,
             status: None,
             worker: None,
             banner_dir: None,
@@ -203,9 +201,6 @@ fn setup_recording(args: &cli::CliArgs, housekeeping_cpus: &[usize]) -> Recordin
     }
 
     let (sender, receiver) = recording::create_recording_transport();
-    let data_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag_for_thread = Arc::clone(&data_available);
-
     let recording_status: recording::SharedRecordingStatus =
         Arc::new(Mutex::new(recording::RecordingStatus::Starting));
     let failed_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -246,23 +241,19 @@ fn setup_recording(args: &cli::CliArgs, housekeeping_cpus: &[usize]) -> Recordin
         base_dir,
     );
 
-    let io_handle = match recording::spawn_recording_worker(
-        receiver,
-        Some(flag_for_thread),
-        init,
-        housekeeping_cpus.to_vec(),
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            log::error!("🛑 Failed to spawn recording worker: {e}");
-            exit::exit_runtime_error(
-                exit::ExitKind::Recording,
-                format!("Failed to spawn recording worker: {e}"),
-                "The recording disk-I/O thread could not be created. Check the \
+    let io_handle =
+        match recording::spawn_recording_worker(receiver, init, housekeeping_cpus.to_vec()) {
+            Ok(h) => h,
+            Err(e) => {
+                log::error!("🛑 Failed to spawn recording worker: {e}");
+                exit::exit_runtime_error(
+                    exit::ExitKind::Recording,
+                    format!("Failed to spawn recording worker: {e}"),
+                    "The recording disk-I/O thread could not be created. Check the \
                  process/thread limit (`ulimit -u`) and available memory, then retry.",
-            );
-        }
-    };
+                );
+            }
+        };
 
     match recording::wait_for_recording_init(init_rx, recording::RECORDING_INIT_TIMEOUT) {
         Ok(dir) => {
@@ -285,7 +276,6 @@ fn setup_recording(args: &cli::CliArgs, housekeeping_cpus: &[usize]) -> Recordin
     }
 
     RecordingSetup {
-        data_available: Some(data_available),
         status: Some(recording_status),
         worker: Some(recording::RecordingWorkerGuard::new(
             io_handle,
@@ -335,6 +325,7 @@ fn exit_with_recording_outcome(outcome: Option<recording::RecordingWorkerOutcome
 /// Entry point for NAM-Audio-Pipe.
 fn main() -> anyhow::Result<()> {
     neural_amp_modeler_rs::common::panic_hook::install_panic_hook("standalone");
+    pw_host::install_deferred_rt_hook();
     let (level_filter, _logger) = init_logging();
 
     #[cfg(feature = "testing")]
@@ -453,7 +444,6 @@ fn main() -> anyhow::Result<()> {
         channels.gc_consumer,
         channels.slimmable_consumer,
         channels.os_consumer,
-        rec.data_available,
         rec.worker,
         pw_host::HostCabinetOptions {
             initial_nam_cab: cabinet.initial_nam_cab,

@@ -83,10 +83,12 @@ pub mod identity;
 pub mod latency;
 pub mod log_redirect;
 pub mod output_pw;
+pub(crate) mod overload;
 mod playback;
 mod reconnect;
 mod rt_callback;
 pub mod rt_log_ring;
+pub(crate) mod rt_panic;
 mod run;
 mod run_lifecycle;
 pub mod spa_format;
@@ -99,6 +101,7 @@ pub use log_redirect::{
 };
 pub use output_pw::PipewireHostConfig;
 pub use rt_callback::STRUCTURAL_POPS_PER_CALLBACK;
+pub use rt_panic::install_deferred_rt_hook;
 pub use run::{HostCabinetOptions, run_pipewire_host, run_pipewire_host_with_cabinet};
 pub use status::{
     BackendState, BackendStatusSnapshot, SharedBackendStatus, TeardownGuard, observe_rt_panic,

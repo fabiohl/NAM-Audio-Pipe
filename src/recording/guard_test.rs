@@ -8,7 +8,6 @@
 use super::*;
 use crate::recording::buffer::{
     AudioMetadata, ControlPayload, OVERRUN_COUNT, OVERRUN_COUNT_LOCK, OVERRUN_FRAMES_COUNT,
-    RingPayload,
 };
 use crate::recording::transport::{RecordingReceiver, RecordingSender, create_recording_transport};
 use crate::standalone::exit::ExitKind;
@@ -43,12 +42,7 @@ fn push_stream_stop_succeeds_when_capacity_frees() {
     // A single-slot control channel pre-filled with a Metadata: the retry loop
     // must land the StreamStop as soon as the consumer frees the slot.
     let (control_p, mut control_c) = crate::recording::buffer::create_control_ring_buffer(1);
-    let mut sender = RecordingSender::Pool {
-        control: Some(control_p),
-        pool: None,
-        pending_barrier: None,
-        next_seq: 1,
-    };
+    let mut sender = RecordingSender::from_parts(Some(control_p), None);
     sender
         .control_producer_mut()
         .unwrap()
@@ -72,12 +66,7 @@ fn push_stream_stop_times_out_when_ring_stays_full() {
     // A single-slot control channel with no consumer: the bounded retry must
     // give up at the timeout — never spin forever.
     let (control_p, _control_c) = crate::recording::buffer::create_control_ring_buffer(1);
-    let mut sender = RecordingSender::Pool {
-        control: Some(control_p),
-        pool: None,
-        pending_barrier: None,
-        next_seq: 1,
-    };
+    let mut sender = RecordingSender::from_parts(Some(control_p), None);
     sender
         .control_producer_mut()
         .unwrap()
@@ -188,51 +177,30 @@ fn spawn_mock_recording_worker(
         .name("guard-mock-recording-io".into())
         .spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            match &mut receiver {
-                RecordingReceiver::Pool { control, pool } => loop {
-                    match control.pop() {
-                        Ok(ControlPayload::StreamStop) => {
-                            exit_reason.store(1, Ordering::Release);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_)
-                            if control.is_abandoned()
-                                && pool.work_is_abandoned()
-                                && pool.work_is_empty() =>
-                        {
-                            exit_reason.store(2, Ordering::Release);
-                            break;
-                        }
-                        Err(_) => {
-                            if std::time::Instant::now() >= deadline {
-                                exit_reason.store(0, Ordering::Release);
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
+            let RecordingReceiver { control, pool } = &mut receiver;
+            loop {
+                match control.pop() {
+                    Ok(ControlPayload::StreamStop) => {
+                        exit_reason.store(1, Ordering::Release);
+                        break;
                     }
-                },
-                RecordingReceiver::Inline(consumer) => loop {
-                    match consumer.pop() {
-                        Ok(RingPayload::StreamStop) => {
-                            exit_reason.store(1, Ordering::Release);
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(_) if consumer.is_abandoned() => {
-                            exit_reason.store(2, Ordering::Release);
-                            break;
-                        }
-                        Err(_) => {
-                            if std::time::Instant::now() >= deadline {
-                                exit_reason.store(0, Ordering::Release);
-                                break;
-                            }
-                            std::thread::yield_now();
-                        }
+                    Ok(_) => {}
+                    Err(_)
+                        if control.is_abandoned()
+                            && pool.work_is_abandoned()
+                            && pool.work_is_empty() =>
+                    {
+                        exit_reason.store(2, Ordering::Release);
+                        break;
                     }
-                },
+                    Err(_) => {
+                        if std::time::Instant::now() >= deadline {
+                            exit_reason.store(0, Ordering::Release);
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                }
             }
             Ok(())
         })
@@ -345,12 +313,12 @@ fn shutdown_reports_success_with_loss_when_pool_slot_was_leaked() {
 
         // Acquire a slot from the pool and drop it without publishing:
         // this simulates slot leak / publish failure.
-        if let RecordingSender::Pool { pool, .. } = &mut sender {
-            let slot = pool.as_mut().unwrap().try_acquire().unwrap();
-            drop(slot);
-        } else {
-            panic!("expected pool transport");
-        }
+        let slot = sender
+            .pool_producer_mut()
+            .expect("expected pool transport")
+            .try_acquire()
+            .unwrap();
+        drop(slot);
 
         assert_eq!(sender.leaked_slots(), 1);
 
@@ -472,12 +440,9 @@ fn sender_slot_is_a_stable_mut_slot() {
         "push through the guard's sender slot must succeed"
     );
 
-    match &mut receiver {
-        RecordingReceiver::Pool { control, .. } => match control.pop() {
-            Ok(ControlPayload::Metadata { .. }) => {}
-            other => panic!("expected the pushed metadata, got {other:?}"),
-        },
-        RecordingReceiver::Inline(_) => panic!("pool transport expected"),
+    match receiver.control_consumer_mut().pop() {
+        Ok(ControlPayload::Metadata { .. }) => {}
+        other => panic!("expected the pushed metadata, got {other:?}"),
     }
 }
 

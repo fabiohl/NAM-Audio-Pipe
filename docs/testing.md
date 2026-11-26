@@ -33,7 +33,6 @@ This document details the automated testing architecture, verification suites, r
   - `pgo_workload` (`src/bin/pgo_workload.rs`, `required-features = ["testing"]`): Synthetic training matrix generator for PGO.
   - `pipe_long_receipt` (`src/bin/pipe_long_receipt.rs`, `required-features = ["testing"]`): Receipt generator and validator for `tests-long.sh`.
   - `pipe_perf_gate` (`src/bin/pipe_perf_gate.rs`): CPU topology resolver for pinning RT and benchmark execution.
-  - `recording_ab_bench` (`src/bin/recording_ab_bench.rs`, `required-features = ["testing"]`): A/B benchmark for recording transports.
   - `ab_opt_bench` (`src/bin/ab_opt_bench.rs`, `required-features = ["testing"]`): Microarchitectural DSP cycle evaluation harness.
   - `pipe_ab_opt` (`src/bin/pipe_ab_opt.rs`): A/B optimization ceremony verdict evaluator.
   - `rt_gate` (`benches/rt_gate.rs`, `required-features = ["testing"]`): Criterion benchmark for RT regression gates.
@@ -108,6 +107,9 @@ Each unit test verifies strict architectural invariants directly within the rele
   - **Episode Latches**: Flag and counter signals emit at most once per anomaly episode and re-arm only after the condition clears.
   - **Gate Log Throttling**: Limits gate transition logs to at most one entry per `GATE_LOG_MIN_INTERVAL`, folding rapid chatters into `(×N)` counters.
   - **Diagnostic Format**: Emits concise `[Exxxx | MNEMONIC]` lines without dumping bloated log traces.
+  - **Latency Histogram Reset Protocol**: The RT side only records (`fetch_add`/`fetch_max`/`fetch_min` per bucket); the telemetry reader summarises and then resets (`swap` per bucket). No bucket is torn and neither side blocks; a sample racing the sweep may be dropped (best-effort reset).
+  - **Explicit Budget Thresholds**: The DSP self-measurement (85 %), adaptive-FSM sample (full period) and off-RT deadline check (100 %) share named helpers in `src/standalone/pw_host/overload.rs`; the numeric values are unchanged.
+  - **Thread/Cabinet Signals**: `playback_thread_divergence` counts playback quanta running off the marked capture data thread, and `cab_rate_stale` signals a cabinet slot bypassed because its rate differs from the host quantum. Both are reported at most once per episode.
 
 #### Shared Memory Bridge
 
@@ -133,6 +135,7 @@ Each unit test verifies strict architectural invariants directly within the rele
   - Wraps RT closure bodies in `catch_unwind(AssertUnwindSafe)` once per quantum.
   - On panic, latches the fatal atomic flag `RT_STATUS_PANIC_CAPTURED` (bit 31) and immediately mutes audio.
   - Subsequent callback invocations exit instantly, preventing repetitive panic loops while awaiting graceful teardown.
+  - A wrapper hook defers the diagnostic bundle and crash-file write when the panic is on the marked RT thread: only the payload is copied to a pre-allocated slot, and the control loop flushes it off-RT after observing the latch.
   - Release profile inherits `panic = "unwind"`, ensuring unwinding containment remains functional in shipped production artifacts.
 
 #### Lock-Free SPSC Resource Swaps & Rebuild Handlers
@@ -168,15 +171,16 @@ Each unit test verifies strict architectural invariants directly within the rele
 - **Key Invariants**:
   - **RAII Teardown**: `RecordingWorkerGuard` guarantees bounded worker joins, stopping worker threads and flushing headers safely on drop.
   - **Loss Accounting**: If overruns occurred during recording, the process exits with code 6 (`ExitKind::Recording`), detailing lost frames in `SuccessWithLoss`.
-  - **Memory Subsystem Efficiency**: The promoted `RecordingPool` slot transport reduces memory subsystem traffic by ~57% compared to traditional inline SPSC rings.
+  - **Intentional Silence vs. Loss**: Gate-closed `Silence` quanta travel as zero-copy frame-count markers and are written as zeros (duration preserved); real overruns are counted, never padded. Covered by `recording::disk::disk_test::intentional_silence_markers_preserve_wav_duration`, `write_error_releases_in_flight_pool_slot`, `low_space_checked_under_continuous_load`, and the `heap-audit`-gated `recording_silence_rt_path_allocates_zero`.
+  - **Memory Subsystem Efficiency**: The `RecordingPool` slot transport reduces memory subsystem traffic by ~57% compared to the retired by-value SPSC ring (the RT thread writes each slot in place and publishes a 4-byte descriptor).
 
 #### PipeWire Log Redirection & Off-RT Log Ring
 
 - **Location**: [`src/standalone/pw_host/log_redirect.rs`](../src/standalone/pw_host/log_redirect.rs), [`rt_log_ring.rs`](../src/standalone/pw_host/rt_log_ring.rs)
 - **Contract**: Intercepts C-ABI PipeWire logs and routes them safely away from the real-time audio thread.
 - **Key Invariants**:
-  - Uses a fixed 1024-byte stack buffer with allocation-free UTF-8 conversion via pure-Rust Rust 1.99 variadics.
-  - Audio threads marked via TLS (`rt_log_mark`) divert log messages into a pre-allocated SPSC ring (~344 KiB), avoiding blocking `log::*` macros on the audio thread.
+  - Non-RT threads use a fixed 1024-byte stack buffer with allocation-free UTF-8 conversion via pure-Rust Rust 1.99 variadics.
+  - Audio threads marked via TLS (`rt_log_mark`) bypass `vsnprintf` entirely: the raw format literal is copied with a bounded byte loop into a pre-allocated SPSC ring (~344 KiB) with an `rt_unformatted` flag. The drainer renders it with the `[rt-unformatted]` marker (variadic arguments are intentionally dropped), avoiding blocking `log::*` macros and libc allocation on the audio thread. Setting `NAM_PW_LOG_SYNC=1` at install time skips the ring and restores the synchronous path bit-for-bit; that mode is a diagnostic rollback and is explicitly **not** RT-safe.
 
 ---
 
@@ -205,6 +209,7 @@ Integration tests validate full-system behavior against real external interfaces
 | [`tests/soak_extended.rs`](../tests/soak_extended.rs)                                     | Accelerated timeline soak (320,000 blocks), zero minor/major page faults, and stable RSS (< 512 KiB drift).                                                                                                                              | `#[ignore]` / `phase1`                     |
 | [`tests/endurance.rs`](../tests/endurance.rs)                                             | Real wall-clock endurance testing at 48 kHz / 64 frames (`NAM_ENDURANCE_SECONDS`, default 30 s).                                                                                                                                         | `#[ignore]` / `phase6`                     |
 | [`tests/rt_metrics.rs`](../tests/rt_metrics.rs)                                           | Nanosecond monotonic clock profiling: deadline gate (< 85% quantum budget), tail jitter, and concurrency.                                                                                                                                | `#[ignore]` / `phase3`, `phase4`, `phase5` |
+| [`tests/aliasing_harness.rs`](../tests/aliasing_harness.rs)                               | Reduced per-instance raw-pointer lifecycle audit for the host instance state (re-derivation per `'host` iteration, teardown `&mut` then fresh derivation; 3/3 under Miri, Stacked and Tree Borrows).                                     | `utils/miri-audit.sh`                      |
 | [`tests/distribution_qa.rs`](../tests/distribution_qa.rs)                                 | Strict AppStream XML validation (`io.github.fabiohl.NAMAudioPipe.metainfo.xml`) and binary smoke checks.                                                                                                                                 | Fast Dev / `phase0`                        |
 
 ---
@@ -308,8 +313,8 @@ Rules for the Pipe cells:
 - Plugin and Pipe gates are **not** interchangeable: this side uses worst
   callback < 85% of the period and p99.99 jitter <= 75%; the plugin uses
   p99 < 85% of the period. A single generic threshold is forbidden.
-- Capture→playback latency is per delivered generation; the legacy
-  global `capture_start_tsc` is no longer the source of that metric.
+- Capture→playback latency is per delivered generation; no global capture
+  timestamp scalar is stored on the RT path.
 
 ---
 
@@ -408,7 +413,7 @@ All test commands must be executed from the root of the `./NAM-Audio-Pipe/` repo
 | **`utils/tests-long.sh`**      | Class B: 11-phase comprehensive audit (catch-all, soak, zero-alloc, RT, endurance, live PipeWire, f64 parity). | Operator / Release qualification |
 | **`utils/build-release.sh`**   | Class C: multi-stage PGO/BOLT compilation, packaging, artifact delivery, and certification.                    | Production releases              |
 | **`utils/ab-opt-ceremony.sh`** | Class D: plain vs PGO vs PGO+BOLT statistical A/B micro-benchmark ceremony for BOLT promotion proof.           | Operator / Pre-release BOLT gate |
-| **`utils/miri-audit.sh`**      | Class D: out-of-band formal aliasing and data-race audit for lock-free memory structures.                      | Maintenance / Unsafe code audit  |
+| **`utils/miri-audit.sh`**      | Class D: out-of-band formal aliasing and data-race audit for lock-free memory structures and the host's Box-derived raw-pointer lifecycle (`tests/aliasing_harness.rs`). | Maintenance / Unsafe code audit  |
 
 ### 5.2 Direct Command Cheat Sheet
 
@@ -469,7 +474,7 @@ The following contractual rules are enforced across test suites and CI checks:
 | **WAV Header Integrity**     | Finalized WAV `data` chunk header size must match the exact PCM payload bytes written to disk.                                                                                                                                                                                  | `tests/recording.rs`, `tests/recording_fault_injection.rs`        |
 | **Buffer Size Domain**       | Strictly `{0} ∪ {2^k \| 16 ≤ 2^k ≤ 8192}`. Out-of-domain inputs reject fail-fast with typed `BufferSizeError`.                                                                                                                                                                  | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                       |
 | **Silence Gate Domain**      | Polymorphic mode: `on`/`off` or `[-96.0, -20.0]` dBFS threshold with 10 dB Schmitt hysteresis. Rejected fail-fast on malformed inputs.                                                                                                                                          | `src/standalone/cli.rs`, `tests/e2e_cli.rs`                       |
-| **RT Quantum Bounds**        | Maximum supported quantum is `MAX_BRIDGE_BUF` (8192 frames / 32,768 bytes). Larger descriptors reject fail-closed.                                                                                                                                                              | `src/standalone/pw_host/rt_callback/process.rs`                   |
+| **RT Quantum Bounds**        | Maximum supported quantum is `MAX_BRIDGE_BUF` (8192 frames / 32,768 bytes). Larger descriptors reject fail-closed.                                                                                                                                                              | `src/standalone/pw_host/rt_callback/pipeline.rs`                  |
 | **RT Deadline Processing**   | Worst-case processing per quantum must be < 85% of quantum budget `(N/SR)` over 10,000 quantums.                                                                                                                                                                                | `tests/rt_metrics.rs`, `utils/tests-long.sh` (`rt-deadline`)      |
 | **Target CPU Baseline**      | Strictly `x86-64-v3` (AVX2, FMA, BMI2). No scalar runtime fallbacks.                                                                                                                                                                                                            | `.cargo/config.toml`                                              |
 | **AppStream XML Validity**   | Metainfo parses under strict XML; exactly one `<release>` tag matching `CARGO_PKG_VERSION` with a valid `date`.                                                                                                                                                                 | `tests/distribution_qa.rs`, `utils/lints.sh`                      |

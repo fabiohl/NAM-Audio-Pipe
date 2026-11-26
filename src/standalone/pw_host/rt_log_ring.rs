@@ -75,6 +75,10 @@ const TOPIC_CAP: usize = 32;
 /// Upper bound of the message body (msg ≤ 256).
 const MSG_CAP: usize = 256;
 
+/// Marker prefixed by the drainer to a record queued unformatted from the RT
+/// thread (variadic arguments were intentionally not expanded).
+pub(crate) const RT_UNFORMATTED_MARKER: &str = "[rt-unformatted]";
+
 /// Compact captured log event transiting the SPSC ring.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RtLogRecord {
@@ -92,8 +96,12 @@ pub(crate) struct RtLogRecord {
     file: [u8; FILE_CAP],
     /// Copy of the topic text (≤ [`TOPIC_CAP`], zero-padded tail).
     topic: [u8; TOPIC_CAP],
-    /// Copy of the message body (≤ [`MSG_CAP`], zero-padded tail).
+    /// Copy of the message body (≤ [`MSG_CAP`], zero-padded tail). For an
+    /// `rt_unformatted` record this is the raw format literal, not expanded.
     msg: [u8; MSG_CAP],
+    /// `true` when the message came from the marked RT thread and must not be
+    /// run through libc formatting; the drainer renders the marker.
+    rt_unformatted: bool,
 }
 
 impl RtLogRecord {
@@ -116,11 +124,49 @@ impl RtLogRecord {
             file: [0; FILE_CAP],
             topic: [0; TOPIC_CAP],
             msg: [0; MSG_CAP],
+            rt_unformatted: false,
         };
         record.file_len = copy_bounded(&mut record.file, file_str);
         record.topic_len = copy_bounded(&mut record.topic, topic_str);
         record.msg_len = copy_bounded(&mut record.msg, msg);
         record
+    }
+
+    /// Captures a record whose message is the raw format literal from a marked
+    /// RT thread. No libc formatter and no `strlen` are involved: the literal
+    /// is copied with a bounded byte loop until the NUL terminator or the
+    /// field capacity.
+    ///
+    /// # Safety
+    ///
+    /// `fmt`, when non-null, must point at a valid NUL-terminated C string for
+    /// the duration of the call (PipeWire's SPA log contract).
+    unsafe fn capture_unformatted(
+        level: spa_log_level,
+        line: i32,
+        file_str: &str,
+        topic_str: &str,
+        fmt: *const c_char,
+    ) -> Option<Self> {
+        if fmt.is_null() {
+            return None;
+        }
+        let mut record = Self {
+            level,
+            line,
+            file_len: 0,
+            topic_len: 0,
+            msg_len: 0,
+            file: [0; FILE_CAP],
+            topic: [0; TOPIC_CAP],
+            msg: [0; MSG_CAP],
+            rt_unformatted: true,
+        };
+        record.file_len = copy_bounded(&mut record.file, file_str);
+        record.topic_len = copy_bounded(&mut record.topic, topic_str);
+        // SAFETY: documented precondition (valid NUL-terminated string).
+        record.msg_len = unsafe { copy_cstr_bounded(fmt, &mut record.msg) };
+        Some(record)
     }
 
     fn file_str(&self) -> &str {
@@ -137,6 +183,28 @@ impl RtLogRecord {
         let end = self.msg_len.min(MSG_CAP as u16) as usize;
         std::str::from_utf8(&self.msg[..end]).unwrap_or("<non-utf8>")
     }
+}
+
+/// Copies a NUL-terminated C string into a fixed field without `strlen` or any
+/// libc call, truncating at the capacity. Returns the stored length.
+///
+/// # Safety
+///
+/// `src` must be non-null and point at a valid NUL-terminated byte string.
+#[inline]
+unsafe fn copy_cstr_bounded(src: *const c_char, dst: &mut [u8]) -> u16 {
+    let mut n = 0usize;
+    while n < dst.len() {
+        // SAFETY: the caller guarantees a valid NUL-terminated string; the
+        // loop stops at the terminator before reading past it.
+        let byte = unsafe { *src.cast::<u8>().add(n) };
+        if byte == 0 {
+            break;
+        }
+        dst[n] = byte;
+        n += 1;
+    }
+    n as u16
 }
 
 /// Copies `src` bytes into a fixed field, truncating; returns the stored
@@ -235,6 +303,56 @@ pub(crate) fn try_offload(
                 // (queued or discarded-and-counted): the marked thread never
                 // falls back to the synchronous dispatch, not even under
                 // ring saturation.
+                true
+            })
+        })
+    }
+}
+
+/// Hot path for a PW log event raised on the marked RT thread.
+///
+/// Unlike [`try_offload`], this never runs a variadic formatter: the raw format
+/// literal is copied with a bounded byte loop and queued with the
+/// `rt_unformatted` flag, so the RT thread makes zero libc formatting calls and
+/// zero allocations. Variadic arguments are dropped by design; the drainer adds
+/// [`RT_UNFORMATTED_MARKER`] so the loss is visible in diagnostics.
+///
+/// Returns `true` when the event was consumed by the ring (queued or
+/// discarded-and-counted). `false` means the caller must take its normal path
+/// (unmarked thread, rollback install, or ring not installed).
+///
+/// # Safety
+///
+/// `topic`/`file` follow the SPA decode contracts; `fmt` must be null or point
+/// at a valid NUL-terminated C format string for the duration of the call.
+#[inline]
+pub(crate) unsafe fn try_offload_unformatted(
+    level: spa_log_level,
+    topic: *const spa_log_topic,
+    file: *const c_char,
+    line: c_int,
+    fmt: *const c_char,
+) -> bool {
+    if !RING_MODE.load(Ordering::Acquire) {
+        return false;
+    }
+    if !crate::standalone::rt_setup::rt_log_mark::rt_is_current_thread_marked() {
+        return false;
+    }
+    let Some(producer) = RT_PRODUCER.get() else {
+        return false;
+    };
+    // SAFETY: the decode helpers' contracts are forwarded from this function's
+    // safety section; the copies happen inside their scoped closures.
+    unsafe {
+        decode_with_topic(topic, |topic_str| {
+            decode_with_file(file, |file_str| {
+                let Some(record) =
+                    RtLogRecord::capture_unformatted(level, line, file_str, topic_str, fmt)
+                else {
+                    return false;
+                };
+                push_or_count(producer, record);
                 true
             })
         })
@@ -388,6 +506,16 @@ fn drain_loop(mut consumer: rtrb::Consumer<RtLogRecord>) {
 }
 
 /// Formats a queued ring record into its target log level and message shape.
+/// Message body the drainer dispatches for a record. Unformatted records are
+/// prefixed off-RT so the dropped variadic arguments are visible.
+fn dispatch_message(record: &RtLogRecord) -> std::borrow::Cow<'_, str> {
+    if record.rt_unformatted {
+        std::borrow::Cow::Owned(format!("{} {}", RT_UNFORMATTED_MARKER, record.msg_str()))
+    } else {
+        std::borrow::Cow::Borrowed(record.msg_str())
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn format_rt_record(record: &RtLogRecord) -> (log::Level, String) {
     render_decoded_pipewire_log(
@@ -395,7 +523,7 @@ pub(crate) fn format_rt_record(record: &RtLogRecord) -> (log::Level, String) {
         record.topic_str(),
         record.file_str(),
         record.line,
-        record.msg_str(),
+        &dispatch_message(record),
     )
 }
 
@@ -408,7 +536,7 @@ fn emit_rt_record(record: &RtLogRecord) {
         record.topic_str(),
         record.file_str(),
         record.line,
-        record.msg_str(),
+        &dispatch_message(record),
     );
     #[cfg(test)]
     DRAINED_RECORDS.fetch_add(1, Ordering::Release);

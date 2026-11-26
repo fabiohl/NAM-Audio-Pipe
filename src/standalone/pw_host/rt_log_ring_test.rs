@@ -193,7 +193,7 @@ fn marked_thread_queues_and_drainer_emits_in_log_buffer() {
         // the redirect is preserved; crash reports keep PW logs.
         let marker = "RT_RING_E2E_MARKER_XYZ";
         rt_mark_current_thread();
-        let fmt = b"e2e-ring-probe %s\0";
+        let fmt = b"e2e-ring-probe RT_RING_E2E_MARKER_XYZ %s\0";
         let marker_c = b"RT_RING_E2E_MARKER_XYZ\0";
         let file = b"rt_log_ring_test.rs\0";
         let func = b"marked_thread_queues_and_drainer_emits_in_log_buffer\0";
@@ -242,8 +242,11 @@ fn marked_thread_queues_and_drainer_emits_in_log_buffer() {
         let message = &found.unwrap().message;
         assert_eq!(
             message,
-            &format!("[PipeWire] e2e-ring-probe {marker} (rt_log_ring_test.rs:1)"),
-            "drained record shape diverged from the sync dispatch template"
+            &format!(
+                "[PipeWire] {} e2e-ring-probe RT_RING_E2E_MARKER_XYZ %s (rt_log_ring_test.rs:1)",
+                super::RT_UNFORMATTED_MARKER
+            ),
+            "the marked RT path must queue the raw format literal with the unformatted marker"
         );
     });
 }
@@ -287,6 +290,86 @@ fn try_offload_refuses_route_without_ring_mode_or_mark() {
         "marked thread must route synchronously when ring mode is off"
     );
     rt_unmark_current_thread();
+}
+
+#[test]
+fn marked_thread_never_calls_the_libc_formatter() {
+    use crate::standalone::pw_host::log_redirect::format_calls_for_test;
+
+    let _lock_guard = PW_LOG_REDIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    install();
+    assert!(is_ring_routing_active());
+
+    let baseline = format_calls_for_test();
+    let fmt = b"must-not-format %d %s\0";
+    let arg = b"expanded\0";
+    let file = b"rt_log_ring_test.rs\0";
+    let func = b"marked_thread_never_calls_the_libc_formatter\0";
+    rt_mark_current_thread();
+    // SAFETY: own extern "C" variadic entry with null-terminated strings.
+    unsafe {
+        nam_pw_log(
+            std::ptr::null_mut(),
+            SPA_LOG_LEVEL_INFO,
+            file.as_ptr() as *const c_char,
+            9,
+            func.as_ptr() as *const c_char,
+            fmt.as_ptr() as *const c_char,
+            7 as std::ffi::c_int,
+            arg.as_ptr() as *const c_char,
+        );
+    }
+    rt_unmark_current_thread();
+
+    assert_eq!(
+        format_calls_for_test(),
+        baseline,
+        "the marked RT thread must not invoke vsnprintf"
+    );
+}
+
+#[cfg(feature = "heap-audit")]
+#[test]
+fn marked_thread_unformatted_route_is_zero_alloc() {
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    let _lock_guard = PW_LOG_REDIR_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    install();
+    assert!(is_ring_routing_active());
+
+    let fmt = b"alloc-probe %d\0";
+    let file = b"rt_log_ring_test.rs\0";
+    let func = b"marked_thread_unformatted_route_is_zero_alloc\0";
+    rt_mark_current_thread();
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        // SAFETY: own extern "C" variadic entry with null-terminated strings.
+        unsafe {
+            nam_pw_log(
+                std::ptr::null_mut(),
+                SPA_LOG_LEVEL_DEBUG,
+                file.as_ptr() as *const c_char,
+                10,
+                func.as_ptr() as *const c_char,
+                fmt.as_ptr() as *const c_char,
+                42 as std::ffi::c_int,
+            );
+        }
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+    rt_unmark_current_thread();
+
+    // Measured: alloc=0, dealloc=0, realloc=0 for the marked unformatted route
+    // (decode + bounded literal copy + ring push, no vsnprintf).
+    assert_eq!(allocs, 0, "allocations on the unformatted RT log path");
+    assert_eq!(deallocs, 0, "deallocation on the unformatted RT log path");
+    assert_eq!(reallocs, 0, "reallocation on the unformatted RT log path");
 }
 
 #[cfg(feature = "heap-audit")]

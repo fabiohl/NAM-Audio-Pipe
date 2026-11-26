@@ -371,6 +371,29 @@ pub fn receive_commands(
     (param_changed, pops)
 }
 
+/// Withdraws the WaveNet slimmable registration and any pending rebuild
+/// request after a non-slimmable model (or no model) is installed.
+///
+/// Bumping the rebuild generation makes any in-flight pair built from the
+/// previous full model stale, so the RT drain discards it instead of swapping
+/// channels derived from a model that is no longer active.
+#[cold]
+fn forget_wavenet_slimmable_registration(
+    adaptive: &mut AdaptiveCompute,
+    rt_status_for_process: &RtStatusFlags,
+) {
+    adaptive.clear_wavenet_registration_rt();
+    // Order matters: lower the request with `Release` *before* bumping the
+    // generation. A builder that observes the new generation through its
+    // `Acquire` load is then guaranteed to observe the lowered flag on its
+    // post-read re-check and abandons the now-obsolete full model.
+    rt_status_for_process
+        .clear_flag_release(neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
+    rt_status_for_process
+        .requested_slimmable_generation
+        .fetch_add(1, Ordering::Release);
+}
+
 /// Installs a `LoadModel` payload atomically: swaps both active channel
 /// pointers, injects the RT status, and cascades the replaced models to GC.
 /// `#[cold]` — a structural apply, never the per-block hot path.
@@ -414,11 +437,17 @@ fn install_load_model(
     }
 
     let old_l = std::mem::replace(active_model_l, model_l);
-    if let Some(model) = active_model_l {
+    if let Some(model) = active_model_l.as_mut() {
         model.inject_rt_status_rt(rt_status_for_process);
         if let StaticModel::WavenetDyn(w) = model.as_ref() {
             adaptive.set_wavenet_full_ch_rt(w.ch(), model.is_slimmable_capable());
+        } else {
+            forget_wavenet_slimmable_registration(adaptive, rt_status_for_process);
         }
+    } else {
+        // No model loaded: the previous WaveNet topology (and any still-latched
+        // slimmable request) no longer applies.
+        forget_wavenet_slimmable_registration(adaptive, rt_status_for_process);
     }
     let old_r = std::mem::replace(active_model_r, model_r);
     if let Some(model) = active_model_r {

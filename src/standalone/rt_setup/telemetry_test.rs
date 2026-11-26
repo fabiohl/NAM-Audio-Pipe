@@ -518,9 +518,6 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
     // 1. Record samples across all 5 metrics
     stream_status.capture_hist.record(1_500);
     stream_status.capture_hist.record(2_500);
-    stream_status
-        .capture_cycle_time
-        .store(2_500, Ordering::Relaxed);
 
     rt_status.latency_hist.record(10_000);
     rt_status.latency_hist.record(20_000);
@@ -528,21 +525,12 @@ fn test_5_stage_latency_metrics_and_telemetry_reporting() {
 
     stream_status.record_hist.record(300);
     stream_status.record_hist.record(700);
-    stream_status
-        .record_cycle_time
-        .store(700, Ordering::Relaxed);
 
     stream_status.playback_hist.record(1_200);
     stream_status.playback_hist.record(1_800);
-    stream_status
-        .playback_cycle_time
-        .store(1_800, Ordering::Relaxed);
 
     stream_status.e2e_hist.record(25_000);
     stream_status.e2e_hist.record(35_000);
-    stream_status
-        .e2e_cycle_time
-        .store(35_000, Ordering::Relaxed);
 
     assert_eq!(stream_status.capture_hist.total_count(), 2);
     assert_eq!(rt_status.latency_hist.total_count(), 2);
@@ -1307,4 +1295,44 @@ fn gate_transition_throttle_does_not_rate_limit_spaced_transitions() {
         Some(1),
         "a transition after the interval is not marked as a repeat"
     );
+}
+
+#[test]
+fn latency_histogram_reset_is_per_bucket_atomic_under_concurrent_record() {
+    use neural_amp_modeler_rs::dsp::telemetry::AtomicHistogram;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    // Protocol under test: the RT side only calls `record()` (fetch_add /
+    // fetch_max / fetch_min per bucket), while the telemetry reader calls
+    // `reset()` (swap per bucket) and `latency_summary()`. No bucket can be
+    // observed torn and neither side blocks; a sample racing the sweep may be
+    // dropped (best-effort reset), which this test tolerates by construction.
+    let hist = Arc::new(AtomicHistogram::new());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let writer_hist = Arc::clone(&hist);
+    let writer_stop = Arc::clone(&stop);
+    let writer = std::thread::spawn(move || {
+        let mut n = 1u64;
+        while !writer_stop.load(Ordering::Relaxed) {
+            writer_hist.record(n);
+            n = n.wrapping_add(7) % 1_000_000 + 1;
+        }
+    });
+
+    for _ in 0..512 {
+        let summary = latency_summary(&*hist);
+        assert!(summary.p50_ns <= summary.p99_ns);
+        assert!(summary.p99_ns <= summary.p999_ns);
+        assert!(summary.p999_ns <= summary.max_ns);
+        hist.reset();
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().unwrap_or_else(|_| panic!("writer panicked"));
+
+    hist.reset();
+    let empty = latency_summary(&*hist);
+    assert_eq!(empty.max_ns, 0);
+    assert_eq!(empty.mean_ns, 0);
 }

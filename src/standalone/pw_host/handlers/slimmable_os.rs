@@ -58,6 +58,14 @@ pub(in crate::standalone::pw_host) fn handle_slimmable_rebuild(
         .requested_slimmable_generation
         .load(Ordering::Acquire);
 
+    // Re-check after the generation load. The RT loader lowers this flag with
+    // `Release` before bumping the generation, so a builder that observes a
+    // newer generation is guaranteed to observe the withdrawal here and never
+    // builds a pair from the replaced full model.
+    if !rt_status.check_flag_acquire(spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD) {
+        return;
+    }
+
     if target_ch < 4 {
         log::warn!(
             "Slimmable rebuild rejected: target channel {target_ch} < 4 — keeping the full \

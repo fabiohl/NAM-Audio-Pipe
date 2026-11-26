@@ -20,7 +20,7 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <p>Key features include:</p>
     <ul>
       <li>Direct native PipeWire integration (libpipewire-0.3) at low quantum buffer sizes down to 64 samples (1.33 ms).</li>
-      <li>Embedded NeuralAmpModeler-rs v4.0.0 DSP engine supporting WaveNet (A1/A2), LSTM, ConvNet, Linear FIR, and Sequential topologies in standard .nam and binary .namb v2 formats.</li>
+      <li>Embedded NeuralAmpModeler-rs v4.1.0 DSP engine supporting WaveNet (A1/A2), LSTM, ConvNet, Linear FIR, and Sequential topologies in standard .nam and binary .namb v2 formats.</li>
       <li>Strict real-time safety: zero heap allocations, zero mutex locks, and zero blocking calls on the audio loop.</li>
       <li>Exclusive cabinet slot supporting partitioned UPOLS convolution for .wav IRs (32–256 sample partitions) or unity-gain .nam/.namb neural cabinets, with constant-latency --cab-bypass and configurable --ir-level-policy.</li>
       <li>PipeWire SPA latency reporting with live graph feedback and exact sample delay compensation.</li>
@@ -71,14 +71,11 @@ Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights 
     <binary>nam-audio-pipe</binary>
   </provides>
   <releases>
-    <release version="1.2.0" date="2026-11-24" type="stable">
+    <release version="1.3.0" date="2026-11-25" type="stable">
       <description>
-        <p>NAM-Audio-Pipe 1.2.0:</p>
+        <p>NAM-Audio-Pipe 1.3.0:</p>
         <ul>
-          <li>Integrated NeuralAmpModeler-rs v4.0.0 core DSP engine with WaveNet head support and updated linear prewarm calibration.</li>
-          <li>Expanded cabinet slot support for WAV, .nam, and .namb payloads with --cab-bypass and explicit --ir-level-policy modes (peak-normalized, preserved, legacy-nam-plugin).</li>
-          <li>Added optional musical noise gate (--gate-mode), input calibration flags (--calibrate-input, --input-calibration-level), and --output-mode selection.</li>
-          <li>Playback-only --output-limit safety clamp for interactive PipeWire monitoring without altering offline captures, plus Freedesktop Platform 26.08 migration.</li>
+          <li>Updated to NeuralAmpModeler-rs 4.1.0.</li>
         </ul>
       </description>
     </release>

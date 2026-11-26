@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for lock-free audio and control ring buffers, `AlignedBlock` memory
-//! invariants, overrun accounting counters, and proptests for planar sample consistency.
+//! Unit tests for the control ring buffer, `AlignedBlock` memory invariants,
+//! overrun accounting counters, and proptests for planar sample consistency.
 
 use super::*;
 use proptest::prelude::*;
@@ -15,64 +15,6 @@ fn assert_bits_eq(a: &[f32], b: &[f32]) {
     for (x, y) in a.iter().zip(b) {
         assert_eq!(x.to_bits(), y.to_bits(), "bitwise sample mismatch");
     }
-}
-
-#[test]
-fn ring_buffer_push_pop_round_trip() {
-    let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(8);
-    let meta = AudioMetadata {
-        sample_rate: 48000.0,
-        bit_depth: 32,
-        channels: 2,
-    };
-    assert!(p.push(RingPayload::Metadata(meta)).is_ok());
-    assert_matches!(c.pop().unwrap(), RingPayload::Metadata(m) if m == meta);
-}
-
-#[test]
-fn ring_buffer_audio_round_trip() {
-    let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
-    let mut block = AlignedBlock::new();
-    block.fill_planar(&[0.0, 1.0, 2.0], &[3.0, 4.0, 5.0]);
-    let expected_len = block.valid_len();
-    let expected = block.as_slice().to_vec();
-    assert!(p.push(RingPayload::Audio(block)).is_ok());
-    match c.pop().unwrap() {
-        RingPayload::Audio(b) => {
-            assert_eq!(b.valid_len(), expected_len);
-            assert_eq!(b.as_slice(), &expected[..]);
-        }
-        other => panic!(
-            "expected Audio payload, got {:?}",
-            std::mem::discriminant(&other)
-        ),
-    }
-}
-
-#[test]
-fn ring_buffer_stream_stop_round_trip() {
-    let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
-    assert!(p.push(RingPayload::StreamStop).is_ok());
-    assert_matches!(c.pop().unwrap(), RingPayload::StreamStop);
-}
-
-#[test]
-fn ring_buffer_fifo_ordering() {
-    let (mut p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(16);
-    let meta = AudioMetadata {
-        sample_rate: 44100.0,
-        bit_depth: 32,
-        channels: 2,
-    };
-    p.push(RingPayload::Metadata(meta)).unwrap();
-    let mut block = AlignedBlock::new();
-    block.fill_planar(&[1.0, 2.0], &[3.0, 4.0]);
-    p.push(RingPayload::Audio(block)).unwrap();
-    p.push(RingPayload::StreamStop).unwrap();
-
-    assert_matches!(c.pop().unwrap(), RingPayload::Metadata(_));
-    assert_matches!(c.pop().unwrap(), RingPayload::Audio(_));
-    assert_matches!(c.pop().unwrap(), RingPayload::StreamStop);
 }
 
 #[test]
@@ -121,12 +63,12 @@ fn overrun_counter_starts_at_zero() {
     );
 }
 
-/// Memory-impact contract: the slot must hold the largest legal host
-/// quantum (8192 frames = `MAX_BRIDGE_BUF` × 2 interleaved channels) and
-/// the reduced `RING_CAPACITY` must keep the total footprint at the same
-/// ~16 MiB budget as the previous 1024 × 16 KiB layout.
+/// Memory-impact contract: a pool slot must hold the largest legal host
+/// quantum (8192 frames = `MAX_BRIDGE_BUF` × 2 interleaved channels) and the
+/// preallocated pool must keep the total payload footprint within the ~16 MiB
+/// budget.
 #[test]
-fn ring_footprint_covers_max_quantum_within_budget() {
+fn pool_footprint_covers_max_quantum_within_budget() {
     // 8192 = MAX_BRIDGE_BUF (largest quantum the RT callbacks accept).
     const {
         assert!(
@@ -135,33 +77,14 @@ fn ring_footprint_covers_max_quantum_within_budget() {
         );
     }
     assert_eq!(MAX_BLOCK_SIZE % 2, 0);
-    let slot = std::mem::size_of::<RingPayload<MAX_BLOCK_SIZE>>();
-    let footprint = slot * RING_CAPACITY;
+    let slot = std::mem::size_of::<AlignedBlock<MAX_BLOCK_SIZE>>();
+    let footprint = slot * crate::recording::pool::POOL_CAPACITY;
     // Measured: slot=65664 B → footprint = 256 × 65664 ≈ 16.8 MiB
     // (was 1024 × 16640 ≈ 16.3 MiB with MAX_BLOCK_SIZE=4096).
     assert!(
         footprint <= 18 * 1024 * 1024,
-        "ring footprint exceeded the 16 MiB budget: {footprint} bytes"
+        "pool footprint exceeded the 16 MiB budget: {footprint} bytes"
     );
-}
-
-#[test]
-fn ring_buffer_empty_pop_is_err() {
-    let (_p, mut c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(4);
-    assert!(c.pop().is_err());
-}
-
-#[test]
-fn ring_buffer_full_push_fails_gracefully() {
-    let (mut p, _c) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(1);
-    let mut block = AlignedBlock::new_uninit();
-    block.fill_planar(&[1.0, 2.0], &[3.0, 4.0]);
-    // Fill the only slot
-    assert!(p.push(RingPayload::Audio(block)).is_ok());
-    // Second push should fail (buffer full)
-    let mut block2 = AlignedBlock::new_uninit();
-    block2.fill_planar(&[5.0, 6.0], &[7.0, 8.0]);
-    assert!(p.push(RingPayload::Audio(block2)).is_err());
 }
 
 proptest! {

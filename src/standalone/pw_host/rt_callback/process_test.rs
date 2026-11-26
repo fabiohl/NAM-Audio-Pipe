@@ -3,7 +3,7 @@
 
 #[cfg(feature = "testing")]
 use super::super::prologue::PrologueOutcome;
-use super::super::recording_tx::send_recording_audio;
+use super::super::recording_tx::{send_recording_audio, send_recording_silence};
 use super::super::spa_contract::{
     ChunkWindow, check_ffi_contract, check_spa_buffer_pair, handle_spa_pair_fail_closed,
     read_chunk_meta, resolve_capture_chunk_window, silence_available_descriptors,
@@ -11,7 +11,7 @@ use super::super::spa_contract::{
 };
 use super::*;
 use crate::recording::buffer::{
-    AlignedBlock, AudioMetadata, CONTROL_CAPACITY, ControlPayload, OVERRUN_COUNT,
+    AudioMetadata, CONTROL_CAPACITY, ControlPayload, MAX_BLOCK_SIZE, OVERRUN_COUNT,
     OVERRUN_FRAMES_COUNT,
 };
 use crate::recording::pool::{POOL_CAPACITY, PoolConsumer, RecordingPool};
@@ -31,12 +31,7 @@ fn pool_sender_and_consumers() -> (
     let pool = RecordingPool::<POOL_CAPACITY>::new();
     let (pool_p, pool_c) = pool.split();
     (
-        RecordingSender::Pool {
-            control: Some(control_p),
-            pool: Some(pool_p),
-            pending_barrier: None,
-            next_seq: 1,
-        },
+        RecordingSender::from_parts(Some(control_p), Some(pool_p)),
         control_c,
         pool_c,
     )
@@ -204,20 +199,11 @@ fn recording_metadata_confirmed_only_on_push_success() {
     let (mut sender, mut control_c, _pool_c) = pool_sender_and_consumers();
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
-    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        Some(&flag),
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
-    assert!(flag.load(Ordering::Relaxed));
     match control_c.pop().unwrap() {
         ControlPayload::Metadata { meta: m, .. } => assert_eq!(m.sample_rate, 48000.0),
         _ => panic!("expected Metadata"),
@@ -229,12 +215,7 @@ fn recording_metadata_not_confirmed_when_channel_full() {
     let (control_p, mut control_c) = crate::recording::buffer::create_control_ring_buffer(1);
     let pool = RecordingPool::<POOL_CAPACITY>::new();
     let (pool_p, _pool_c) = pool.split();
-    let mut sender = RecordingSender::Pool {
-        control: Some(control_p),
-        pool: Some(pool_p),
-        pending_barrier: None,
-        next_seq: 1,
-    };
+    let mut sender = RecordingSender::from_parts(Some(control_p), Some(pool_p));
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
 
@@ -248,28 +229,14 @@ fn recording_metadata_not_confirmed_when_channel_full() {
         })
         .unwrap();
 
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(!meta_sent, "metadata must not be confirmed when push fails");
     assert_eq!(meta_rate, 0);
 
     // Free the channel and retry: the flag is confirmed.
     let _ = control_c.pop().unwrap();
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
@@ -285,38 +252,17 @@ fn recording_metadata_reset_on_host_rate_change() {
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
 
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
     assert!(meta_sent);
     assert_eq!(meta_rate, 48000);
     let _ = control_c.pop().unwrap();
 
     // Same rate again: no duplicate header.
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
     assert!(control_c.pop().is_err());
 
     // Host rate change: a new header is emitted for the new rate.
-    send_recording_metadata(
-        &mut sender,
-        44100,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 44100, &mut meta_sent, &mut meta_rate, None);
     assert!(meta_sent);
     assert_eq!(meta_rate, 44100);
     match control_c.pop().unwrap() {
@@ -331,14 +277,7 @@ fn recording_metadata_absent_producer_never_confirmed() {
     let mut meta_sent = false;
     let mut meta_rate = 0u32;
 
-    send_recording_metadata(
-        &mut sender,
-        48000,
-        &mut meta_sent,
-        &mut meta_rate,
-        None,
-        None,
-    );
+    send_recording_metadata(&mut sender, 48000, &mut meta_sent, &mut meta_rate, None);
 
     assert!(!meta_sent);
     assert_eq!(meta_rate, 0);
@@ -357,7 +296,6 @@ fn recording_metadata_not_pushed_when_worker_failed() {
         48000,
         &mut meta_sent,
         &mut meta_rate,
-        None,
         Some(&failed),
     );
 
@@ -383,7 +321,6 @@ fn recording_audio_not_pushed_when_worker_failed() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
     let failed = AtomicBool::new(true);
 
     send_recording_audio(
@@ -391,8 +328,6 @@ fn recording_audio_not_pushed_when_worker_failed() {
         MAX_BLOCK_SIZE,
         &resamp_l,
         &resamp_r,
-        &mut block,
-        None,
         Some(&failed),
     );
 
@@ -412,9 +347,8 @@ fn recording_audio_zero_quantum_is_noop() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
 
-    send_recording_audio(&mut sender, 0, &resamp_l, &resamp_r, &mut block, None, None);
+    send_recording_audio(&mut sender, 0, &resamp_l, &resamp_r, None);
 
     assert!(pool_c.try_pop().is_none());
 }
@@ -423,98 +357,9 @@ fn recording_audio_zero_quantum_is_noop() {
 fn recording_audio_sender_none_is_noop() {
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
     let mut none = RecordingSender::none();
 
-    send_recording_audio(&mut none, 64, &resamp_l, &resamp_r, &mut block, None, None);
-}
-
-/// Debug tripwire acceptance: while the pool transport is the compiled
-/// default, an `Inline` sender reaching the RT send path is, by construction,
-/// an accidental hand-wired pairing ([`create_recording_transport`] can never
-/// produce it) — debug builds must accuse fail-fast instead of silently using
-/// the rollback route. Release builds compile the guard away and this test
-/// does not exist there.
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Inline recording transport")]
-#[test]
-fn inline_sender_reaching_the_rt_send_path_is_accused_outside_rollback_build() {
-    let (producer, _consumer) = crate::recording::buffer::create_audio_ring_buffer::<MAX_BLOCK_SIZE>(
-        crate::recording::buffer::RING_CAPACITY,
-    );
-    let resamp_l = [0.0f32; 4];
-    let resamp_r = [0.0f32; 4];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let mut sender = RecordingSender::Inline(Some(producer));
-
-    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, &mut block, None, None);
-}
-
-/// Release-codegen coverage of the rollback arm: with the debug tripwire
-/// compiled away (also true for a deliberate rollback build with
-/// `RECORDING_POOL_TRANSPORT` flipped to `false`), the `Inline` arm must keep
-/// routing the filled block into the inline ring exactly as before.
-#[cfg(not(debug_assertions))]
-#[test]
-fn inline_sender_still_routes_into_the_inline_ring_once_the_tripwire_is_compiled_out() {
-    use crate::recording::buffer::RingPayload;
-
-    let (producer, mut consumer) = crate::recording::buffer::create_audio_ring_buffer::<
-        MAX_BLOCK_SIZE,
-    >(crate::recording::buffer::RING_CAPACITY);
-    let resamp_l = [1.0f32, 2.0, 3.0, 4.0];
-    let resamp_r = [9.0f32, -1.0, 0.5, 7.0];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let mut sender = RecordingSender::Inline(Some(producer));
-
-    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, &mut block, None, None);
-
-    let RingPayload::Audio(published) = consumer.pop().expect("inline ring payload") else {
-        panic!("expected an Audio payload on the inline ring");
-    };
-    assert_eq!(published.valid_len(), 8, "4 stereo frames interleaved");
-    assert_eq!(published.left_slice(), &resamp_l[..]);
-    assert_eq!(published.right_slice(), &resamp_r[..]);
-    assert!(consumer.pop().is_err(), "exactly one payload was enqueued");
-}
-
-#[test]
-fn recording_audio_flag_cleared_when_worker_fails_in_flight() {
-    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
-    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
-    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let failed = AtomicBool::new(false);
-    let flag = AtomicBool::new(true);
-
-    // Normal enqueue: flag stays true
-    send_recording_audio(
-        &mut sender,
-        4,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        Some(&flag),
-        Some(&failed),
-    );
-    assert!(flag.load(Ordering::Relaxed));
-
-    // Worker fails: subsequent enqueue clears the active flag
-    failed.store(true, Ordering::Release);
-    send_recording_audio(
-        &mut sender,
-        4,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        Some(&flag),
-        Some(&failed),
-    );
-    assert!(!flag.load(Ordering::Relaxed));
-
-    let in_flight = pool_c.try_pop().expect("published descriptor");
-    assert_eq!(in_flight.block().valid_len(), 8);
-    in_flight.release();
+    send_recording_audio(&mut none, 64, &resamp_l, &resamp_r, None);
 }
 
 #[test]
@@ -530,18 +375,9 @@ fn recording_audio_oversized_block_dropped_and_counted() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
 
     // interleaved_len = MAX_BLOCK_SIZE * 2 > MAX_BLOCK_SIZE -> dropped.
-    send_recording_audio(
-        &mut sender,
-        MAX_BLOCK_SIZE,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        None,
-        None,
-    );
+    send_recording_audio(&mut sender, MAX_BLOCK_SIZE, &resamp_l, &resamp_r, None);
 
     assert!(
         pool_c.try_pop().is_none(),
@@ -572,20 +408,9 @@ fn recording_audio_normal_block_pushed() {
         resamp_l[i] = i as f32;
         resamp_r[i] = -(i as f32);
     }
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_audio(
-        &mut sender,
-        4,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        Some(&flag),
-        None,
-    );
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, None);
 
-    assert!(flag.load(Ordering::Relaxed));
     let in_flight = pool_c.try_pop().expect("published descriptor");
     // Planar layout: L = [0, 1, 2, 3], R = [-0, -1, -2, -3].
     assert_eq!(in_flight.block().left_slice(), &[0.0, 1.0, 2.0, 3.0]);
@@ -611,20 +436,9 @@ fn recording_audio_full_channel_counted_as_overrun() {
 
     let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
     let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let flag = std::sync::atomic::AtomicBool::new(false);
 
-    send_recording_audio(
-        &mut sender,
-        4,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        Some(&flag),
-        None,
-    );
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, None);
 
-    assert!(!flag.load(Ordering::Relaxed));
     assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(
         OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed),
@@ -639,6 +453,99 @@ fn recording_audio_full_channel_counted_as_overrun() {
 
     OVERRUN_COUNT.store(0, Ordering::Relaxed);
     OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Acceptance (T6.2): gate suppression is registered as intentional silence
+/// (a marker with the exact frame count) and never counted as overrun; a real
+/// pool overrun, conversely, is counted and never padded with silence.
+#[test]
+fn recording_silence_is_not_overrun_and_loss_is_not_padded() {
+    let _guard = crate::recording::buffer::OVERRUN_COUNT_LOCK.lock().unwrap();
+    OVERRUN_COUNT.store(0, Ordering::Relaxed);
+    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+
+    // Part A: intentional silence accumulates with zero overrun accounting.
+    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
+    send_recording_silence(&mut sender, 1000, None);
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 0);
+    assert_eq!(OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed), 0);
+    assert!(
+        pool_c.try_pop().is_none(),
+        "a sub-threshold silence burst must stay coalesced in the sender"
+    );
+
+    // Production ordering: the next audio block must be preceded by the
+    // pending silence marker, even though the marker never reached the
+    // coalescing threshold. The audio path bypasses `try_push_audio`, so this
+    // exercises `send_recording_audio` directly.
+    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
+    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, None);
+    let marker = pool_c.try_pop().expect("silence marker before audio");
+    assert!(marker.is_silence());
+    assert_eq!(marker.silence_frames(), 1000);
+    assert!(marker.release());
+    let audio = pool_c.try_pop().expect("audio descriptor after silence");
+    assert!(!audio.is_control(), "audio must follow the silence marker");
+    assert_eq!(audio.block().frames(), 4);
+    assert!(audio.release());
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 0);
+
+    assert!(sender.try_push_stream_stop());
+
+    // Part B: a genuine pool exhaustion is counted and not padded.
+    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
+    for _ in 0..POOL_CAPACITY {
+        assert!(sender.try_push_audio(&[1.0], &[2.0]));
+    }
+    let resamp_l = [0.0f32; MAX_BLOCK_SIZE];
+    let resamp_r = [0.0f32; MAX_BLOCK_SIZE];
+    send_recording_audio(&mut sender, 4, &resamp_l, &resamp_r, None);
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
+    assert_eq!(OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed), 4);
+    while let Some(item) = pool_c.try_pop() {
+        assert!(
+            !item.is_silence(),
+            "real loss must never be synthesized as intentional silence"
+        );
+        assert!(item.release());
+    }
+
+    OVERRUN_COUNT.store(0, Ordering::Relaxed);
+    OVERRUN_FRAMES_COUNT.store(0, Ordering::Relaxed);
+}
+
+/// Acceptance (T6.2): the silence-marker RT path performs zero heap
+/// allocations — the pool descriptor is built on the stack and the frame count
+/// is accumulated in sender state (run under `--features "testing heap-audit"`).
+#[cfg(feature = "heap-audit")]
+#[test]
+fn recording_silence_rt_path_allocates_zero() {
+    use neural_amp_modeler_rs::common::alloc_audit::{
+        TrackingGuard, get_alloc_count, get_dealloc_count, get_realloc_count,
+    };
+
+    let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
+
+    let (allocs, deallocs, reallocs) = {
+        let _guard = TrackingGuard::new();
+        // 300 × 256 frames crosses the coalescing threshold (65 535), exercising
+        // both the accumulator and a mid-stream marker publication.
+        for _ in 0..300 {
+            send_recording_silence(&mut sender, 256, None);
+        }
+        assert!(sender.try_push_stream_stop());
+        (get_alloc_count(), get_dealloc_count(), get_realloc_count())
+    };
+
+    assert_eq!(
+        (allocs, deallocs, reallocs),
+        (0, 0, 0),
+        "the intentional-silence RT path must not allocate"
+    );
+    while let Some(item) = pool_c.try_pop() {
+        assert!(item.release());
+    }
 }
 
 // ── Capacity Domain Boundaries & Frame Reconciliation ────────────────────────
@@ -656,20 +563,9 @@ fn recording_audio_boundary_2048_2049_8192_frames_pushed() {
         let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
         let resamp_l = vec![0.5f32; n_pw];
         let resamp_r = vec![0.25f32; n_pw];
-        let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-        let flag = std::sync::atomic::AtomicBool::new(false);
 
-        send_recording_audio(
-            &mut sender,
-            n_pw,
-            &resamp_l,
-            &resamp_r,
-            &mut block,
-            Some(&flag),
-            None,
-        );
+        send_recording_audio(&mut sender, n_pw, &resamp_l, &resamp_r, None);
 
-        assert!(flag.load(Ordering::Relaxed), "n_pw={n_pw}");
         let in_flight = pool_c
             .try_pop()
             .expect("published descriptor for n_pw={n_pw}");
@@ -690,22 +586,13 @@ fn recording_audio_reconciliation_enqueued_plus_lost_equals_produced() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = vec![0.5f32; FRAMES];
     let resamp_r = vec![0.25f32; FRAMES];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
 
     // `POOL_CAPACITY` blocks fill every slot; the next one finds the pool
     // exhausted and is lost.
     for _ in 0..POOL_CAPACITY {
         assert!(sender.try_push_audio(&resamp_l, &resamp_r));
     }
-    send_recording_audio(
-        &mut sender,
-        FRAMES,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        None,
-        None,
-    );
+    send_recording_audio(&mut sender, FRAMES, &resamp_l, &resamp_r, None);
 
     let mut enqueued_frames = 0usize;
     while let Some(in_flight) = pool_c.try_pop() {
@@ -737,7 +624,6 @@ fn recording_audio_publish_failure_accounts_overruns_and_leaked_slots() {
     let (mut sender, _control_c, _pool_c) = pool_sender_and_consumers();
     let resamp_l = vec![0.5f32; FRAMES];
     let resamp_r = vec![0.25f32; FRAMES];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
 
     // Satiate the pool's work_ring with sync barriers so that work_producer is full,
     // but free slots remain available for try_acquire().
@@ -757,15 +643,7 @@ fn recording_audio_publish_failure_accounts_overruns_and_leaked_slots() {
     // 3. slot.publish() fails because work_producer is full.
     // 4. cold_path: OVERRUN_COUNT += 1, OVERRUN_FRAMES_COUNT += FRAMES.
     // 5. slot is dropped: slot_leaks was incremented by publish() failure.
-    send_recording_audio(
-        &mut sender,
-        FRAMES,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        None,
-        None,
-    );
+    send_recording_audio(&mut sender, FRAMES, &resamp_l, &resamp_r, None);
 
     assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 1);
     assert_eq!(OVERRUN_FRAMES_COUNT.load(Ordering::Relaxed), FRAMES as u64);
@@ -803,21 +681,11 @@ fn recording_audio_enqueue_zero_alloc_dealloc() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = vec![0.5f32; MAX_BRIDGE_BUF];
     let resamp_r = vec![0.25f32; MAX_BRIDGE_BUF];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
-    let flag = std::sync::atomic::AtomicBool::new(false);
 
     let (allocs, deallocs, reallocs) = {
         let _guard = TrackingGuard::new();
         for _ in 0..64 {
-            send_recording_audio(
-                &mut sender,
-                MAX_BRIDGE_BUF,
-                &resamp_l,
-                &resamp_r,
-                &mut block,
-                Some(&flag),
-                None,
-            );
+            send_recording_audio(&mut sender, MAX_BRIDGE_BUF, &resamp_l, &resamp_r, None);
             let in_flight = pool_c.try_pop().expect("published descriptor");
             in_flight.release();
         }
@@ -1572,12 +1440,7 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
         crate::recording::buffer::create_control_ring_buffer(CONTROL_CAPACITY);
     let pool = RecordingPool::<POOL_CAPACITY>::new();
     let (pool_p, _pool_c) = pool.split();
-    let mut recording_sender = RecordingSender::Pool {
-        control: Some(control_p),
-        pool: Some(pool_p),
-        pending_barrier: None,
-        next_seq: 1,
-    };
+    let mut recording_sender = RecordingSender::from_parts(Some(control_p), Some(pool_p));
     let mut meta_sent = false;
     let mut meta_rate = 44100u32;
 
@@ -1587,7 +1450,6 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
         44100,
         &mut meta_sent,
         &mut meta_rate,
-        None,
         None,
     );
     assert!(meta_sent);
@@ -1617,7 +1479,6 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
         &mut meta_sent,
         &mut meta_rate,
         None,
-        None,
     );
 
     // Control ring is full -> Metadata(48000) push failed -> meta_sent MUST
@@ -1636,7 +1497,6 @@ fn recording_metadata_rate_change_full_control_ring_blocks_audio_until_consumed(
         48000,
         &mut meta_sent,
         &mut meta_rate,
-        None,
         None,
     );
     assert!(
@@ -1851,17 +1711,8 @@ fn recording_audio_pushed_when_gate_off_and_energy_zero() {
     let (mut sender, _control_c, mut pool_c) = pool_sender_and_consumers();
     let resamp_l = [0.0f32; 64];
     let resamp_r = [0.0f32; 64];
-    let mut block = AlignedBlock::<MAX_BLOCK_SIZE>::new();
 
-    send_recording_audio(
-        &mut sender,
-        64,
-        &resamp_l,
-        &resamp_r,
-        &mut block,
-        None,
-        None,
-    );
+    send_recording_audio(&mut sender, 64, &resamp_l, &resamp_r, None);
 
     let in_flight = pool_c
         .try_pop()
@@ -2219,6 +2070,8 @@ fn test_silence_gate_closed_drains_neural_cabinet_tail() {
             target_bypass: false,
             dry_delay: &mut state.cab_dry_delay,
             bypass_state: &mut state.cab_bypass_state,
+            tail_hysteresis: &mut state.tail_hysteresis,
+            tail_draining: &mut state.tail_draining,
         };
         run_capture_dsp_pipeline(
             samples_l,
@@ -2234,6 +2087,7 @@ fn test_silence_gate_closed_drains_neural_cabinet_tail() {
             cab,
             crate::standalone::rt_setup::rdtsc_nanos(),
         )
+        .n_pw
     };
 
     // Loud input opens the gate and arms the neural cabinet tail budget.
@@ -2264,6 +2118,14 @@ fn test_silence_gate_closed_drains_neural_cabinet_tail() {
             if out > 0 {
                 tail_blocks += 1;
                 assert!(
+                    state.tail_draining,
+                    "a draining quantum must be marked as an active tail"
+                );
+                assert!(
+                    state.tail_hysteresis.is_steady(),
+                    "the tail envelope must stay steady while the tail rings"
+                );
+                assert!(
                     slot.remaining_tail_samples() < slot.tail_budget,
                     "closed-gate output must consume the tail budget"
                 );
@@ -2286,4 +2148,5 @@ fn test_silence_gate_closed_drains_neural_cabinet_tail() {
     samples_r.fill(0.0);
     let out = run_block(&mut samples_l, &mut samples_r, &mut slot, &mut state);
     assert_eq!(out, 0, "an exhausted cabinet tail must emit silence");
+    assert!(!state.tail_draining, "an exhausted tail must be unmarked");
 }

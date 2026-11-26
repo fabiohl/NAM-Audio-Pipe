@@ -8,7 +8,6 @@
 //! which runs in the main thread. The `Box` pointers remain on the stack,
 //! preserving RT safety by avoiding dynamic allocation in the audio thread.
 
-use crate::recording::buffer::{AlignedBlock, MAX_BLOCK_SIZE};
 use crate::standalone::cli::GateConfig;
 use crate::standalone::pw_host::StreamStatusFlags;
 use crate::standalone::pw_host::rt_callback::{
@@ -87,11 +86,17 @@ pub struct CaptureState {
     pub input_gain_mult: f32,
     pub output_gain_mult: f32,
     pub gate_params: GateParams,
-    pub gate_config: crate::standalone::cli::GateConfig,
     pub gate_mode: crate::standalone::cli::GateMode,
     pub musical_gate: crate::dsp::musical_gate::MusicalNoiseGate,
     pub silence_hysteresis: DynamicHysteresis,
     pub mono_hysteresis: DynamicHysteresis,
+    /// Persistent hysteresis for the gate-closed cabinet tail path. Constructed
+    /// off-RT and reset when a tail drain begins, so the RT callback never
+    /// builds a fresh FSM per quantum.
+    pub tail_hysteresis: DynamicHysteresis,
+    /// Whether the previous quantum was draining the cabinet tail. Used to
+    /// reset [`Self::tail_hysteresis`] exactly at the start of the tail.
+    pub tail_draining: bool,
     pub process_mono: bool,
     pub adaptive_compute: AdaptiveCompute,
     pub threshold_open_sq: f32,
@@ -100,7 +105,6 @@ pub struct CaptureState {
     pub frame_count: u32,
     pub recording_meta_sent: bool,
     pub recording_meta_rate: u32,
-    pub recording_block: AlignedBlock<MAX_BLOCK_SIZE>,
     pub thread_configured: bool,
     /// Activation precision mode for the audio data thread.
     pub activation: neural_amp_modeler_rs::math::activations::ActivationPrecision,
@@ -158,6 +162,45 @@ pub struct CaptureState {
     pub cab_dry_delay: Box<crate::standalone::cabinet::CabDryDelay>,
     /// 64-sample raised-cosine crossfader & reset-before-engage controller.
     pub cab_bypass_state: crate::standalone::cabinet::CabBypassState,
+}
+
+pub(crate) struct CaptureRtView<'a> {
+    pub resampler: &'a mut NamResampler,
+    pub os_l: &'a mut OversampleEngine,
+    pub os_r: &'a mut OversampleEngine,
+    pub active_model_l: &'a mut Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
+    pub active_model_r: &'a mut Option<Box<neural_amp_modeler_rs::models::StaticModel>>,
+    pub active_cabsim: &'a mut Option<Box<CabSimPair>>,
+    pub active_cab_nam: &'a mut Option<crate::standalone::cabinet::CabNamSlot>,
+    pub cab_bypass: &'a Arc<std::sync::atomic::AtomicBool>,
+    pub cab_dry_delay: &'a mut crate::standalone::cabinet::CabDryDelay,
+    pub cab_bypass_state: &'a mut crate::standalone::cabinet::CabBypassState,
+    pub stream: &'a mut StreamingResampleBuffer,
+    pub resamp_out_l: &'a mut [f32; MAX_RESAMP_BUF],
+    pub resamp_out_r: &'a mut [f32; MAX_RESAMP_BUF],
+    pub os_in_l: &'a mut [f32],
+    pub os_in_r: &'a mut [f32],
+    pub os_model_l: &'a mut [f32],
+    pub os_model_r: &'a mut [f32],
+    pub xfd_scratch_l: &'a mut [f32; MAX_RESAMP_BUF],
+    pub xfd_scratch_r: &'a mut [f32; MAX_RESAMP_BUF],
+    pub gate_params: &'a GateParams,
+    pub input_gain_mult: f32,
+    pub output_gain_mult: f32,
+    pub threshold_open_sq: f32,
+    pub threshold_close_sq: f32,
+    pub silence_hysteresis: &'a mut DynamicHysteresis,
+    pub mono_hysteresis: &'a mut DynamicHysteresis,
+    pub process_mono: &'a mut bool,
+    pub adaptive_compute: &'a mut AdaptiveCompute,
+    pub user_input_gain_mult: f32,
+    pub gate_mode: crate::standalone::cli::GateMode,
+    pub musical_gate: &'a mut crate::dsp::musical_gate::MusicalNoiseGate,
+    pub tail_hysteresis: &'a mut DynamicHysteresis,
+    pub tail_draining: &'a mut bool,
+    pub frame_count: &'a mut u32,
+    pub recording_meta_sent: &'a mut bool,
+    pub recording_meta_rate: &'a mut u32,
 }
 
 impl CaptureState {
@@ -306,11 +349,12 @@ impl CaptureState {
             input_gain_mult: 1.0,
             output_gain_mult: 1.0,
             gate_params,
-            gate_config,
             gate_mode: crate::standalone::cli::GateMode::Silence,
             musical_gate: crate::dsp::musical_gate::MusicalNoiseGate::new(48_000),
             silence_hysteresis: DynamicHysteresis::new(),
             mono_hysteresis: DynamicHysteresis::new(),
+            tail_hysteresis: DynamicHysteresis::new(),
+            tail_draining: false,
             process_mono: false,
             adaptive_compute: AdaptiveCompute::new(AdaptiveComputeMode::Conservative),
             threshold_open_sq: open_lin * open_lin,
@@ -319,7 +363,6 @@ impl CaptureState {
             frame_count: 0,
             recording_meta_sent: false,
             recording_meta_rate: 0,
-            recording_block: AlignedBlock::new(),
             thread_configured: false,
             activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
             rate_sync: crate::standalone::pw_host::rt_callback::RateSyncState::new(48_000),
@@ -342,6 +385,47 @@ impl CaptureState {
         }
     }
 
+    pub(crate) fn split_rt(&mut self) -> CaptureRtView<'_> {
+        CaptureRtView {
+            resampler: &mut self.resampler,
+            os_l: &mut self.os_l,
+            os_r: &mut self.os_r,
+            active_model_l: &mut self.active_model_l,
+            active_model_r: &mut self.active_model_r,
+            active_cabsim: &mut self.active_cabsim,
+            active_cab_nam: &mut self.active_cab_nam,
+            cab_bypass: &self.cab_bypass,
+            cab_dry_delay: &mut self.cab_dry_delay,
+            cab_bypass_state: &mut self.cab_bypass_state,
+            stream: &mut self.stream,
+            resamp_out_l: &mut self.resamp_out_l,
+            resamp_out_r: &mut self.resamp_out_r,
+            os_in_l: &mut self.os_in_l,
+            os_in_r: &mut self.os_in_r,
+            os_model_l: &mut self.os_model_l,
+            os_model_r: &mut self.os_model_r,
+            xfd_scratch_l: &mut self.xfd_scratch_l,
+            xfd_scratch_r: &mut self.xfd_scratch_r,
+            gate_params: &self.gate_params,
+            input_gain_mult: self.input_gain_mult,
+            output_gain_mult: self.output_gain_mult,
+            threshold_open_sq: self.threshold_open_sq,
+            threshold_close_sq: self.threshold_close_sq,
+            silence_hysteresis: &mut self.silence_hysteresis,
+            mono_hysteresis: &mut self.mono_hysteresis,
+            process_mono: &mut self.process_mono,
+            adaptive_compute: &mut self.adaptive_compute,
+            user_input_gain_mult: self.user_input_gain_mult,
+            gate_mode: self.gate_mode,
+            musical_gate: &mut self.musical_gate,
+            tail_hysteresis: &mut self.tail_hysteresis,
+            tail_draining: &mut self.tail_draining,
+            frame_count: &mut self.frame_count,
+            recording_meta_sent: &mut self.recording_meta_sent,
+            recording_meta_rate: &mut self.recording_meta_rate,
+        }
+    }
+
     /// Configures the active gate topology (`Silence` vs `Musical`) and synchronizes thresholds.
     pub fn configure_gate_mode(&mut self, gate_mode: crate::standalone::cli::GateMode) {
         self.gate_mode = gate_mode;
@@ -353,13 +437,13 @@ impl CaptureState {
     pub fn apply_gate_resolution(&mut self, lut: &gain_lut::GainLUT) {
         match self.gate_mode {
             crate::standalone::cli::GateMode::Silence => {
-                let (open_sq, close_sq) = match self.gate_config {
-                    GateConfig::Off => (0.0, 0.0),
-                    GateConfig::Threshold { .. } => {
-                        let open_lin = lut.db_to_linear(self.gate_params.threshold_open_db);
-                        let close_lin = lut.db_to_linear(self.gate_params.threshold_close_db);
-                        (open_lin * open_lin, close_lin * close_lin)
-                    }
+                let off = self.threshold_open_sq == 0.0 && self.threshold_close_sq == 0.0;
+                let (open_sq, close_sq) = if off {
+                    (0.0, 0.0)
+                } else {
+                    let open_lin = lut.db_to_linear(self.gate_params.threshold_open_db);
+                    let close_lin = lut.db_to_linear(self.gate_params.threshold_close_db);
+                    (open_lin * open_lin, close_lin * close_lin)
                 };
                 self.threshold_open_sq = open_sq;
                 self.threshold_close_sq = close_sq;
@@ -367,10 +451,9 @@ impl CaptureState {
                     .set_threshold(self.gate_params.threshold_open_db as f64, false);
             }
             crate::standalone::cli::GateMode::Musical => {
-                let enabled = matches!(self.gate_config, GateConfig::Threshold { .. })
-                    && self.gate_params.threshold_open_db > -120.0;
-                self.threshold_open_sq = 0.0;
-                self.threshold_close_sq = 0.0;
+                let threshold_configured =
+                    !(self.threshold_open_sq == 0.0 && self.threshold_close_sq == 0.0);
+                let enabled = threshold_configured && self.gate_params.threshold_open_db > -120.0;
                 self.silence_hysteresis.reset();
                 self.musical_gate
                     .set_threshold(self.gate_params.threshold_open_db as f64, enabled);

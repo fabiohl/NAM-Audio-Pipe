@@ -208,6 +208,36 @@ impl<W: WriteAt> AsyncWavWriter<W> {
         Ok(())
     }
 
+    /// Persists `frames` stereo frames of digital silence (zero samples).
+    ///
+    /// Used for [intentional-silence markers](crate::recording::pool::SILENCE_MARKER_SLOT):
+    /// the RT thread never copies zeros, and the writer materializes them here,
+    /// off-RT, from the reusable I/O buffer. Chunked to the buffer capacity, so
+    /// the zero fill never exceeds `MAX_BLOCK_SIZE` samples per disk write and
+    /// never grows the allocation.
+    pub(crate) async fn write_silence(&mut self, frames: usize) -> Result<()> {
+        const MAX_FRAMES_PER_WRITE: usize = MAX_BLOCK_SIZE / 2;
+        let mut remaining = frames;
+        while remaining > 0 {
+            let chunk = remaining.min(MAX_FRAMES_PER_WRITE);
+            let bytes_len = chunk * 2 * 4;
+            self.io_buf.clear();
+            self.io_buf.resize(bytes_len, 0);
+
+            let buf = std::mem::take(&mut self.io_buf);
+            let (res, returned_buf) = write_all_at(&mut self.file, buf, self.current_offset).await;
+            self.io_buf = returned_buf;
+
+            res.context("Failed to write silence frames via io_uring")?;
+
+            self.data_bytes_written += bytes_len as u32;
+            self.current_offset += bytes_len as u64;
+            self.bytes_since_checkpoint += bytes_len as u64;
+            remaining -= chunk;
+        }
+        Ok(())
+    }
+
     /// Returns true if writing `sample_count` samples would overflow the `u32`
     /// RIFF size field mandated by the RIFF/WAV specification (~4 GiB).
     ///
@@ -295,6 +325,15 @@ pub(crate) trait WavSink {
     fn free_bytes(&self, _metadata: &AudioMetadata) -> Option<u64> {
         None
     }
+
+    /// Cadence of the periodic free-space re-check.
+    ///
+    /// Production uses [`crate::recording::space::SPACE_CHECK_INTERVAL`]; tests
+    /// override it with a zero interval to prove the drain loop probes space
+    /// independently of ring occupancy, without waiting a real minute.
+    fn space_check_interval(&self) -> std::time::Duration {
+        crate::recording::space::SPACE_CHECK_INTERVAL
+    }
 }
 
 /// Minimal per-file surface the drain loop needs from a live WAV writer.
@@ -308,6 +347,9 @@ pub(crate) trait WavWriter {
 
     /// Persists one audio block fully (short-write safe).
     async fn write_block(&mut self, block: &AlignedBlock<MAX_BLOCK_SIZE>) -> Result<()>;
+
+    /// Persists `frames` stereo frames of digital silence.
+    async fn write_silence(&mut self, frames: usize) -> Result<()>;
 
     /// Returns `true` when a periodic header checkpoint is due.
     fn checkpoint_due(&self) -> bool;
@@ -331,6 +373,10 @@ impl<W: WriteAt> WavWriter for AsyncWavWriter<W> {
 
     async fn write_block(&mut self, block: &AlignedBlock<MAX_BLOCK_SIZE>) -> Result<()> {
         AsyncWavWriter::<W>::write_block(self, block).await
+    }
+
+    async fn write_silence(&mut self, frames: usize) -> Result<()> {
+        AsyncWavWriter::<W>::write_silence(self, frames).await
     }
 
     fn checkpoint_due(&self) -> bool {

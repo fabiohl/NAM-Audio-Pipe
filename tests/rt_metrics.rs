@@ -73,9 +73,7 @@
 mod common;
 
 use common::swap::*;
-use nam_audio_pipe::recording::{
-    AlignedBlock, MAX_BLOCK_SIZE, RecordingReceiver, create_recording_transport,
-};
+use nam_audio_pipe::recording::create_recording_transport;
 use nam_audio_pipe::standalone::pw_host::output_pw::deliver_playback_pair_fail_closed;
 use nam_audio_pipe::standalone::pw_host::{
     RtSwapHarness, SharedBackendStatus, handle_spa_pair_fail_closed, observe_stream_state,
@@ -490,8 +488,6 @@ fn rt_deadline_full() {
     let mut h = real_load_harness();
     let bridge_reader = h.bridge_reader();
     let (mut recording_sender, mut recording_receiver) = create_recording_transport();
-    let mut recording_block = AlignedBlock::<MAX_BLOCK_SIZE>::default();
-    let recording_data_available = AtomicBool::new(false);
     let rt_status = RtStatusFlags::default();
 
     let budget_ns = ((BLOCK as f64 / SAMPLE_RATE as f64) * 1e9 * BUDGET_FACTOR) as u64;
@@ -569,15 +565,7 @@ fn rt_deadline_full() {
 
         h.run_callback(&mut cap_l, &mut cap_r, BLOCK);
 
-        send_recording_audio(
-            &mut recording_sender,
-            BLOCK,
-            &cap_l,
-            &cap_r,
-            &mut recording_block,
-            Some(&recording_data_available),
-            None,
-        );
+        send_recording_audio(&mut recording_sender, BLOCK, &cap_l, &cap_r, None);
 
         let pb_chunk_l_ptr = &raw mut pb_chunk_l;
         let pb_chunk_r_ptr = &raw mut pb_chunk_r;
@@ -599,10 +587,8 @@ fn rt_deadline_full() {
             );
         });
 
-        if let RecordingReceiver::Pool { ref mut pool, .. } = recording_receiver {
-            while let Some(in_flight) = pool.try_pop() {
-                let _ = in_flight.release();
-            }
+        while let Some(in_flight) = recording_receiver.pool_consumer_mut().try_pop() {
+            let _ = in_flight.release();
         }
     }
 
@@ -699,15 +685,7 @@ fn rt_deadline_full() {
         let dur_dsp = t2 - t1;
 
         // Stage 3: Recording pool enqueue
-        send_recording_audio(
-            &mut recording_sender,
-            BLOCK,
-            &cap_l,
-            &cap_r,
-            &mut recording_block,
-            Some(&recording_data_available),
-            None,
-        );
+        send_recording_audio(&mut recording_sender, BLOCK, &cap_l, &cap_r, None);
         let t3 = now_ns();
         let dur_rec = t3 - t2;
 
@@ -738,10 +716,8 @@ fn rt_deadline_full() {
         let dur_total = t4 - t0;
 
         // Recycle recording slot off the critical path
-        if let RecordingReceiver::Pool { ref mut pool, .. } = recording_receiver {
-            while let Some(in_flight) = pool.try_pop() {
-                let _ = in_flight.release();
-            }
+        while let Some(in_flight) = recording_receiver.pool_consumer_mut().try_pop() {
+            let _ = in_flight.release();
         }
 
         cap_samples[block] = dur_cap;

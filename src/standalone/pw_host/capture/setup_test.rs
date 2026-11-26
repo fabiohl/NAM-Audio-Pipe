@@ -2,6 +2,7 @@
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
 use super::*;
+use crate::standalone::pw_host::StreamStatusFlags;
 
 #[test]
 fn test_create_capture_properties_with_latency() {
@@ -559,4 +560,23 @@ fn adaptive_update_path_is_zero_alloc() {
     assert_eq!(allocs, 0, "adaptive update allocated on RT: {allocs}");
     assert_eq!(deallocs, 0, "adaptive update deallocated on RT: {deallocs}");
     assert_eq!(reallocs, 0, "adaptive update reallocated on RT: {reallocs}");
+}
+
+#[test]
+fn cab_rate_diverged_flags_only_mismatched_installed_slots() {
+    assert!(!cab_rate_diverged(48_000, None, None));
+    assert!(!cab_rate_diverged(48_000, Some(48_000), Some(48_000)));
+    assert!(cab_rate_diverged(48_000, Some(44_100), None));
+    assert!(cab_rate_diverged(48_000, None, Some(44_100)));
+    assert!(cab_rate_diverged(96_000, Some(48_000), Some(48_000)));
+}
+
+#[test]
+fn stream_status_cab_rate_stale_is_observable() {
+    let status = StreamStatusFlags::new();
+    assert!(!status.is_cab_rate_stale());
+    status.note_cab_rate_stale(true);
+    assert!(status.is_cab_rate_stale());
+    status.note_cab_rate_stale(false);
+    assert!(!status.is_cab_rate_stale());
 }

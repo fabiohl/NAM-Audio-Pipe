@@ -58,6 +58,7 @@ pub fn rt_mark_current_thread() -> bool {
 /// Returns the new mark state (`false`). Production never needs this — the
 /// mark dies together with the data thread — but tests and defensive
 /// teardown paths use it to leave no residue on shared threads.
+#[cfg(test)]
 #[inline]
 pub fn rt_unmark_current_thread() -> bool {
     RT_MARK.with(|mark| mark.set(false));

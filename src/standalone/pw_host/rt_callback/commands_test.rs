@@ -4,7 +4,9 @@
 use super::super::{cabsim_swap_drain, resampler_swap_drain};
 use super::*;
 use neural_amp_modeler_rs::common::params::AdaptiveComputeMode;
+use neural_amp_modeler_rs::common::spsc::RT_STATUS_NEEDS_SLIMMABLE_REBUILD;
 use neural_amp_modeler_rs::dsp::oversample::OversampleFactor;
+use neural_amp_modeler_rs::models::lstm::Lstm1x3;
 use neural_amp_modeler_rs::models::wavenet::WaveNetModelDyn;
 use std::assert_matches;
 use std::sync::Arc;
@@ -549,6 +551,75 @@ fn receive_commands_load_model_coalesces_obsolete_to_gc() {
     assert!(
         flags.check_flag(RT_STATUS_STRUCTURAL_SUPERSEDED),
         "obsolete intermediate models must be flagged superseded"
+    );
+}
+
+/// Installing a non-WaveNet model clears the adaptive WaveNet topology and
+/// withdraws any slimmable rebuild request latched for the previous model.
+#[test]
+fn non_wavenet_model_clears_slimmable_registration_and_pending_request() {
+    let flags = Arc::new(RtStatusFlags::new());
+    let (mut gc_producer, _gc_consumer) = rtrb::RingBuffer::<GcItem>::new(8);
+    let mut parking_lot: [Option<GcItem>; 16] = Default::default();
+    let overflow = GcOverflowBuffer::default();
+    let mut gc = GcSink {
+        producer: &mut gc_producer,
+        parking_lot: &mut parking_lot,
+        overflow: &overflow,
+        rt_status: &flags,
+        parking_lot_dirty: None,
+    };
+    let mut adaptive = AdaptiveCompute::new(AdaptiveComputeMode::Conservative);
+    let mut model_l: Option<Box<StaticModel>> = None;
+    let mut model_r: Option<Box<StaticModel>> = None;
+    let mut in_adj = 1.0f32;
+    let mut out_adj = 1.0f32;
+    let mut nam_rate = 48_000u32;
+
+    install_load_model(
+        load_model_payload(Some(fake_wavenet(16)), None),
+        &mut in_adj,
+        &mut out_adj,
+        &mut nam_rate,
+        &mut model_l,
+        &mut model_r,
+        &mut gc,
+        &flags,
+        &mut adaptive,
+    );
+    assert_eq!(adaptive.wavenet_current_ch(), Some(16));
+
+    flags.set_flag(RT_STATUS_NEEDS_SLIMMABLE_REBUILD);
+    flags
+        .requested_slimmable_generation
+        .store(3, Ordering::Release);
+
+    let lstm = Box::new(StaticModel::Lstm1x3(Box::new(Lstm1x3::new())));
+    install_load_model(
+        load_model_payload(Some(lstm), None),
+        &mut in_adj,
+        &mut out_adj,
+        &mut nam_rate,
+        &mut model_l,
+        &mut model_r,
+        &mut gc,
+        &flags,
+        &mut adaptive,
+    );
+
+    assert_eq!(
+        adaptive.wavenet_current_ch(),
+        None,
+        "stale WaveNet topology must not survive a non-WaveNet install"
+    );
+    assert!(
+        !flags.check_flag(RT_STATUS_NEEDS_SLIMMABLE_REBUILD),
+        "the pending slimmable request belongs to the replaced model"
+    );
+    assert_eq!(
+        flags.requested_slimmable_generation.load(Ordering::Acquire),
+        4,
+        "in-flight slimmable pairs must be invalidated by a generation bump"
     );
 }
 

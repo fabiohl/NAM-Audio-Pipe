@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 
-//! Unit tests for recording transport abstraction: disabled sender behavior,
-//! production defaults, round-trip audio delivery, exhaustion reporting, and
-//! pending barrier retries.
+//! Unit tests for recording transport: disabled sender behavior, production
+//! wiring, round-trip audio delivery, exhaustion reporting, and pending barrier
+//! retries.
 
 use super::*;
 use crate::recording::buffer::CONTROL_CAPACITY;
@@ -21,40 +21,16 @@ fn disabled_sender_rejects_everything() {
         channels: 2,
     }));
     assert!(!sender.try_push_audio(&[0.0], &[0.0]));
+    assert!(!sender.try_push_silence(64));
     assert!(!sender.try_push_stream_stop());
 }
 
-/// The const must stay `true` until a deliberate rollback — the guard and
-/// the wiring assume the pool transport is the production default.
+/// `create_recording_transport` must wire both halves of the pool transport.
 #[test]
-fn pool_transport_is_the_production_default() {
-    const { assert!(RECORDING_POOL_TRANSPORT) };
+fn pool_transport_is_the_production_wiring() {
     let (sender, receiver) = create_recording_transport();
-    assert!(matches!(
-        (&sender, &receiver),
-        (RecordingSender::Pool { .. }, RecordingReceiver::Pool { .. })
-    ));
     assert!(sender.has_producer());
-}
-
-/// Debug tripwire for the metadata route: while the pool transport is the
-/// compiled default, an `Inline` sender reaching `try_push_metadata` is an
-/// accidental construction (`create_recording_transport` can never supply
-/// this pairing) and debug builds accuse fail-fast via
-/// [`assert_inline_rollback_build`]. Release builds compile the guard away
-/// and this test does not exist there.
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Inline recording transport")]
-#[test]
-fn inline_sender_metadata_route_is_accused_outside_rollback_build() {
-    let (producer, _consumer) = create_audio_ring_buffer::<MAX_BLOCK_SIZE>(RING_CAPACITY);
-    let mut sender = RecordingSender::Inline(Some(producer));
-
-    assert!(!sender.try_push_metadata(AudioMetadata {
-        sample_rate: 48000.0,
-        bit_depth: 32,
-        channels: 2,
-    }));
+    assert!(!receiver.control.is_abandoned());
 }
 
 /// `try_push_audio` on the pool path must land in the pool slot
@@ -62,10 +38,7 @@ fn inline_sender_metadata_route_is_accused_outside_rollback_build() {
 #[test]
 fn pool_sender_audio_round_trip() {
     let (mut sender, mut receiver) = create_recording_transport();
-    let (control, pool) = match &mut receiver {
-        RecordingReceiver::Pool { control, pool } => (control, pool),
-        RecordingReceiver::Inline(_) => panic!("pool transport expected"),
-    };
+    let RecordingReceiver { control, pool } = &mut receiver;
 
     assert!(sender.try_push_metadata(AudioMetadata {
         sample_rate: 44100.0,
@@ -111,10 +84,7 @@ fn pool_sender_audio_round_trip() {
 #[test]
 fn pool_sender_exhaustion_reports_false() {
     let (mut sender, mut receiver) = create_recording_transport();
-    let (_, pool) = match &mut receiver {
-        RecordingReceiver::Pool { control, pool } => (control, pool),
-        RecordingReceiver::Inline(_) => panic!("pool transport expected"),
-    };
+    let pool = receiver.pool_consumer_mut();
 
     for _ in 0..POOL_CAPACITY {
         assert!(
@@ -146,12 +116,10 @@ fn pool_sender_exhaustion_reports_false() {
 #[test]
 fn pool_sender_pending_barrier_retry_deduplicates_metadata() {
     let (mut sender, mut receiver) = create_recording_transport();
-    let (control, pool) = match &mut receiver {
-        RecordingReceiver::Pool { control, pool } => (control, pool),
-        RecordingReceiver::Inline(_) => panic!("pool transport expected"),
-    };
+    let RecordingReceiver { control, pool } = &mut receiver;
 
-    // Fill the work ring completely: POOL_CAPACITY audio blocks + CONTROL_CAPACITY barriers
+    // Fill the work ring completely: POOL_CAPACITY audio blocks +
+    // CONTROL_CAPACITY barriers + the reserved silence-marker headroom.
     for _ in 0..POOL_CAPACITY {
         assert!(sender.try_push_audio(&[0.5], &[0.5]));
     }
@@ -159,6 +127,12 @@ fn pool_sender_pending_barrier_retry_deduplicates_metadata() {
         assert!(
             sender.pool_producer_mut().unwrap().try_push_barrier(0),
             "work ring has CONTROL_CAPACITY slack for barriers"
+        );
+    }
+    for _ in 0..crate::recording::pool::SILENCE_MARKER_RESERVE {
+        assert!(
+            sender.pool_producer_mut().unwrap().try_push_silence(1),
+            "work ring has reserve headroom for silence markers"
         );
     }
 
@@ -213,7 +187,7 @@ fn pool_sender_pending_barrier_retry_deduplicates_metadata() {
     while let Some(item) = pool.try_pop() {
         if item.is_barrier() && item.barrier_seq() == 1 {
             barrier_seen = true;
-        } else if !item.is_barrier() {
+        } else if !item.is_control() {
             audio_count += 1;
         }
         assert!(item.release());
@@ -223,4 +197,57 @@ fn pool_sender_pending_barrier_retry_deduplicates_metadata() {
         barrier_seen,
         "barrier must have been delivered to work ring"
     );
+}
+
+/// Intentional silence is coalesced on the RT side (no descriptor per
+/// quantum) and flushed before the next audio block, preserving stream order.
+#[test]
+fn silence_is_coalesced_and_flushed_before_audio() {
+    let (mut sender, mut receiver) = create_recording_transport();
+    let pool = receiver.pool_consumer_mut();
+
+    assert!(sender.try_push_silence(10_000));
+    assert!(
+        pool.try_pop().is_none(),
+        "below the coalescing threshold no descriptor must be published"
+    );
+
+    assert!(sender.try_push_audio(&[0.5, -0.5], &[0.25, -0.25]));
+    let first = pool.try_pop().expect("silence descriptor");
+    assert!(first.is_silence());
+    assert_eq!(first.silence_frames(), 10_000);
+    assert!(first.release());
+
+    let second = pool.try_pop().expect("audio descriptor");
+    assert!(!second.is_control());
+    assert_eq!(second.block().frames(), 2);
+    assert!(second.release());
+}
+
+/// A gate-closed episode longer than one descriptor can carry is split into
+/// maximal markers, and the terminal token flushes the remainder first.
+#[test]
+fn long_silence_is_split_into_maximal_markers() {
+    let (mut sender, mut receiver) = create_recording_transport();
+    let RecordingReceiver { control, pool } = &mut receiver;
+
+    let total = MAX_SILENCE_FRAMES as usize + 4_465;
+    assert!(sender.try_push_silence(total));
+
+    let mut frames = 0usize;
+    let mut markers = 0usize;
+    while let Some(item) = pool.try_pop() {
+        if item.is_silence() {
+            let n = item.silence_frames();
+            assert!(n > 0, "marker frame count must be positive");
+            frames += n as usize;
+            markers += 1;
+        }
+        assert!(item.release());
+    }
+    assert_eq!(frames, total, "the whole episode must be published");
+    assert_eq!(markers, 2, "coalesced into maximal descriptors");
+
+    assert!(sender.try_push_stream_stop());
+    assert!(matches!(control.pop(), Ok(ControlPayload::StreamStop)));
 }

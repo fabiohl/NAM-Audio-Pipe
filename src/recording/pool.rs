@@ -3,14 +3,7 @@
 
 //! Preallocated pool + small-descriptor SPSC transport for the recording path.
 //!
-//! # Why this transport exists
-//!
-//! The inline recording transport moves every 64 KiB audio block *by value*
-//! through an `rtrb` SPSC ring: the RT thread copies the PipeWire frames into a
-//! scratch block and `push`es it (64 KiB write into the ring slot), and the
-//! I/O thread `pop`s it (64 KiB read out of the ring slot into its own stack
-//! block) before interleaving it into the WAV I/O buffer. The block therefore
-//! crosses the L1/L2/LLC hierarchy an extra round-trip per quantum.
+//! # Design
 //!
 //! This module provides a **preallocated slot pool** whose data never moves.
 //! The RT thread pops a small slot *index* from a free-list ring, copies the
@@ -19,7 +12,8 @@
 //! descriptor, reads the block **in place**, and returns the index to the
 //! free-list ring — the "return" channel. The 64 KiB payload is written once
 //! and read once; only 4-byte descriptors and 2-byte indices travel through the
-//! rings.
+//! rings. Measured against the retired by-value ring, this removes an extra
+//! L1/L2/LLC round-trip per quantum (~57% fewer data cache lines).
 //!
 //! ```text
 //!            ┌──────────── free ring (u16 indices, I/O → RT) ────────────┐
@@ -36,17 +30,13 @@
 //!                                  then release() → push index ───────────┘
 //! ```
 //!
-//! # Memory-traffic model (the A/B claim being tested)
+//! # Memory-traffic model
 //!
-//! Per quantum of `F` stereo frames (`B = 8·F` bytes, 64 B lines = `B/64`):
-//!
-//! | path | producer | consumer | total data lines |
-//! |------|----------|----------|------------------|
-//! | inline | fill scratch (`B`W) + push (`B`R+`B`W) | pop (`B`R+`B`W) + write (`B`R+`B`W) | **7·B/64** |
-//! | pool + descriptor | fill slot in place (`B`W) | read slot + write io buf (`B`R+`B`W) | **3·B/64** |
-//!
-//! The pool touches ~57% fewer data cache lines per quantum, significantly
-//! reducing CPU cache pressure and memory bandwidth consumption on the RT thread.
+//! Per quantum of `F` stereo frames (`B = 8·F` bytes, 64 B lines = `B/64`),
+//! the producer writes the slot in place (`B`W) and the consumer reads the
+//! slot plus writes its I/O buffer (`B`R + `B`W): **3·B/64** data lines,
+//! compared with **7·B/64** for a by-value ring. This significantly reduces
+//! CPU cache pressure and memory bandwidth consumption on the RT thread.
 //!
 //! # Ownership protocol & soundness
 //!
@@ -67,21 +57,32 @@
 //! once in order. The unit tests prove this with a full ownership-transition
 //! state machine plus an end-of-shutdown exactly-once drain.
 //!
-//! With `POOL_CAPACITY == RING_CAPACITY == 256` and the `work` ring sized to
-//! `N + CONTROL_CAPACITY`, both ring pushes are **infallible by construction**:
+//! With `POOL_CAPACITY == 256` and the `work` ring sized to
+//! `N + CONTROL_CAPACITY + SILENCE_MARKER_RESERVE`, the audio pushes are
+//! infallible **by construction**:
 //!
 //! - **`publish`**: the producer holds ≥ 1 slot while filling, so at most `N - 1`
 //!   audio descriptors can be in flight in `work`. Even with all `CONTROL_CAPACITY`
-//!   metadata barriers concurrently pending in `work`, the ring contains at most
-//!   `(N - 1) + CONTROL_CAPACITY` descriptors, leaving at least 1 slot free in the
-//!   `N + CONTROL_CAPACITY` ring. Thus `publish` can never fail structurally.
+//!   metadata barriers and all `SILENCE_MARKER_RESERVE` silence markers pending,
+//!   the ring contains at most
+//!   `(N - 1) + CONTROL_CAPACITY + SILENCE_MARKER_RESERVE` descriptors, leaving
+//!   at least 1 slot free in the equally-sized ring. Thus `publish` cannot fail
+//!   structurally.
 //! - **`release`**: the consumer holds ≥ 1 slot while reading, so `free` can
-//!   hold at most `N - 1` indices when returning an audio slot. For barriers,
-//!   `release` does not push to `free`. Thus `release` can never fail structurally.
+//!   hold at most `N - 1` indices when returning an audio slot. For barriers
+//!   and silence markers, `release` does not push to `free`. Thus `release` can
+//!   never fail structurally.
+//!
+//! [Silence markers](SILENCE_MARKER_SLOT) hold no slot, so they consume the one
+//! spare descriptor the proof above leaves. [`MAX_SILENCE_MARKERS_IN_FLIGHT`]
+//! caps them at exactly one: the producer admits one marker, and the I/O
+//! consumer returns the credit when it pops it. A long gate-closed episode is
+//! still coalesced (one marker per `MAX_SILENCE_FRAMES` frames) and a refused
+//! marker stays pending for the next callback, so `publish` remains infallible
+//! even with the work ring fully loaded and a stalled consumer.
 //!
 //! The only failure point is `try_acquire` on an empty `free` ring, which is
-//! the pool's overrun condition — the caller accounts it exactly like a full
-//! inline ring.
+//! the pool's overrun condition — the caller accounts it as lost frames.
 //!
 //! A slot acquired (`AcquiredSlot`) or popped (`InFlightBlock`) but dropped
 //! without `publish`/`release` is lost forever (the free-ring producer lives
@@ -90,15 +91,13 @@
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::buffer::{AlignedBlock, CONTROL_CAPACITY, MAX_BLOCK_SIZE};
 
-/// Number of preallocated slots. Mirrors [`super::buffer::RING_CAPACITY`]
-/// (256 × ~64 KiB ≈ 16.8 MiB) so both transports operate within the same
-/// memory budget.
+/// Number of preallocated slots (256 × ~64 KiB ≈ 16.8 MiB).
 pub const POOL_CAPACITY: usize = 256;
 
 /// Reserved slot index marking a **control barrier** in the `work` ring.
@@ -118,27 +117,72 @@ pub const POOL_CAPACITY: usize = 256;
 /// them in any fixed order cannot reconstruct the RT thread's publication order
 /// when a rate change interleaves with audio (`... A4 A5 M B1 B2 ...`). The
 /// barrier carries the ordering information *inside* the audio FIFO, so the
-/// I/O thread applies `M` between `A5` and `B1` exactly like the inline ring
-/// does — the promoted transport stays byte-exact under mid-stream metadata
-/// changes.
+/// I/O thread applies `M` between `A5` and `B1`, keeping the transport
+/// byte-exact under mid-stream metadata changes.
 pub const CONTROL_BARRIER_SLOT: u16 = u16::MAX;
+
+/// Reserved slot index marking an **intentional-silence marker** in the `work`
+/// ring.
+///
+/// When the `Silence` noise gate suppresses a quantum, the RT thread publishes
+/// this descriptor instead of a 64 KiB block of zeros: `valid_len` carries the
+/// suppressed frame count (coalesced off-air-time), so the I/O thread can write
+/// exactly that many zero frames. The marker holds no pool slot — its ownership
+/// is dissolved on `release` — and it keeps the continuous-capture duration
+/// invariant without copying zeros on the RT thread.
+///
+/// `u16::MAX - 1` can never be handed out by [`PoolProducer::try_acquire`] (the
+/// free ring is seeded with `0..N` and [`RecordingPool::new`] const-asserts
+/// `N < SILENCE_MARKER_SLOT`), so audio, control barriers and silence markers
+/// stay distinguishable in the same FIFO.
+pub const SILENCE_MARKER_SLOT: u16 = u16::MAX - 1;
+
+/// Maximum frame count a single silence marker can carry (`valid_len` is a
+/// `u16`). The RT thread coalesces longer gate-closed episodes into successive
+/// markers of this size, so the `work` ring sees at most one marker per
+/// `SILENCE_MARKER_SLOT` frames of silence.
+pub const MAX_SILENCE_FRAMES: u16 = u16::MAX;
+
+/// Maximum number of silence-marker descriptors allowed in flight at once.
+///
+/// The audio [`AcquiredSlot::publish`](AcquiredSlot::publish) infallibility
+/// proof reserves `N - 1` descriptors for audio plus `CONTROL_CAPACITY` for
+/// barriers and explicitly sizes the work ring with `SILENCE_MARKER_RESERVE`
+/// extra descriptors for markers. Markers hold no pool slot, so the producer
+/// caps them at that reserve; the I/O thread releases the credit when it pops
+/// each marker.
+pub const SILENCE_MARKER_RESERVE: usize = 16;
+
+/// Maximum number of silence-marker descriptors allowed in flight at once.
+///
+/// Equal to [`SILENCE_MARKER_RESERVE`] so the work-ring headroom reserved for
+/// markers can never be exceeded, which keeps audio `publish` structurally
+/// infallible even with a lagging I/O consumer. A long gate-closed episode
+/// coalesces into one marker per `MAX_SILENCE_FRAMES`; if more than the reserve
+/// is pending, the remainder stays in the sender and is retried, never dropped.
+pub const MAX_SILENCE_MARKERS_IN_FLIGHT: u32 = SILENCE_MARKER_RESERVE as u32;
 
 /// Small descriptor published by the RT thread and consumed by the I/O thread.
 ///
 /// `#[repr(C)]`, 4 bytes: the 16-bit slot index into the pool plus the valid
 /// planar sample count. The payload itself stays in the preallocated slot —
 /// only this word travels through the `work` SPSC ring. A descriptor with
-/// [`slot == CONTROL_BARRIER_SLOT`](CONTROL_BARRIER_SLOT) is a control barrier,
-/// not audio.
+/// [`slot == CONTROL_BARRIER_SLOT`](CONTROL_BARRIER_SLOT) is a control barrier;
+/// one with [`slot == SILENCE_MARKER_SLOT`](SILENCE_MARKER_SLOT) is an
+/// intentional-silence marker whose `valid_len` carries a frame count. Neither
+/// control kind holds a pool slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Descriptor {
-    /// Index of the pool slot holding the audio data, or
-    /// [`CONTROL_BARRIER_SLOT`] for a control barrier.
+    /// Index of the pool slot holding the audio data,
+    /// [`CONTROL_BARRIER_SLOT`] for a control barrier, or
+    /// [`SILENCE_MARKER_SLOT`] for an intentional-silence marker.
     pub slot: u16,
     /// Valid f32 samples in the slot (`2 * frames`), as published by
     /// `fill_planar`. For a control barrier (`slot == CONTROL_BARRIER_SLOT`),
-    /// this carries the sequence number `seq: u16` matching `ControlPayload::Metadata`.
+    /// this carries the sequence number `seq: u16` matching `ControlPayload::Metadata`;
+    /// for a silence marker (`slot == SILENCE_MARKER_SLOT`) it carries the
+    /// suppressed frame count.
     pub valid_len: u16,
 }
 
@@ -153,6 +197,11 @@ struct PoolSlots<const N: usize> {
     /// Total slots acquired/popped but dropped without publish/release
     /// (fail-closed leak telemetry; see module docs).
     slot_leaks: AtomicU64,
+    /// Silence-marker descriptors currently in flight in the `work` ring.
+    /// Bounded by [`MAX_SILENCE_MARKERS_IN_FLIGHT`] to preserve the audio
+    /// publish infallibility proof; the RT producer increments before pushing
+    /// and the I/O consumer decrements when it pops the marker.
+    silence_markers_in_flight: AtomicU32,
 }
 
 // SAFETY: `PoolSlots` may be shared between the two transport threads because
@@ -180,8 +229,9 @@ pub struct RecordingPool<const N: usize> {
 
 impl<const N: usize> RecordingPool<N> {
     /// Preallocates `N` slots, dimensions the `work` ring to
-    /// `N + CONTROL_CAPACITY` to accommodate control barriers without audio
-    /// backpressure, and seeds the free-list ring with every index.
+    /// `N + CONTROL_CAPACITY + SILENCE_MARKER_RESERVE` to accommodate control
+    /// barriers and silence markers without audio backpressure, and seeds the
+    /// free-list ring with every index.
     ///
     /// # Panics
     ///
@@ -192,17 +242,18 @@ impl<const N: usize> RecordingPool<N> {
     pub fn new() -> Self {
         // Compile-time invariant, checked for every instantiation: every
         // legal free-ring index `0..N` stays strictly below the reserved
-        // `CONTROL_BARRIER_SLOT` sentinel. A future instantiation with
-        // `N >= u16::MAX` could seed the sentinel into the free ring, where
-        // an audio slot could never be distinguished from a control barrier
-        // (silent ordering corruption); fail the build instead.
-        const { assert!(N < CONTROL_BARRIER_SLOT as usize) };
+        // `SILENCE_MARKER_SLOT` sentinel (and therefore below
+        // `CONTROL_BARRIER_SLOT`). A future instantiation with
+        // `N >= SILENCE_MARKER_SLOT` could seed a sentinel into the free ring,
+        // where an audio slot could never be distinguished from a control
+        // marker (silent ordering corruption); fail the build instead.
+        const { assert!(N < SILENCE_MARKER_SLOT as usize) };
         assert!(N > 0, "RecordingPool requires at least one slot");
-        let (work, work_consumer) = RingBuffer::new(N + CONTROL_CAPACITY);
+        let (work, work_consumer) = RingBuffer::new(N + CONTROL_CAPACITY + SILENCE_MARKER_RESERVE);
         let (mut free, free_consumer) = RingBuffer::new(N);
         // Seed the free ring with `0..N` using a `u16` counter: `N <
-        // CONTROL_BARRIER_SLOT == u16::MAX` is const-asserted above, so the
-        // counter never overflows and the sentinel is never seeded. This keeps
+        // SILENCE_MARKER_SLOT` is const-asserted above, so the counter never
+        // overflows and neither sentinel is ever seeded. This keeps
         // the checked, lossless semantics without a truncating `as u16` or a
         // fallible `try_from`/`expect` pair.
         let mut idx: u16 = 0;
@@ -233,6 +284,7 @@ impl<const N: usize> RecordingPool<N> {
             inner: Arc::new(PoolSlots {
                 slots,
                 slot_leaks: AtomicU64::new(0),
+                silence_markers_in_flight: AtomicU32::new(0),
             }),
             work,
             work_consumer,
@@ -294,7 +346,7 @@ impl<const N: usize> PoolProducer<N> {
 
     /// Pops a free slot index and returns exclusive mutable access to the
     /// preallocated block. `None` means the pool is exhausted — the caller
-    /// accounts it as an overrun (mirroring a full inline ring).
+    /// accounts it as an overrun.
     #[inline]
     pub fn try_acquire(&mut self) -> Option<AcquiredSlot<'_, N>> {
         let idx = self.free.pop().ok()?;
@@ -341,6 +393,47 @@ impl<const N: usize> PoolProducer<N> {
             })
             .is_ok()
     }
+
+    /// Publishes an **intentional-silence marker** carrying `frames` suppressed
+    /// stereo frames into the `work` ring.
+    ///
+    /// The marker holds no pool slot: the I/O thread writes `frames` zero
+    /// frames and dissolves the descriptor. Returns `false` on a full ring; the
+    /// caller keeps the frame count pending and retries on the next callback,
+    /// so the silence duration is never lost. `frames == 0` is rejected (a
+    /// no-op marker would only add ring pressure).
+    #[inline]
+    pub fn try_push_silence(&mut self, frames: u16) -> bool {
+        if frames == 0 {
+            return true;
+        }
+        // Preserve the audio publish infallibility proof: markers may only
+        // occupy the work-ring headroom reserved for them, never the
+        // descriptors needed by audio (N - 1) and barriers (CONTROL_CAPACITY).
+        if self.inner.silence_markers_in_flight.load(Ordering::Relaxed)
+            >= MAX_SILENCE_MARKERS_IN_FLIGHT
+        {
+            return false;
+        }
+        // Reserve the credit *before* the descriptor becomes visible so the
+        // I/O thread's decrement can never observe an unincremented count.
+        self.inner
+            .silence_markers_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        let pushed = self
+            .work
+            .push(Descriptor {
+                slot: SILENCE_MARKER_SLOT,
+                valid_len: frames,
+            })
+            .is_ok();
+        if !pushed {
+            self.inner
+                .silence_markers_in_flight
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        pushed
+    }
 }
 
 /// A pool slot owned by the RT thread, mid-fill.
@@ -373,11 +466,15 @@ impl<const N: usize> AcquiredSlot<'_, N> {
     /// Publishes the slot to the I/O thread by pushing its descriptor.
     ///
     /// Infallible by construction: the `work` ring has capacity
-    /// `N + CONTROL_CAPACITY`, while at most `N - 1` audio descriptors and
-    /// `CONTROL_CAPACITY` control barriers can be pending in flight when this
-    /// method is called (`(N - 1) + CONTROL_CAPACITY < N + CONTROL_CAPACITY`).
-    /// Returns `false` only on an invariant violation, in which case the slot
-    /// is counted as leaked rather than double-returned.
+    /// `N + CONTROL_CAPACITY + SILENCE_MARKER_RESERVE`, while at most `N - 1`
+    /// audio descriptors, `CONTROL_CAPACITY` control barriers and
+    /// `SILENCE_MARKER_RESERVE` silence markers can be pending in flight when
+    /// this method is called (their sum is one less than the ring capacity).
+    /// Returns `false` only on an invariant violation (a full `work` ring even
+    /// with the marker reserve), in which case the slot is counted as leaked
+    /// rather than double-returned. With the reserve enforced by
+    /// [`MAX_SILENCE_MARKERS_IN_FLIGHT`], a legal configuration cannot reach
+    /// this path.
     #[inline]
     pub fn publish(self) -> bool {
         // SAFETY: exclusive ownership (see `block_mut`).
@@ -454,8 +551,13 @@ impl<const N: usize> PoolConsumer<N> {
     #[inline]
     pub fn try_pop(&mut self) -> Option<InFlightBlock<'_, N>> {
         let desc = self.work.pop().ok()?;
-        if desc.slot == CONTROL_BARRIER_SLOT {
-            // No slot is associated with a barrier.
+        if desc.slot == SILENCE_MARKER_SLOT {
+            self.inner
+                .silence_markers_in_flight
+                .fetch_sub(1, Ordering::Relaxed);
+        }
+        if desc.slot == CONTROL_BARRIER_SLOT || desc.slot == SILENCE_MARKER_SLOT {
+            // Neither control kind is associated with a pool slot.
             return Some(InFlightBlock {
                 consumer: self,
                 desc,
@@ -503,6 +605,37 @@ impl<const N: usize> InFlightBlock<'_, N> {
         self.desc.slot == CONTROL_BARRIER_SLOT
     }
 
+    /// `true` for an [intentional-silence marker](SILENCE_MARKER_SLOT) — an
+    /// ordering-correct marker carrying a suppressed-frame count and no audio
+    /// block. The I/O thread must write that many zero frames.
+    #[inline]
+    pub fn is_silence(&self) -> bool {
+        self.desc.slot == SILENCE_MARKER_SLOT
+    }
+
+    /// `true` when this descriptor references no pool slot (control barrier or
+    /// silence marker).
+    #[inline]
+    pub fn is_control(&self) -> bool {
+        self.is_barrier() || self.is_silence()
+    }
+
+    /// Suppressed stereo frame count carried by an
+    /// [intentional-silence marker](SILENCE_MARKER_SLOT).
+    ///
+    /// # Panics
+    ///
+    /// Panics if this block is not a silence marker
+    /// ([`is_silence`](Self::is_silence) is `false`).
+    #[inline]
+    pub fn silence_frames(&self) -> u16 {
+        assert!(
+            self.is_silence(),
+            "a non-silence descriptor carries no suppressed frame count"
+        );
+        self.desc.valid_len
+    }
+
     /// Sequence number carried by a control barrier descriptor.
     ///
     /// # Panics
@@ -528,7 +661,7 @@ impl<const N: usize> InFlightBlock<'_, N> {
     pub fn block(&self) -> &AlignedBlock<MAX_BLOCK_SIZE> {
         match self.block {
             Some(block) => block,
-            None => panic!("a control barrier carries no audio block"),
+            None => panic!("a control/silence descriptor carries no audio block"),
         }
     }
 
@@ -546,7 +679,7 @@ impl<const N: usize> InFlightBlock<'_, N> {
     /// barrier holds no slot to recycle.
     #[inline]
     pub fn release(self) -> bool {
-        if self.is_barrier() {
+        if self.is_control() {
             // No slot to recycle; ownership of the marker is simply dissolved.
             std::mem::forget(self);
             return true;

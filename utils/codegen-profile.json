@@ -20,7 +20,7 @@
     },
     {
       "id": "process_dsp_buffer",
-      "pattern": "^(<)?nam_audio_pipe::standalone::pw_host::capture::setup::setup_capture_stream::\\{closure#2\\}(>)?$|process_dsp_buffer$",
+      "pattern": "^(<)?nam_audio_pipe::standalone::pw_host::capture::setup::stream::setup_capture_stream::\\{closure#2\\}(>)?$|process_dsp_buffer$",
       "required": true,
       "expected_methods": ["closure#2", "process_dsp_buffer"],
       "gates": { "zmm": 0, "libm": 0, "alloc": 0 },

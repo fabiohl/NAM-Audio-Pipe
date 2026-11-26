@@ -72,9 +72,11 @@ fn capture_state_off_oversample_runs_closed_silence_gate_without_panic() {
             target_bypass: false,
             dry_delay: &mut state.cab_dry_delay,
             bypass_state: &mut state.cab_bypass_state,
+            tail_hysteresis: &mut state.tail_hysteresis,
+            tail_draining: &mut state.tail_draining,
         };
 
-        let n_pw = run_capture_dsp_pipeline(
+        let outcome = run_capture_dsp_pipeline(
             &mut samples_l,
             &mut samples_r,
             256,
@@ -88,7 +90,13 @@ fn capture_state_off_oversample_runs_closed_silence_gate_without_panic() {
             cab,
             crate::standalone::rt_setup::rdtsc_nanos(),
         );
-        if n_pw == 0 {
+        if outcome.n_pw == 0 {
+            // The gate-closed quantum must be reported as intentional silence,
+            // not as a transport gap, so recording can preserve its duration.
+            assert_eq!(
+                outcome.silence_frames, 256,
+                "a gate-closed quantum must report its processed frame count"
+            );
             closed_observed = true;
             break;
         }

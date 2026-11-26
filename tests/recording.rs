@@ -353,7 +353,7 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
 
     let (recording_sender, recording_receiver) = create_recording_transport();
     let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
-    let io_handle = spawn_recording_worker(recording_receiver, None, init, Vec::new())
+    let io_handle = spawn_recording_worker(recording_receiver, init, Vec::new())
         .expect("failed to spawn recording I/O thread");
     wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect("recording worker must confirm readiness");
@@ -406,7 +406,6 @@ fn record_e2e_pipewire_wav_header_matches_bytes() {
             gc_cons,
             sl_cons,
             os_cons,
-            None,
             Some(recording_worker),
         )
     });
@@ -521,7 +520,7 @@ fn disk_writer_loop_fails_fast_on_missing_output_dir() {
     let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&missing);
     let handle =
-        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
+        spawn_recording_worker(receiver, init, Vec::new()).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a missing output dir must fail the startup handshake");
@@ -563,7 +562,7 @@ fn disk_writer_loop_fails_fast_on_file_as_output_dir() {
     let (_sender, receiver) = create_recording_transport();
     let (init, init_rx, status, failed_flag) = recording_init_for(&file_dir);
     let handle =
-        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
+        spawn_recording_worker(receiver, init, Vec::new()).expect("spawn recording worker");
 
     let err = wait_for_recording_init(init_rx, Duration::from_secs(5))
         .expect_err("a file-as-dir must fail the startup handshake");
@@ -583,4 +582,80 @@ fn disk_writer_loop_fails_fast_on_file_as_output_dir() {
         .expect("worker must finish cleanly")
         .expect_err("a file-as-dir must surface as an Err on the join");
     std::fs::remove_file(&file_dir).unwrap();
+}
+
+/// Acceptance (T6.2, real io_uring writer): a gate-closed burst registered as
+/// intentional silence extends the finalized WAV by exactly those frames, with
+/// zero samples in the tail.
+#[test]
+#[ignore = "requires io_uring support"]
+fn disk_writer_loop_silence_markers_extend_wav_duration() {
+    let _lock = TEST_MUTEX.lock().unwrap();
+    let _sd = ShutdownGuard::new();
+    let dir = temp_dir();
+    let _cwd = CwdGuard::enter(&dir);
+    let _guard = DirGuard::new(dir.clone());
+
+    let (mut sender, receiver) = create_recording_transport();
+    let (handle, _, _) = spawn_ready_worker(receiver, &dir);
+
+    let meta = AudioMetadata {
+        sample_rate: 48000.0,
+        bit_depth: 32,
+        channels: 2,
+    };
+    assert!(
+        sender.try_push_metadata(meta),
+        "metadata push should succeed"
+    );
+
+    const AUDIO_FRAMES: usize = 480;
+    const SILENCE_FRAMES: usize = 1200;
+    let left = vec![0.5f32; AUDIO_FRAMES];
+    let right = vec![-0.5f32; AUDIO_FRAMES];
+    assert!(
+        sender.try_push_audio(&left, &right),
+        "audio push should succeed"
+    );
+    assert!(
+        sender.try_push_silence(SILENCE_FRAMES),
+        "silence accumulation should be accepted"
+    );
+    assert!(
+        sender.try_push_stream_stop(),
+        "StreamStop must flush the pending silence and terminate"
+    );
+
+    handle
+        .join()
+        .expect("I/O thread should complete")
+        .expect("integral drain must finalize the WAV successfully");
+
+    let mut found: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(&dir).expect("failed to read temp dir") {
+        let e = entry.expect("dir entry error");
+        let p = e.path();
+        if p.extension().is_some_and(|ext| ext == "wav") {
+            found = Some(p);
+            break;
+        }
+    }
+    let wav_path = found.expect("no WAV file created by disk_writer_loop");
+    let frames = wav_sample_count(&wav_path);
+    assert_eq!(
+        frames,
+        (AUDIO_FRAMES + SILENCE_FRAMES) as u32,
+        "the WAV must keep the gate-closed duration as zero frames"
+    );
+
+    let mut reader = hound::WavReader::open(&wav_path).expect("open finalized WAV");
+    let samples: Vec<f32> = reader
+        .samples::<f32>()
+        .collect::<Result<_, _>>()
+        .expect("read float samples");
+    assert!(
+        samples[AUDIO_FRAMES * 2..].iter().all(|&s| s == 0.0),
+        "the intentional-silence tail must be exactly zero"
+    );
+    assert_eq!(OVERRUN_COUNT.load(Ordering::Relaxed), 0);
 }

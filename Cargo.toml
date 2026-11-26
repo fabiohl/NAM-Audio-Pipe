@@ -2,7 +2,7 @@
 # Copyright (c) 2026 Fábio Henrique de Lima Silva (fhl.bsb@gmail.com) All rights reserved.
 [package]
 name = "nam-audio-pipe"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 rust-version = "1.99.0"
 license = "GPL-3.0-or-later"
@@ -46,15 +46,6 @@ required-features = ["testing"]
 name = "pipe_perf_gate"
 path = "src/bin/pipe_perf_gate.rs"
 
-# A/B benchmark of the recording transports (inline SPSC ring
-# vs preallocated pool + small descriptor). A profiling-only harness like
-# pgo_workload: excluded from the standard test path, compiled only when the
-# `testing` feature is active.
-[[bin]]
-name = "recording_ab_bench"
-path = "src/bin/recording_ab_bench.rs"
-required-features = ["testing"]
-
 # A/B optimization benchmark of the DSP hot-path envelope
 # (plain → PGO → PGO+BOLT). A profiling-only harness like pgo_workload: excluded
 # from the standard test path, compiled only when the `testing` feature is
@@ -97,7 +88,7 @@ hound = "3.5"
 rtrb = "0.4.1"
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tokio-uring = "0.5"
-anyhow = "1.0.104"
+anyhow = "1.0.105"
 libc = "0.2.191"
 log = "0.4.35"
 # Typed FAIL-cause carrier for the long audit (src/receipt/fail_reasons.rs):
@@ -196,3 +187,6 @@ split-debuginfo = "unpacked"
 
 [lints.rust]
 raw_borrows_via_references = "warn"
+
+[patch.crates-io]
+NeuralAmpModeler-rs = { path = "../NeuralAmpModeler-rs" }

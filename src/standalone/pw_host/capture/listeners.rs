@@ -63,8 +63,9 @@ pub fn param_changed_handler(
     match validate_audio_raw_format(param) {
         Ok(rate) => {
             rate_for_param.store(rate, Ordering::Release); // Pairs with Acquire swap in sync_rate (rt_callback/rate_sync.rs)
-            backend
-                .stream_status()
+            let stream_status = backend.stream_status();
+            stream_status.last_known_rate.store(rate, Ordering::Relaxed);
+            stream_status
                 .capture_negotiated_rate
                 .store(rate, Ordering::Release);
             backend.mark_format_ok("capture");

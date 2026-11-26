@@ -206,6 +206,12 @@ pub struct TelemetryLatches {
     /// PW log ring saturation (`pw_host::rt_log_ring::pw_log_dropped`): PW
     /// log events discarded with the SPSC ring full (off-RT offload budget).
     pub pw_log_dropped: LatchedSignal,
+    /// Playback callbacks running on a thread other than the capture-marked RT
+    /// data thread (`StreamStatusFlags::playback_thread_divergence`).
+    pub playback_thread_divergence: LatchedSignal,
+    /// Installed cabinet slot bypassed because its rate differs from the host
+    /// quantum rate (`StreamStatusFlags::cab_rate_stale`).
+    pub cab_rate_stale: LatchedSignal,
 }
 
 /// Mutable state for `poll_rt_status`, replacing function-scoped statics
@@ -226,6 +232,8 @@ pub struct PollState {
     /// Last observed cumulative PW-log ring discard count
     /// (`rt_log_ring::pw_log_dropped`, `pw_log_dropped_last`).
     pub pw_log_dropped_last: u64,
+    /// Last observed cumulative playback-thread divergence count.
+    pub playback_thread_divergence_last: u64,
     /// Last observed `playback_quantums` value; used to re-arm the bridge
     /// bring-up suppression budget whenever playback makes progress.
     pub last_bringup_quanta: u32,
@@ -261,6 +269,7 @@ impl PollState {
             last_early: 0,
             last_muted: 0,
             pw_log_dropped_last: 0,
+            playback_thread_divergence_last: 0,
             last_bringup_quanta: 0,
             bringup_suppressed_polls: 0,
             has_polled_in_bringup: false,

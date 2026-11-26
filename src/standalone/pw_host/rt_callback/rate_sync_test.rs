@@ -283,3 +283,28 @@ fn failed_build_rollback_and_retry_limit() {
     assert_eq!(sync_state.failed_rates, (0, 0));
     assert_eq!(sync_state.failed_retry_count, 0);
 }
+
+#[test]
+fn diagnostic_last_known_rate_survives_the_consumed_inbox_swap() {
+    let stream_status = crate::standalone::pw_host::StreamStatusFlags::new();
+    stream_status
+        .last_known_rate
+        .store(48_000, Ordering::Relaxed);
+    let inbox = AtomicU32::new(48_000);
+    let flags = RtStatusFlags::new();
+    let rs = make_resampler(48_000, 48_000);
+    let mut sync_state = RateSyncState::new(48_000);
+
+    sync_rate(&inbox, &rs, 48_000, &flags, &mut sync_state);
+
+    assert_eq!(
+        inbox.load(Ordering::Acquire),
+        0,
+        "the RT inbox is consumed by swap(0)"
+    );
+    assert_eq!(
+        stream_status.last_known_rate.load(Ordering::Relaxed),
+        48_000,
+        "the diagnostic cell must keep the last known rate"
+    );
+}

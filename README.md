@@ -67,7 +67,7 @@ Capture your tone directly to pristine 32-bit float stereo WAV files without tou
 - **Zero-Impact `io_uring` Engine**: Audio samples travel through a pre-allocated 64 KiB slot pool transport with safe, non-nullable memory references (~57% lower memory traffic than traditional rings) and write to disk via Linux `tokio-uring`.
 - **Crash-Resilient Header Checkpointing**: Automatically updates WAV header chunk lengths and invokes `fsync` every 3 seconds. An unexpected power outage or signal kill loses at most 3 seconds instead of destroying the entire recording.
 - **Automatic 4 GiB RIFF File Splitting**: Seamlessly splits extended jam sessions into continuous, gapless `_partN.wav` segments.
-- **Noise Gate Silence Trimming**: In default `--gate-mode silence`, only commits audio blocks to disk when the silence gate is open, avoiding massive empty files during rehearsal pauses; `--gate-mode musical` keeps `--record` output continuous with expanded tails.
+- **Continuous Capture Across Gate Pauses**: In the default `--gate-mode silence`, a gate-closed quantum is committed as a zero-copy *intentional-silence marker* — the RT thread only sends the frame count and the disk worker writes the matching zero frames. The take keeps its real duration (including rehearsal pauses) without copying zeros on the audio thread. Genuine transport loss (pool starvation, full ring) is never padded: it is counted as overrun and reported as a lossy capture. `--gate-mode musical` records continuously with expanded tails.
 
 ### 🐧 6. Deep Linux Real-Time Hardening
 

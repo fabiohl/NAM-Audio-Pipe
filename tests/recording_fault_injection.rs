@@ -993,6 +993,23 @@ fn enospc_class_failure_mid_stream_marks_failed_and_preserves_partial_wav() {
         push_block_or_retry(&mut sender, &left, &right);
     }
 
+    // The failing write must release its in-flight pool slot before the worker
+    // exits: wait for the RT-observable failure flag, then inspect the producer
+    // leak counter while the sender is still alive.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !failed_flag.load(Ordering::Acquire) {
+        assert!(
+            Instant::now() < deadline,
+            "the failing disk worker never raised the RT failure flag"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        sender.leaked_slots(),
+        0,
+        "a failed write must release the in-flight pool slot instead of leaking it"
+    );
+
     let guard = RecordingWorkerGuard::new(handle, Some(sender), Some(failed_flag.clone()));
     let outcome = guard.shutdown();
     assert!(
@@ -1173,7 +1190,7 @@ fn concurrent_workers_same_dir_atomic_creation_no_clobber() {
             scope.spawn(move || {
                 let (mut sender, receiver) = create_recording_transport();
                 let (init, init_rx, _status, failed_flag) = recording_init_for(&dir);
-                let handle = spawn_recording_worker(receiver, None, init, Vec::new())
+                let handle = spawn_recording_worker(receiver, init, Vec::new())
                     .expect("spawn recording worker");
 
                 // Align all instances so the atomic create attempts collide in

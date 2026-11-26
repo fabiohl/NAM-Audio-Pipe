@@ -372,7 +372,7 @@ pub fn spawn_ready_worker(
 ) {
     let (init, init_rx, status, failed_flag) = recording_init_for(dir);
     let handle =
-        spawn_recording_worker(receiver, None, init, Vec::new()).expect("spawn recording worker");
+        spawn_recording_worker(receiver, init, Vec::new()).expect("spawn recording worker");
     let ready_dir = wait_for_recording_init(init_rx, std::time::Duration::from_secs(5))
         .expect("recording worker must confirm readiness via the startup handshake");
     assert_eq!(

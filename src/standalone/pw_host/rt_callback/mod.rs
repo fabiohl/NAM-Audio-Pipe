@@ -12,7 +12,9 @@ use neural_amp_modeler_rs::common::spsc::RtStatusFlags;
 
 mod cabsim_swap;
 mod commands;
+mod epilogue;
 mod os_swap;
+mod pipeline;
 mod process;
 mod prologue;
 mod rate_sync;
@@ -36,9 +38,19 @@ pub use commands::{
     drain_os_engines_with_status, drain_slimmable_models, os_swap_drain, receive_commands,
     slimmable_swap_drain, try_slimmable_rebuild,
 };
+pub(crate) use epilogue::capture_epilogue;
 #[cfg(test)]
-pub(crate) use process::run_capture_dsp_pipeline;
-pub use process::{PipeCabRuntime, process_dsp_buffer};
+pub(crate) use epilogue::{
+    adaptive_update_due, cabsim_partition_to_request, cabsim_rebuild_needed, nam_cab_rebuild_needed,
+};
+#[cfg(test)]
+pub(crate) use pipeline::run_capture_dsp_pipeline;
+#[cfg(test)]
+pub(crate) use process::PipeCabRuntime;
+#[cfg(feature = "testing")]
+pub(crate) use process::RtDspParts;
+pub(crate) use process::assemble_rt_dsp;
+pub use process::process_dsp_buffer;
 pub use prologue::{PrologueOutcome, rt_quantum_prologue};
 pub use rate_sync::{RateSyncState, sync_rate};
 #[cfg(feature = "testing")]

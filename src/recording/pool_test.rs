@@ -86,7 +86,7 @@ fn pool_round_trip_reuses_slot_and_drains_exactly_once() {
     assert_eq!(producer.leaked_slots(), 0);
 }
 
-/// Descriptors must arrive in FIFO order, matching the inline ring.
+/// Descriptors must arrive in FIFO order.
 #[test]
 fn pool_descriptors_are_fifo() {
     let pool = RecordingPool::<8>::new();
@@ -122,7 +122,7 @@ fn pool_exhaustion_overruns_without_leak() {
 
     // Fill the pool: 4 slots acquired and published, 0 consumed yet →
     // 5th acquire fails (the free ring is exhausted, mirroring a full
-    // inline ring).
+    // by-value ring).
     for _ in 0..4 {
         let mut s = producer.try_acquire().expect("slots 0..3 free");
         let idx = s.slot_index() as usize;
@@ -232,7 +232,7 @@ fn pool_slots_cycle_and_are_reusable() {
 #[test]
 fn descriptor_is_a_small_word() {
     assert_eq!(std::mem::size_of::<Descriptor>(), 4);
-    assert_eq!(POOL_CAPACITY, super::super::buffer::RING_CAPACITY);
+    assert_eq!(POOL_CAPACITY, 256);
 }
 
 /// Ordering contract: a control barrier must (a) be published through
@@ -517,4 +517,60 @@ fn pool_work_ring_with_barrier_backpressure() {
     assert_eq!(prod_max.free_available(), POOL_CAPACITY);
     assert_eq!(prod_max.drain_free_for_check().len(), POOL_CAPACITY);
     assert_eq!(prod_max.leaked_slots(), 0);
+}
+
+/// S6 regression: silence markers may only consume the work-ring headroom
+/// reserved for them. Even with the full marker reserve, all barriers and every
+/// pool slot in flight, audio `publish` stays infallible and no slot leaks.
+#[test]
+fn silence_marker_reserve_never_starves_audio_publish() {
+    let pool = RecordingPool::<POOL_CAPACITY>::new();
+    let (mut producer, mut consumer) = pool.split();
+
+    for i in 0..SILENCE_MARKER_RESERVE {
+        assert!(
+            producer.try_push_silence(1),
+            "marker {i} must fit the reserved work-ring headroom"
+        );
+    }
+    assert!(
+        !producer.try_push_silence(1),
+        "the marker reserve must be a hard cap, not unbounded pressure"
+    );
+
+    for seq in 0..CONTROL_CAPACITY {
+        assert!(
+            producer.try_push_barrier(seq as u16),
+            "barrier {seq} must fit alongside the marker reserve"
+        );
+    }
+
+    for i in 0..POOL_CAPACITY {
+        let mut slot = producer
+            .try_acquire()
+            .unwrap_or_else(|| panic!("slot {i} must be free"));
+        slot.block_mut().fill_planar(&[i as f32], &[0.0]);
+        assert!(
+            slot.publish(),
+            "audio publish must stay infallible with the full marker reserve"
+        );
+    }
+    assert_eq!(producer.leaked_slots(), 0);
+    assert!(producer.try_acquire().is_none(), "pool fully in flight");
+
+    let mut markers = 0usize;
+    while let Some(item) = consumer.try_pop() {
+        if item.is_silence() {
+            markers += 1;
+        }
+        assert!(item.release());
+    }
+    assert_eq!(markers, SILENCE_MARKER_RESERVE);
+    // Popping all markers returned every credit to the producer.
+    assert!(
+        producer.try_push_silence(1),
+        "marker credit must be reusable after the consumer drains it"
+    );
+    assert_eq!(producer.free_available(), POOL_CAPACITY);
+    assert_eq!(producer.leaked_slots(), 0);
 }

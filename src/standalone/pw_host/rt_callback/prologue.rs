@@ -244,14 +244,6 @@ pub fn rt_quantum_prologue(
         &mut state.adaptive_compute,
     );
     if state.gate_params != prev_gate_params {
-        state.gate_config = if state.threshold_open_sq == 0.0 {
-            crate::standalone::cli::GateConfig::Off
-        } else {
-            crate::standalone::cli::GateConfig::Threshold {
-                threshold_open_db: state.gate_params.threshold_open_db,
-                threshold_close_db: state.gate_params.threshold_close_db,
-            }
-        };
         state.apply_gate_resolution(lut);
     }
 

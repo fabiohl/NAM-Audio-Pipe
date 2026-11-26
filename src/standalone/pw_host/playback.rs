@@ -22,6 +22,19 @@ use pw::properties::properties;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+/// Records whether the current thread is the capture-marked RT data thread.
+///
+/// Called once per playback quantum: one TLS load plus (on divergence) one
+/// `Relaxed` atomic increment. No syscall, no lock, no allocation. The
+/// playback thread is intentionally not promoted to SCHED_FIFO here — that
+/// would require revisiting the single-producer invariant of the log ring.
+#[inline]
+pub(crate) fn observe_playback_thread(stream_status: &super::StreamStatusFlags) {
+    stream_status.note_playback_thread_divergence(
+        crate::standalone::rt_setup::rt_is_current_thread_marked(),
+    );
+}
+
 /// Handles playback stream state changes — feeds the backend state machine.
 ///
 /// Mirrors the capture `state_changed_handler`: a fatal `StreamState::Error` or
@@ -42,10 +55,7 @@ pub fn playback_state_changed_handler(
     if matches!(new, pw::stream::StreamState::Streaming)
         && !matches!(old, pw::stream::StreamState::Streaming)
     {
-        backend
-            .stream_status()
-            .playback_quantums
-            .store(0, Ordering::Relaxed);
+        backend.stream_status().reset_playback_quantums();
     }
     observe_stream_state("playback", old, new, backend);
 }
@@ -181,6 +191,7 @@ pub fn setup_playback_stream<'c>(
             rt_callback::run_rt_callback_body(
                 &rt_status_playback,
                 std::panic::AssertUnwindSafe(|| {
+                    observe_playback_thread(&stream_status_playback);
                     if (pb_callback_count & 0x3F) == 0
                         && let Ok(pw_time) = stream.time()
                     {
@@ -200,14 +211,9 @@ pub fn setup_playback_stream<'c>(
                     // stream can never re-open the suppression window; the
                     // counter is reset to 0 by the state handler on entering
                     // `Streaming`.
-                    let quanta = stream_status_playback
-                        .playback_quantums
-                        .load(Ordering::Relaxed);
-                    if quanta < crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS {
-                        stream_status_playback
-                            .playback_quantums
-                            .store(quanta + 1, Ordering::Relaxed);
-                    }
+                    stream_status_playback.bump_playback_quantums(
+                        crate::standalone::pw_host::PLAYBACK_BRINGUP_QUANTUMS,
+                    );
 
                     playback_dsp_cycle(
                         stream,
@@ -260,4 +266,48 @@ pub fn setup_playback_stream<'c>(
     );
 
     Ok((playback_stream, playback_listener))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::standalone::rt_setup::{rt_mark_current_thread, rt_unmark_current_thread};
+    use std::sync::Arc;
+
+    #[test]
+    fn unmarked_playback_thread_counts_divergence() {
+        let status = Arc::new(super::super::StreamStatusFlags::new());
+        let worker_status = Arc::clone(&status);
+        let handle = std::thread::spawn(move || {
+            rt_unmark_current_thread();
+            for _ in 0..5 {
+                observe_playback_thread(&worker_status);
+            }
+        });
+        handle.join().unwrap_or_else(|_| panic!("worker panicked"));
+        assert_eq!(
+            status.playback_thread_divergence.load(Ordering::Relaxed),
+            5,
+            "an unmarked playback thread must be counted on every quantum"
+        );
+    }
+
+    #[test]
+    fn playback_on_the_marked_rt_thread_is_not_divergent() {
+        let status = Arc::new(super::super::StreamStatusFlags::new());
+        let worker_status = Arc::clone(&status);
+        let handle = std::thread::spawn(move || {
+            rt_mark_current_thread();
+            for _ in 0..5 {
+                observe_playback_thread(&worker_status);
+            }
+            rt_unmark_current_thread();
+        });
+        handle.join().unwrap_or_else(|_| panic!("worker panicked"));
+        assert_eq!(
+            status.playback_thread_divergence.load(Ordering::Relaxed),
+            0,
+            "the marked capture data thread must not report divergence"
+        );
+    }
 }
