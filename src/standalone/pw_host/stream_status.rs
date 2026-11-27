@@ -82,6 +82,10 @@ pub struct StreamStatusFlags {
     /// single-producer invariant of `RtProducer`.
     pub playback_thread_divergence: AtomicU64,
 
+    /// Incremented by the capture callback when `pw_stream_trigger_process`
+    /// fails while the playback stream is active.
+    pub playback_trigger_errors: AtomicU32,
+
     /// `true` when at least one cab-sim slot (IR pair or NAM cabinet) is
     /// installed at a rate that differs from the host quantum rate, so the
     /// callback is currently bypassing it. The Pipe-local signal for the
@@ -208,6 +212,7 @@ impl StreamStatusFlags {
             playback_muted_callbacks: AtomicU32::new(0),
             bridge_dropped_frames: AtomicU32::new(0),
             playback_thread_divergence: AtomicU64::new(0),
+            playback_trigger_errors: AtomicU32::new(0),
             cab_rate_stale: AtomicBool::new(false),
             playback_quantums: AtomicU32::new(0),
             capture_negotiated_rate: AtomicU32::new(0),
@@ -381,6 +386,12 @@ impl StreamStatusFlags {
     #[inline]
     pub fn reset_playback_thread_divergence(&self) {
         self.playback_thread_divergence.store(0, Ordering::Relaxed);
+    }
+
+    /// Restarts the playback-trigger error window for a fresh stream instance.
+    #[inline]
+    pub fn reset_playback_trigger_errors(&self) {
+        self.playback_trigger_errors.store(0, Ordering::Relaxed);
     }
 
     /// Re-arms the format-contract latches for a fresh stream instance.

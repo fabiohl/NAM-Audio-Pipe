@@ -580,3 +580,35 @@ fn stream_status_cab_rate_stale_is_observable() {
     status.note_cab_rate_stale(false);
     assert!(!status.is_cab_rate_stale());
 }
+
+#[test]
+fn trigger_playback_after_capture_disarmed_is_noop() {
+    use crate::standalone::pw_host::trigger::PlaybackTriggerSlot;
+
+    let slot = PlaybackTriggerSlot::new();
+    let status = StreamStatusFlags::new();
+    status.playback_active.store(1, Ordering::Release);
+
+    trigger_playback_after_capture(&slot, &status);
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn trigger_playback_after_capture_accounts_errors_only_when_playback_active() {
+    use crate::standalone::pw_host::trigger::TriggerResult;
+
+    let status = StreamStatusFlags::new();
+
+    // Masked while playback stream is inactive (connection/pause transient).
+    status.playback_active.store(0, Ordering::Release);
+    record_trigger_result(TriggerResult::Failed(-libc::EIO), &status);
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 0);
+
+    // Accounted once playback stream is active.
+    status.playback_active.store(1, Ordering::Release);
+    record_trigger_result(TriggerResult::Triggered, &status);
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 0);
+
+    record_trigger_result(TriggerResult::Failed(-libc::EIO), &status);
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 1);
+}

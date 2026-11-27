@@ -110,3 +110,44 @@ fn disjoint_field_raw_write_keeps_owner_allocation_valid() {
     }
     assert!(owner.flag);
 }
+
+#[test]
+fn playback_trigger_slot_per_instance_lifecycle() {
+    use std::ptr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    // Mirrors `PlaybackTriggerSlot` across two `'host` reconnect instances:
+    // arm -> Acquire read in RT trigger -> disarm after loop stop -> drop owner ->
+    // fresh instance with new slot/owner.
+    for instance in 1..=2u32 {
+        let slot = Arc::new(AtomicPtr::new(ptr::null_mut()));
+        let mut stream_owner = Box::new(Inner {
+            counter: instance,
+            flag: true,
+        });
+
+        let raw: *mut Inner = &raw mut *stream_owner;
+        slot.store(raw, Ordering::Release);
+
+        // Simulated RT capture callback reading the armed pointer.
+        let rt_slot = Arc::clone(&slot);
+        let observed = std::thread::spawn(move || {
+            let p = rt_slot.load(Ordering::Acquire);
+            if p.is_null() {
+                return None;
+            }
+            // SAFETY: `stream_owner` stays live and unaliased for reads until
+            // `disarm()` completes after the thread joins (`thread_loop.stop()`).
+            unsafe { Some((*p).counter) }
+        })
+        .join()
+        .expect("RT trigger simulation thread panicked");
+        assert_eq!(observed, Some(instance));
+
+        // Teardown order: stop loop (join above), disarm, then drop owner.
+        slot.store(ptr::null_mut(), Ordering::Release);
+        assert!(slot.load(Ordering::Acquire).is_null());
+        drop(stream_owner);
+    }
+}

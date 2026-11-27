@@ -152,6 +152,22 @@ pub(super) fn poll_xruns_and_playback_health(
             delta_muted
         );
     }
+
+    let current_trigger_errors = stream_status
+        .map(|s| s.playback_trigger_errors.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    let delta_trigger_errors = current_trigger_errors.saturating_sub(state.last_trigger_errors);
+    state.last_trigger_errors = current_trigger_errors;
+    if state
+        .latches
+        .playback_trigger_errors
+        .observe(delta_trigger_errors > 0)
+    {
+        log::warn!(
+            "PipeWire playback stream trigger failed {} time(s) this episode.",
+            delta_trigger_errors
+        );
+    }
 }
 
 pub(super) fn poll_clock_drift(

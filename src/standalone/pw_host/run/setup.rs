@@ -5,6 +5,7 @@
 
 use super::super::capture::state::{CaptureState, RtHostChannels};
 use super::super::run_lifecycle::snapshot_and_publish_initial_latencies;
+use super::super::trigger::PlaybackTriggerSlot;
 use super::super::{SharedBackendStatus, capture, playback};
 use crate::recording::transport::RecordingSender;
 use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
@@ -19,6 +20,7 @@ pub(super) type StreamSet<'c> = (
     pw::stream::StreamBox<'c>,
     pw::stream::StreamListener<()>,
     u32,
+    Arc<PlaybackTriggerSlot>,
 );
 
 #[expect(
@@ -49,6 +51,7 @@ pub(super) fn create_streams<'c>(
     // SAFETY: both PipeWire loops are stopped here, so `state_ptr` is exclusive.
     let initial_latency_samples =
         unsafe { snapshot_and_publish_initial_latencies(state_ptr, backend_status) };
+    let playback_trigger = Arc::new(PlaybackTriggerSlot::new());
 
     let (cs, cl) = capture::setup_capture_stream(
         core,
@@ -65,6 +68,7 @@ pub(super) fn create_streams<'c>(
         parking_lot_dirty_ptr,
         recording_failed.clone(),
         backend_for_capture.clone(),
+        Arc::clone(&playback_trigger),
     )?;
 
     let (ps, pl) = playback::setup_playback_stream(
@@ -78,5 +82,5 @@ pub(super) fn create_streams<'c>(
         output_limit,
     )?;
 
-    Ok((cs, cl, ps, pl, initial_latency_samples))
+    Ok((cs, cl, ps, pl, initial_latency_samples, playback_trigger))
 }

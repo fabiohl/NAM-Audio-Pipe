@@ -27,18 +27,25 @@
 //! ## Intra-cycle ordering guarantee (0 quantum extra latency)
 //!
 //! Both streams share `node.group = "nam-audio-pipe-dsp"` and
-//! `node.link-group = "nam-audio-pipe-link-group"`, ensuring they are scheduled by the
-//! same driver in the same PipeWire quantum. Within the driver's `target_list`,
-//! nodes are processed in **FIFO registration order**. The capture stream is
-//! created first (`setup_capture_stream`), therefore it always processes before the
-//! playback stream (`setup_playback_stream`) within the same cycle:
+//! `node.link-group = "nam-audio-pipe-link-group"`, co-scheduling them on the
+//! same PipeWire driver/data-loop, while explicit causal ordering within each
+//! quantum is enforced via `StreamFlags::TRIGGER` (`PW_STREAM_FLAG_TRIGGER`):
 //!
-//! 1. Capture `process()` runs → DSP pipeline → writes `DspBridge` with Release
-//! 2. Playback `process()` runs → reads `DspBridge` with Acquire → delivers to hardware
+//! 1. The playback stream is connected with `StreamFlags::TRIGGER`, so PipeWire
+//!    does not schedule playback until explicitly triggered.
+//! 2. Capture `process()` runs → DSP pipeline → writes `DspBridge` with `Release`.
+//! 3. Capture `process()` invokes `pw_stream_trigger_process()` through
+//!    `PlaybackTriggerSlot` (and also triggers on prologue skip so playback
+//!    delivers deterministic silence and recycles its SPA buffer).
+//! 4. Playback `process()` runs → reads `DspBridge` with `Acquire` → delivers
+//!    to hardware within the same quantum (0 extra quantum latency, even when
+//!    upstream follower nodes feed `NAM-Audio-Pipe-input`).
 //!
-//! The `PRIORITY_DRIVER = 2000` on the capture node further ensures it leads the
-//! group. The PipeWire library version is reported at startup via
-//! `pw_get_library_version()` in the `SystemSnapshot` diagnostic bundle.
+//! `SilenceReason::Early` and `StreamStatusFlags::playback_early_callbacks`
+//! remain as a regression sentinel (`0` expected in steady state), and
+//! `StreamStatusFlags::playback_trigger_errors` tracks any active-stream trigger
+//! failures off-RT. The PipeWire library version (`>= 0.3.41` required) is
+//! reported at startup via `pw_get_library_version()` in `SystemSnapshot`.
 //!
 //! ## Dual-stream validation via `pw_stream::time()`
 //!
@@ -94,6 +101,7 @@ mod run_lifecycle;
 pub mod spa_format;
 pub mod status;
 pub mod stream_status;
+pub(crate) mod trigger;
 mod wakeup;
 
 pub use log_redirect::{

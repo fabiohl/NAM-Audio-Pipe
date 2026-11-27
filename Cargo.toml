@@ -82,7 +82,7 @@ required-features = ["testing"]
 NeuralAmpModeler-rs = { version = "4.0.0", default-features = false, features = [
     "rt-hardening",
 ] }
-pipewire = "0.10"
+pipewire = { version = "0.10", features = ["v0_3_41"] }
 lexopt = "0.3.2"
 hound = "3.5"
 rtrb = "0.4.1"

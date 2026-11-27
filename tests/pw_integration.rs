@@ -955,3 +955,327 @@ fn test_pipewire_fail_fast_stream_error_terminates_within_sla() {
     );
     println!("TEST_RESULT[daemon_bounce_failfast]=PASS");
 }
+
+/// Reproduces a follower -> capture -> playback chain on the running PipeWire
+/// daemon (`pw-play` -> `pw-loopback` follower -> `NAM-Audio-Pipe-input` ->
+/// `NAM-Audio-Pipe-playback`) and measures steady-state and idle-input metrics.
+#[test]
+#[ignore = "requires a running PipeWire daemon + pw-play; follower ordering repro"]
+fn test_pipewire_follower_chain_ordering() {
+    assert_daemon_probe_consistent();
+    assert!(
+        common::pw_play_available(),
+        "pw-play must be available for follower ordering repro"
+    );
+
+    let _daemon_lock = common::TEST_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _shutdown = common::ShutdownGuard::new();
+    let _rt_calibrate = RtThreadCalibrateGuard::arm_if_isolated_available();
+
+    pipewire::init();
+
+    let (_param_prod, param_cons) = RingBuffer::new(4);
+    let (gc_prod, gc_cons) = RingBuffer::new(4);
+    let (res_prod, res_cons) = RingBuffer::new(2);
+    let (cs_prod, cs_cons) = RingBuffer::new(2);
+    let (sl_prod, sl_cons) = RingBuffer::new(2);
+    let (os_prod, os_cons) = RingBuffer::new(2);
+
+    let gc_overflow = Arc::new(GcOverflowBuffer::new(64));
+    let rt_status = Arc::new(RtStatusFlags::default());
+    let stream_status = Arc::new(StreamStatusFlags::new());
+
+    let rt_clone = rt_status.clone();
+    let gc_overflow_clone = gc_overflow.clone();
+    let stream_status_clone = stream_status.clone();
+    let sys = SystemSnapshot::capture();
+    let buffer_size = 128u32;
+
+    spsc::SHUTDOWN.store(false, Ordering::Relaxed);
+
+    let pw_thread = thread::spawn(move || {
+        pw_host::run_pipewire_host(
+            param_cons,
+            gc_prod,
+            gc_overflow_clone,
+            res_cons,
+            res_prod,
+            cs_cons,
+            cs_prod,
+            rt_clone,
+            PipewireHostConfig {
+                buffer_size,
+                cabsim_partition: cli::CABSIM_PARTITION_DEFAULT,
+                sys,
+                ir_raw_samples: None,
+                ir_source_rate: 0,
+                full_wavenet_model_l: None,
+                full_wavenet_model_r: None,
+                has_model_r: false,
+                slimmable_producer: sl_prod,
+                os_producer: os_prod,
+                oversample: OversampleFactor::Off,
+                cpu_receipt: common::deterministic_cpu_receipt(),
+                fail_fast: true,
+                reconnect_timeout: None,
+                gate_config: cli::GateConfig::Off,
+                gate_mode: Default::default(),
+                stream_status: Some(stream_status_clone),
+                recording_status: None,
+                banner: Default::default(),
+                activation: neural_amp_modeler_rs::math::activations::ActivationPrecision::Standard,
+                ir_level_policy: Default::default(),
+                output_limit: Default::default(),
+            },
+            gc_cons,
+            sl_cons,
+            os_cons,
+            None,
+        )
+    });
+
+    assert!(
+        common::wait_for_nam_sink(Duration::from_secs(5)),
+        "NAM-Audio-Pipe-input sink did not register in time"
+    );
+
+    let dir = common::temp_dir();
+    let _dir_guard = common::DirGuard::new(dir.clone());
+    let wav_path = dir.join("follower-silence.wav");
+    common::generate_silent_wav(&wav_path, 30);
+
+    // Intermediate follower node feeding NAM-Audio-Pipe-input.
+    let mut loopback_cmd = std::process::Command::new("pw-loopback");
+    loopback_cmd
+        .args([
+            "-n",
+            "nam_follower_test",
+            "-c",
+            "2",
+            "-i",
+            "media.class=Audio/Sink node.name=nam_follower_in",
+            "-o",
+            "node.name=nam_follower_out",
+            "-P",
+            "NAM-Audio-Pipe-input",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    demote_child_to_housekeeping(&mut loopback_cmd);
+    let loopback = ChildGuard(loopback_cmd.spawn().expect("failed to spawn pw-loopback"));
+
+    let link_deadline = Instant::now() + Duration::from_secs(5);
+    let mut follower_ready = false;
+    while Instant::now() < link_deadline {
+        if let Ok(out) = std::process::Command::new("pw-link").arg("-i").output() {
+            let listing = String::from_utf8_lossy(&out.stdout);
+            if listing.contains("nam_follower_in:") {
+                follower_ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(follower_ready, "pw-loopback follower sink did not appear");
+
+    let mut tone_cmd = std::process::Command::new("pw-play");
+    tone_cmd
+        .args(["--target", "nam_follower_in", "--volume", "0"])
+        .arg(&wav_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    demote_child_to_housekeeping(&mut tone_cmd);
+    let tone = ChildGuard(tone_cmd.spawn().expect("failed to spawn pw-play"));
+
+    let warmup_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < warmup_deadline {
+        if stream_status.e2e_hist.total_count() >= 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        stream_status.e2e_hist.total_count() >= 2,
+        "follower chain did not reach streaming state"
+    );
+
+    let bringup_early = stream_status
+        .playback_early_callbacks
+        .load(Ordering::Relaxed);
+    let bringup_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed);
+    let bringup_discard = stream_status.bridge_dropped_frames.load(Ordering::Relaxed);
+    let startup_divergence = stream_status
+        .playback_thread_divergence
+        .load(Ordering::Relaxed);
+    stream_status.e2e_hist.reset();
+    #[cfg(any(feature = "testing", feature = "heap-audit"))]
+    stream_status.e2e_exact.reset();
+
+    let measure_start = Instant::now();
+    loop {
+        let samples = stream_status.e2e_hist.total_count();
+        if (samples >= E2E_MEASURE_SAMPLES && measure_start.elapsed() >= E2E_MIN_WINDOW)
+            || measure_start.elapsed() >= E2E_MAX_WINDOW
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+
+    let last_n_samples = rt_status.last_n_samples.load(Ordering::Relaxed);
+    let steady_early = stream_status
+        .playback_early_callbacks
+        .load(Ordering::Relaxed)
+        .saturating_sub(bringup_early);
+    let steady_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed)
+        .saturating_sub(bringup_starvation);
+    let steady_dropped = stream_status
+        .bridge_dropped_frames
+        .load(Ordering::Relaxed)
+        .saturating_sub(bringup_discard);
+    let total_divergence = stream_status
+        .playback_thread_divergence
+        .load(Ordering::Relaxed);
+    let steady_divergence = total_divergence.saturating_sub(startup_divergence);
+
+    let samples = stream_status.e2e_hist.total_count();
+    let latency =
+        nam_audio_pipe::standalone::rt_setup::telemetry::latency_summary(&stream_status.e2e_hist);
+    #[cfg(any(feature = "testing", feature = "heap-audit"))]
+    let (p50_exact_ns, p99_exact_ns, p999_exact_ns) = (
+        stream_status.e2e_exact.percentile_exact(0.50),
+        stream_status.e2e_exact.percentile_exact(0.99),
+        stream_status.e2e_exact.percentile_exact(0.999),
+    );
+    #[cfg(not(any(feature = "testing", feature = "heap-audit")))]
+    let (p50_exact_ns, p99_exact_ns, p999_exact_ns) = (0u64, 0u64, 0u64);
+
+    println!(
+        "FOLLOWER_METRICS buffer_size={buffer_size} samples={samples} \
+         bringup_early={bringup_early} steady_early={steady_early} \
+         bringup_starvation={bringup_starvation} steady_starvation={steady_starvation} \
+         bringup_discard={bringup_discard} steady_dropped={steady_dropped} \
+         startup_divergence={startup_divergence} steady_divergence={steady_divergence} \
+         p50_ns={} p99_ns={} p999_ns={} max_ns={} \
+         p50_exact_ns={p50_exact_ns} p99_exact_ns={p99_exact_ns} p999_exact_ns={p999_exact_ns}",
+        latency.p50_ns, latency.p99_ns, latency.p999_ns, latency.max_ns
+    );
+
+    // Phase B: idle/paused input (disconnect follower + tone while host remains active).
+    drop(tone);
+    drop(loopback);
+    let idle_pre_early = stream_status
+        .playback_early_callbacks
+        .load(Ordering::Relaxed);
+    let idle_pre_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed);
+    let idle_pre_muted = stream_status
+        .playback_muted_callbacks
+        .load(Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(500));
+    let idle_early = stream_status
+        .playback_early_callbacks
+        .load(Ordering::Relaxed)
+        .saturating_sub(idle_pre_early);
+    let idle_starvation = stream_status
+        .playback_bridge_starvation
+        .load(Ordering::Relaxed)
+        .saturating_sub(idle_pre_starvation);
+    let idle_muted = stream_status
+        .playback_muted_callbacks
+        .load(Ordering::Relaxed)
+        .saturating_sub(idle_pre_muted);
+    println!(
+        "FOLLOWER_IDLE_METRICS idle_early={idle_early} idle_starvation={idle_starvation} \
+         idle_muted={idle_muted}"
+    );
+
+    // Phase C: producer resume after idle/disconnect (GAP-PW-01).
+    let resume_pre_samples = stream_status.e2e_hist.total_count();
+    let mut resume_tone = ToneDriver::new(&dir);
+    assert!(
+        resume_tone.wait_for_sink_and_attach(Duration::from_secs(5)),
+        "resumed ToneDriver could not attach to NAM-Audio-Pipe-input"
+    );
+    let resume_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < resume_deadline {
+        if stream_status.e2e_hist.total_count() >= resume_pre_samples + 4 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        stream_status.e2e_hist.total_count() >= resume_pre_samples + 4,
+        "pipeline did not resume streaming after idle disconnect"
+    );
+    drop(resume_tone);
+
+    let trigger_errors = stream_status
+        .playback_trigger_errors
+        .load(Ordering::Relaxed);
+    let mut rate = stream_status
+        .playback_negotiated_rate
+        .load(Ordering::Relaxed);
+    if rate == 0 {
+        rate = stream_status
+            .capture_negotiated_rate
+            .load(Ordering::Relaxed);
+    }
+    if rate == 0 {
+        rate = 48_000;
+    }
+    let quantum_ns = (last_n_samples as u64) * 1_000_000_000 / (rate as u64);
+    let effective_p99_ns = if p99_exact_ns > 0 {
+        p99_exact_ns
+    } else {
+        latency.p99_ns
+    };
+
+    spsc::SHUTDOWN.store(true, Ordering::Relaxed);
+    let host_result = pw_thread.join().expect("PipeWire host thread panicked");
+    assert!(host_result.is_ok(), "host failed: {host_result:?}");
+    assert!(
+        !rt_status.check_flag(neural_amp_modeler_rs::common::spsc::RT_STATUS_PANIC_CAPTURED),
+        "RT panic flag must stay clear across follower, idle, and resume phases"
+    );
+    assert!(last_n_samples > 0, "no audio quantum processed");
+    assert_eq!(
+        steady_early, 0,
+        "steady-state playback_early_callbacks must be zero (got {steady_early})"
+    );
+    assert_eq!(
+        trigger_errors, 0,
+        "playback_trigger_errors must be zero (got {trigger_errors})"
+    );
+    assert_eq!(
+        steady_starvation, 0,
+        "steady-state starvation must be zero (got {steady_starvation})"
+    );
+    assert_eq!(
+        steady_dropped, 0,
+        "steady-state dropped frames must be zero (got {steady_dropped})"
+    );
+    assert_eq!(
+        idle_early, 0,
+        "idle playback_early_callbacks must be zero (got {idle_early})"
+    );
+    assert_eq!(
+        idle_starvation, 0,
+        "idle starvation must be zero (got {idle_starvation})"
+    );
+    assert!(
+        effective_p99_ns < quantum_ns,
+        "follower chain p99 E2E ({effective_p99_ns} ns) must stay below 1 quantum ({quantum_ns} ns)"
+    );
+    assert_eq!(
+        total_divergence, 0,
+        "single-data-loop playback_thread_divergence must be zero (got startup={startup_divergence}, steady={steady_divergence})"
+    );
+}

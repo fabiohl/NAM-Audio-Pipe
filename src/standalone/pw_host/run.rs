@@ -90,9 +90,11 @@ pub fn run_pipewire_host(
 /// Runs the full PipeWire host loop with single-slot cabinet (WAV or 1x1 NAM/NAMB) and bypass support.
 ///
 /// Architecture: Apps → [Capture: Audio/Sink] → process(DSP) → DspBridge → [Playback: Stream/Output] → Hardware.
-/// Both streams share `node.group` / `node.link-group`, executing synchronously on the PipeWire
-/// driver loop with zero extra quantum latency. DSP state and SPSC channels survive bounded
-/// daemon reconnect cycles via heap `Box`es reached through raw pointers.
+/// Both streams share `node.group` / `node.link-group`, while `StreamFlags::TRIGGER`
+/// and `PlaybackTriggerSlot` (`pw_stream_trigger_process`) enforce causal
+/// intra-quantum `capture → playback` ordering with zero extra quantum latency.
+/// DSP state and SPSC channels survive bounded daemon reconnect cycles via heap
+/// `Box`es reached through raw pointers.
 #[expect(
     clippy::too_many_arguments,
     reason = "FFI design or complex DSP kernel signature required by construction"
@@ -248,6 +250,9 @@ pub fn run_pipewire_host_with_cabinet(
         backend_status
             .stream_status()
             .reset_playback_thread_divergence();
+        backend_status
+            .stream_status()
+            .reset_playback_trigger_errors();
 
         // Derive every raw pointer to host-owned state afresh per instance,
         // only after the owner's pre-stream writes above are complete and
@@ -298,6 +303,7 @@ pub fn run_pipewire_host_with_cabinet(
             playback_stream,
             playback_listener,
             initial_latency_samples,
+            playback_trigger,
         ) = match setup::create_streams(
             &core,
             bridge_ptr,
@@ -340,6 +346,12 @@ pub fn run_pipewire_host_with_cabinet(
             playback_listener,
             playback_stream,
         };
+        // SAFETY: `app_state.playback_stream` remains live and pinned inside
+        // `AppState` for the active loop window; `playback_trigger.disarm()`
+        // runs after `thread_loop.stop()` and strictly before `drop(app_state)`.
+        unsafe {
+            playback_trigger.arm(&app_state.playback_stream);
+        }
         drop(teardown_guard.take());
         sys.emit_irq_advisory(target_cpu);
 
@@ -422,6 +434,7 @@ pub fn run_pipewire_host_with_cabinet(
 
         teardown_guard = Some(backend_status.enter_teardown());
         thread_loop.stop();
+        playback_trigger.disarm();
         drop(app_state);
         drop(core);
         drop(context);

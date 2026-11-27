@@ -124,3 +124,15 @@ fn playback_quantum_bump_saturates_and_resets() {
     status.reset_playback_quantums();
     assert_eq!(status.playback_quantums.load(Ordering::Relaxed), 0);
 }
+
+#[test]
+fn playback_trigger_errors_start_at_zero_and_reset_per_instance() {
+    let status = StreamStatusFlags::new();
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 0);
+    status
+        .playback_trigger_errors
+        .fetch_add(3, Ordering::Relaxed);
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 3);
+    status.reset_playback_trigger_errors();
+    assert_eq!(status.playback_trigger_errors.load(Ordering::Relaxed), 0);
+}

@@ -256,7 +256,8 @@ pub fn setup_playback_stream<'c>(
         None,
         pw::stream::StreamFlags::AUTOCONNECT
             | pw::stream::StreamFlags::MAP_BUFFERS
-            | pw::stream::StreamFlags::RT_PROCESS,
+            | pw::stream::StreamFlags::RT_PROCESS
+            | pw::stream::StreamFlags::TRIGGER,
         &mut [playback_format_pod, proc_pod, lat_pod],
     )?;
 

@@ -71,12 +71,10 @@ All PipeWire node names, stream descriptions, and thread loop identifiers are de
 
 ### 1.2 Graph Scheduling Synchronization & Control Plane Wakeup
 
-To eliminate inter-thread synchronization jitter, both streams are bound to identical scheduling groups:
+To eliminate inter-thread synchronization jitter and guarantee deterministic intra-quantum ordering (`capture -> DspBridge -> playback`), both streams are bound to identical scheduling groups and linked by an explicit PipeWire trigger:
 
-- `node.group = "nam-audio-pipe-dsp"` (`PW_NODE_GROUP`)
-- `node.link-group = "nam-audio-pipe-link-group"` (`PW_LINK_GROUP`)
-
-This configuration instructs the PipeWire graph scheduler to execute both capture and playback callbacks synchronously on the same real-time driver loop thread (`nam-audio-pipe-loop`, `PW_THREAD_LOOP_NAME`).
+- `node.group = "nam-audio-pipe-dsp"` (`PW_NODE_GROUP`) and `node.link-group = "nam-audio-pipe-link-group"` (`PW_LINK_GROUP`) co-schedule both streams on the same real-time driver loop (`nam-audio-pipe-loop`, `PW_THREAD_LOOP_NAME`).
+- The playback stream is connected with `StreamFlags::TRIGGER` (`PW_STREAM_FLAG_TRIGGER`, requiring `libpipewire >= 0.3.41`), and the capture callback triggers it via [`PlaybackTriggerSlot`](../src/standalone/pw_host/trigger.rs) (`pw_stream_trigger_process`) immediately after publishing the DSP block to `DspBridge` (and on prologue skip so playback emits deterministic silence and recycles its SPA buffer). This prevents FIFO reordering or 1-quantum lag even when upstream follower nodes feed `NAM-Audio-Pipe-input`; `playback_early_callbacks` remains as a regression sentinel (`0` expected in steady state).
 
 Furthermore, coordination between the PipeWire `ThreadLoop` and the main process loop is managed by [`ControlPlaneWakeup`](../src/standalone/pw_host/wakeup.rs). Rather than relying on unconditional sleep intervals, state changes, format renegotiations, and shutdown events trigger instant condition variable notifications with a bounded fallback timeout ($\le 100\text{ ms}$), achieving near-zero latency control plane responsiveness without system call overhead on the audio thread.
 

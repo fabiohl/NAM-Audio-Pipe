@@ -1336,3 +1336,86 @@ fn latency_histogram_reset_is_per_bucket_atomic_under_concurrent_record() {
     assert_eq!(empty.max_ns, 0);
     assert_eq!(empty.mean_ns, 0);
 }
+
+#[test]
+fn playback_trigger_errors_latch_fires_once_per_episode() {
+    let _guard = init_test_logger();
+    let rt_status = RtStatusFlags::new();
+    let stream_status = StreamStatusFlags::new();
+    let sys = SystemSnapshot::capture();
+    let bridge = create_test_bridge();
+    let mut state = PollState::default();
+
+    // Clean baseline: latch stays disarmed.
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
+    assert!(!state.latches.playback_trigger_errors.active);
+    assert_eq!(state.last_trigger_errors, 0);
+
+    // Episode 1: trigger errors occur -> latch becomes active and records count.
+    stream_status
+        .playback_trigger_errors
+        .fetch_add(2, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
+    assert!(state.latches.playback_trigger_errors.active);
+    assert_eq!(state.last_trigger_errors, 2);
+
+    // Sustained errors keep latch active without re-arming until cleared.
+    stream_status
+        .playback_trigger_errors
+        .fetch_add(1, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
+    assert!(state.latches.playback_trigger_errors.active);
+    assert_eq!(state.last_trigger_errors, 3);
+
+    // Clean poll clears the latch so a subsequent episode can fire again.
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
+    assert!(!state.latches.playback_trigger_errors.active);
+
+    // Episode 2: re-triggers cleanly.
+    stream_status
+        .playback_trigger_errors
+        .fetch_add(1, Ordering::Relaxed);
+    let _ = poll_rt_status(
+        &rt_status,
+        Some(&stream_status),
+        &sys,
+        false,
+        false,
+        bridge.drain_dropped_frames(),
+        &mut state,
+    );
+    assert!(state.latches.playback_trigger_errors.active);
+    assert_eq!(state.last_trigger_errors, 4);
+}

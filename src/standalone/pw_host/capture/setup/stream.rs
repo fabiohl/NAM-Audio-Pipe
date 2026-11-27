@@ -3,15 +3,38 @@
 
 use super::super::state::{CaptureState, RtHostChannels};
 use crate::recording::transport::RecordingSender;
-use crate::standalone::pw_host::SharedBackendStatus;
 use crate::standalone::pw_host::rt_callback;
+use crate::standalone::pw_host::trigger::{PlaybackTriggerSlot, TriggerResult};
+use crate::standalone::pw_host::{SharedBackendStatus, StreamStatusFlags};
 use crate::standalone::rt_setup;
 use neural_amp_modeler_rs::common::spsc::{GcItem, RtStatusFlags};
 use neural_amp_modeler_rs::dsp::pipeline::{BridgeRef, DspBridgeWriter};
 
 use pipewire as pw;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+#[inline]
+pub(super) fn record_trigger_result(result: TriggerResult, stream_status: &StreamStatusFlags) {
+    if matches!(result, TriggerResult::Failed(_))
+        && stream_status.playback_active.load(Ordering::Acquire) != 0
+    {
+        stream_status
+            .playback_trigger_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Triggers the `PW_STREAM_FLAG_TRIGGER` playback stream immediately after
+/// capture finishes producing (or skipping) a quantum, preserving zero-alloc,
+/// lock-free RT safety and suppressing connection-transient errors when inactive.
+#[inline]
+pub(super) fn trigger_playback_after_capture(
+    trigger: &PlaybackTriggerSlot,
+    stream_status: &StreamStatusFlags,
+) {
+    record_trigger_result(trigger.trigger(), stream_status);
+}
 
 #[expect(
     clippy::too_many_arguments,
@@ -32,6 +55,7 @@ pub fn setup_capture_stream<'c>(
     parking_lot_dirty_ptr: *const AtomicBool,
     recording_failed: Option<Arc<AtomicBool>>,
     backend_status: Arc<SharedBackendStatus>,
+    playback_trigger: Arc<PlaybackTriggerSlot>,
 ) -> anyhow::Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>)> {
     let capture_props = super::properties::create_capture_properties(buffer_size);
 
@@ -141,6 +165,12 @@ pub fn setup_capture_stream<'c>(
                     } = outcome
                     else {
                         let _ = stream.dequeue_buffer();
+                        // Trigger playback even on prologue skip so it emits
+                        // deterministic silence and recycles its SPA buffer.
+                        trigger_playback_after_capture(
+                            &playback_trigger,
+                            &stream_status_for_process,
+                        );
                         return;
                     };
 
@@ -169,6 +199,8 @@ pub fn setup_capture_stream<'c>(
                         recording_failed_ref,
                         t_cap_start,
                     );
+
+                    trigger_playback_after_capture(&playback_trigger, &stream_status_for_process);
 
                     rt_callback::capture_epilogue(
                         stream,

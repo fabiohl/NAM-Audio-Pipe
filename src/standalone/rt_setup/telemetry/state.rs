@@ -209,6 +209,8 @@ pub struct TelemetryLatches {
     /// Playback callbacks running on a thread other than the capture-marked RT
     /// data thread (`StreamStatusFlags::playback_thread_divergence`).
     pub playback_thread_divergence: LatchedSignal,
+    /// Playback stream trigger failures (`StreamStatusFlags::playback_trigger_errors`).
+    pub playback_trigger_errors: LatchedSignal,
     /// Installed cabinet slot bypassed because its rate differs from the host
     /// quantum rate (`StreamStatusFlags::cab_rate_stale`).
     pub cab_rate_stale: LatchedSignal,
@@ -234,6 +236,8 @@ pub struct PollState {
     pub pw_log_dropped_last: u64,
     /// Last observed cumulative playback-thread divergence count.
     pub playback_thread_divergence_last: u64,
+    /// Last observed cumulative playback-trigger error count.
+    pub last_trigger_errors: u32,
     /// Last observed `playback_quantums` value; used to re-arm the bridge
     /// bring-up suppression budget whenever playback makes progress.
     pub last_bringup_quanta: u32,
@@ -270,6 +274,7 @@ impl PollState {
             last_muted: 0,
             pw_log_dropped_last: 0,
             playback_thread_divergence_last: 0,
+            last_trigger_errors: 0,
             last_bringup_quanta: 0,
             bringup_suppressed_polls: 0,
             has_polled_in_bringup: false,

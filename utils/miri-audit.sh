@@ -24,7 +24,7 @@ precondition_fail() {
 echo "Miri concurrency & UB audit gate"
 echo "  TARGET: recording::pool::pool_test (RecordingPool SPSC ring, 13/13)"
 echo "  TARGET: standalone::pw_host::pw_host_test (DspBridge handshake)"
-echo "  TARGET: aliasing_harness (per-instance raw pointer lifecycle, 3/3 Stacked + Tree Borrows)"
+echo "  TARGET: aliasing_harness (per-instance raw pointer lifecycle, 4/4 Stacked + Tree Borrows)"
 echo "  EXCLUDED: rt_callback/harness.rs (AVX2/FMA intrinsics, ~10,000x slowdown)"
 
 # Fail-closed prerequisites: an unavailable toolchain is a typed usage
@@ -62,13 +62,13 @@ emit "PHASE: bridge PASS log=$CUR_LOG"
 
 PHASE_NAME=aliasing; CUR_LOG="$LOG_DIR/miri-audit-aliasing.log"; phase aliasing
 cargo +nightly miri test --test aliasing_harness 2>&1 | tee "$CUR_LOG"
-assert_ran_tests "$CUR_LOG" 3
+assert_ran_tests "$CUR_LOG" 4
 emit "PHASE: aliasing PASS log=$CUR_LOG"
 
 PHASE_NAME=aliasing_tb; CUR_LOG="$LOG_DIR/miri-audit-aliasing-tb.log"; phase aliasing_tb
 MIRIFLAGS="${MIRIFLAGS} -Zmiri-tree-borrows" cargo +nightly miri test --test aliasing_harness 2>&1 | tee "$CUR_LOG"
-assert_ran_tests "$CUR_LOG" 3
+assert_ran_tests "$CUR_LOG" 4
 emit "PHASE: aliasing_tb PASS log=$CUR_LOG"
 
-ok "Miri concurrency and aliasing audit completed successfully (pool 13/13 + bridge handshake + aliasing 3/3 Stacked + Tree Borrows)!"
+ok "Miri concurrency and aliasing audit completed successfully (pool 13/13 + bridge handshake + aliasing 4/4 Stacked + Tree Borrows)!"
 finish || exit 1

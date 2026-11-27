@@ -14,6 +14,8 @@ use listener::cab_rate_diverged;
 #[cfg(test)]
 pub(crate) use properties::create_capture_properties;
 pub use stream::setup_capture_stream;
+#[cfg(test)]
+use stream::{record_trigger_result, trigger_playback_after_capture};
 
 #[cfg(test)]
 pub(crate) use super::super::rt_callback::{
